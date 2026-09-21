@@ -22,7 +22,7 @@
   ],
   "author": "Fluxwright contributors",
   "homepage": "https://github.com/harshit-d3v/fluxwright#readme",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   },

@@ -22,7 +22,7 @@
     "napi-rs"
   ],
   "author": "Fluxwright contributors",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   },
