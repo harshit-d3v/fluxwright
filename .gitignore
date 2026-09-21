@@ -15,6 +15,7 @@ benchmarks/results/*.json
 !benchmarks/results/.gitkeep
 .vercel
 .cursor/
+.playwright-mcp/
 users-data/
 *.log
 *.tgz
