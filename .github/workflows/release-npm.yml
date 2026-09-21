@@ -1,0 +1,88 @@
+name: release-npm
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: bindings/node
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+          - host: macos-latest
+            target: aarch64-apple-darwin
+          - host: macos-latest
+            target: x86_64-apple-darwin
+          # 22.04 for glibc 2.35: binaries built on 24.04 will not load on older distros.
+          - host: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/node
+      - run: npm ci
+      - run: npx napi build --platform --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: bindings/node/*.node
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - run: npm ci
+      - name: Tag and platform package versions agree
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          test "$want" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $want"; exit 1; }
+          node -e '
+            const p = require("./package.json");
+            for (const [n, v] of Object.entries(p.optionalDependencies || {})) {
+              if (v !== p.version) { console.error(`${n}@${v} != ${p.version}`); process.exit(1); }
+            }
+            if (Object.keys(p.optionalDependencies || {}).length === 0) {
+              console.error("no optionalDependencies: the published package would ship no binary");
+              process.exit(1);
+            }
+          '
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bindings-*
+          merge-multiple: true
+          path: bindings/node/artifacts
+      - run: npx napi artifacts
+      - name: Publish
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          npm publish --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
