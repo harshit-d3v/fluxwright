@@ -116,7 +116,7 @@ export default function Home() {
         <h2 id="install">Install</h2>
         <h3>Rust (source)</h3>
         <pre>
-          <code>{`git clone https://github.com/fluxwright/fluxwright
+          <code>{`git clone https://github.com/harshit-d3v/fluxwright
 cd fluxwright
 # Windows cmd:
 set PATH=%USERPROFILE%\\.cargo\\bin;%PATH%

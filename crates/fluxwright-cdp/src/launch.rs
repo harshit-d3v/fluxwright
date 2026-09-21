@@ -73,6 +73,7 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         "--window-size=1280,720".to_string(),
         "--disable-crash-reporter".to_string(),
         "--disable-breakpad".to_string(),
+        "--disable-dev-shm-usage".to_string(),
         format!(
             "--crash-dumps-dir={}",
             user_data_dir.path().join("Crashpad").display()

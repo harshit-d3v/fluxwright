@@ -84,6 +84,10 @@ impl Engine {
                 }
                 let notified = pump.admit.notified();
                 tokio::pin!(notified);
+                // notify_waiters() stores no permit, and Notified only listens
+                // once polled: without enable() every wakeup raised while
+                // dispatch runs is lost and the queue stalls until timeout.
+                notified.as_mut().enable();
                 let progress = Inner::dispatch(pump.clone()).await.unwrap_or(false);
                 if !progress {
                     notified.await;
@@ -122,6 +126,8 @@ impl Engine {
                                 return Err(Error::AcquireTimeout);
                             }
                             let notified = self.inner.admit.notified();
+                            tokio::pin!(notified);
+                            notified.as_mut().enable();
                             {
                                 let st = self.inner.state.lock().await;
                                 if st.queue.len() < self.inner.config.queue_capacity {
@@ -360,8 +366,14 @@ impl Inner {
                     let _ = waiter.tx.send(Ok(lease));
                 }
                 Err(Error::NoBrowser) => {
-                    let mut st = inner.state.lock().await;
-                    st.queue.push_front(waiter);
+                    {
+                        let mut st = inner.state.lock().await;
+                        st.queue.push_front(waiter);
+                    }
+                    // ponytail: flat 50ms backoff. The rss ceiling clears on a
+                    // release, which notifies anyway; this only stops dispatch
+                    // from spinning on a waiter it cannot serve yet.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => {
                     let _ = waiter.tx.send(Err(e));

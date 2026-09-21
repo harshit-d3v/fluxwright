@@ -1,0 +1,40 @@
+{
+  "name": "fluxwright-darwin-arm64",
+  "version": "0.1.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "fluxwright.darwin-arm64.node",
+  "files": [
+    "fluxwright.darwin-arm64.node"
+  ],
+  "description": "In-process Chromium fleet engine (napi-rs). Lease API, not Playwright parity.",
+  "keywords": [
+    "chromium",
+    "chrome",
+    "cdp",
+    "browser-pool",
+    "automation",
+    "napi-rs"
+  ],
+  "author": "Fluxwright contributors",
+  "homepage": "https://github.com/harshit-d3v/fluxwright#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/harshit-d3v/fluxwright.git",
+    "directory": "bindings/node"
+  },
+  "bugs": {
+    "url": "https://github.com/harshit-d3v/fluxwright/issues"
+  }
+}
