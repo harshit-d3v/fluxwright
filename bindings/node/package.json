@@ -1,0 +1,56 @@
+{
+  "name": "fluxwright",
+  "version": "0.1.0",
+  "description": "In-process Chromium fleet engine (napi-rs). Lease API, not Playwright parity.",
+  "main": "addon.js",
+  "types": "addon.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fluxwright/fluxwright.git",
+    "directory": "bindings/node"
+  },
+  "homepage": "https://github.com/fluxwright/fluxwright#readme",
+  "bugs": {
+    "url": "https://github.com/fluxwright/fluxwright/issues"
+  },
+  "keywords": [
+    "chromium",
+    "chrome",
+    "cdp",
+    "browser-pool",
+    "automation",
+    "napi-rs"
+  ],
+  "author": "Fluxwright contributors",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "addon.js",
+    "addon.d.ts",
+    "index.js",
+    "index.d.ts",
+    "MISSING.md",
+    "README.md",
+    "LICENSE-MIT",
+    "*.node"
+  ],
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi build --platform --release"
+  },
+  "napi": {
+    "name": "fluxwright",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}

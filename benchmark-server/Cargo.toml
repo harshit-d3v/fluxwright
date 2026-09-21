@@ -1,0 +1,17 @@
+[package]
+name = "benchmark-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic local HTTP fixtures for Fluxwright benchmarks"
+publish = false
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "benchmark-server"
+path = "src/main.rs"

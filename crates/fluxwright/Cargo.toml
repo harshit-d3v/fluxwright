@@ -1,0 +1,24 @@
+[package]
+name = "fluxwright"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "High-concurrency Chromium automation engine"
+rust-version.workspace = true
+
+[dependencies]
+fluxwright-cdp.workspace = true
+fluxwright-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+benchmark-server.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber.workspace = true
+axum.workspace = true
+serde_json.workspace = true
