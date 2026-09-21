@@ -5,6 +5,36 @@ use std::time::Duration;
 
 use fluxwright::{BrowserEngine, JobOptions, QueueFullMode};
 
+// Diagnostics for the two acquire stalls that only reproduce on CI. Remove
+// once the Linux runs are green.
+fn trace() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "fluxwright_core=debug,fluxwright_cdp=warn".into());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Prints pool state every 2s, so an acquire that never returns says why.
+fn watchdog(eng: BrowserEngine, label: &'static str) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let m = eng.metrics().await;
+            eprintln!(
+                "[{label}] browsers={} contexts={} queued={} crashes={} recycles={} rss={}MB",
+                m.browsers,
+                m.contexts,
+                m.queued_requests,
+                m.crash_count,
+                m.recycle_count,
+                m.browser_tree_rss_bytes / (1024 * 1024),
+            );
+        }
+    })
+}
+
 fn kill_pid(pid: u32) {
     if cfg!(windows) {
         let _ = Command::new("taskkill")
@@ -105,6 +135,7 @@ async fn queue_full_error_mode() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_full_wait_mode() {
+    trace();
     let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
     let base = srv.base_url.clone();
     let eng = BrowserEngine::builder()
@@ -117,12 +148,14 @@ async fn queue_full_wait_mode() {
         .await
         .unwrap();
 
+    let wd = watchdog(eng.clone(), "wait_mode");
     let held = eng.acquire().await.unwrap();
     let eng2 = eng.clone();
     let waiter = tokio::spawn(async move { eng2.acquire().await });
     tokio::time::sleep(Duration::from_millis(150)).await;
     drop(held);
     let page = waiter.await.unwrap().expect("waited for slot");
+    wd.abort();
     page.goto(&format!("{base}/")).await.unwrap();
     drop(page);
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
@@ -258,6 +291,7 @@ async fn kill_browser_mid_job_retries() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn two_hundred_leases_five_browsers_no_deadlock() {
+    trace();
     let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
     let url = format!("{}/", srv.base_url);
     let eng = BrowserEngine::builder()
@@ -271,6 +305,7 @@ async fn two_hundred_leases_five_browsers_no_deadlock() {
         .await
         .unwrap();
 
+    let wd = watchdog(eng.clone(), "200_leases");
     let mut joins = Vec::new();
     for _ in 0..200 {
         let eng = eng.clone();
@@ -286,5 +321,6 @@ async fn two_hundred_leases_five_browsers_no_deadlock() {
     for j in joins {
         j.await.unwrap().expect("lease");
     }
+    wd.abort();
     eng.shutdown(Duration::from_secs(15)).await.unwrap();
 }
