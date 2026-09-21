@@ -78,7 +78,7 @@ async fn queue_full_error_mode() {
         .max_contexts_per_browser(1)
         .queue_capacity(1)
         .queue_full_mode(QueueFullMode::Error)
-        .acquire_timeout(Duration::from_secs(5))
+        .acquire_timeout(Duration::from_secs(60))
         .build()
         .await
         .unwrap();

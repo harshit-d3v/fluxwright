@@ -13,8 +13,10 @@ jobs:
   test:
     name: rust
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       FLUXWRIGHT_NO_SANDBOX: "1"
+      FLUXWRIGHT_HEADLESS: "1"
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +26,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
+          for c in chromium chromium-browser google-chrome; do
+            if command -v "$c"; then
+              echo "FLUXWRIGHT_CHROMIUM=$(command -v "$c")" >> "$GITHUB_ENV"
+              break
+            fi
+          done
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
   site:
     name: website
