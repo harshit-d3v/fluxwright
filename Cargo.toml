@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fluxwright-cdp",
+    "crates/fluxwright-core",
+    "crates/fluxwright",
+    "crates/fluxwright-cli",
+    "crates/fluxwright-mcp",
+    "benchmark-server",
+    "benchmarks",
+]
+exclude = ["bindings/node"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/fluxwright/fluxwright"
+rust-version = "1.85"
+
+[workspace.dependencies]
+fluxwright-cdp = { path = "crates/fluxwright-cdp", version = "0.1.0" }
+fluxwright-core = { path = "crates/fluxwright-core", version = "0.1.0" }
+fluxwright = { path = "crates/fluxwright", version = "0.1.0" }
+benchmark-server = { path = "benchmark-server", version = "0.1.0" }
+
+tokio = { version = "1.47", features = ["full"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+tempfile = "3.13"
+sysinfo = "0.33"
+bytes = "1.9"
+clap = { version = "4.5", features = ["derive"] }
+axum = "0.8"
+http-body-util = "0.1"
+hyper = { version = "1.6", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+anyhow = "1.0"
+parking_lot = "0.12"
+async-trait = "0.1"
+base64 = "0.22"
+napi = { version = "2.16", default-features = false, features = ["napi8", "async", "serde-json"] }
+napi-derive = "2.16"

@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.pdb
+.env
+node_modules/
+www/.next/
+www/out/
+benchmarks/node_modules/
+bindings/node/target/
+bindings/node/index.js
+bindings/node/*.node
+benchmarks/results/*.json
+!benchmarks/results/.gitkeep
+.vercel
+.cursor/
+users-data/
+*.log
+*.tgz
+Cargo.lock
+# Keep lockfile for an application workspace
+!/Cargo.lock
