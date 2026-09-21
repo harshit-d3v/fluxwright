@@ -33,10 +33,13 @@ fn walk(sys: &System, pid: Pid) -> u64 {
     if let Some(p) = sys.process(pid) {
         sum += p.memory();
     }
+    // Linux lists threads as processes: parent() is their thread-group leader
+    // and memory() is the whole process RSS, so counting them multiplies a
+    // browser's footprint by its thread count.
     let children: Vec<Pid> = sys
         .processes()
         .iter()
-        .filter(|(_, proc)| proc.parent() == Some(pid))
+        .filter(|(_, proc)| proc.thread_kind().is_none() && proc.parent() == Some(pid))
         .map(|(id, _)| *id)
         .collect();
     for c in children {
@@ -51,4 +54,44 @@ pub fn current_process_rss_bytes() -> u64 {
     sys.process(Pid::from_u32(std::process::id()))
         .map(|p| p.memory())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn tree_rss_does_not_multiply_by_thread_count() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                })
+            })
+            .collect();
+
+        let own = current_process_rss_bytes();
+        let tree = process_tree_rss_bytes(std::process::id());
+
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert!(tree > 0);
+        // No child processes, so the tree is this process alone. With threads
+        // miscounted as children it would be at least 9x.
+        assert!(
+            tree <= own * 2,
+            "tree {tree} vs own {own}: threads counted as child processes"
+        );
+    }
 }
