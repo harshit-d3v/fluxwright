@@ -22,16 +22,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Chromium
+      - name: Locate Chrome
         run: |
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
-          for c in chromium chromium-browser google-chrome; do
-            if command -v "$c"; then
-              echo "FLUXWRIGHT_CHROMIUM=$(command -v "$c")" >> "$GITHUB_ENV"
-              break
-            fi
-          done
+          echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          google-chrome --version
       - name: Test
         run: cargo test --workspace -- --test-threads=1
 
