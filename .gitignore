@@ -9,8 +9,8 @@ www/.next/
 www/out/
 benchmarks/node_modules/
 bindings/node/target/
-bindings/node/index.js
 bindings/node/*.node
+bindings/node/npm/*/*.node
 benchmarks/results/*.json
 !benchmarks/results/.gitkeep
 .vercel

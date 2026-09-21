@@ -6,12 +6,12 @@
   "types": "addon.d.ts",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fluxwright/fluxwright.git",
+    "url": "git+https://github.com/harshit-d3v/fluxwright.git",
     "directory": "bindings/node"
   },
-  "homepage": "https://github.com/fluxwright/fluxwright#readme",
+  "homepage": "https://github.com/harshit-d3v/fluxwright#readme",
   "bugs": {
-    "url": "https://github.com/fluxwright/fluxwright/issues"
+    "url": "https://github.com/harshit-d3v/fluxwright/issues"
   },
   "keywords": [
     "chromium",
@@ -22,7 +22,7 @@
     "napi-rs"
   ],
   "author": "Fluxwright contributors",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   },
@@ -33,18 +33,21 @@
     "index.d.ts",
     "MISSING.md",
     "README.md",
-    "LICENSE-MIT",
-    "*.node"
+    "LICENSE-MIT"
   ],
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "prepublishOnly": "napi build --platform --release"
+    "artifacts": "napi artifacts",
+    "prepublishOnly": "napi prepublish -t npm --skip-gh-release"
   },
   "napi": {
     "name": "fluxwright",
     "triples": {
-      "defaults": true
+      "defaults": true,
+      "additional": [
+        "aarch64-apple-darwin"
+      ]
     }
   },
   "publishConfig": {
@@ -52,5 +55,11 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4"
+  },
+  "optionalDependencies": {
+    "fluxwright-darwin-arm64": "0.1.0",
+    "fluxwright-darwin-x64": "0.1.0",
+    "fluxwright-linux-x64-gnu": "0.1.0",
+    "fluxwright-win32-x64-msvc": "0.1.0"
   }
 }
