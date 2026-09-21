@@ -18,6 +18,8 @@ jobs:
       FLUXWRIGHT_NO_SANDBOX: "1"
       FLUXWRIGHT_HEADLESS: "1"
       RUST_BACKTRACE: "1"
+      # Diagnostics for the CI-only acquire stalls; drop once the runs are green.
+      RUST_LOG: "fluxwright_core=debug,fluxwright_cdp=warn"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,7 +29,7 @@ jobs:
           echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
           google-chrome --version
       - name: Test
-        run: cargo test --workspace -- --test-threads=1
+        run: cargo test --workspace -- --test-threads=1 --nocapture
 
   site:
     name: website
