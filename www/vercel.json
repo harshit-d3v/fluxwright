@@ -4,5 +4,8 @@
   "installCommand": "npm ci",
   "buildCommand": "npm run build",
   "outputDirectory": "out",
-  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- ."
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- .",
+  "redirects": [
+    { "source": "/favicon.ico", "destination": "/favicon.svg", "permanent": false }
+  ]
 }

@@ -20,6 +20,7 @@ export const metadata: Metadata = {
   title: "Fluxwright — Chromium fleet engine",
   description:
     "Lease-based Chromium pooling, admission, recycle, and crash recovery. Not a Playwright rewrite. Rust, Node, CLI, and MCP.",
+  icons: { icon: "/favicon.svg" },
 };
 
 export const viewport = {
