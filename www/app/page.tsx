@@ -126,11 +126,9 @@ cargo run -p fluxwright --example thousand_jobs`}</code>
         <h3>npm</h3>
         <pre>
           <code>{`npm install fluxwright
-# first publish ships a prebuilt for your OS when CI artifacts exist.
-# otherwise, from the repo:
-cd bindings/node
-npm install
-npm run build`}</code>
+# prebuilt for Windows x64, macOS x64 / arm64, Linux x64 (glibc).
+# other platforms build from the repo (needs Rust):
+cd bindings/node && npm install && npm run build`}</code>
         </pre>
         <h3>MCP binary</h3>
         <pre>
@@ -252,8 +250,8 @@ command = "C:\\\\Users\\\\YOU\\\\.cargo\\\\bin\\\\fluxwright-mcp.exe"`}</code>
         </pre>
         <h3>Cursor</h3>
         <p>
-          This repo already has <code>.cursor/mcp.json</code>. Reload MCP in
-          Cursor settings.
+          <code>.cursor/mcp.json</code> in your project, same shape as the
+          Claude Desktop config above. Reload MCP in Cursor settings.
         </p>
         <p className="callout">
           Chrome opens visible unless you set{" "}
@@ -305,8 +303,8 @@ cargo run -p fluxwright-benchmarks --release`}</code>
         </ul>
         <hr />
         <p className="note">
-          License MIT OR Apache-2.0. Source in this repository. npm package
-          name: <span translate="no">fluxwright</span>.
+          License MIT. Source in this repository. npm package name:{" "}
+          <span translate="no">fluxwright</span>.
         </p>
       </main>
     </div>
