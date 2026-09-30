@@ -599,6 +599,63 @@ async fn proxy_per_job() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+/// Review findings on PR #2: each used to misclick or fill silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn actionability_edge_cases() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(2))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<title>t</title>",
+        "<input type=button value=Save onclick=\"document.title='input'\">",
+        "<span onclick=\"document.title='span'\">Save</span>",
+        "<button onclick=\"document.title='img'\" style='padding:8px'><img alt=Upload></button>",
+        "<fieldset disabled><button>Locked</button></fieldset>",
+        "<div aria-disabled=true><button>Aria</button></div>",
+        "<div id=ce contenteditable>old</div><h1>Head</h1>",
+        "<input id=gone onfocus=\"this.replaceWith(document.createElement('input'))\">"
+    ))
+    .await
+    .unwrap();
+
+    // text= finds matches in DOM order, input buttons included.
+    page.get_by_text("save", false).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "input");
+    // A button named by its image's alt text.
+    page.get_by_role("button", Some("Upload"), true).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "img");
+    // Disabled through <fieldset disabled> or an ancestor's aria-disabled.
+    for name in ["Locked", "Aria"] {
+        let err = page.get_by_role("button", Some(name), true).click().await.unwrap_err().to_string();
+        assert!(err.contains("disabled"), "{name}: {err}");
+    }
+    // fill replaces contenteditable content, refuses non-editable elements, and fails when
+    // the page swaps the element out on focus instead of typing into nothing.
+    page.fill("#ce", "new").await.unwrap();
+    assert_eq!(page.evaluate("document.querySelector('#ce').textContent").await.unwrap(), "new");
+    let err = page.fill("h1", "x").await.unwrap_err().to_string();
+    assert!(err.contains("not an <input>"), "{err}");
+    let err = page.fill("#gone", "x").await.unwrap_err().to_string();
+    assert!(err.contains("removed after the click"), "{err}");
+
+    // An overlay in the parent page covers the iframe: the click must not report success.
+    page.goto(concat!(
+        "data:text/html,<iframe id=f srcdoc='<button>In</button>'></iframe>",
+        "<div style='position:fixed;inset:0;background:rgba(0,0,0,.1)'></div>"
+    ))
+    .await
+    .unwrap();
+    let err = page.frame_locator("#f").get_by_role("button", Some("In"), true).click().await.unwrap_err().to_string();
+    assert!(err.contains("obscured by <div>"), "{err}");
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// Chrome sends each CDP message as one WebSocket frame; tungstenite's default 16 MiB frame
 /// cap made a big screenshot kill the connection, and with it every job on that browser.
 #[tokio::test(flavor = "multi_thread")]

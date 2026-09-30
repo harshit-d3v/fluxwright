@@ -25,9 +25,13 @@
     const has = (t) => (exact ? t.includes(want) : t.toLowerCase().includes(lw));
     const is = (t) => (exact ? t === want : has(t));
     const skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD)$/;
+    // Input buttons show their value, not text content; they are matched in the same
+    // walk so the first match in DOM order wins.
+    const buttons = 'input[type=button],input[type=submit],input[type=reset]';
     const walk = (el) => {
+      if (el.matches(buttons)) return is(norm(el.value)) ? el : null;
       const t = norm(el.textContent);
-      if (!has(t)) return null; // no descendant can match either
+      if (!has(t) && !el.querySelector(buttons)) return null; // nothing below can match
       for (const c of el.children) {
         if (skip.test(c.tagName)) continue;
         const r = walk(c);
@@ -35,11 +39,7 @@
       }
       return is(t) ? el : null;
     };
-    const buttons = 'input[type=button],input[type=submit],input[type=reset]';
-    return () =>
-      (document.body && walk(document.body)) ||
-      [...document.querySelectorAll(buttons)].find((i) => is(norm(i.value))) ||
-      null;
+    return () => (document.body && walk(document.body)) || null;
   } else {
     const r = /^([\w-]+)(?:\[name=("(?:[^"\\]|\\.)*")(s?)\])?$/.exec(body);
     if (!r) throw new SyntaxError('expected role=button or role=button[name="Save"], got ' + body);
@@ -78,8 +78,21 @@
       (el.getAttribute('role') || '').trim().split(/\s+/)[0].toLowerCase() || implicit(el);
     const nameFromContent =
       /^(button|link|heading|cell|columnheader|option|listitem|tab|menuitem|checkbox|radio|switch|treeitem|row)$/;
+    // Name from content (AccName 2F, compact): descendant text, alt text, aria-label and input
+    // button values, skipping hidden descendants. <button><img alt="Save"></button> is "Save".
+    const contentName = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+      const st = getComputedStyle(node);
+      if (node.getAttribute('aria-hidden') === 'true' || st.display === 'none' || st.visibility === 'hidden') return '';
+      const label = norm(node.getAttribute('aria-label'));
+      if (label) return label;
+      if (node.tagName === 'IMG' || (node.tagName === 'INPUT' && node.type === 'image')) return node.getAttribute('alt') || '';
+      if (node.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(node.type)) return node.value;
+      return [...node.childNodes].map(contentName).join(' ');
+    };
     // A compact accessible-name computation: aria-labelledby, aria-label, <label>, value of
-    // input buttons, alt, then text content for roles named by content, placeholder, title.
+    // input buttons, alt, then content for roles named by content, placeholder, title.
     const nameOf = (el) => {
       const ids = el.getAttribute('aria-labelledby');
       if (ids) {
@@ -97,7 +110,7 @@
         if (alt) return alt;
       }
       if (nameFromContent.test(roleOf(el) || '')) {
-        const t = norm(el.textContent);
+        const t = norm([...el.childNodes].map(contentName).join(' '));
         if (t) return t;
       }
       return norm(el.getAttribute('placeholder')) || norm(el.getAttribute('title'));
@@ -116,6 +129,35 @@
   }
   };
 
+  // fill() steps act on the element the click just checked, not a fresh match: the page may
+  // have replaced it, and a new match could be another element.
+  if (mode === 'clear' || mode === 'changed') {
+    const t = globalThis.__fluxwrightTarget;
+    if (!t || !t.isConnected) return { ok: false, reason: 'element was removed after the click' };
+    if (mode === 'changed') {
+      t.dispatchEvent(new Event('input', { bubbles: true }));
+      t.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true };
+    }
+    const typable = t.tagName === 'TEXTAREA' ||
+      (t.tagName === 'INPUT' && !/^(button|submit|reset|checkbox|radio|file|image|range|color|hidden)$/i.test(t.type));
+    if (!typable && !t.isContentEditable) return { ok: false, reason: 'not an <input>, <textarea> or contenteditable element' };
+    if (t.readOnly) return { ok: false, reason: 'element is read-only' };
+    t.focus();
+    if (t.isContentEditable) {
+      // Select the old content so the typed text replaces it.
+      const range = document.createRange();
+      range.selectNodeContents(t);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+    } else {
+      t.value = '';
+    }
+    const active = t.getRootNode().activeElement;
+    if (active !== t && !t.contains(active)) return { ok: false, reason: 'element did not take focus' };
+    return { ok: true };
+  }
+
   let el;
   try {
     el = makeFind()();
@@ -124,20 +166,11 @@
   }
   if (!el) return { ok: false, reason: 'no element matches selector' };
   if (mode === 'attached') return { ok: true, text: el.textContent };
-  if (mode === 'clear') {
-    el.focus();
-    if ('value' in el) el.value = '';
-    return { ok: true };
-  }
-  if (mode === 'changed') {
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    return { ok: true };
-  }
   if (!visible(el)) return { ok: false, reason: 'hidden' };
   if (mode === 'visible') return { ok: true, text: el.textContent };
   // click: enabled, scrolled into view, and the topmost element at its centre.
-  if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') {
+  // :disabled covers <fieldset disabled> ancestors; aria-disabled applies to descendants.
+  if (el.matches(':disabled') || el.closest('[aria-disabled="true"]')) {
     return { ok: false, reason: 'disabled' };
   }
   el.scrollIntoViewIfNeeded(true);
@@ -149,5 +182,6 @@
   if (hit !== el && !el.contains(hit)) {
     return { ok: false, reason: 'obscured by <' + hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + '>' };
   }
+  globalThis.__fluxwrightTarget = el; // isolated world: invisible to page scripts
   return { ok: true, x, y };
 })

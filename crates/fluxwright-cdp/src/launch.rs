@@ -212,6 +212,8 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
             let (chrome_in, to_chrome) = cloexec_pipe()?;
             let (from_chrome, chrome_out) = cloexec_pipe()?;
             let (cin, cout) = (chrome_in.as_raw_fd(), chrome_out.as_raw_fd());
+            #[cfg(target_os = "linux")]
+            let engine = std::process::id() as libc::pid_t;
             // Async-signal-safe calls only: this runs between fork and exec.
             unsafe {
                 cmd.pre_exec(move || {
@@ -219,7 +221,16 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
                     // ponytail: the signal fires when the *thread* that spawned Chrome exits;
                     // tokio workers live as long as the runtime, so launch from async code.
                     #[cfg(target_os = "linux")]
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        // The engine may have died between fork and prctl: then no signal
+                        // comes, so do not start Chrome at all.
+                        if libc::getppid() != engine {
+                            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                        }
+                    }
                     // Move both ends above 4 first, so neither dup2 clobbers the other.
                     let a = libc::fcntl(cin, libc::F_DUPFD_CLOEXEC, 5);
                     let b = libc::fcntl(cout, libc::F_DUPFD_CLOEXEC, 5);

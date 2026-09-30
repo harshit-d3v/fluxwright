@@ -105,6 +105,7 @@ enum Wait {
 
 /// Where selector JS runs: a CDP session, an execution context in it (`None`: the main world),
 /// and that frame's viewport offset in top-level page coordinates.
+#[derive(Clone)]
 struct Scope {
     session: String,
     context: Option<i64>,
@@ -300,11 +301,18 @@ impl CdpPage {
     /// `scroll` brings each iframe into view first, which a click inside it needs.
     /// Element code always runs in an isolated world, where page scripts cannot patch what it
     /// calls (`querySelector`, `getBoundingClientRect`, ...). `evaluate` stays in the page's world.
-    async fn scope(&self, frames: &[String], scroll: bool, timeout: Duration) -> Result<std::result::Result<Scope, String>> {
+    /// Also returns each iframe hop as (parent scope, iframe selector), for [`Self::covered`].
+    async fn scope(
+        &self,
+        frames: &[String],
+        scroll: bool,
+        timeout: Duration,
+    ) -> Result<std::result::Result<(Scope, Vec<(Scope, String)>), String>> {
         // A page target's main frame id is its target id.
         let Some(mut scope) = self.world(self.sid(), &self.target_id.0, 0.0, 0.0, timeout).await else {
             return Ok(Err("page not ready".into()));
         };
+        let mut hops = Vec::new();
         for css in frames {
             let find = format!(
                 "(() => {{ const f = document.querySelector({}); if (f && {scroll}) f.scrollIntoViewIfNeeded(true); return f; }})()",
@@ -343,12 +351,32 @@ impl CdpPage {
             // A cross-site iframe runs in its own process: its own target and session.
             let session = CdpBrowser::session_for_target(&self.targets, &frame_id).await.unwrap_or(s);
             match self.world(&session, &frame_id, dx, dy, timeout).await {
-                Some(next) => scope = next,
+                Some(next) => hops.push((std::mem::replace(&mut scope, next), css.clone())),
                 // Still loading, or a cross-site frame whose session is not attached yet.
                 None => return Ok(Err(format!("{css}: frame not ready"))),
             }
         }
-        Ok(Ok(scope))
+        Ok(Ok((scope, hops)))
+    }
+
+    /// A click inside an iframe lands only if nothing in a parent document covers the iframe
+    /// at that point: the element's own hit test cannot see a parent's overlay.
+    async fn covered(&self, hops: &[(Scope, String)], x: f64, y: f64, timeout: Duration) -> Option<String> {
+        for (parent, css) in hops {
+            let css = serde_json::to_string(css).unwrap();
+            let expr = format!(
+                "(() => {{ const f = document.querySelector({css}); const h = document.elementFromPoint({}, {}); \
+                 return f && h === f ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over ' + {css}; }})()",
+                x - parent.dx,
+                y - parent.dy
+            );
+            match self.eval_in(parent, &expr, true, timeout).await {
+                Ok(v) if v["value"] == "" => {}
+                Ok(v) => return Some(v["value"].as_str().unwrap_or("frame hit test failed").to_string()),
+                Err(e) => return Some(e.to_string()),
+            }
+        }
+        None
     }
 
     /// The isolated world of `frame_id`, made once per document and cached.
@@ -444,8 +472,8 @@ impl CdpPage {
             if self.browser.is_dead() {
                 return Err(Error::BrowserDead { pid: self.browser_pid });
             }
-            let scope = match self.scope(&sel.frames, wait == Wait::Click, timeout).await? {
-                Ok(scope) => scope,
+            let (scope, hops) = match self.scope(&sel.frames, wait == Wait::Click, timeout).await? {
+                Ok(found) => found,
                 Err(reason) => {
                     last_reason = reason;
                     sleep(Duration::from_millis(50)).await;
@@ -467,13 +495,16 @@ impl CdpPage {
                 }
                 let x = v["x"].as_f64().unwrap_or(0.0) + scope.dx;
                 let y = v["y"].as_f64().unwrap_or(0.0) + scope.dy;
-                if let Some((px, py)) = last_pos {
-                    if (px - x).abs() < 1.0 && (py - y).abs() < 1.0 {
-                        return Ok((json!({ "x": x, "y": y }), scope));
+                let stable = last_pos.is_some_and(|(px, py)| (px - x).abs() < 1.0 && (py - y).abs() < 1.0);
+                last_pos = Some((x, y));
+                if !stable {
+                    last_reason = "still moving".into();
+                } else {
+                    match self.covered(&hops, x, y, timeout).await {
+                        None => return Ok((json!({ "x": x, "y": y }), scope)),
+                        Some(reason) => last_reason = reason,
                     }
                 }
-                last_pos = Some((x, y));
-                last_reason = "still moving".into();
             } else {
                 last_reason = v["reason"].as_str().unwrap_or("unknown").to_string();
                 if v["fatal"].as_bool() == Some(true) {
@@ -514,12 +545,26 @@ impl CdpPage {
 
     pub async fn fill(&self, sel: &Selector, value: &str, timeout: Duration) -> Result<()> {
         let scope = self.click_in_scope(sel, timeout).await?;
-        let _ = self.eval_in(&scope, &engine_call(&sel.query, "clear"), true, timeout).await;
+        // Both steps act on the clicked element (see query.js); any failure is an error, never
+        // text typed into whatever else has focus.
+        let step = |mode: &'static str| {
+            let scope = &scope;
+            async move {
+                let r = self.eval_in(scope, &engine_call(&sel.query, mode), true, timeout).await?;
+                match r["value"]["ok"].as_bool() {
+                    Some(true) => Ok(()),
+                    _ => Err(Error::NotActionable {
+                        selector: sel.to_string(),
+                        reason: r["value"]["reason"].as_str().unwrap_or("fill failed").to_string(),
+                    }),
+                }
+            }
+        };
+        step("clear").await?;
         // Sent to the frame's own session: a cross-site iframe has its own input handler.
         self.session_call(&scope.session, "Input.insertText", json!({ "text": value }), timeout)
             .await?;
-        let _ = self.eval_in(&scope, &engine_call(&sel.query, "changed"), true, timeout).await;
-        Ok(())
+        step("changed").await
     }
 
     /// Blocks requests whose URL matches any pattern, in this page and its iframes.
