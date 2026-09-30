@@ -22,3 +22,4 @@ users-data/
 Cargo.lock
 # Keep lockfile for an application workspace
 !/Cargo.lock
+*.tsbuildinfo

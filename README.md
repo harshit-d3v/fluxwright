@@ -107,4 +107,6 @@ await browser.close();
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under the [Apache License, Version 2.0](LICENSE). Versions up to 0.2.0 were released under the MIT license.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project shall be licensed under the Apache License, Version 2.0, without any additional terms or conditions.
