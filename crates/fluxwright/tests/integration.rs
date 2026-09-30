@@ -537,15 +537,26 @@ async fn proxy_per_job() {
 
     // A forward proxy that wants user:pass and answers every request itself, so a host
     // that does not exist (fluxwright.invalid) loads only through it.
+    // A fresh password each run, so no credential is written in the code.
+    use base64::Engine;
+    use std::hash::{BuildHasher, Hasher};
+    let pass = format!("{:016x}", std::collections::hash_map::RandomState::new().build_hasher().finish());
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("user:{pass}"))
+    );
     let challenges = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = format!("http://{}", listener.local_addr().unwrap());
     let seen = challenges.clone();
     let app = axum::Router::new().fallback(move |headers: HeaderMap| {
         let seen = seen.clone();
+        let expected = expected.clone();
         async move {
-            // base64("user:pass")
-            if headers.get(header::PROXY_AUTHORIZATION).is_some_and(|v| v == "Basic dXNlcjpwYXNz") {
+            if headers
+                .get(header::PROXY_AUTHORIZATION)
+                .is_some_and(|v| v.as_bytes() == expected.as_bytes())
+            {
                 Html("<title>via proxy</title>").into_response()
             } else {
                 seen.fetch_add(1, SeqCst);
@@ -569,7 +580,7 @@ async fn proxy_per_job() {
         })
     };
 
-    let good = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", "pass"));
+    let good = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", &pass));
     assert_eq!(title(good).await.unwrap(), "via proxy");
 
     let direct = title(JobOptions::default()).await;
@@ -579,7 +590,7 @@ async fn proxy_per_job() {
     // requests, such as the favicon, meet the proxy without Fetch and give up by themselves.)
     challenges.store(0, SeqCst);
     let start = std::time::Instant::now();
-    let bad = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", "nope"));
+    let bad = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", format!("{pass}-wrong")));
     let bad = title(bad).await;
     assert!(!matches!(bad.as_deref(), Ok("via proxy")), "{bad:?}");
     assert!(start.elapsed() < Duration::from_secs(5), "wrong credentials took {:?}", start.elapsed());
