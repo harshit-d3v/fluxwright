@@ -157,7 +157,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.2.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux.
+              Version 0.2.1, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux.
             </p>
           </div>
           <FleetBoard />
