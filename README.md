@@ -4,13 +4,13 @@ A Rust engine for **high-concurrency Chromium automation**: pooling, admission c
 
 It is not a Playwright rewrite. Client-side overhead (Node driver, idle RAM) is a rounding error next to Chromium. Fluxwright’s job is fleet management.
 
-No speed or memory-advantage claims appear here. Run `cargo run -p fluxwright-benchmarks` and read `benchmarks/results/`.
+Measured on one Windows machine (2026-09-30): both tools on the same chrome-headless-shell binary, alternating runs, 10 concurrent jobs loading a small local page. Fluxwright ran 54–70 jobs/s, Playwright 42–51. On Chrome’s new headless mode the two were level (about 13 jobs/s each with 5 browsers). One machine and one page shape: measure your own workload. Run `cargo run --release -p fluxwright-benchmarks` for your own numbers (written to `benchmarks/results/`).
 
 **Docs site:** https://fluxwright.vercel.app — source in `www/` (`cd www && npm install && npm run dev` → http://localhost:3456).
 
 **CI/CD:** GitHub Actions runs Rust tests and builds the site on every push. Vercel deploys `www/` on `main` (production) and on pull requests (preview). Add a custom domain later in the Vercel project (`fluxwright`); `fluxwright.com` is taken, `fluxwright.dev` / `fluxwright.io` / `fluxwright.app` are free to register.
 
-**npm:** `bindings/node` — `npm install fluxwright` after publish. Local: `cd bindings/node && npm run build`.
+**npm:** `npm install fluxwright` (source in `bindings/node`; local build: `cd bindings/node && npm run build`).
 
 **MCP:** `crates/fluxwright-mcp` — `install-mcp.bat`.
 
@@ -18,6 +18,7 @@ No speed or memory-advantage claims appear here. Run `cargo run -p fluxwright-be
 
 - Rust 1.85+
 - Google Chrome or Chromium (`FLUXWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM`)
+- Optional, recommended for headless: chrome-headless-shell, which headless launches pick up from `PATH` or Puppeteer's/Playwright's cache (`npx @puppeteer/browsers install chrome-headless-shell@stable`). Pages opened 5-10x faster than on Chrome's new headless mode in our runs.
 
 `--no-sandbox` is off unless you set `FLUXWRIGHT_NO_SANDBOX=1` (logs a warning).
 
@@ -56,8 +57,8 @@ Each lease is a **fresh browser context** on a reused browser. Context reuse is 
 
 | Crate | Role |
 |-------|------|
-| `fluxwright-cdp` | One WebSocket per browser, flat sessions |
-| `fluxwright-core` | Pool, scheduler, RSS ceiling, recycle, metrics |
+| `fluxwright-cdp` | One connection per browser (DevTools pipe on Linux/macOS, WebSocket on Windows), flat sessions |
+| `fluxwright-core` | Pool, scheduler, memory ceiling, recycle, metrics |
 | `fluxwright` | Public API |
 | `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `benchmark` |
 
@@ -76,7 +77,7 @@ The control channel is a Unix socket, or `\\.\pipe\fluxwright` on Windows. Nothi
 
 ```bash
 cargo run -p fluxwright-benchmarks
-# two-hour soak (RSS over time): cargo run -p fluxwright-benchmarks -- --soak
+# two-hour soak (memory over time): cargo run -p fluxwright-benchmarks -- --soak
 ```
 
 The harness talks to `benchmark-server` (localhost only). Playwright / Puppeteer adapters run if Node packages are installed; Kitewright is skipped (MCP server, not a library). Results go to `benchmarks/results/`.

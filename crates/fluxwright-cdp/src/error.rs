@@ -24,6 +24,8 @@ pub enum Error {
     SessionGone(String),
     #[error("no main frame")]
     NoMainFrame,
+    #[error("evaluate threw: {0}")]
+    JavaScript(String),
     #[error("element {selector} not actionable: {reason}")]
     NotActionable { selector: String, reason: String },
     #[error(transparent)]

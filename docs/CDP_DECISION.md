@@ -1,5 +1,7 @@
 # CDP client decision
 
+**Update 2026-09-30:** on Linux and macOS the connection is Chrome’s DevTools pipe (`--remote-debugging-pipe`), not a WebSocket; Windows keeps the WebSocket. Flat sessions are unchanged. See `DECISIONS.md`.
+
 Researched 2026-09-21. Writing a correct CDP client is months of protocol edge cases. This document evaluates **chromiumoxide** against Fluxwright’s requirements and picks: wrap its protocol + transport, **replace its Handler**.
 
 ---

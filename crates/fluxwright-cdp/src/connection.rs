@@ -7,7 +7,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
@@ -51,26 +52,18 @@ enum Outgoing {
 
 impl Connection {
     pub async fn connect(ws_url: &str) -> Result<Arc<Self>> {
-        let (ws, _) = connect_async(ws_url)
+        // Chrome sends every CDP message as a single frame, and a full-page screenshot can
+        // pass tungstenite's 16 MiB default, which closes the socket and every job on it.
+        // 256 MB is Playwright's cap. Nagle off: CDP is many small request/response pairs.
+        let limit = Some(256 << 20);
+        let config = WebSocketConfig::default()
+            .max_message_size(limit)
+            .max_frame_size(limit);
+        let (ws, _) = connect_async_with_config(ws_url, Some(config), true)
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outgoing>();
-        let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (events, _) = broadcast::channel(16_384);
-        let watchers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dead = Arc::new(AtomicBool::new(false));
-
-        let conn = Arc::new(Self {
-            next_id: AtomicU64::new(1),
-            tx: out_tx,
-            pending: pending.clone(),
-            events: events.clone(),
-            watchers: watchers.clone(),
-            dead: dead.clone(),
-            dead_notify: tokio::sync::Notify::new(),
-        });
+        let (conn, mut out_rx, inbound) = Self::open();
 
         tokio::spawn(async move {
             while let Some(Outgoing::Json(s)) = out_rx.recv().await {
@@ -80,37 +73,85 @@ impl Connection {
             }
         });
 
-        let pending_r = pending;
-        let dead_r = dead;
-        let events_r = events;
-        let watchers_r = watchers;
         tokio::spawn(async move {
             while let Some(msg) = stream.next().await {
                 match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Err(e) =
-                            dispatch(&text, &pending_r, &events_r, &watchers_r).await
-                        {
-                            warn!(error = %e, "cdp dispatch");
-                        }
-                    }
+                    Ok(Message::Text(text)) => inbound.handle(&text).await,
                     Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => {}
                     Ok(Message::Close(_)) | Err(_) => break,
                     Ok(Message::Frame(_)) => {}
                 }
             }
-            dead_r.store(true, Ordering::SeqCst);
-            fail_all(&pending_r, Error::WebSocket("connection closed".into())).await;
-            let ev = CdpEvent {
-                method: "Fluxwright.disconnected".into(),
-                params: json!({}),
-                session_id: None,
-            };
-            let _ = events_r.send(ev.clone());
-            fanout(&watchers_r, ev);
+            inbound.closed().await;
         });
 
         Ok(conn)
+    }
+
+    /// `--remote-debugging-pipe`: NUL-separated JSON over two pipes.
+    #[cfg(unix)]
+    pub fn from_pipes(to_chrome: std::os::fd::OwnedFd, from_chrome: std::os::fd::OwnedFd) -> Result<Arc<Self>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::unix::pipe;
+
+        let mut writer = pipe::Sender::from_owned_fd(to_chrome)?;
+        let reader = pipe::Receiver::from_owned_fd(from_chrome)?;
+        let (conn, mut out_rx, inbound) = Self::open();
+
+        tokio::spawn(async move {
+            while let Some(Outgoing::Json(s)) = out_rx.recv().await {
+                let mut msg = s.into_bytes();
+                msg.push(0);
+                if writer.write_all(&msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(reader);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(0, &mut buf).await {
+                    Ok(0) | Err(_) => break, // Chrome exited
+                    Ok(_) => {
+                        if buf.last() == Some(&0) {
+                            buf.pop();
+                        }
+                        match std::str::from_utf8(&buf) {
+                            Ok(text) => inbound.handle(text).await,
+                            Err(e) => warn!(error = %e, "cdp pipe: invalid utf-8"),
+                        }
+                    }
+                }
+            }
+            inbound.closed().await;
+        });
+
+        Ok(conn)
+    }
+
+    /// A connection with no transport yet: the caller spawns a writer draining the
+    /// receiver and a reader feeding `Inbound`.
+    fn open() -> (Arc<Self>, mpsc::UnboundedReceiver<Outgoing>, Inbound) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<Outgoing>();
+        let inbound = Inbound {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(16_384).0,
+            watchers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            dead: Arc::new(AtomicBool::new(false)),
+        };
+        let conn = Arc::new(Self {
+            next_id: AtomicU64::new(1),
+            tx: out_tx,
+            pending: inbound.pending.clone(),
+            events: inbound.events.clone(),
+            watchers: inbound.watchers.clone(),
+            dead: inbound.dead.clone(),
+            dead_notify: tokio::sync::Notify::new(),
+        });
+        (conn, out_rx, inbound)
     }
 
     pub fn is_dead(&self) -> bool {
@@ -167,6 +208,35 @@ impl Connection {
     pub fn mark_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
         self.dead_notify.notify_waiters();
+    }
+}
+
+/// The reader's half of a connection, whatever the transport.
+struct Inbound {
+    pending: Arc<Mutex<HashMap<u64, Pending>>>,
+    events: broadcast::Sender<CdpEvent>,
+    watchers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>>,
+    dead: Arc<AtomicBool>,
+}
+
+impl Inbound {
+    async fn handle(&self, text: &str) {
+        if let Err(e) = dispatch(text, &self.pending, &self.events, &self.watchers).await {
+            warn!(error = %e, "cdp dispatch");
+        }
+    }
+
+    /// The browser end went away: fail every pending call and tell subscribers.
+    async fn closed(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+        fail_all(&self.pending, Error::WebSocket("connection closed".into())).await;
+        let ev = CdpEvent {
+            method: "Fluxwright.disconnected".into(),
+            params: json!({}),
+            session_id: None,
+        };
+        let _ = self.events.send(ev.clone());
+        fanout(&self.watchers, ev);
     }
 }
 

@@ -43,7 +43,7 @@ export default function Home() {
         <h1>A fleet for Chromium, not another driver.</h1>
         <p className="lede">
           Fluxwright hands out page leases: a fresh browser context on a pooled
-          Chrome process, with a queue, an RSS ceiling, recycle, and crash
+          Chrome process, with a queue, a memory ceiling, recycle, and crash
           retry. Client overhead is noise next to Chromium. The job is running
           many browsers without deadlocking the box.
         </p>
@@ -81,11 +81,11 @@ export default function Home() {
           <tbody>
             <tr>
               <td translate="no">fluxwright-cdp</td>
-              <td>One WebSocket per browser, flat sessions</td>
+              <td>One pipe (Linux, macOS) or WebSocket (Windows) per browser, flat sessions</td>
             </tr>
             <tr>
               <td translate="no">fluxwright-core</td>
-              <td>Pool, scheduler, RSS, recycle, metrics</td>
+              <td>Pool, scheduler, memory ceiling, recycle, metrics</td>
             </tr>
             <tr>
               <td translate="no">fluxwright</td>
@@ -167,10 +167,16 @@ let title = engine
         <p>
           Page actions: <code>goto</code>, <code>title</code>,{" "}
           <code>content</code>, <code>click</code>, <code>fill</code>,{" "}
-          <code>evaluate</code>, <code>screenshot</code>,{" "}
-          <code>wait_for_selector</code>, CSS <code>locator</code>. Queue full
+          <code>evaluate</code>, <code>screenshot</code> (viewport or full
+          page), <code>set_viewport_size</code>,{" "}
+          <code>wait_for_selector</code>, <code>get_by_role</code>,{" "}
+          <code>get_by_text</code>, <code>frame_locator</code> (cross-origin
+          iframes too). Queue full
           mode is <code>Error</code> or <code>Wait</code>. Recycle by job count,
-          age, or process-tree RSS.
+          age, or process-tree memory (Chrome&apos;s own footprint measure). Per-job
+          proxies (with credentials), <code>waitUntil</code> on{" "}
+          <code>goto</code>, and dialogs answered automatically. Chrome cannot
+          outlive a crashed engine.
         </p>
         <p>
           Visible Chrome: <code>.headless(false)</code>. Example:{" "}
@@ -262,8 +268,8 @@ command = "C:\\\\Users\\\\YOU\\\\.cargo\\\\bin\\\\fluxwright-mcp.exe"`}</code>
 
         <h2 id="bench">Benchmarks</h2>
         <p>
-          Fluxwright does not claim to be faster or lighter than Playwright or
-          Puppeteer. Run the harness yourself:
+          Measured on one Windows machine (2026-09-30): both tools on the same chrome-headless-shell binary, alternating runs, 10 concurrent jobs loading a small local page. Fluxwright ran 54–70 jobs/s, Playwright 42–51. On Chrome&apos;s new headless mode the two were level (about 13 jobs/s each with 5 browsers). One machine and one page shape: measure your own workload. Run the harness
+          yourself:
         </p>
         <pre>
           <code>{`cd benchmarks && npm install
@@ -294,7 +300,9 @@ cargo run -p fluxwright-benchmarks --release`}</code>
           <li>Tracing, HAR, video</li>
           <li>Playwright Test, fixtures, expect</li>
           <li>
-            <code>getByRole</code> / <code>getByText</code> (CSS locator only)
+            <code>locator.filter</code>, <code>nth</code>, <code>getByLabel</code>{" "}
+            (<code>getByRole</code>, <code>getByText</code>, and{" "}
+            <code>frameLocator</code> are supported)
           </li>
           <li>Multiple pages per context, downloads, uploads</li>
           <li>

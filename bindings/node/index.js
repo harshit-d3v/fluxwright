@@ -310,9 +310,11 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Browser, Page, Chromium, chromium } = nativeBinding
+const { Browser, Page, Locator, FrameLocator, Chromium, chromium } = nativeBinding
 
 module.exports.Browser = Browser
 module.exports.Page = Page
+module.exports.Locator = Locator
+module.exports.FrameLocator = FrameLocator
 module.exports.Chromium = Chromium
 module.exports.chromium = chromium
