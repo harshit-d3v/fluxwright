@@ -468,6 +468,35 @@ async fn blocking_covers_cross_origin_frames() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+/// An unhandled dialog used to block every call on the page until it timed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn dialogs_do_not_block() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(3))
+        .navigation_timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto("data:text/html,<title>d</title><body style='height:400px'>x</body>").await.unwrap();
+
+    assert_eq!(page.evaluate("alert('hi'); 42").await.unwrap(), 42);
+    assert_eq!(page.evaluate("confirm('sure?')").await.unwrap(), false, "confirm is dismissed");
+    assert_eq!(page.evaluate("prompt('name?')").await.unwrap(), serde_json::Value::Null);
+
+    // beforeunload is accepted, so a "leave this page?" handler cannot pin the page. Chrome
+    // only asks after a user gesture, hence the click.
+    page.evaluate("window.onbeforeunload = e => { e.preventDefault(); e.returnValue = ''; }; 1")
+        .await
+        .unwrap();
+    page.click("body").await.unwrap();
+    page.goto("about:blank").await.unwrap();
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// Chrome sends each CDP message as one WebSocket frame; tungstenite's default 16 MiB frame
 /// cap made a big screenshot kill the connection, and with it every job on that browser.
 #[tokio::test(flavor = "multi_thread")]

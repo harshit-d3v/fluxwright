@@ -242,6 +242,26 @@ impl CdpBrowser {
                     });
                 }
             }
+            // Nothing handles dialogs, and an open one blocks every call on its page until it
+            // times out. As Playwright does by default: accept beforeunload so navigation goes
+            // on, dismiss alert/confirm/prompt.
+            "Page.javascriptDialogOpening" => {
+                if let Some(sid) = ev.session_id.clone() {
+                    let accept = ev.params["type"] == "beforeunload";
+                    debug!(message = %ev.params["message"], accept, "answering dialog");
+                    let conn = self.conn.clone();
+                    tokio::spawn(async move {
+                        let _ = conn
+                            .call(
+                                "Page.handleJavaScriptDialog",
+                                json!({ "accept": accept }),
+                                Some(&sid),
+                                Duration::from_secs(5),
+                            )
+                            .await;
+                    });
+                }
+            }
             "Target.targetCrashed" => {
                 warn!(params = %ev.params, "target crashed");
             }
