@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::config::{EngineConfig, JobOptions, Priority, QueueFullMode};
 use crate::error::{Error, Result};
 use crate::metrics::{Counters, MetricsSnapshot};
-use crate::process::{current_process_rss_bytes, process_tree_rss_map, process_trees_rss_bytes};
+use crate::process::{current_process_rss_bytes, process_tree_memory_map, process_trees_memory_bytes};
 use crate::source::BrowserSource;
 
 #[derive(Clone)]
@@ -241,7 +241,7 @@ impl Engine {
                 pids,
             )
         };
-        let tree = tokio::task::spawn_blocking(move || process_trees_rss_bytes(&pids))
+        let tree = tokio::task::spawn_blocking(move || process_trees_memory_bytes(&pids))
             .await
             .unwrap_or(0);
         let engine_rss = tokio::task::spawn_blocking(current_process_rss_bytes)
@@ -284,7 +284,7 @@ impl Engine {
             let pids: Vec<u32> = rows.iter().map(|r| r.1).collect();
             (rows, pids)
         };
-        let rss = tokio::task::spawn_blocking(move || process_tree_rss_map(&pids))
+        let rss = tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
             .await
             .unwrap_or_default();
         rows.into_iter()
@@ -420,7 +420,7 @@ impl Inner {
                         .map(|s| s.browser.pid)
                         .collect()
                 };
-                let tree = tokio::task::spawn_blocking(move || process_trees_rss_bytes(&pids))
+                let tree = tokio::task::spawn_blocking(move || process_trees_memory_bytes(&pids))
                     .await
                     .unwrap_or(0);
                 *me.rss_cache.lock().await = (Instant::now(), tree);
@@ -576,7 +576,7 @@ impl Inner {
                     .map(|s| s.browser.pid)
                     .collect()
             };
-            tokio::task::spawn_blocking(move || process_tree_rss_map(&pids))
+            tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
                 .await
                 .unwrap_or_default()
         } else {
