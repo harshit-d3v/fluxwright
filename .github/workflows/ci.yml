@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
 
-# Checkout is all either job needs from the GITHUB_TOKEN.
+# Checkout is all any job needs from the GITHUB_TOKEN.
 permissions:
   contents: read
 
@@ -32,6 +32,33 @@ jobs:
           google-chrome --version
       - name: Test
         run: cargo test --workspace -- --test-threads=1
+
+  node:
+    name: node binding
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FLUXWRIGHT_NO_SANDBOX: "1"
+    defaults:
+      run:
+        working-directory: bindings/node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/node -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - name: Locate Chrome
+        run: echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: npm run test:types
+      - run: npm run build:debug
+      - run: npm test
 
   site:
     name: website

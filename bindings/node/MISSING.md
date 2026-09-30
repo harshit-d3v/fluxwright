@@ -1,15 +1,22 @@
-# Playwright methods not in Fluxwright (TypeScript)
+# Playwright features not in Fluxwright
 
-The TS binding covers the same small page API as the Rust crate. Missing on purpose:
+The Node binding covers the same page API as the Rust crate. Some Playwright features are planned, and some are out of scope.
 
-- Firefox / WebKit
-- Tracing, HAR, video
-- `page.route` beyond resource-type / URL blocking on the job
-- Storage state import/export
-- `page.emulateMedia`, geolocation, permissions helpers
-- Playwright Test runner, fixtures, expect
-- `locator.filter`, `nth`, `getByLabel`/`getByPlaceholder`/`getByTestId`, shadow-DOM piercing
+## Planned (see [ROADMAP.md](https://github.com/harshit-d3v/fluxwright/blob/main/ROADMAP.md))
+
+- Saved login state: `storageState` import and export
+- `page.route` to fulfill or modify requests (today: blocking by resource type or URL)
+- Emulation: user agent, locale, timezone, geolocation, permissions, `emulateMedia`
+- `locator.screenshot()`
+- `getByLabel`, `getByPlaceholder`, `getByTestId`, `nth`, `filter`
+- Downloads
+- `connectOverCDP`, to use browsers you already run
+- Python bindings
+
+## Out of scope
+
+- Firefox and WebKit
+- Playwright Test: the runner, fixtures and `expect`
+- Tracing, the trace viewer, codegen and video recording
 - Multiple pages per context
-- Download / upload helpers
-- WebSocket / worker APIs
-- `connectOverCDP` (planned as a later `BrowserSource`)
+- WebSocket and worker APIs
