@@ -1,8 +1,10 @@
 # fluxwright
 
-In-process **Chromium fleet** for Node. Lease API (fresh context per `newPage`), not Playwright parity.
+Run hundreds of headless Chrome jobs on one machine, with a Playwright-style API. Each `newPage` is a fresh browser context on a pooled Chrome. The engine queues jobs when every slot is busy, restarts browsers before they bloat, and replaces browsers that crash.
 
-Requires a local Chrome/Chromium binary (`FLUXWRIGHT_CHROMIUM`, `CHROME`, `CHROMIUM`, or a standard install path).
+Docs: https://fluxwright.vercel.app
+
+Requires a local Chrome/Chromium binary (`FLUXWRIGHT_CHROMIUM`, `CHROME`, `CHROMIUM`, or a standard install path). For headless jobs, chrome-headless-shell is picked up from `PATH` or Puppeteer's/Playwright's cache and opens pages much faster: `npx @puppeteer/browsers install chrome-headless-shell@stable`.
 
 ## Install
 
@@ -24,11 +26,9 @@ import { chromium } from "fluxwright";
 const browser = await chromium.launch({ maxBrowsers: 4 });
 const page = await browser.newPage();
 await page.goto("https://example.com");
-console.log(await page.title());
-await page.click("css-selector");
-await page.fill("input", "value");
-const html = await page.content();
-const png = await page.screenshot(); // Buffer
+console.log(await page.getByRole("heading").textContent()); // "Example Domain"
+console.log(await page.evaluate(() => location.hostname));
+const png = await page.screenshot({ fullPage: true }); // Buffer
 await page.close();
 await browser.close();
 ```
@@ -46,13 +46,23 @@ await browser.close();
 | `page.click(selector)` / `page.fill(selector, value)` | Scrolls into view, waits until enabled, stable, and not covered. Selector: CSS, `text=Foo`, `text="Exact"`, `role=button[name="Save"]` |
 | `page.getByRole(role, { name?, exact? })` / `page.getByText(text, { exact? })` / `page.locator(selector)` | `Locator` with `click()`, `fill(v)`, `waitFor()`, `textContent()`. Implicit ARIA roles and accessible names; hidden elements never match a role |
 | `page.frameLocator(iframeSelector)` | Same locators inside an iframe, same- or cross-origin; nest with `.frameLocator()` |
-| `page.evaluate(expression)` | `Runtime.evaluate`, JSON. A thrown JS error rejects with its message and stack |
+| `page.evaluate(fn, arg?)` / `page.evaluate(expression)` | Runs a function with a JSON-serializable `arg`, or a string expression, in the page. Awaits promises and returns JSON. As in Playwright, the function is sent as source text, so it can't use variables from Node. A thrown JS error rejects with its message and stack |
 | `page.screenshot({ fullPage? })` | PNG `Buffer` |
 | `page.setViewportSize({ width, height })` | CSS-pixel viewport for this page |
 | `page.waitForSelector(selector)` | Waits until visible (Playwright's default state) |
 | `page.close()` / `browser.close()` | Dispose context / shut down |
 
-See `MISSING.md` for Playwright methods that will not be added.
+Close pages when a job is done. A page you forget is cleaned up when Node garbage-collects it, which may be much later.
+
+See `MISSING.md` for Playwright features that are planned or out of scope.
+
+## Develop
+
+```bash
+npm install
+npm run build   # needs Rust
+npm test        # smoke test against a real Chrome
+```
 
 ## License
 

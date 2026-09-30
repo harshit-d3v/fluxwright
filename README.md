@@ -1,66 +1,123 @@
 # Fluxwright
 
-A Rust engine for **high-concurrency Chromium automation**: pooling, admission control, recycling, crash recovery, and metrics.
+Run hundreds of headless Chrome jobs on one machine. Fluxwright pools browsers, queues jobs when every slot is busy, restarts browsers before they bloat, and retries jobs when a browser crashes, behind a Playwright-style API for Node and Rust.
 
-It is not a Playwright rewrite. Client-side overhead (Node driver, idle RAM) is a rounding error next to Chromium. Fluxwright’s job is fleet management.
+It is not a Playwright rewrite. Playwright drives a browser; Fluxwright runs a fleet of them.
 
-Measured on one Windows machine (2026-09-30): both tools on the same chrome-headless-shell binary, alternating runs, 10 concurrent jobs loading a small local page. Fluxwright ran 54–70 jobs/s, Playwright 42–51. On Chrome’s new headless mode the two were level (about 13 jobs/s each with 5 browsers). One machine and one page shape: measure your own workload. Run `cargo run --release -p fluxwright-benchmarks` for your own numbers (written to `benchmarks/results/`).
+**Docs:** https://fluxwright.vercel.app · **Roadmap:** [ROADMAP.md](ROADMAP.md)
 
-**Docs site:** https://fluxwright.vercel.app — source in `www/` (`cd www && npm install && npm run dev` → http://localhost:3456).
+## Quick start (Node)
 
-**CI/CD:** GitHub Actions runs Rust tests and builds the site on every push. Vercel deploys `www/` on `main` (production) and on pull requests (preview). Add a custom domain later in the Vercel project (`fluxwright`); `fluxwright.com` is taken, `fluxwright.dev` / `fluxwright.io` / `fluxwright.app` are free to register.
+```bash
+npm install fluxwright
+```
 
-**npm:** `npm install fluxwright` (source in `bindings/node`; local build: `cd bindings/node && npm run build`).
+```ts
+import { chromium } from "fluxwright";
 
-**MCP:** `crates/fluxwright-mcp` — `install-mcp.bat`.
+const browser = await chromium.launch({ maxBrowsers: 4 });
+const page = await browser.newPage(); // a fresh context on a pooled Chrome
+await page.goto("https://example.com");
+console.log(await page.getByRole("heading").textContent()); // "Example Domain"
+console.log(await page.evaluate(() => location.hostname));
+await page.close(); // the context is destroyed and the slot is free again
+await browser.close();
+```
 
-## Require
+Fluxwright uses the Chrome on your machine. For headless jobs, install chrome-headless-shell: pages open 5-10x faster than on Chrome's new headless mode in our runs.
 
-- Rust 1.85+
-- Google Chrome or Chromium (`FLUXWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM`)
-- Optional, recommended for headless: chrome-headless-shell, which headless launches pick up from `PATH` or Puppeteer's/Playwright's cache (`npx @puppeteer/browsers install chrome-headless-shell@stable`). Pages opened 5-10x faster than on Chrome's new headless mode in our runs.
+```bash
+npx @puppeteer/browsers install chrome-headless-shell@stable
+```
 
-`--no-sandbox` is off unless you set `FLUXWRIGHT_NO_SANDBOX=1` (logs a warning).
+## What a page can do
 
-## Example
+| Area | API |
+|---|---|
+| Navigate | `goto(url, { waitUntil })` with `load` (default), `domcontentloaded`, `networkidle` or `commit`, event-driven like Playwright |
+| Find | `getByRole(role, { name })`, `getByText(text)`, `locator(css \| "text=…" \| "role=…")`, `frameLocator(iframe)` for same- and cross-origin iframes |
+| Act | `click()` and `fill()` wait until the element is visible, enabled, stable and not covered; `waitFor()`, `waitForSelector()` |
+| Read | `title()`, `content()`, `textContent()`, `evaluate(fn, arg)` or `evaluate("expression")` |
+| Capture | `screenshot({ fullPage })`, `setViewportSize({ width, height })` |
+| Network | a proxy per page, with a username and password; blocking by resource type or URL (Rust `JobOptions`) |
+
+The full Node API is in [bindings/node/README.md](bindings/node/README.md).
+
+## What the fleet does
+
+- **A fresh page per job:** every lease is a new browser context on a reused Chrome, so cookies, storage and cache never leak between jobs.
+- **A queue with priorities:** when every slot is busy, jobs wait by priority, or fail fast if you would rather shed load.
+- **A memory ceiling:** no new work starts while the fleet's real memory footprint is over budget (PSS on Linux, private bytes on Windows).
+- **Recycling:** a browser restarts after a number of jobs, an age or a memory threshold, and finishes its running jobs first.
+- **Crash recovery:** a dead browser fails its jobs at once and they retry on a healthy one. Chrome is tied to the engine process, so it never outlives it.
+- **For AI agents:** an MCP server lets Claude, Codex or Cursor drive the fleet.
+
+## When to use Playwright instead
+
+- **Firefox or Safari (WebKit):** Fluxwright drives Chromium only.
+- **End-to-end tests:** Playwright Test gives you a runner, `expect`, fixtures, a trace viewer and a recorder. Fluxwright is an engine, not a test framework.
+- **Python, Java or .NET:** Fluxwright has Node and Rust today. Python is on the [roadmap](ROADMAP.md).
+- **Request mocking, saved logins, device emulation, geolocation, permissions:** not yet. See [MISSING.md](bindings/node/MISSING.md) and the roadmap.
+
+Use Fluxwright when you run many browser jobs, such as scraping, crawling, PDF and screenshot rendering, or automation at volume, and want the fleet handled for you.
+
+## Speed
+
+Measured on one Windows machine (2026-09-30): both tools on the same chrome-headless-shell binary, alternating runs, 10 concurrent jobs loading a small local page. Fluxwright ran 54–70 jobs/s, Playwright 42–51. On Chrome's new headless mode the two were level (about 13 jobs/s each with 5 browsers). One machine and one page shape say little about yours, so measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
+
+## Rust
+
+```toml
+[dependencies]
+fluxwright = { git = "https://github.com/harshit-d3v/fluxwright" }
+```
 
 ```rust
 use fluxwright::{BrowserEngine, JobOptions, Priority};
 
-# async fn demo() -> fluxwright::Result<()> {
-let engine = BrowserEngine::builder()
-    .max_browsers(50)
-    .max_contexts_per_browser(10)
-    .memory_ceiling_mb(8192)
-    .build()
-    .await?;
+#[tokio::main]
+async fn main() -> fluxwright::Result<()> {
+    let engine = BrowserEngine::builder()
+        .max_browsers(50)
+        .max_contexts_per_browser(10)
+        .memory_ceiling_mb(8192)
+        .build()
+        .await?;
 
-let page = engine.acquire().await?;
-page.goto("https://example.com").await?;
-let title = page.title().await?;
-drop(page); // context destroyed, slot returned
+    let page = engine.acquire().await?;
+    page.goto("https://example.com").await?;
+    println!("{}", page.title().await?);
+    drop(page); // context destroyed, slot returned
 
-let title = engine
-    .run(JobOptions::default().priority(Priority::High), |page| async move {
-        page.goto("https://example.com").await?;
-        page.title().await
-    })
-    .await?;
-# let _ = title;
-# Ok(())
-# }
+    // run() queues, leases, retries after a crash, and always releases the page.
+    let title = engine
+        .run(JobOptions::default().priority(Priority::High).retries(2), |page| async move {
+            page.goto("https://example.com").await?;
+            page.title().await
+        })
+        .await?;
+    println!("{title}");
+    Ok(())
+}
 ```
 
-Each lease is a **fresh browser context** on a reused browser. Context reuse is not the default.
-
-## Crates
+Requires Rust 1.85+ and Chrome or Chromium (found on the standard install paths, or set `FLUXWRIGHT_CHROMIUM`, `CHROME` or `CHROMIUM`). `--no-sandbox` is off unless you set `FLUXWRIGHT_NO_SANDBOX=1` (logs a warning).
 
 | Crate | Role |
 |-------|------|
 | `fluxwright-cdp` | One connection per browser (DevTools pipe on Linux/macOS, WebSocket on Windows), flat sessions |
-| `fluxwright-core` | Pool, scheduler, memory ceiling, recycle, metrics |
+| `fluxwright-core` | Pool, scheduler, memory ceiling, recycling, metrics |
 | `fluxwright` | Public API |
 | `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `benchmark` |
+| `fluxwright-mcp` | MCP server: open, goto, click, fill, evaluate, screenshot, close |
+
+## MCP server
+
+```bash
+cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-mcp
+```
+
+Then add `{ "mcpServers": { "fluxwright": { "command": "fluxwright-mcp" } } }` to your client's configuration (Windows: `install-mcp.bat`).
 
 ## CLI
 
@@ -76,34 +133,18 @@ The control channel is a Unix socket, or `\\.\pipe\fluxwright` on Windows. Nothi
 ## Benchmarks
 
 ```bash
-cargo run -p fluxwright-benchmarks
-# two-hour soak (memory over time): cargo run -p fluxwright-benchmarks -- --soak
+cargo run --release -p fluxwright-benchmarks
+# two-hour soak (memory over time): cargo run --release -p fluxwright-benchmarks -- --soak
 ```
 
-The harness talks to `benchmark-server` (localhost only). Playwright / Puppeteer adapters run if Node packages are installed; Kitewright is skipped (MCP server, not a library). Results go to `benchmarks/results/`.
+The harness talks to `benchmark-server` (localhost only). Playwright and Puppeteer adapters run if their Node packages are installed.
 
-## TypeScript
+## Development
 
-`bindings/node` is a napi-rs addon over the lease API. See `bindings/node/MISSING.md` for Playwright methods that are intentionally absent.
-
-```bash
-cd bindings/node && npm install && npm run build
-```
-
-```ts
-import { chromium } from "fluxwright";
-const browser = await chromium.launch({ maxBrowsers: 50 });
-const page = await browser.newPage();
-await page.goto("https://example.com");
-console.log(await page.title());
-await browser.close();
-```
-
-## Docs
-
-- `docs/COMPETITIVE_ANALYSIS.md`
-- `docs/CDP_DECISION.md`
-- `docs/DECISIONS.md`
+- Site: `cd www && npm install && npm run dev` (http://localhost:3456). Vercel deploys `www/` from `main`.
+- Node binding: `cd bindings/node && npm install && npm run build && npm test`.
+- Rust tests need Chrome: `cargo test --workspace -- --test-threads=1`.
+- Design notes: `docs/COMPETITIVE_ANALYSIS.md`, `docs/CDP_DECISION.md`, `docs/DECISIONS.md`.
 
 ## License
 
