@@ -39,7 +39,7 @@ await browser.close();
 
 | Method | What it does |
 |---|---|
-| `chromium.launch({ maxBrowsers? })` | Start the pool |
+| `chromium.launch({ maxBrowsers?, executablePath?, headless? })` | Start the pool. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executablePath` overrides |
 | `browser.newPage({ proxy? })` | Acquire a lease (a fresh context). `proxy: { server, bypass?, username?, password? }` applies to this page only |
 | `page.goto(url, { waitUntil? })` | Navigate. `waitUntil`: `load` (default), `domcontentloaded`, `networkidle`, `commit`. Event-driven, like Playwright |
 | `page.title()` / `page.content()` | Read |

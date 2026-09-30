@@ -14,6 +14,10 @@ export interface GetByRoleOptions {
 }
 export interface LaunchOptions {
   maxBrowsers?: number
+  /** Browser binary. Default: chrome-headless-shell when headless and installed, else Chrome. */
+  executablePath?: string
+  /** Default true. */
+  headless?: boolean
 }
 export interface ProxyOptions {
   /** `http://host:port`, `socks5://host:port`, ... */

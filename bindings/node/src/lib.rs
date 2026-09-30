@@ -138,6 +138,10 @@ impl FrameLocator {
 #[napi(object)]
 pub struct LaunchOptions {
     pub max_browsers: Option<u32>,
+    /// Browser binary. Default: chrome-headless-shell when headless and installed, else Chrome.
+    pub executable_path: Option<String>,
+    /// Default true.
+    pub headless: Option<bool>,
 }
 
 #[napi(object)]
@@ -180,14 +184,22 @@ pub struct Chromium {}
 impl Chromium {
     #[napi]
     pub async fn launch(options: Option<LaunchOptions>) -> Result<Browser> {
-        let max = options.and_then(|o| o.max_browsers).unwrap_or(4) as usize;
+        let (max, exe, headless) = match options {
+            Some(o) => (o.max_browsers, o.executable_path, o.headless),
+            None => (None, None, None),
+        };
         let engine = RT
             .spawn(async move {
-                fluxwright::BrowserEngine::builder()
-                    .max_browsers(max)
-                    .max_contexts_per_browser(8)
-                    .build()
-                    .await
+                let mut b = fluxwright::BrowserEngine::builder()
+                    .max_browsers(max.unwrap_or(4) as usize)
+                    .max_contexts_per_browser(8);
+                if let Some(exe) = exe {
+                    b = b.chrome(exe);
+                }
+                if let Some(h) = headless {
+                    b = b.headless(h);
+                }
+                b.build().await
             })
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?

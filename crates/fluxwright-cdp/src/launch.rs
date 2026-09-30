@@ -10,17 +10,75 @@ use tracing::{info, warn};
 
 use crate::error::{Error, LaunchOptions, Result};
 
+fn from_env() -> Option<PathBuf> {
+    ["FLUXWRIGHT_CHROMIUM", "CHROME", "CHROMIUM", "GOOGLE_CHROME"]
+        .into_iter()
+        .filter_map(|key| std::env::var_os(key).map(PathBuf::from))
+        .find(|p| p.exists())
+}
+
+/// The browser a launch uses when none is given. FLUXWRIGHT_CHROMIUM / CHROME / CHROMIUM win.
+/// Then, for headless launches, chrome-headless-shell if one is installed: Chrome's lighter
+/// headless-only build, and Playwright's default. Pages were 5-10x faster to open with it
+/// than with Chrome's new headless mode. Otherwise Chrome itself.
+pub fn find_browser(headless: bool) -> Result<PathBuf> {
+    if let Some(p) = from_env() {
+        return Ok(p);
+    }
+    if headless {
+        if let Some(p) = find_headless_shell() {
+            return Ok(p);
+        }
+    }
+    find_chrome(None)
+}
+
+/// chrome-headless-shell on PATH, else the newest in Puppeteer's or Playwright's cache.
+fn find_headless_shell() -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "chrome-headless-shell.exe" } else { "chrome-headless-shell" };
+    let on_path = std::env::var_os("PATH")
+        .and_then(|paths| std::env::split_paths(&paths).map(|d| d.join(exe)).find(|p| p.is_file()));
+    if on_path.is_some() {
+        return on_path;
+    }
+    let home = PathBuf::from(std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?);
+    let playwright = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH").map(PathBuf::from).unwrap_or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA").map_or_else(|| home.join("AppData/Local"), PathBuf::from).join("ms-playwright")
+        } else if cfg!(target_os = "macos") {
+            home.join("Library/Caches/ms-playwright")
+        } else {
+            home.join(".cache/ms-playwright")
+        }
+    });
+    newest_shell(&home.join(".cache/puppeteer/chrome-headless-shell"), "", exe)
+        .or_else(|| newest_shell(&playwright, "chromium_headless_shell-", exe))
+}
+
+/// Layout `<root>/<prefix><version>/chrome-headless-shell-<platform>/<exe>`; highest version
+/// wins ("1243" in Playwright's cache, "win64-131.0.6778.85" in Puppeteer's).
+fn newest_shell(root: &Path, prefix: &str, exe: &str) -> Option<PathBuf> {
+    let mut found: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter_map(|dir| {
+            let name = dir.file_name().to_string_lossy().into_owned();
+            let version = name.strip_prefix(prefix)?;
+            let key = version.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
+            let bin = std::fs::read_dir(dir.path()).ok()?.flatten().map(|d| d.path().join(exe)).find(|p| p.is_file())?;
+            Some((key, bin))
+        })
+        .collect();
+    found.sort();
+    found.pop().map(|(_, bin)| bin)
+}
+
 pub fn find_chrome(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }
-    for key in ["FLUXWRIGHT_CHROMIUM", "CHROME", "CHROMIUM", "GOOGLE_CHROME"] {
-        if let Ok(v) = std::env::var(key) {
-            let p = PathBuf::from(v);
-            if p.exists() {
-                return Ok(p);
-            }
-        }
+    if let Some(p) = from_env() {
+        return Ok(p);
     }
     let candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -55,7 +113,10 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
     SWEEP.call_once(|| {
         std::thread::spawn(sweep_stale_profiles);
     });
-    let exe = find_chrome(opts.executable.as_deref())?;
+    let exe = match opts.executable.as_deref() {
+        Some(p) => p.to_path_buf(),
+        None => find_browser(opts.headless)?,
+    };
     // The pid in the name lets sweep_stale_profiles tell a dead engine's profile from a live one.
     let user_data_dir = tempfile::Builder::new()
         .prefix(&format!("fluxwright-{}-", std::process::id()))
@@ -289,5 +350,31 @@ async fn wait_devtools_url(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newest_shell;
+
+    #[test]
+    fn newest_headless_shell_wins() {
+        let root = tempfile::tempdir().unwrap();
+        for version in ["chromium_headless_shell-1200", "chromium_headless_shell-1243", "chromium-1243"] {
+            let dir = root.path().join(version).join("chrome-headless-shell-linux64");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("shell"), "").unwrap();
+        }
+        let found = newest_shell(root.path(), "chromium_headless_shell-", "shell").unwrap();
+        assert!(found.starts_with(root.path().join("chromium_headless_shell-1243")), "{found:?}");
+
+        let puppeteer = tempfile::tempdir().unwrap();
+        for version in ["win64-131.0.6778.85", "win64-140.0.7339.80", "win64-99.0.1.1"] {
+            let dir = puppeteer.path().join(version).join("chrome-headless-shell-win64");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("shell"), "").unwrap();
+        }
+        let found = newest_shell(puppeteer.path(), "", "shell").unwrap();
+        assert!(found.starts_with(puppeteer.path().join("win64-140.0.7339.80")), "{found:?}");
     }
 }

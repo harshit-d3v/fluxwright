@@ -252,7 +252,7 @@ async fn rpc(sock: &PathBuf, req: Request) -> Result<()> {
 }
 
 async fn doctor() -> Result<()> {
-    let chrome = fluxwright::find_chrome(None);
+    let chrome = fluxwright::find_browser(true);
     let report = serde_json::json!({
         "chrome": chrome.as_ref().ok().map(|p| p.display().to_string()),
         "chrome_ok": chrome.is_ok(),

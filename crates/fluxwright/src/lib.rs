@@ -9,5 +9,6 @@ pub use fluxwright_core::{
 };
 
 pub use fluxwright_cdp::{
-    find_chrome, sweep_stale_profiles, LaunchOptions, Proxy, ResourceType, Selector, WaitUntil,
+    find_browser, find_chrome, sweep_stale_profiles, LaunchOptions, Proxy, ResourceType, Selector,
+    WaitUntil,
 };

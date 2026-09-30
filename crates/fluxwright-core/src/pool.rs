@@ -952,6 +952,12 @@ impl EngineBuilder {
         self.config.launch.headless = v;
         self
     }
+    /// Browser binary. Default: see `find_browser` (chrome-headless-shell when headless and
+    /// installed, else Chrome).
+    pub fn chrome(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.config.launch.executable = Some(path.into());
+        self
+    }
     pub fn source(self, _source: Arc<dyn BrowserSource>) -> EngineBuilderWithSource {
         EngineBuilderWithSource {
             config: self.config,

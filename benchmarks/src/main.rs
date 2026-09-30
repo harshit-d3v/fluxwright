@@ -40,7 +40,8 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&args.out)?;
     let server = benchmark_server::spawn("127.0.0.1:0").await?;
     let url = format!("{}/", server.base_url);
-    let chrome = fluxwright::find_chrome(None).ok();
+    // One binary for every tool: chrome-headless-shell when installed, as Playwright defaults to.
+    let chrome = fluxwright::find_browser(true).ok();
 
     let scenarios = [
         ("1-browser-10-pages", 1, 10, 100u32),
@@ -121,7 +122,7 @@ async fn run_fluxwright(
 ) -> Result<Record> {
     // min_browsers launches every browser in build(), before the clock starts, as the
     // Node runner does for Playwright/Puppeteer. Lazy launch put up to 9 launches in the timed run.
-    let builder = BrowserEngine::builder()
+    let mut builder = BrowserEngine::builder()
         .max_browsers(max_browsers)
         .min_browsers(max_browsers)
         .max_contexts_per_browser(max_ctx)
@@ -129,7 +130,9 @@ async fn run_fluxwright(
         .queue_capacity(jobs as usize + 32)
         .queue_full_mode(QueueFullMode::Wait)
         .acquire_timeout(Duration::from_secs(180));
-    let _ = chrome;
+    if let Some(c) = chrome {
+        builder = builder.chrome(c);
+    }
     let engine = builder.build().await?;
     // warmup
     {
@@ -199,13 +202,15 @@ async fn run_fluxwright(
 }
 
 async fn run_soak(url: &str, chrome: Option<&PathBuf>) -> Result<Record> {
-    let engine = BrowserEngine::builder()
+    let mut builder = BrowserEngine::builder()
         .max_browsers(3)
         .max_contexts_per_browser(6)
         .recycle_after_jobs(50)
-        .memory_ceiling_mb(16_384)
-        .build()
-        .await?;
+        .memory_ceiling_mb(16_384);
+    if let Some(c) = chrome {
+        builder = builder.chrome(c);
+    }
+    let engine = builder.build().await?;
     let deadline = Instant::now() + Duration::from_secs(2 * 60 * 60);
     let mut jobs = 0u32;
     let mut failures = 0u32;
