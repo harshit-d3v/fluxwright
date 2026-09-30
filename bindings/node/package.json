@@ -1,6 +1,6 @@
 {
   "name": "fluxwright",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "In-process Chromium fleet engine (napi-rs). Lease API, not Playwright parity.",
   "main": "addon.js",
   "types": "addon.d.ts",
@@ -57,9 +57,9 @@
     "@napi-rs/cli": "^2.18.4"
   },
   "optionalDependencies": {
-    "fluxwright-darwin-arm64": "0.2.0",
-    "fluxwright-darwin-x64": "0.2.0",
-    "fluxwright-linux-x64-gnu": "0.2.0",
-    "fluxwright-win32-x64-msvc": "0.2.0"
+    "fluxwright-darwin-arm64": "0.2.1",
+    "fluxwright-darwin-x64": "0.2.1",
+    "fluxwright-linux-x64-gnu": "0.2.1",
+    "fluxwright-win32-x64-msvc": "0.2.1"
   }
 }
