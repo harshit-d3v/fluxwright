@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxwright::{BrowserEngine, JobOptions, QueueFullMode};
+use fluxwright::{BrowserEngine, JobOptions, Proxy, QueueFullMode, WaitUntil};
 
 fn kill_pid(pid: u32) {
     if cfg!(windows) {
@@ -256,13 +256,506 @@ async fn kill_browser_mid_job_retries() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn page_actions() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(2))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    // No '#' or '%' in the markup: it goes into a data: URL unencoded.
+    page.goto(concat!(
+        "data:text/html,<title>start</title><body style='margin:0'>",
+        "<div style='height:3000px'></div>",
+        "<button id='far' onclick=\"document.title='far'\">far</button>",
+        "<button id='dis' disabled>disabled</button>",
+        "<div style='height:500px'></div>"
+    ))
+    .await
+    .unwrap();
+
+    page.click("#far").await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "far", "below-the-fold click missed");
+
+    page.wait_for_selector("#dis")
+        .await
+        .expect("visible but disabled satisfies wait_for_selector");
+
+    let err = page.wait_for_selector("#nope").await.unwrap_err().to_string();
+    assert!(err.contains("no element matches selector"), "{err}");
+    let err = page.click("button[").await.unwrap_err().to_string();
+    assert!(err.contains("invalid selector"), "{err}");
+
+    let err = page.evaluate("null.x").await.unwrap_err().to_string();
+    assert!(err.contains("TypeError") && !err.contains("exceptionId"), "{err}");
+
+    page.set_viewport_size(400, 300).await.unwrap();
+    assert_eq!(page.evaluate("innerWidth").await.unwrap(), 400);
+    let png = page.screenshot_full_page().await.unwrap();
+    let height = u32::from_be_bytes(png[20..24].try_into().unwrap()); // IHDR height
+    assert!(height > 3000, "full-page screenshot is {height}px tall");
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port(); // listener dropped: port now refuses
+    let err = page
+        .goto(&format!("http://127.0.0.1:{port}/"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("net::ERR_"), "{err}");
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn goto_wait_until() {
+    let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .navigation_timeout(Duration::from_secs(3))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    // The image takes 30 s: DOMContentLoaded fires at once, load does not.
+    let url = format!("{}/slow-subresource", srv.base_url);
+
+    let t = std::time::Instant::now();
+    page.goto_with(&url, WaitUntil::DomContentLoaded).await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "domcontentloaded took {:?}", t.elapsed());
+    assert_eq!(page.title().await.unwrap(), "dcl");
+
+    let err = page.goto(&url).await.unwrap_err().to_string();
+    assert!(err.contains("timed out"), "load must wait for the image: {err}");
+
+    page.goto_with(&url, WaitUntil::Commit).await.unwrap();
+
+    let t = std::time::Instant::now();
+    page.goto_with(&format!("{}/", srv.base_url), WaitUntil::NetworkIdle)
+        .await
+        .unwrap();
+    assert!(t.elapsed() >= Duration::from_millis(500), "networkidle returned after {:?}", t.elapsed());
+    assert_eq!(page.title().await.unwrap(), "home");
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// getByRole / getByText, and elements inside a same-origin and a cross-origin iframe.
+#[tokio::test(flavor = "multi_thread")]
+async fn selectors_and_frames() {
+    use axum::{response::Html, routing::get, Router};
+
+    // The cross-origin frame is on `localhost`, the page on 127.0.0.1: a different site, so
+    // Chrome runs it in its own process (an OOPIF) with its own CDP session.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let top = format!(
+        r#"<!doctype html><title>top</title>
+        <h1>Welcome back</h1>
+        <p>Hello <b>World</b></p>
+        <button onclick="document.title='draft'">Save draft</button>
+        <button onclick="document.title='saved'">Save</button>
+        <button style="display:none">Ghost</button>
+        <label for="email">Email</label><input id="email">
+        <div style="height:1500px"></div>
+        <iframe id="same" src="/inner"></iframe>
+        <iframe id="cross" src="http://localhost:{port}/inner"></iframe>"#
+    );
+    const INNER: &str = r#"<!doctype html><title>inner</title>
+        <input aria-label="Code"><p id="out">idle</p>
+        <button onclick="document.getElementById('out').textContent =
+            'clicked ' + document.querySelector('input').value">Inner</button>"#;
+    let app = Router::new()
+        .route("/", get(move || async move { Html(top) }))
+        .route("/inner", get(|| async { Html(INNER) }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(2))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+
+    // Name is a case-insensitive substring by default, so "Save" finds "Save draft" first.
+    page.get_by_role("button", Some("save"), false).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "draft");
+    page.get_by_role("button", Some("Save"), true).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "saved");
+
+    let heading = page.get_by_role("heading", Some("welcome"), false);
+    assert_eq!(heading.text_content().await.unwrap().as_deref(), Some("Welcome back"));
+    // The deepest element wins: <b>, not <p>.
+    assert_eq!(page.get_by_text("world", false).text_content().await.unwrap().as_deref(), Some("World"));
+    assert!(page.get_by_text("hello world", true).wait().await.is_err(), "exact is case-sensitive");
+
+    page.get_by_role("textbox", Some("Email"), false).fill("a@b.co").await.unwrap();
+    assert_eq!(page.evaluate("document.querySelector('#email').value").await.unwrap(), "a@b.co");
+
+    let err = page.get_by_role("button", Some("Ghost"), false).click().await.unwrap_err().to_string();
+    assert!(err.contains("no element matches"), "hidden elements never match a role: {err}");
+
+    for frame in ["#same", "#cross"] {
+        let f = page.frame_locator(frame);
+        f.get_by_role("textbox", Some("code"), false).fill("42").await.unwrap();
+        f.get_by_role("button", Some("Inner"), true).click().await.unwrap();
+        let out = f.locator("#out").text_content().await.unwrap();
+        assert_eq!(out.as_deref(), Some("clicked 42"), "in {frame}");
+    }
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// block_images must hold in cross-origin iframes (their own CDP sessions) and on every job
+/// on a browser, and leave no per-job task behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn blocking_covers_cross_origin_frames() {
+    use axum::{http::header, response::Html, routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Each document marks itself done once its image loads or fails.
+    const IMG: &str = r#"<img src="/img.png" onload="document.body.dataset.done=1" onerror="document.body.dataset.done=1">"#;
+    let top = format!(r#"<!doctype html><body>{IMG}<iframe src="http://localhost:{port}/frame"></iframe>"#);
+    let counter = hits.clone();
+    let app = Router::new()
+        .route("/", get(move || async move { Html(top) }))
+        .route("/frame", get(|| async { Html(format!("<!doctype html><body>{IMG}")) }))
+        .route(
+            "/img.png",
+            get(move || {
+                counter.fetch_add(1, SeqCst);
+                async { ([(header::CONTENT_TYPE, "image/png")], "not really a png") }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = BrowserEngine::builder().max_browsers(1).build().await.unwrap();
+    let url = format!("http://127.0.0.1:{port}/");
+    let load = |opts: JobOptions| {
+        let url = url.clone();
+        eng.run(opts, move |page| {
+            let url = url.clone();
+            async move {
+                page.goto(&url).await?;
+                page.wait_for_selector("body[data-done]").await?;
+                page.frame_locator("iframe").locator("body[data-done]").wait().await?;
+                Ok(())
+            }
+        })
+    };
+
+    for _ in 0..3 {
+        let opts = JobOptions { block_images: true, ..JobOptions::default() };
+        load(opts).await.unwrap();
+    }
+    assert_eq!(hits.load(SeqCst), 0, "images fetched despite block_images");
+
+    load(JobOptions::default()).await.unwrap();
+    assert_eq!(hits.load(SeqCst), 2, "control run: page and cross-origin frame each fetch the image");
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// An unhandled dialog used to block every call on the page until it timed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn dialogs_do_not_block() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(3))
+        .navigation_timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto("data:text/html,<title>d</title><body style='height:400px'>x</body>").await.unwrap();
+
+    assert_eq!(page.evaluate("alert('hi'); 42").await.unwrap(), 42);
+    assert_eq!(page.evaluate("confirm('sure?')").await.unwrap(), false, "confirm is dismissed");
+    assert_eq!(page.evaluate("prompt('name?')").await.unwrap(), serde_json::Value::Null);
+
+    // beforeunload is accepted, so a "leave this page?" handler cannot pin the page. Chrome
+    // only asks after a user gesture, hence the click.
+    page.evaluate("window.onbeforeunload = e => { e.preventDefault(); e.returnValue = ''; }; 1")
+        .await
+        .unwrap();
+    page.click("body").await.unwrap();
+    page.goto("about:blank").await.unwrap();
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// Selector code runs in an isolated world, so a page that patches DOM APIs (anti-bot
+/// scripts do) cannot break clicks, fills or waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn page_scripts_cannot_break_selectors() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(3))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<title>t</title>",
+        "<button onclick=\"document.title='clicked'\">Go</button><input aria-label='Name'>",
+        "<script>document.querySelector = () => null; document.querySelectorAll = () => [];",
+        "Element.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 0, 0);</script>"
+    ))
+    .await
+    .unwrap();
+
+    page.get_by_role("button", Some("Go"), true).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "clicked");
+    page.fill("input", "ok").await.unwrap();
+    assert_eq!(page.get_by_role("textbox", Some("Name"), true).text_content().await.unwrap().as_deref(), Some(""));
+    // evaluate still runs in the page's own world, where the patch is visible.
+    assert_eq!(page.evaluate("document.querySelector('input')").await.unwrap(), serde_json::Value::Null);
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// A proxy per job, with credentials, next to direct jobs on the same browser.
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_per_job() {
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::{Html, IntoResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    // A forward proxy that wants user:pass and answers every request itself, so a host
+    // that does not exist (fluxwright.invalid) loads only through it.
+    // A fresh password each run, so no credential is written in the code.
+    use base64::Engine;
+    use std::hash::{BuildHasher, Hasher};
+    let pass = format!("{:016x}", std::collections::hash_map::RandomState::new().build_hasher().finish());
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("user:{pass}"))
+    );
+    let challenges = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let seen = challenges.clone();
+    let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+        let seen = seen.clone();
+        let expected = expected.clone();
+        async move {
+            if headers
+                .get(header::PROXY_AUTHORIZATION)
+                .is_some_and(|v| v.as_bytes() == expected.as_bytes())
+            {
+                Html("<title>via proxy</title>").into_response()
+            } else {
+                seen.fetch_add(1, SeqCst);
+                (StatusCode::PROXY_AUTHENTICATION_REQUIRED, [(header::PROXY_AUTHENTICATE, "Basic realm=\"fw\"")])
+                    .into_response()
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .navigation_timeout(Duration::from_secs(10))
+        .build()
+        .await
+        .unwrap();
+    let title = |opts: JobOptions| {
+        eng.run(opts.retries(0), |page| async move {
+            page.goto("http://fluxwright.invalid/").await?;
+            page.title().await
+        })
+    };
+
+    let good = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", &pass));
+    assert_eq!(title(good).await.unwrap(), "via proxy");
+
+    let direct = title(JobOptions::default()).await;
+    assert!(!matches!(direct.as_deref(), Ok("via proxy")), "a job without a proxy used it: {direct:?}");
+
+    // Wrong credentials: answered once, then cancelled, instead of a 407 loop. (Chrome's own
+    // requests, such as the favicon, meet the proxy without Fetch and give up by themselves.)
+    challenges.store(0, SeqCst);
+    let start = std::time::Instant::now();
+    let bad = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", format!("{pass}-wrong")));
+    let bad = title(bad).await;
+    assert!(!matches!(bad.as_deref(), Ok("via proxy")), "{bad:?}");
+    assert!(start.elapsed() < Duration::from_secs(5), "wrong credentials took {:?}", start.elapsed());
+    assert!(challenges.load(SeqCst) < 10, "{} proxy challenges: auth is looping", challenges.load(SeqCst));
+
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// Review findings on PR #2: each used to misclick or fill silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn actionability_edge_cases() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(2))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<title>t</title>",
+        "<input type=button value=Save onclick=\"document.title='input'\">",
+        "<span onclick=\"document.title='span'\">Save</span>",
+        "<button onclick=\"document.title='img'\" style='padding:8px'><img alt=Upload></button>",
+        "<fieldset disabled><button>Locked</button></fieldset>",
+        "<div aria-disabled=true><button>Aria</button></div>",
+        "<div id=ce contenteditable>old</div><h1>Head</h1>",
+        "<input id=gone onfocus=\"this.replaceWith(document.createElement('input'))\">"
+    ))
+    .await
+    .unwrap();
+
+    // text= finds matches in DOM order, input buttons included.
+    page.get_by_text("save", false).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "input");
+    // A button named by its image's alt text.
+    page.get_by_role("button", Some("Upload"), true).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "img");
+    // Disabled through <fieldset disabled> or an ancestor's aria-disabled.
+    for name in ["Locked", "Aria"] {
+        let err = page.get_by_role("button", Some(name), true).click().await.unwrap_err().to_string();
+        assert!(err.contains("disabled"), "{name}: {err}");
+    }
+    // fill replaces contenteditable content, refuses non-editable elements, and fails when
+    // the page swaps the element out on focus instead of typing into nothing.
+    page.fill("#ce", "new").await.unwrap();
+    assert_eq!(page.evaluate("document.querySelector('#ce').textContent").await.unwrap(), "new");
+    let err = page.fill("h1", "x").await.unwrap_err().to_string();
+    assert!(err.contains("not an <input>"), "{err}");
+    let err = page.fill("#gone", "x").await.unwrap_err().to_string();
+    assert!(err.contains("removed after the click"), "{err}");
+
+    // An overlay in the parent page covers the iframe: the click must not report success.
+    page.goto(concat!(
+        "data:text/html,<iframe id=f srcdoc='<button>In</button>'></iframe>",
+        "<div style='position:fixed;inset:0;background:rgba(0,0,0,.1)'></div>"
+    ))
+    .await
+    .unwrap();
+    let err = page.frame_locator("#f").get_by_role("button", Some("In"), true).click().await.unwrap_err().to_string();
+    assert!(err.contains("obscured by <div>"), "{err}");
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// Chrome sends each CDP message as one WebSocket frame; tungstenite's default 16 MiB frame
+/// cap made a big screenshot kill the connection, and with it every job on that browser.
+#[tokio::test(flavor = "multi_thread")]
+async fn screenshot_larger_than_16_mib() {
+    let eng = BrowserEngine::builder().max_browsers(1).build().await.unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto("about:blank").await.unwrap();
+    // Random pixels do not compress: 1280x8000 comes out around 30 MB of PNG, 40 MB as base64.
+    page.evaluate(
+        r#"(() => {
+            const c = document.createElement('canvas');
+            c.width = 1280; c.height = 8000; c.style.display = 'block';
+            const ctx = c.getContext('2d'), img = ctx.createImageData(1280, 8000);
+            for (let i = 0; i < img.data.length; i += 65536)
+                crypto.getRandomValues(img.data.subarray(i, i + 65536));
+            ctx.putImageData(img, 0, 0);
+            document.body.style.margin = '0';
+            document.body.appendChild(c);
+        })()"#,
+    )
+    .await
+    .unwrap();
+    let png = page.screenshot_full_page().await.unwrap();
+    assert!(png.len() > 16 << 20, "only {} bytes; the test page did not get big enough", png.len());
+    assert_eq!(page.title().await.unwrap(), "", "connection still usable afterwards");
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// A crashed or hard-killed engine must take Chrome with it (job object on Windows;
+/// PR_SET_PDEATHSIG and the DevTools pipe on Linux; the pipe on macOS), and its temp
+/// profile must be swept afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn chrome_dies_with_engine() {
+    use std::io::{BufRead, BufReader};
+
+    if std::env::var_os("FLUXWRIGHT_TEST_CHILD").is_some() {
+        // Child: start Chrome, report its pid, wait to be killed.
+        let eng = BrowserEngine::builder().max_browsers(1).build().await.unwrap();
+        let page = eng.acquire().await.unwrap();
+        println!("BROWSER_PID {}", page.browser_pid());
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["chrome_dies_with_engine", "--exact", "--nocapture", "--test-threads=1"])
+        .env("FLUXWRIGHT_TEST_CHILD", "1")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let engine_pid = child.id();
+    let browser_pid = BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(|l| l.ok())
+        // libtest may print "test chrome_dies_with_engine ... " on the same line first.
+        .find_map(|l| l.split("BROWSER_PID ").nth(1).and_then(|p| p.trim().parse::<u32>().ok()))
+        .expect("child never reported a browser pid");
+    child.kill().unwrap(); // TerminateProcess / SIGKILL: no destructor or kill_on_drop runs
+    child.wait().unwrap();
+
+    let alive = |pid: u32| {
+        let mut sys = sysinfo::System::new();
+        let pid = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        sys.process(pid).is_some()
+    };
+    let start = std::time::Instant::now();
+    while alive(browser_pid) {
+        assert!(start.elapsed() < Duration::from_secs(10), "chrome {browser_pid} outlived its engine");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let prefix = format!("fluxwright-{engine_pid}-");
+    let leftovers = || {
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .count()
+    };
+    let start = std::time::Instant::now();
+    loop {
+        fluxwright::sweep_stale_profiles(); // retried: Windows holds file locks briefly after exit
+        if leftovers() == 0 {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "profile of dead engine not swept");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn two_hundred_leases_five_browsers_no_deadlock() {
     let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
     let url = format!("{}/", srv.base_url);
+    // 50 slots for 200 leases: most leases queue, which is what exercises the wakeup path.
+    // 200 tabs loading at once pushed single navigations near the 30 s timeout on Windows.
     let eng = BrowserEngine::builder()
         .max_browsers(5)
-        .max_contexts_per_browser(40)
+        .max_contexts_per_browser(10)
         .queue_capacity(256)
         .recycle_after_jobs(u64::MAX)
         .memory_ceiling_mb(32_768)

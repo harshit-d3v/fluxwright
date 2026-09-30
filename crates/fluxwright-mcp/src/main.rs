@@ -42,13 +42,13 @@ struct OpenArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SelectorArgs {
-    #[schemars(description = "CSS selector")]
+    #[schemars(description = "CSS selector, text=Visible text, or role=button[name=\"Save\"]")]
     selector: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct FillArgs {
-    #[schemars(description = "CSS selector")]
+    #[schemars(description = "CSS selector, text=Visible text, or role=textbox[name=\"Email\"]")]
     selector: String,
     #[schemars(description = "Text to type")]
     value: String,
@@ -169,7 +169,7 @@ impl FluxwrightMcp {
         }
     }
 
-    #[tool(description = "Click an element by CSS selector.")]
+    #[tool(description = "Click an element by CSS, text= or role= selector.")]
     async fn click(
         &self,
         Parameters(SelectorArgs { selector }): Parameters<SelectorArgs>,
@@ -185,7 +185,7 @@ impl FluxwrightMcp {
         Ok(format!("clicked {selector}"))
     }
 
-    #[tool(description = "Fill an input/textarea by CSS selector.")]
+    #[tool(description = "Fill an input/textarea by CSS, text= or role= selector.")]
     async fn fill(
         &self,
         Parameters(FillArgs { selector, value }): Parameters<FillArgs>,
@@ -248,7 +248,8 @@ impl ServerHandler for FluxwrightMcp {
         ServerInfo {
             instructions: Some(
                 "Fluxwright Chromium fleet. Tools: open, goto, title, content, click, fill, evaluate, screenshot, close. \
-                 Each open() is a fresh browser context. Use CSS selectors. Prefer evaluate() to extract prices/text."
+                 Each open() is a fresh browser context. Selectors: CSS, text=Sign in, or role=button[name=\"Sign in\"]. \
+                 Prefer evaluate() to extract prices/text."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

@@ -2,7 +2,7 @@
 
 Researched 2026-09-21. Fluxwright is a fleet engine, not a Playwright rewrite. This document judges other tools on pooling, admission control, recycling, crash recovery, and honest metrics.
 
-**How to read this.** Each section splits **claimed** (the project’s own words) from **verified** (read from source, docs, or issue trackers). Unverified marketing numbers are not treated as facts. Fluxwright has no benchmarks yet; this file does not claim we are faster or lighter than anyone.
+**How to read this.** Each section splits **claimed** (the project’s own words) from **verified** (read from source, docs, or issue trackers). Unverified marketing numbers are not treated as facts. Fluxwright’s own measurements, with their method, are in the README’s opening section; this file compares designs, not speed.
 
 ---
 

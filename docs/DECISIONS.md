@@ -22,7 +22,7 @@ Bounded queue of waiters. **Error**: `acquire` returns `QueueFull` when the queu
 
 Each lease creates one context and one page. The config exists and is enforced (a lease will not open more pages than the cap). Default is 1.
 
-## 2026-09-21 — Memory ceiling is process-tree RSS
+## 2026-09-21 — Memory ceiling is process-tree RSS (superseded 2026-09-30)
 
 `sysinfo` walks the Chrome pid and descendants. Windows and Linux. This is an estimate: shared mappings can be counted more than once. Named as such in metrics.
 
@@ -31,3 +31,15 @@ Each lease creates one context and one page. The config exists and is enforced (
 A two-hour soak is `--soak` on `fluxwright-benchmarks`. The default command still writes JSON for the concurrency scenarios to `benchmarks/results/`. Defaulting to 2h would block CI and local iteration.
 
 GitHub-hosted Linux often cannot use the SUID sandbox. CI sets `FLUXWRIGHT_NO_SANDBOX=1`, which is the documented opt-in and logs a warning. Default remains sandboxed.
+
+## 2026-09-30 — Memory ceiling is Chrome’s footprint
+
+Summed RSS counted pages shared between Chrome’s processes once per process: one browser with four pages read 1202 MB against a 665 MB footprint, so the ceiling tripped at about half its setting. Each process now counts PSS on Linux and private bytes on Windows, the measures behind Chrome’s own memory footprint. macOS keeps RSS.
+
+## 2026-09-30 — DevTools pipe on Unix
+
+Linux and macOS launch Chrome with `--remote-debugging-pipe`. Chrome exits when the pipe closes, which is the only way to tie it to the engine on macOS (no parent-death signal). A debugging port is also reachable by every local user; the pipe is not. Windows keeps the WebSocket, tied to the engine by a kill-on-close job object.
+
+## 2026-09-30 — Headless launches prefer chrome-headless-shell
+
+Playwright’s default. Pages opened 5–10x faster than on Chrome’s new headless mode in interleaved runs. Picked from `PATH`, then Puppeteer’s and Playwright’s caches; `FLUXWRIGHT_CHROMIUM` and `EngineBuilder::chrome` override.

@@ -39,14 +39,17 @@ await browser.close();
 
 | Method | What it does |
 |---|---|
-| `chromium.launch({ maxBrowsers? })` | Start the pool |
-| `browser.newPage()` | Acquire a lease |
-| `page.goto(url)` | Navigate |
+| `chromium.launch({ maxBrowsers?, executablePath?, headless? })` | Start the pool. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executablePath` overrides |
+| `browser.newPage({ proxy? })` | Acquire a lease (a fresh context). `proxy: { server, bypass?, username?, password? }` applies to this page only |
+| `page.goto(url, { waitUntil? })` | Navigate. `waitUntil`: `load` (default), `domcontentloaded`, `networkidle`, `commit`. Event-driven, like Playwright |
 | `page.title()` / `page.content()` | Read |
-| `page.click(selector)` / `page.fill(selector, value)` | CSS only |
-| `page.evaluate(expression)` | `Runtime.evaluate`, JSON |
-| `page.screenshot()` | PNG `Buffer` |
-| `page.waitForSelector(selector)` | Actionable wait |
+| `page.click(selector)` / `page.fill(selector, value)` | Scrolls into view, waits until enabled, stable, and not covered. Selector: CSS, `text=Foo`, `text="Exact"`, `role=button[name="Save"]` |
+| `page.getByRole(role, { name?, exact? })` / `page.getByText(text, { exact? })` / `page.locator(selector)` | `Locator` with `click()`, `fill(v)`, `waitFor()`, `textContent()`. Implicit ARIA roles and accessible names; hidden elements never match a role |
+| `page.frameLocator(iframeSelector)` | Same locators inside an iframe, same- or cross-origin; nest with `.frameLocator()` |
+| `page.evaluate(expression)` | `Runtime.evaluate`, JSON. A thrown JS error rejects with its message and stack |
+| `page.screenshot({ fullPage? })` | PNG `Buffer` |
+| `page.setViewportSize({ width, height })` | CSS-pixel viewport for this page |
+| `page.waitForSelector(selector)` | Waits until visible (Playwright's default state) |
 | `page.close()` / `browser.close()` | Dispose context / shut down |
 
 See `MISSING.md` for Playwright methods that will not be added.

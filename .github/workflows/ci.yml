@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Checkout is all either job needs from the GITHUB_TOKEN.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

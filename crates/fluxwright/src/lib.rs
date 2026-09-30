@@ -4,8 +4,11 @@
 //! or any other tool. See `docs/COMPETITIVE_ANALYSIS.md`.
 
 pub use fluxwright_core::{
-    BrowserInfo, Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, JobOptions, Locator,
+    BrowserInfo, Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, FrameLocator, JobOptions, Locator,
     MetricsSnapshot, PageLease, Priority, QueueFullMode, Result,
 };
 
-pub use fluxwright_cdp::{find_chrome, LaunchOptions, ResourceType};
+pub use fluxwright_cdp::{
+    find_browser, find_chrome, sweep_stale_profiles, LaunchOptions, Proxy, ResourceType, Selector,
+    WaitUntil,
+};

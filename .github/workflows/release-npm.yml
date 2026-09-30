@@ -5,6 +5,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# npm publishes with NPM_TOKEN; the GITHUB_TOKEN only needs to check out code.
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: bindings/node

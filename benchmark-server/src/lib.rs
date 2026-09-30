@@ -40,6 +40,7 @@ pub fn router() -> Router {
         .route("/set-cookie", get(set_cookie))
         .route("/show-cookie", get(show_cookie))
         .route("/slow", get(slow))
+        .route("/slow-subresource", get(slow_subresource))
 }
 
 async fn home() -> Html<&'static str> {
@@ -104,6 +105,11 @@ async fn show_cookie() -> Html<&'static str> {
         <pre id="c"></pre>
         <script>document.getElementById('c').textContent = document.cookie;</script>"#,
     )
+}
+
+/// DOMContentLoaded at once, `load` only after /slow answers (30 s).
+async fn slow_subresource() -> Html<&'static str> {
+    Html("<!doctype html><title>dcl</title><img src=\"/slow\">")
 }
 
 async fn slow() -> Html<&'static str> {
