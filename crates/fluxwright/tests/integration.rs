@@ -416,6 +416,58 @@ async fn selectors_and_frames() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+/// block_images must hold in cross-origin iframes (their own CDP sessions) and on every job
+/// on a browser, and leave no per-job task behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn blocking_covers_cross_origin_frames() {
+    use axum::{http::header, response::Html, routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Each document marks itself done once its image loads or fails.
+    const IMG: &str = r#"<img src="/img.png" onload="document.body.dataset.done=1" onerror="document.body.dataset.done=1">"#;
+    let top = format!(r#"<!doctype html><body>{IMG}<iframe src="http://localhost:{port}/frame"></iframe>"#);
+    let counter = hits.clone();
+    let app = Router::new()
+        .route("/", get(move || async move { Html(top) }))
+        .route("/frame", get(|| async { Html(format!("<!doctype html><body>{IMG}")) }))
+        .route(
+            "/img.png",
+            get(move || {
+                counter.fetch_add(1, SeqCst);
+                async { ([(header::CONTENT_TYPE, "image/png")], "not really a png") }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = BrowserEngine::builder().max_browsers(1).build().await.unwrap();
+    let url = format!("http://127.0.0.1:{port}/");
+    let load = |opts: JobOptions| {
+        let url = url.clone();
+        eng.run(opts, move |page| {
+            let url = url.clone();
+            async move {
+                page.goto(&url).await?;
+                page.wait_for_selector("body[data-done]").await?;
+                page.frame_locator("iframe").locator("body[data-done]").wait().await?;
+                Ok(())
+            }
+        })
+    };
+
+    for _ in 0..3 {
+        let opts = JobOptions { block_images: true, ..JobOptions::default() };
+        load(opts).await.unwrap();
+    }
+    assert_eq!(hits.load(SeqCst), 0, "images fetched despite block_images");
+
+    load(JobOptions::default()).await.unwrap();
+    assert_eq!(hits.load(SeqCst), 2, "control run: page and cross-origin frame each fetch the image");
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// Chrome sends each CDP message as one WebSocket frame; tungstenite's default 16 MiB frame
 /// cap made a big screenshot kill the connection, and with it every job on that browser.
 #[tokio::test(flavor = "multi_thread")]

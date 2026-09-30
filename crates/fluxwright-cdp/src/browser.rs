@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::connection::{CdpEvent, Connection};
 use crate::error::{Error, LaunchOptions, Result};
 use crate::launch::{launch_chrome, Launched};
-use crate::page::CdpPage;
+use crate::page::{fetch_patterns, Blocking, CdpPage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BrowserId(pub Uuid);
@@ -42,6 +42,8 @@ pub struct CdpBrowser {
     _child: Mutex<Option<Child>>,
     _profile: Option<tempfile::TempDir>,
     targets: Arc<Mutex<HashMap<String, TargetState>>>,
+    /// Resource blocking per browser context, so iframes that attach later get it too.
+    blocking: Arc<Mutex<HashMap<String, Blocking>>>,
     pub events: broadcast::Sender<CdpEvent>,
 }
 
@@ -61,6 +63,7 @@ impl CdpBrowser {
             _child: Mutex::new(Some(launched.child)),
             _profile: Some(launched.user_data_dir),
             targets: Arc::new(Mutex::new(HashMap::new())),
+            blocking: Default::default(),
             events: fanout.clone(),
         });
 
@@ -110,7 +113,7 @@ impl CdpBrowser {
                 "Target.setAutoAttach",
                 json!({
                     "autoAttach": true,
-                    "waitForDebuggerOnStart": false,
+                    "waitForDebuggerOnStart": true,
                     "flatten": true
                 }),
                 None,
@@ -140,6 +143,10 @@ impl CdpBrowser {
                 let url = info["url"].as_str().unwrap_or("").to_string();
                 let ctx = info["browserContextId"].as_str().map(|s| s.to_string());
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
+                let blocking = match &ctx {
+                    Some(c) => self.blocking.lock().await.get(c).cloned(),
+                    None => None,
+                };
 
                 {
                     let mut targets = self.targets.lock().await;
@@ -181,7 +188,7 @@ impl CdpBrowser {
                 // page never reaches a caller with its domains still being enabled.
                 let me = self.clone();
                 tokio::spawn(async move {
-                    prepare_session(&me.conn, &session_id, &ty, waiting).await;
+                    prepare_session(&me.conn, &session_id, &ty, waiting, blocking).await;
                     let waiters = match me.targets.lock().await.get_mut(&target_id) {
                         Some(t) => {
                             t.session_id = Some(session_id.clone());
@@ -220,6 +227,19 @@ impl CdpBrowser {
                             t.session_id = None;
                         }
                     }
+                }
+            }
+            // Fetch is only enabled for resource blocking, so every paused request is one to
+            // fail. Answered here, on the loop that sees every session and never lags.
+            "Fetch.requestPaused" => {
+                if let (Some(sid), Some(id)) = (ev.session_id.clone(), ev.params["requestId"].as_str()) {
+                    let conn = self.conn.clone();
+                    let params = json!({ "requestId": id, "errorReason": "BlockedByClient" });
+                    tokio::spawn(async move {
+                        let _ = conn
+                            .call("Fetch.failRequest", params, Some(&sid), Duration::from_secs(5))
+                            .await;
+                    });
                 }
             }
             "Target.targetCrashed" => {
@@ -261,6 +281,7 @@ impl CdpBrowser {
     }
 
     pub async fn dispose_context(&self, id: &ContextId) -> Result<()> {
+        self.blocking.lock().await.remove(&id.0);
         let _ = self
             .call(
                 "Target.disposeBrowserContext",
@@ -301,6 +322,7 @@ impl CdpBrowser {
             events: self.events.clone(),
             targets: self.targets.clone(),
             worlds: Default::default(),
+            blocking: self.blocking.clone(),
         })
     }
 
@@ -378,16 +400,26 @@ async fn prepare_session(
     session_id: &str,
     ty: &str,
     waiting_for_debugger: bool,
+    blocking: Option<Blocking>,
 ) {
     let mut calls = vec![(
         "Target.setAutoAttach",
-        json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+        json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
     )];
     if ty == "page" || ty == "iframe" {
         calls.push(("Page.enable", json!({})));
         calls.push(("Runtime.enable", json!({})));
         calls.push(("Network.enable", json!({})));
         calls.push(("Page.setLifecycleEventsEnabled", json!({ "enabled": true })));
+    }
+    if let Some(b) = blocking.filter(|_| ty == "page" || ty == "iframe") {
+        if !b.types.is_empty() {
+            calls.push(("Fetch.enable", fetch_patterns(&b.types)));
+        }
+        if !b.urls.is_empty() {
+            calls.push(("Network.enable", json!({})));
+            calls.push(("Network.setBlockedURLs", json!({ "urls": b.urls })));
+        }
     }
     if waiting_for_debugger {
         calls.push(("Runtime.runIfWaitingForDebugger", json!({})));

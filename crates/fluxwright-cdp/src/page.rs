@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::debug;
 
 use crate::browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId, TargetState};
 use crate::connection::{CdpEvent, Connection};
@@ -155,6 +154,7 @@ pub struct CdpPage {
     pub(crate) targets: Arc<Mutex<HashMap<String, TargetState>>>,
     /// Isolated worlds made for same-process iframes, by frame id.
     pub(crate) worlds: Arc<Mutex<HashMap<String, i64>>>,
+    pub(crate) blocking: Arc<Mutex<HashMap<String, Blocking>>>,
 }
 
 impl CdpPage {
@@ -514,68 +514,42 @@ impl CdpPage {
         Ok(())
     }
 
+    /// Blocks requests whose URL matches any pattern, in this page and its iframes.
     pub async fn set_blocked_urls(&self, urls: &[String], timeout: Duration) -> Result<()> {
-        self.call(
-            "Network.setBlockedURLs",
-            json!({ "urls": urls }),
-            timeout,
-        )
-        .await?;
+        self.blocking.lock().await.entry(self.context_id.0.clone()).or_default().urls = urls.to_vec();
+        self.call("Network.enable", json!({}), timeout).await?;
+        self.call("Network.setBlockedURLs", json!({ "urls": urls }), timeout).await?;
         Ok(())
     }
 
-    pub async fn block_resource_types(
-        &self,
-        types: &[ResourceType],
-        timeout: Duration,
-    ) -> Result<()> {
+    /// Fails requests of these types, in this page and its iframes (cross-origin ones
+    /// included). The browser's event loop answers the paused requests; see
+    /// `Fetch.requestPaused` in browser.rs.
+    pub async fn block_resource_types(&self, types: &[ResourceType], timeout: Duration) -> Result<()> {
         if types.is_empty() {
             return Ok(());
         }
-        self.call(
-            "Fetch.enable",
-            json!({
-                "patterns": types.iter().map(|t| json!({
-                    "urlPattern": "*",
-                    "resourceType": t.as_str(),
-                    "requestStage": "Request"
-                })).collect::<Vec<_>>()
-            }),
-            timeout,
-        )
-        .await?;
-        let mut rx = self.events.subscribe();
-        let sid = self.sid().to_string();
-        let conn = self.browser.clone();
-        let pid = self.browser_pid;
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) if ev.method == "Fetch.requestPaused" && ev.session_id.as_deref() == Some(sid.as_str()) => {
-                        let id = ev.params["requestId"].as_str().unwrap_or("");
-                        let _ = conn
-                            .call(
-                                "Fetch.failRequest",
-                                json!({ "requestId": id, "errorReason": "BlockedByClient" }),
-                                Some(&sid),
-                                Duration::from_secs(5),
-                            )
-                            .await;
-                    }
-                    Ok(ev) if ev.method == "Fluxwright.disconnected" => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(_) => {
-                        if conn.is_dead() {
-                            debug!(pid, "fetch blocker stopping");
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
+        self.blocking.lock().await.entry(self.context_id.0.clone()).or_default().types = types.to_vec();
+        self.call("Fetch.enable", fetch_patterns(types), timeout).await?;
         Ok(())
     }
+}
+
+/// What a browser context blocks; applied to each of its sessions as they attach.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Blocking {
+    pub(crate) types: Vec<ResourceType>,
+    pub(crate) urls: Vec<String>,
+}
+
+pub(crate) fn fetch_patterns(types: &[ResourceType]) -> Value {
+    json!({
+        "patterns": types.iter().map(|t| json!({
+            "urlPattern": "*",
+            "resourceType": t.as_str(),
+            "requestStage": "Request"
+        })).collect::<Vec<_>>()
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
