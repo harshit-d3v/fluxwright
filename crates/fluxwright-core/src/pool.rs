@@ -61,6 +61,9 @@ pub struct PageLease {
     page: CdpPage,
     lease_id: Uuid,
     released: bool,
+    /// Where `Drop` runs its cleanup: a lease can be dropped outside any runtime (Node's garbage
+    /// collector does this), and `tokio::spawn` panics there.
+    runtime: tokio::runtime::Handle,
 }
 
 impl Engine {
@@ -527,6 +530,7 @@ impl Inner {
             page,
             lease_id: Uuid::new_v4(),
             released: false,
+            runtime: tokio::runtime::Handle::current(),
         })
     }
 
@@ -811,7 +815,7 @@ impl Drop for PageLease {
         let browser = self.browser.clone();
         let ctx = self.context.clone();
         let engine = self.engine.clone();
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             let _ = browser.dispose_context(&ctx).await;
             engine.release_slot(&browser, true).await;
         });

@@ -29,6 +29,30 @@ async fn engine(max_browsers: usize, max_ctx: usize) -> BrowserEngine {
         .expect("engine")
 }
 
+/// Node's garbage collector drops a page that was never closed on its own thread, outside any
+/// runtime. That must not panic, and the slot must still come back.
+#[test]
+fn lease_dropped_outside_runtime_frees_its_slot() {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let eng = rt
+        .block_on(
+            BrowserEngine::builder()
+                .max_browsers(1)
+                .max_contexts_per_browser(1)
+                .acquire_timeout(Duration::from_secs(20))
+                .build(),
+        )
+        .expect("engine");
+    let lease = rt.block_on(eng.acquire()).expect("first lease");
+    drop(lease);
+    let again = rt.block_on(eng.acquire());
+    assert!(again.is_ok(), "the dropped lease kept its slot: {:?}", again.err());
+    rt.block_on(async move {
+        drop(again);
+        eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cookie_set_in_one_job_not_visible_in_next() {
     let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();

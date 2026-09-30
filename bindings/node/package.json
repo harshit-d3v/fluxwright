@@ -1,7 +1,7 @@
 {
   "name": "fluxwright",
-  "version": "0.2.1",
-  "description": "In-process Chromium fleet engine (napi-rs). Lease API, not Playwright parity.",
+  "version": "0.2.2",
+  "description": "Run hundreds of headless Chrome jobs on one machine: pooling, queueing, recycling and crash recovery, with a Playwright-style API.",
   "main": "addon.js",
   "types": "addon.d.ts",
   "repository": {
@@ -9,16 +9,20 @@
     "url": "git+https://github.com/harshit-d3v/fluxwright.git",
     "directory": "bindings/node"
   },
-  "homepage": "https://github.com/harshit-d3v/fluxwright#readme",
+  "homepage": "https://fluxwright.vercel.app",
   "bugs": {
     "url": "https://github.com/harshit-d3v/fluxwright/issues"
   },
   "keywords": [
     "chromium",
     "chrome",
-    "cdp",
+    "headless",
+    "playwright",
+    "puppeteer",
     "browser-pool",
-    "automation",
+    "browser-automation",
+    "scraping",
+    "cdp",
     "napi-rs"
   ],
   "author": "Fluxwright contributors",
@@ -37,6 +41,8 @@
   ],
   "scripts": {
     "build": "napi build --platform --release",
+    "test": "node test/smoke.mjs",
+    "test:types": "tsc -p test",
     "build:debug": "napi build --platform",
     "artifacts": "napi artifacts",
     "prepublishOnly": "napi prepublish -t npm --skip-gh-release"
@@ -54,12 +60,14 @@
     "access": "public"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4"
+    "@napi-rs/cli": "^2.18.4",
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3"
   },
   "optionalDependencies": {
-    "fluxwright-darwin-arm64": "0.2.1",
-    "fluxwright-darwin-x64": "0.2.1",
-    "fluxwright-linux-x64-gnu": "0.2.1",
-    "fluxwright-win32-x64-msvc": "0.2.1"
+    "fluxwright-darwin-arm64": "0.2.2",
+    "fluxwright-darwin-x64": "0.2.2",
+    "fluxwright-linux-x64-gnu": "0.2.2",
+    "fluxwright-win32-x64-msvc": "0.2.2"
   }
 }
