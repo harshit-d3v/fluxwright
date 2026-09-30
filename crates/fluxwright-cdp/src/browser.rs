@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::connection::{CdpEvent, Connection};
 use crate::error::{Error, LaunchOptions, Result};
-use crate::launch::{launch_chrome, Launched};
+use crate::launch::{launch_chrome, Launched, Transport};
 use crate::page::{fetch_params, CdpPage, ContextSetup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,7 +84,16 @@ impl CdpBrowser {
     }
 
     async fn from_launched(launched: Launched) -> Result<Arc<Self>> {
-        let conn = Connection::connect(&launched.ws_url).await?;
+        let conn = match launched.transport {
+            #[cfg(windows)]
+            Transport::WebSocket(url) => Connection::connect(&url).await?,
+            #[cfg(unix)]
+            Transport::Pipe { to_chrome, from_chrome } => Connection::from_pipes(to_chrome, from_chrome)?,
+        };
+        // Over a pipe nothing has waited for Chrome to start yet.
+        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(20))
+            .await
+            .map_err(|e| Error::Launch(format!("chromium did not answer on its DevTools connection: {e}")))?;
         let (fanout, _) = broadcast::channel(512);
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),

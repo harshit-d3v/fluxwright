@@ -617,9 +617,9 @@ async fn screenshot_larger_than_16_mib() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
-/// A crashed or hard-killed engine must take Chrome with it (job object on Windows,
-/// PR_SET_PDEATHSIG on Linux), and its temp profile must be swept afterwards.
-#[cfg(any(windows, target_os = "linux"))]
+/// A crashed or hard-killed engine must take Chrome with it (job object on Windows;
+/// PR_SET_PDEATHSIG and the DevTools pipe on Linux; the pipe on macOS), and its temp
+/// profile must be swept afterwards.
 #[tokio::test(flavor = "multi_thread")]
 async fn chrome_dies_with_engine() {
     use std::io::{BufRead, BufReader};

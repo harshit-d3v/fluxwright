@@ -1,10 +1,16 @@
+#[cfg(windows)]
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+#[cfg(windows)]
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -104,8 +110,21 @@ pub fn find_chrome(explicit: Option<&Path>) -> Result<PathBuf> {
 pub struct Launched {
     pub child: Child,
     pub pid: u32,
-    pub ws_url: String,
+    pub transport: Transport,
     pub user_data_dir: tempfile::TempDir,
+}
+
+/// How the engine talks to a browser it launched.
+pub enum Transport {
+    /// DevTools WebSocket on a localhost port (Windows; the job object ties Chrome to us).
+    #[cfg(windows)]
+    WebSocket(String),
+    /// `--remote-debugging-pipe`: commands on Chrome's fd 3, replies on fd 4, NUL-separated.
+    /// Private to this process (a debugging port is open to every local user), and Chrome
+    /// exits when the pipe closes, so it cannot outlive a crashed engine. That is the only
+    /// tether on macOS, which has no parent-death signal.
+    #[cfg(unix)]
+    Pipe { to_chrome: OwnedFd, from_chrome: OwnedFd },
 }
 
 pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
@@ -123,8 +142,6 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         .tempdir()?;
     let mut args = vec![
         format!("--user-data-dir={}", user_data_dir.path().display()),
-        "--remote-debugging-port=0".to_string(),
-        "--remote-allow-origins=*".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-default-apps".to_string(),
@@ -168,6 +185,12 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         args.push("--no-sandbox".to_string());
         args.push("--disable-setuid-sandbox".to_string());
     }
+    if cfg!(unix) {
+        args.push("--remote-debugging-pipe".to_string());
+    } else {
+        args.push("--remote-debugging-port=0".to_string());
+        args.push("--remote-allow-origins=*".to_string());
+    }
     args.extend(opts.extra_args.iter().cloned());
 
     info!(executable = %exe.display(), "launching chromium");
@@ -175,42 +198,85 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        // Windows reads the DevTools URL from stderr; the pipe needs nothing from it.
+        .stderr(if cfg!(unix) { Stdio::null() } else { Stdio::piped() })
         .kill_on_drop(true);
-    // kill_on_drop only runs on a clean exit. If the engine crashes or is killed, the kernel
-    // kills Chrome. ponytail: the signal fires when the *thread* that spawned Chrome exits;
-    // tokio workers live as long as the runtime, so launch from async code, not spawn_blocking.
-    #[cfg(target_os = "linux")]
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn().map_err(|e| Error::Launch(e.to_string()))?;
-    #[cfg(windows)]
-    tie_to_this_process(&child);
-    // ponytail: macOS has no parent-death signal, so a crashed engine still orphans Chrome
-    // there. A --remote-debugging-pipe tether would cover it.
 
-    let pid = child.id().ok_or_else(|| Error::Launch("no pid".into()))?;
-
-    let ws_url = match wait_devtools_url(&mut child, user_data_dir.path(), Duration::from_secs(20))
-        .await
+    #[cfg(unix)]
     {
-        Ok(u) => u,
-        Err(e) => {
-            let _ = child.kill().await;
-            return Err(e);
-        }
-    };
+        // Our own launches must not fork between pipe() and FD_CLOEXEC (not atomic on
+        // macOS): a sibling Chrome inheriting our write end would keep this pipe open.
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let (child, to_chrome, from_chrome) = {
+            let _one_at_a_time = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+            let (chrome_in, to_chrome) = cloexec_pipe()?;
+            let (from_chrome, chrome_out) = cloexec_pipe()?;
+            let (cin, cout) = (chrome_in.as_raw_fd(), chrome_out.as_raw_fd());
+            // Async-signal-safe calls only: this runs between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    // kill_on_drop only runs on a clean exit; the kernel covers a crash too.
+                    // ponytail: the signal fires when the *thread* that spawned Chrome exits;
+                    // tokio workers live as long as the runtime, so launch from async code.
+                    #[cfg(target_os = "linux")]
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    // Move both ends above 4 first, so neither dup2 clobbers the other.
+                    let a = libc::fcntl(cin, libc::F_DUPFD_CLOEXEC, 5);
+                    let b = libc::fcntl(cout, libc::F_DUPFD_CLOEXEC, 5);
+                    if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = cmd.spawn().map_err(|e| Error::Launch(e.to_string()))?;
+            // chrome_in / chrome_out drop here: only Chrome holds its ends now.
+            (child, to_chrome, from_chrome)
+        };
+        let pid = child.id().ok_or_else(|| Error::Launch("no pid".into()))?;
+        Ok(Launched {
+            child,
+            pid,
+            transport: Transport::Pipe { to_chrome, from_chrome },
+            user_data_dir,
+        })
+    }
 
-    Ok(Launched {
-        child,
-        pid,
-        ws_url,
-        user_data_dir,
-    })
+    #[cfg(windows)]
+    {
+        let mut child = cmd.spawn().map_err(|e| Error::Launch(e.to_string()))?;
+        tie_to_this_process(&child);
+        let pid = child.id().ok_or_else(|| Error::Launch("no pid".into()))?;
+        let ws_url = match wait_devtools_url(&mut child, user_data_dir.path(), Duration::from_secs(20)).await {
+            Ok(u) => u,
+            Err(e) => {
+                let _ = child.kill().await;
+                return Err(e);
+            }
+        };
+        Ok(Launched {
+            child,
+            pid,
+            transport: Transport::WebSocket(ws_url),
+            user_data_dir,
+        })
+    }
+}
+
+/// A pipe whose ends are both close-on-exec, so no child inherits them by accident.
+#[cfg(unix)]
+fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&read, &write] {
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok((read, write))
 }
 
 /// Puts Chrome in a job object that Windows kills when this process exits for any reason,
@@ -276,6 +342,7 @@ pub fn sweep_stale_profiles() {
     }
 }
 
+#[cfg(windows)]
 fn ws_url_from_line(line: &str) -> Option<String> {
     let line = line.trim();
     if let Some(rest) = line.strip_prefix("DevTools listening on ") {
@@ -286,6 +353,7 @@ fn ws_url_from_line(line: &str) -> Option<String> {
         .filter(|s| s.starts_with("ws://"))
 }
 
+#[cfg(windows)]
 async fn try_read_port_file(port_file: &Path) -> Result<Option<String>> {
     let text = match tokio::fs::read_to_string(port_file).await {
         Ok(t) => t,
@@ -317,6 +385,7 @@ async fn try_read_port_file(port_file: &Path) -> Result<Option<String>> {
     Ok(Some(url))
 }
 
+#[cfg(windows)]
 async fn wait_devtools_url(
     child: &mut Child,
     user_data_dir: &Path,
