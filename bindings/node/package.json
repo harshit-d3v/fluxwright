@@ -22,7 +22,7 @@
     "napi-rs"
   ],
   "author": "Fluxwright contributors",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "engines": {
     "node": ">=18"
   },
@@ -33,6 +33,7 @@
     "index.d.ts",
     "MISSING.md",
     "README.md",
+    "LICENSE-APACHE",
     "LICENSE-MIT"
   ],
   "scripts": {
