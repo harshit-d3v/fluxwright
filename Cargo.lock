@@ -415,6 +415,7 @@ dependencies = [
  "fluxwright-core",
  "serde",
  "serde_json",
+ "sysinfo",
  "thiserror",
  "tokio",
  "tracing",
@@ -442,14 +443,17 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]

@@ -7,7 +7,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
@@ -51,7 +52,14 @@ enum Outgoing {
 
 impl Connection {
     pub async fn connect(ws_url: &str) -> Result<Arc<Self>> {
-        let (ws, _) = connect_async(ws_url)
+        // Chrome sends every CDP message as a single frame, and a full-page screenshot can
+        // pass tungstenite's 16 MiB default, which closes the socket and every job on it.
+        // 256 MB is Playwright's cap. Nagle off: CDP is many small request/response pairs.
+        let limit = Some(256 << 20);
+        let config = WebSocketConfig::default()
+            .max_message_size(limit)
+            .max_frame_size(limit);
+        let (ws, _) = connect_async_with_config(ws_url, Some(config), true)
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();

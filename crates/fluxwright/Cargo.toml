@@ -22,3 +22,4 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber.workspace = true
 axum.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true

@@ -119,8 +119,11 @@ async fn run_fluxwright(
     jobs: u32,
     chrome: Option<&PathBuf>,
 ) -> Result<Record> {
+    // min_browsers launches every browser in build(), before the clock starts, as the
+    // Node runner does for Playwright/Puppeteer. Lazy launch put up to 9 launches in the timed run.
     let builder = BrowserEngine::builder()
         .max_browsers(max_browsers)
+        .min_browsers(max_browsers)
         .max_contexts_per_browser(max_ctx)
         .memory_ceiling_mb(32_768)
         .queue_capacity(jobs as usize + 32)

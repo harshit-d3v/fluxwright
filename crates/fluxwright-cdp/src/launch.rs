@@ -51,8 +51,15 @@ pub struct Launched {
 }
 
 pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| {
+        std::thread::spawn(sweep_stale_profiles);
+    });
     let exe = find_chrome(opts.executable.as_deref())?;
-    let user_data_dir = tempfile::TempDir::new()?;
+    // The pid in the name lets sweep_stale_profiles tell a dead engine's profile from a live one.
+    let user_data_dir = tempfile::Builder::new()
+        .prefix(&format!("fluxwright-{}-", std::process::id()))
+        .tempdir()?;
     let mut args = vec![
         format!("--user-data-dir={}", user_data_dir.path().display()),
         "--remote-debugging-port=0".to_string(),
@@ -73,6 +80,17 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         "--window-size=1280,720".to_string(),
         "--disable-crash-reporter".to_string(),
         "--disable-breakpad".to_string(),
+        // Each launch gets a fresh profile, so without these every browser spends its first
+        // minutes on component updates, field trials and model downloads. Playwright's set.
+        "--disable-component-update".to_string(),
+        "--disable-field-trial-config".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-component-extensions-with-background-pages".to_string(),
+        "--disable-client-side-phishing-detection".to_string(),
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-search-engine-choice-screen".to_string(),
+        "--no-service-autorun".to_string(),
+        "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,GlobalMediaControls,LensOverlay,PaintHolding".to_string(),
         "--disable-dev-shm-usage".to_string(),
         format!(
             "--crash-dumps-dir={}",
@@ -92,14 +110,27 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
     args.extend(opts.extra_args.iter().cloned());
 
     info!(executable = %exe.display(), "launching chromium");
-    let mut child = Command::new(&exe)
-        .args(&args)
+    let mut cmd = Command::new(&exe);
+    cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| Error::Launch(e.to_string()))?;
+        .kill_on_drop(true);
+    // kill_on_drop only runs on a clean exit. If the engine crashes or is killed, the kernel
+    // kills Chrome. ponytail: the signal fires when the *thread* that spawned Chrome exits;
+    // tokio workers live as long as the runtime, so launch from async code, not spawn_blocking.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| Error::Launch(e.to_string()))?;
+    #[cfg(windows)]
+    tie_to_this_process(&child);
+    // ponytail: macOS has no parent-death signal, so a crashed engine still orphans Chrome
+    // there. A --remote-debugging-pipe tether would cover it.
 
     let pid = child.id().ok_or_else(|| Error::Launch("no pid".into()))?;
 
@@ -119,6 +150,69 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         ws_url,
         user_data_dir,
     })
+}
+
+/// Puts Chrome in a job object that Windows kills when this process exits for any reason,
+/// crash and hard kill included. Chrome's own children join the job, so the tree goes too.
+#[cfg(windows)]
+fn tie_to_this_process(child: &Child) {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::*;
+
+    // One job per process, never closed by us: its only handle dies with the process. It is
+    // not inheritable, so Chrome cannot keep it open.
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            std::mem::size_of_val(&info) as u32,
+        );
+        if ok == 0 {
+            CloseHandle(job);
+            return 0;
+        }
+        job as usize
+    });
+    let tied = match child.raw_handle() {
+        Some(h) if job != 0 => unsafe { AssignProcessToJobObject(job as HANDLE, h as HANDLE) != 0 },
+        _ => false,
+    };
+    if !tied {
+        warn!("could not tie chromium to this process; it may outlive a crash");
+    }
+}
+
+/// Deletes profile dirs of engines that died without cleaning up (a crash or hard kill skips
+/// TempDir's Drop). Only `fluxwright-<pid>-*` dirs whose pid is no longer running.
+/// Runs once, in the background, on the first launch in a process.
+pub fn sweep_stale_profiles() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("fluxwright-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok());
+        if let Some(pid) = pid {
+            if sys.process(sysinfo::Pid::from_u32(pid)).is_none() {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
 }
 
 fn ws_url_from_line(line: &str) -> Option<String> {

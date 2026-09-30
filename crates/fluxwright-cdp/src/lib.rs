@@ -7,5 +7,5 @@ mod page;
 pub use browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId};
 pub use connection::{CdpEvent, Connection};
 pub use error::{Error, LaunchOptions, Result};
-pub use launch::find_chrome;
-pub use page::{CdpPage, ResourceType};
+pub use launch::{find_chrome, sweep_stale_profiles};
+pub use page::{CdpPage, ResourceType, Selector, WaitUntil};

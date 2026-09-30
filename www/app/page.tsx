@@ -167,8 +167,11 @@ let title = engine
         <p>
           Page actions: <code>goto</code>, <code>title</code>,{" "}
           <code>content</code>, <code>click</code>, <code>fill</code>,{" "}
-          <code>evaluate</code>, <code>screenshot</code>,{" "}
-          <code>wait_for_selector</code>, CSS <code>locator</code>. Queue full
+          <code>evaluate</code>, <code>screenshot</code> (viewport or full
+          page), <code>set_viewport_size</code>,{" "}
+          <code>wait_for_selector</code>, <code>get_by_role</code>,{" "}
+          <code>get_by_text</code>, <code>frame_locator</code> (cross-origin
+          iframes too). Queue full
           mode is <code>Error</code> or <code>Wait</code>. Recycle by job count,
           age, or process-tree RSS.
         </p>
@@ -294,7 +297,9 @@ cargo run -p fluxwright-benchmarks --release`}</code>
           <li>Tracing, HAR, video</li>
           <li>Playwright Test, fixtures, expect</li>
           <li>
-            <code>getByRole</code> / <code>getByText</code> (CSS locator only)
+            <code>locator.filter</code>, <code>nth</code>, <code>getByLabel</code>{" "}
+            (<code>getByRole</code>, <code>getByText</code>, and{" "}
+            <code>frameLocator</code> are supported)
           </li>
           <li>Multiple pages per context, downloads, uploads</li>
           <li>

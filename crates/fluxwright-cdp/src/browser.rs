@@ -25,7 +25,7 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TargetId(pub String);
 
-struct TargetState {
+pub(crate) struct TargetState {
     #[allow(dead_code)]
     target_id: String,
     session_id: Option<String>,
@@ -41,7 +41,7 @@ pub struct CdpBrowser {
     conn: Arc<Connection>,
     _child: Mutex<Option<Child>>,
     _profile: Option<tempfile::TempDir>,
-    targets: Mutex<HashMap<String, TargetState>>,
+    targets: Arc<Mutex<HashMap<String, TargetState>>>,
     pub events: broadcast::Sender<CdpEvent>,
 }
 
@@ -60,7 +60,7 @@ impl CdpBrowser {
             conn: conn.clone(),
             _child: Mutex::new(Some(launched.child)),
             _profile: Some(launched.user_data_dir),
-            targets: Mutex::new(HashMap::new()),
+            targets: Arc::new(Mutex::new(HashMap::new())),
             events: fanout.clone(),
         });
 
@@ -126,7 +126,7 @@ impl CdpBrowser {
         self.conn.is_dead()
     }
 
-    async fn on_event(&self, ev: CdpEvent) {
+    async fn on_event(self: &Arc<Self>, ev: CdpEvent) {
         let _ = self.events.send(ev.clone());
         match ev.method.as_str() {
             "Target.attachedToTarget" => {
@@ -141,7 +141,7 @@ impl CdpBrowser {
                 let ctx = info["browserContextId"].as_str().map(|s| s.to_string());
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
 
-                let waiters = {
+                {
                     let mut targets = self.targets.lock().await;
                     let state = targets.entry(target_id.clone()).or_insert(TargetState {
                         target_id: target_id.clone(),
@@ -151,23 +151,47 @@ impl CdpBrowser {
                         browser_context_id: ctx.clone(),
                         waiting: Vec::new(),
                     });
-                    state.session_id = Some(session_id.clone());
                     state.r#type = ty.clone();
                     state.url = url;
                     state.browser_context_id = ctx;
-                    std::mem::take(&mut state.waiting)
-                };
-                for w in waiters {
-                    let _ = w.send(session_id.clone());
                 }
 
                 // Do not await CDP on this task: it is the only consumer of
                 // attachedToTarget and must stay ahead of createTarget.
-                let conn = self.conn.clone();
-                let sid = session_id;
                 let waiting = ev.params["waitingForDebugger"].as_bool().unwrap_or(false);
+                if ty != "page" && ty != "iframe" {
+                    // Chrome's own targets (browser_ui, extension workers, background pages)
+                    // and workers: nothing drives them, and setup hung on ~1 in 3 browser_ui
+                    // sessions. Detach, as Playwright does; resume first in case one is paused.
+                    let conn = self.conn.clone();
+                    tokio::spawn(async move {
+                        let t = Duration::from_secs(5);
+                        if waiting {
+                            let _ = conn
+                                .call("Runtime.runIfWaitingForDebugger", json!({}), Some(&session_id), t)
+                                .await;
+                        }
+                        let _ = conn
+                            .call("Target.detachFromTarget", json!({ "sessionId": session_id }), None, t)
+                            .await;
+                    });
+                    return;
+                }
+                // The session is published (and waiters woken) only once prepared, so a
+                // page never reaches a caller with its domains still being enabled.
+                let me = self.clone();
                 tokio::spawn(async move {
-                    prepare_session(&conn, &sid, &ty, waiting).await;
+                    prepare_session(&me.conn, &session_id, &ty, waiting).await;
+                    let waiters = match me.targets.lock().await.get_mut(&target_id) {
+                        Some(t) => {
+                            t.session_id = Some(session_id.clone());
+                            std::mem::take(&mut t.waiting)
+                        }
+                        None => Vec::new(), // destroyed while preparing
+                    };
+                    for w in waiters {
+                        let _ = w.send(session_id.clone());
+                    }
                 });
             }
             "Target.targetCreated" => {
@@ -265,8 +289,8 @@ impl CdpBrowser {
             .ok_or_else(|| Error::Other("createTarget: no targetId".into()))?
             .to_string();
 
+        // Auto-attach prepares the session before announcing it; see on_event.
         let session_id = self.wait_for_session(&target_id, timeout).await?;
-        prepare_session(&self.conn, &session_id, "page", false).await;
         Ok(CdpPage {
             browser: self.conn.clone(),
             browser_pid: self.pid,
@@ -275,6 +299,8 @@ impl CdpBrowser {
             target_id: TargetId(target_id),
             session_id: SessionId(session_id),
             events: self.events.clone(),
+            targets: self.targets.clone(),
+            worlds: Default::default(),
         })
     }
 
@@ -300,25 +326,21 @@ impl CdpBrowser {
                 .waiting
                 .push(tx);
             drop(targets);
-            // Also try explicit attach in case auto-attach missed it.
-            let conn = self.conn.clone();
-            let tid = target_id.to_string();
-            tokio::spawn(async move {
-                let _ = conn
-                    .call(
-                        "Target.attachToTarget",
-                        json!({ "targetId": tid, "flatten": true }),
-                        None,
-                        Duration::from_secs(10),
-                    )
-                    .await;
-            });
+            // No explicit Target.attachToTarget: browser-level auto-attach covers new pages,
+            // and a second attach opens a second session that duplicates every event.
             match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(sid)) => Ok(sid),
                 Ok(Err(_)) => Err(Error::SessionGone(target_id.into())),
                 Err(_) => Err(Error::timeout("attachToTarget", timeout.as_millis() as u64)),
             }
         }
+    }
+
+    pub(crate) async fn session_for_target(
+        targets: &Mutex<HashMap<String, TargetState>>,
+        target_id: &str,
+    ) -> Option<String> {
+        targets.lock().await.get(target_id).and_then(|t| t.session_id.clone())
     }
 
     pub async fn iframe_session_for_url(&self, needle: &str) -> Option<String> {
@@ -357,41 +379,25 @@ async fn prepare_session(
     ty: &str,
     waiting_for_debugger: bool,
 ) {
-    let _ = conn
-        .call(
-            "Target.setAutoAttach",
-            json!({
-                "autoAttach": true,
-                "waitForDebuggerOnStart": false,
-                "flatten": true
-            }),
-            Some(session_id),
-            Duration::from_secs(5),
-        )
-        .await;
-    if waiting_for_debugger {
-        let _ = conn
-            .call(
-                "Runtime.runIfWaitingForDebugger",
-                json!({}),
-                Some(session_id),
-                Duration::from_secs(5),
-            )
-            .await;
-    }
+    let mut calls = vec![(
+        "Target.setAutoAttach",
+        json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+    )];
     if ty == "page" || ty == "iframe" {
-        for method in ["Page.enable", "Runtime.enable", "Network.enable", "DOM.enable"] {
-            let _ = conn
-                .call(method, json!({}), Some(session_id), Duration::from_secs(5))
-                .await;
-        }
-        let _ = conn
-            .call(
-                "Page.setLifecycleEventsEnabled",
-                json!({ "enabled": true }),
-                Some(session_id),
-                Duration::from_secs(5),
-            )
-            .await;
+        calls.push(("Page.enable", json!({})));
+        calls.push(("Runtime.enable", json!({})));
+        calls.push(("Network.enable", json!({})));
+        calls.push(("Page.setLifecycleEventsEnabled", json!({ "enabled": true })));
     }
+    if waiting_for_debugger {
+        calls.push(("Runtime.runIfWaitingForDebugger", json!({})));
+    }
+    // Pipelined: Chrome runs a session's commands in order, so one round trip instead of
+    // one per command. Sequential calls cost ~1 s per page on a busy browser.
+    futures_util::future::join_all(
+        calls
+            .into_iter()
+            .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(5))),
+    )
+    .await;
 }

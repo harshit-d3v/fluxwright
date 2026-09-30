@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fluxwright_cdp::{CdpBrowser, CdpPage, ContextId, ResourceType};
+use fluxwright_cdp::{CdpBrowser, CdpPage, ContextId, ResourceType, Selector};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -25,6 +26,7 @@ struct Inner {
     admit: Notify,
     shutdown: Mutex<bool>,
     rss_cache: Mutex<(Instant, u64)>,
+    rss_refreshing: AtomicBool,
     grants: Arc<tokio::sync::Semaphore>,
 }
 
@@ -74,6 +76,7 @@ impl Engine {
             admit: Notify::new(),
             shutdown: Mutex::new(false),
             rss_cache: Mutex::new((Instant::now(), 0)),
+            rss_refreshing: AtomicBool::new(false),
             grants: Arc::new(tokio::sync::Semaphore::new(24)),
         });
         let pump = inner.clone();
@@ -384,23 +387,31 @@ impl Inner {
         Ok(true)
     }
 
-    async fn browser_tree_rss(&self) -> u64 {
-        let mut cache = self.rss_cache.lock().await;
-        if cache.0.elapsed() < Duration::from_millis(500) {
-            return cache.1;
+    /// Last measured process-tree RSS of all browsers. Never waits for the walk: a stale
+    /// value starts one background refresh. The walk takes ~30 ms idle and ~200 ms under
+    /// load, and every acquire used to queue behind it.
+    async fn browser_tree_rss(self: &Arc<Self>) -> u64 {
+        let (at, tree) = *self.rss_cache.lock().await;
+        if at.elapsed() >= Duration::from_millis(500)
+            && !self.rss_refreshing.swap(true, Ordering::SeqCst)
+        {
+            let me = self.clone();
+            tokio::spawn(async move {
+                let pids: Vec<u32> = {
+                    let st = me.state.lock().await;
+                    st.browsers
+                        .iter()
+                        .filter(|s| !s.crashed)
+                        .map(|s| s.browser.pid)
+                        .collect()
+                };
+                let tree = tokio::task::spawn_blocking(move || process_trees_rss_bytes(&pids))
+                    .await
+                    .unwrap_or(0);
+                *me.rss_cache.lock().await = (Instant::now(), tree);
+                me.rss_refreshing.store(false, Ordering::SeqCst);
+            });
         }
-        let pids: Vec<u32> = {
-            let st = self.state.lock().await;
-            st.browsers
-                .iter()
-                .filter(|s| !s.crashed)
-                .map(|s| s.browser.pid)
-                .collect()
-        };
-        let tree = tokio::task::spawn_blocking(move || process_trees_rss_bytes(&pids))
-            .await
-            .unwrap_or(0);
-        *cache = (Instant::now(), tree);
         tree
     }
 
@@ -655,9 +666,14 @@ impl PageLease {
         self.lease_id
     }
 
+    /// Navigates and waits for the `load` event.
     pub async fn goto(&self, url: &str) -> Result<()> {
+        self.goto_with(url, fluxwright_cdp::WaitUntil::Load).await
+    }
+
+    pub async fn goto_with(&self, url: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
         self.page
-            .goto(url, self.engine.config.navigation_timeout)
+            .goto(url, wait_until, self.engine.config.navigation_timeout)
             .await?;
         Ok(())
     }
@@ -680,35 +696,79 @@ impl PageLease {
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
         Ok(self
             .page
-            .screenshot(self.engine.config.action_timeout)
+            .screenshot(false, self.engine.config.action_timeout)
             .await?)
     }
 
-    pub async fn click(&self, selector: &str) -> Result<()> {
+    /// PNG of the whole scrollable page, not just the viewport.
+    pub async fn screenshot_full_page(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .page
+            .screenshot(true, self.engine.config.action_timeout)
+            .await?)
+    }
+
+    /// CSS-pixel viewport for this lease's page. Leases are fresh contexts, so it never leaks.
+    pub async fn set_viewport_size(&self, width: u32, height: u32) -> Result<()> {
+        Ok(self
+            .page
+            .set_viewport(width, height, self.engine.config.action_timeout)
+            .await?)
+    }
+
+    /// Selectors: CSS, `text=`, `role=` (see [`Selector`]), or a [`Selector`] with frames.
+    pub async fn click(&self, selector: impl Into<Selector>) -> Result<()> {
         self.page
-            .click(selector, self.engine.config.action_timeout)
+            .click(&selector.into(), self.engine.config.action_timeout)
             .await?;
         Ok(())
     }
 
-    pub async fn fill(&self, selector: &str, value: &str) -> Result<()> {
+    pub async fn fill(&self, selector: impl Into<Selector>, value: &str) -> Result<()> {
         self.page
-            .fill(selector, value, self.engine.config.action_timeout)
+            .fill(&selector.into(), value, self.engine.config.action_timeout)
             .await?;
         Ok(())
     }
 
-    pub async fn wait_for_selector(&self, selector: &str) -> Result<()> {
+    pub async fn wait_for_selector(&self, selector: impl Into<Selector>) -> Result<()> {
         self.page
-            .wait_for_selector(selector, self.engine.config.action_timeout)
+            .wait_for_selector(&selector.into(), self.engine.config.action_timeout)
             .await?;
         Ok(())
+    }
+
+    /// `textContent` of the first match, once it exists.
+    pub async fn text_content(&self, selector: impl Into<Selector>) -> Result<Option<String>> {
+        Ok(self
+            .page
+            .text_content(&selector.into(), self.engine.config.action_timeout)
+            .await?)
     }
 
     pub fn locator(&self, selector: impl Into<String>) -> Locator<'_> {
         Locator {
             lease: self,
-            selector: selector.into(),
+            selector: Selector::from(selector.into()),
+        }
+    }
+
+    /// Like Playwright's `getByText`: case-insensitive substring, or exact.
+    pub fn get_by_text(&self, text: &str, exact: bool) -> Locator<'_> {
+        self.locator(Selector::text(text, exact))
+    }
+
+    /// Like Playwright's `getByRole`: implicit and explicit ARIA roles, accessible name as a
+    /// case-insensitive substring, or exact. Hidden elements never match.
+    pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'_> {
+        self.locator(Selector::role(role, name, exact))
+    }
+
+    /// Enters an iframe (same- or cross-origin) by CSS selector.
+    pub fn frame_locator(&self, iframe: &str) -> FrameLocator<'_> {
+        FrameLocator {
+            lease: self,
+            frames: vec![iframe.to_string()],
         }
     }
 
@@ -745,10 +805,14 @@ impl Drop for PageLease {
 
 pub struct Locator<'a> {
     lease: &'a PageLease,
-    selector: String,
+    selector: Selector,
 }
 
 impl Locator<'_> {
+    pub fn selector(&self) -> &Selector {
+        &self.selector
+    }
+
     pub async fn click(&self) -> Result<()> {
         self.lease.click(&self.selector).await
     }
@@ -757,8 +821,49 @@ impl Locator<'_> {
         self.lease.fill(&self.selector, value).await
     }
 
+    /// Waits until visible.
     pub async fn wait(&self) -> Result<()> {
         self.lease.wait_for_selector(&self.selector).await
+    }
+
+    pub async fn text_content(&self) -> Result<Option<String>> {
+        self.lease.text_content(&self.selector).await
+    }
+}
+
+/// An iframe (or a chain of nested ones) to find elements in. Cross-origin frames work too.
+pub struct FrameLocator<'a> {
+    lease: &'a PageLease,
+    frames: Vec<String>,
+}
+
+impl<'a> FrameLocator<'a> {
+    pub fn locator(&self, query: impl Into<String>) -> Locator<'a> {
+        Locator {
+            lease: self.lease,
+            selector: Selector {
+                frames: self.frames.clone(),
+                query: query.into(),
+            },
+        }
+    }
+
+    pub fn get_by_text(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.locator(Selector::text(text, exact))
+    }
+
+    pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'a> {
+        self.locator(Selector::role(role, name, exact))
+    }
+
+    /// A nested iframe inside this one.
+    pub fn frame_locator(&self, iframe: &str) -> FrameLocator<'a> {
+        let mut frames = self.frames.clone();
+        frames.push(iframe.to_string());
+        FrameLocator {
+            lease: self.lease,
+            frames,
+        }
     }
 }
 
@@ -813,6 +918,15 @@ impl EngineBuilder {
     }
     pub fn acquire_timeout(mut self, d: Duration) -> Self {
         self.config.acquire_timeout = d;
+        self
+    }
+    pub fn navigation_timeout(mut self, d: Duration) -> Self {
+        self.config.navigation_timeout = d;
+        self
+    }
+    /// Timeout for click, fill, evaluate, wait_for_selector, screenshot.
+    pub fn action_timeout(mut self, d: Duration) -> Self {
+        self.config.action_timeout = d;
         self
     }
     pub fn no_sandbox(mut self, v: bool) -> Self {
