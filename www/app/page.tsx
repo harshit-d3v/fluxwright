@@ -157,7 +157,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.2.0, open source under MIT or Apache-2.0. Prebuilt for Windows, macOS and Linux.
+              Version 0.2.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux.
             </p>
           </div>
           <FleetBoard />
@@ -395,7 +395,7 @@ fluxwright stats`}</Code>
               </li>
             </ul>
           </nav>
-          <p className="footer-note">MIT or Apache-2.0.</p>
+          <p className="footer-note">Apache-2.0 licensed.</p>
         </div>
       </footer>
     </>
