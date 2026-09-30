@@ -298,8 +298,13 @@ impl CdpPage {
 
     /// Enters `frames` one by one. `Ok(Err(reason))` means not there yet, so the caller retries.
     /// `scroll` brings each iframe into view first, which a click inside it needs.
+    /// Element code always runs in an isolated world, where page scripts cannot patch what it
+    /// calls (`querySelector`, `getBoundingClientRect`, ...). `evaluate` stays in the page's world.
     async fn scope(&self, frames: &[String], scroll: bool, timeout: Duration) -> Result<std::result::Result<Scope, String>> {
-        let mut scope = self.main_scope();
+        // A page target's main frame id is its target id.
+        let Some(mut scope) = self.world(self.sid(), &self.target_id.0, 0.0, 0.0, timeout).await else {
+            return Ok(Err("page not ready".into()));
+        };
         for css in frames {
             let find = format!(
                 "(() => {{ const f = document.querySelector({}); if (f && {scroll}) f.scrollIntoViewIfNeeded(true); return f; }})()",
@@ -336,30 +341,33 @@ impl CdpPage {
             let dx = scope.dx + o[0].as_f64().unwrap_or(0.0);
             let dy = scope.dy + o[1].as_f64().unwrap_or(0.0);
             // A cross-site iframe runs in its own process: its own target and session.
-            if let Some(session) = CdpBrowser::session_for_target(&self.targets, &frame_id).await {
-                scope = Scope { session, context: None, world_of: None, dx, dy };
-                continue;
+            let session = CdpBrowser::session_for_target(&self.targets, &frame_id).await.unwrap_or(s);
+            match self.world(&session, &frame_id, dx, dy, timeout).await {
+                Some(next) => scope = next,
+                // Still loading, or a cross-site frame whose session is not attached yet.
+                None => return Ok(Err(format!("{css}: frame not ready"))),
             }
-            // Same process: an isolated world in that frame, made once and cached.
-            let cached = self.worlds.lock().await.get(&frame_id).copied();
-            let context = match cached {
-                Some(id) => id,
-                None => {
-                    let made = self
-                        .session_call(&s, "Page.createIsolatedWorld",
-                            json!({ "frameId": frame_id, "worldName": "fluxwright" }), timeout)
-                        .await;
-                    // Fails while the frame loads, or for a cross-site frame not attached yet.
-                    let Some(id) = made.as_ref().ok().and_then(|w| w["executionContextId"].as_i64()) else {
-                        return Ok(Err(format!("{css}: frame not ready")));
-                    };
-                    self.worlds.lock().await.insert(frame_id.clone(), id);
-                    id
-                }
-            };
-            scope = Scope { session: s, context: Some(context), world_of: Some(frame_id), dx, dy };
         }
         Ok(Ok(scope))
+    }
+
+    /// The isolated world of `frame_id`, made once per document and cached.
+    async fn world(&self, session: &str, frame_id: &str, dx: f64, dy: f64, timeout: Duration) -> Option<Scope> {
+        let cached = self.worlds.lock().await.get(frame_id).copied();
+        let id = match cached {
+            Some(id) => id,
+            None => {
+                let w = self
+                    .session_call(session, "Page.createIsolatedWorld",
+                        json!({ "frameId": frame_id, "worldName": "fluxwright" }), timeout)
+                    .await
+                    .ok()?;
+                let id = w["executionContextId"].as_i64()?;
+                self.worlds.lock().await.insert(frame_id.to_string(), id);
+                id
+            }
+        };
+        Some(Scope { session: session.to_string(), context: Some(id), world_of: Some(frame_id.to_string()), dx, dy })
     }
 
     /// Navigation destroys isolated worlds; drop a dead one so the next poll makes a new one.

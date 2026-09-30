@@ -497,6 +497,37 @@ async fn dialogs_do_not_block() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+/// Selector code runs in an isolated world, so a page that patches DOM APIs (anti-bot
+/// scripts do) cannot break clicks, fills or waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn page_scripts_cannot_break_selectors() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(3))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<title>t</title>",
+        "<button onclick=\"document.title='clicked'\">Go</button><input aria-label='Name'>",
+        "<script>document.querySelector = () => null; document.querySelectorAll = () => [];",
+        "Element.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 0, 0);</script>"
+    ))
+    .await
+    .unwrap();
+
+    page.get_by_role("button", Some("Go"), true).click().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "clicked");
+    page.fill("input", "ok").await.unwrap();
+    assert_eq!(page.get_by_role("textbox", Some("Name"), true).text_content().await.unwrap().as_deref(), Some(""));
+    // evaluate still runs in the page's own world, where the patch is visible.
+    assert_eq!(page.evaluate("document.querySelector('input')").await.unwrap(), serde_json::Value::Null);
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// Chrome sends each CDP message as one WebSocket frame; tungstenite's default 16 MiB frame
 /// cap made a big screenshot kill the connection, and with it every job on that browser.
 #[tokio::test(flavor = "multi_thread")]
