@@ -19,6 +19,25 @@ try {
     }),
     /boom/,
   )
+
+  // Methods stringify as `name(x) { ... }`, which needs turning into a function expression.
+  const methods = {
+    add(x) {
+      return x + 1
+    },
+    async twice(x) {
+      return x * 2
+    },
+  }
+  class Calc {
+    triple(x) {
+      return x * 3
+    }
+  }
+  assert.equal(await page.evaluate(methods.add, 1), 2)
+  assert.equal(await page.evaluate(methods.twice, 4), 8)
+  assert.equal(await page.evaluate(new Calc().triple, 2), 6)
+  await assert.rejects(page.evaluate(Math.max), /can't be sent to the page/)
   await page.close()
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
