@@ -18,6 +18,7 @@ No speed or memory-advantage claims appear here. Run `cargo run -p fluxwright-be
 
 - Rust 1.85+
 - Google Chrome or Chromium (`FLUXWRIGHT_CHROMIUM`, `CHROME`, or `CHROMIUM`)
+- Optional, recommended for headless: chrome-headless-shell, which headless launches pick up from `PATH` or Puppeteer's/Playwright's cache (`npx @puppeteer/browsers install chrome-headless-shell@stable`). Pages opened 5-10x faster than on Chrome's new headless mode in our runs.
 
 `--no-sandbox` is off unless you set `FLUXWRIGHT_NO_SANDBOX=1` (logs a warning).
 
