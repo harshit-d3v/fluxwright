@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxwright::{BrowserEngine, JobOptions, QueueFullMode, WaitUntil};
+use fluxwright::{BrowserEngine, JobOptions, Proxy, QueueFullMode, WaitUntil};
 
 fn kill_pid(pid: u32) {
     if cfg!(windows) {
@@ -525,6 +525,66 @@ async fn page_scripts_cannot_break_selectors() {
     assert_eq!(page.evaluate("document.querySelector('input')").await.unwrap(), serde_json::Value::Null);
 
     drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// A proxy per job, with credentials, next to direct jobs on the same browser.
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_per_job() {
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::{Html, IntoResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    // A forward proxy that wants user:pass and answers every request itself, so a host
+    // that does not exist (fluxwright.invalid) loads only through it.
+    let challenges = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let seen = challenges.clone();
+    let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+        let seen = seen.clone();
+        async move {
+            // base64("user:pass")
+            if headers.get(header::PROXY_AUTHORIZATION).is_some_and(|v| v == "Basic dXNlcjpwYXNz") {
+                Html("<title>via proxy</title>").into_response()
+            } else {
+                seen.fetch_add(1, SeqCst);
+                (StatusCode::PROXY_AUTHENTICATION_REQUIRED, [(header::PROXY_AUTHENTICATE, "Basic realm=\"fw\"")])
+                    .into_response()
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .navigation_timeout(Duration::from_secs(10))
+        .build()
+        .await
+        .unwrap();
+    let title = |opts: JobOptions| {
+        eng.run(opts.retries(0), |page| async move {
+            page.goto("http://fluxwright.invalid/").await?;
+            page.title().await
+        })
+    };
+
+    let good = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", "pass"));
+    assert_eq!(title(good).await.unwrap(), "via proxy");
+
+    let direct = title(JobOptions::default()).await;
+    assert!(!matches!(direct.as_deref(), Ok("via proxy")), "a job without a proxy used it: {direct:?}");
+
+    // Wrong credentials: answered once, then cancelled, instead of a 407 loop. (Chrome's own
+    // requests, such as the favicon, meet the proxy without Fetch and give up by themselves.)
+    challenges.store(0, SeqCst);
+    let start = std::time::Instant::now();
+    let bad = JobOptions::default().proxy(Proxy::new(&proxy).auth("user", "nope"));
+    let bad = title(bad).await;
+    assert!(!matches!(bad.as_deref(), Ok("via proxy")), "{bad:?}");
+    assert!(start.elapsed() < Duration::from_secs(5), "wrong credentials took {:?}", start.elapsed());
+    assert!(challenges.load(SeqCst) < 10, "{} proxy challenges: auth is looping", challenges.load(SeqCst));
+
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 

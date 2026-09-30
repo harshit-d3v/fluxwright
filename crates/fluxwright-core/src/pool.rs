@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fluxwright_cdp::{CdpBrowser, CdpPage, ContextId, ResourceType, Selector};
+use fluxwright_cdp::{CdpBrowser, CdpPage, ContextId, Proxy, ResourceType, Selector};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -49,6 +49,7 @@ struct Slot {
 
 struct Waiter {
     priority: Priority,
+    proxy: Option<Proxy>,
     queued_at: Instant,
     tx: tokio::sync::oneshot::Sender<Result<PageLease>>,
 }
@@ -112,6 +113,19 @@ impl Engine {
     }
 
     pub async fn acquire_with(&self, priority: Priority, timeout: Duration) -> Result<PageLease> {
+        self.acquire_inner(priority, None, timeout).await
+    }
+
+    /// A lease set up for `opts`: priority, proxy, and resource blocking.
+    pub async fn acquire_job(&self, opts: &JobOptions) -> Result<PageLease> {
+        let page = self
+            .acquire_inner(opts.priority, opts.proxy.clone(), self.inner.config.acquire_timeout)
+            .await?;
+        apply_blocking(&page, opts).await?;
+        Ok(page)
+    }
+
+    async fn acquire_inner(&self, priority: Priority, proxy: Option<Proxy>, timeout: Duration) -> Result<PageLease> {
         if *self.inner.shutdown.lock().await {
             return Err(Error::ShuttingDown);
         }
@@ -147,6 +161,7 @@ impl Engine {
                         let mut st = self.inner.state.lock().await;
                         st.queue.push_back(Waiter {
                             priority,
+                            proxy,
                             queued_at: Instant::now(),
                             tx,
                         });
@@ -155,6 +170,7 @@ impl Engine {
             } else {
                 st.queue.push_back(Waiter {
                     priority,
+                    proxy,
                     queued_at: Instant::now(),
                     tx,
                 });
@@ -183,8 +199,7 @@ impl Engine {
         let mut attempt = 0;
         loop {
             let result = tokio::time::timeout(timeout, async {
-                let page = self.acquire_with(opts.priority, self.inner.config.acquire_timeout).await?;
-                apply_blocking(&page, &opts).await?;
+                let page = self.acquire_job(&opts).await?;
                 f.clone()(page).await
             })
             .await
@@ -364,7 +379,7 @@ impl Inner {
         let inner = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match inner.grant_lease().await {
+            match inner.grant_lease(waiter.proxy.as_ref()).await {
                 Ok(lease) => {
                     let _ = waiter.tx.send(Ok(lease));
                 }
@@ -415,7 +430,7 @@ impl Inner {
         tree
     }
 
-    async fn grant_lease(self: &Arc<Self>) -> Result<PageLease> {
+    async fn grant_lease(self: &Arc<Self>, proxy: Option<&Proxy>) -> Result<PageLease> {
         if *self.shutdown.lock().await {
             return Err(Error::ShuttingDown);
         }
@@ -480,7 +495,7 @@ impl Inner {
             browser
         };
 
-        let ctx = match browser.create_context().await {
+        let ctx = match browser.create_context(proxy).await {
             Ok(c) => c,
             Err(e) => {
                 self.release_slot(&browser, false).await;

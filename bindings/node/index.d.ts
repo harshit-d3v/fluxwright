@@ -15,6 +15,17 @@ export interface GetByRoleOptions {
 export interface LaunchOptions {
   maxBrowsers?: number
 }
+export interface ProxyOptions {
+  /** `http://host:port`, `socks5://host:port`, ... */
+  server: string
+  /** Comma-separated hosts that skip the proxy. */
+  bypass?: string
+  username?: string
+  password?: string
+}
+export interface NewPageOptions {
+  proxy?: ProxyOptions
+}
 export interface GotoOptions {
   /** Default "load". */
   waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit'
@@ -28,7 +39,8 @@ export interface ViewportSize {
 }
 export declare function chromium(): Chromium
 export declare class Browser {
-  newPage(): Promise<Page>
+  /** A fresh browser context. `proxy` applies to this page only. */
+  newPage(options?: NewPageOptions | undefined | null): Promise<Page>
   close(): Promise<void>
 }
 export declare class Page {

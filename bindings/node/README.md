@@ -40,7 +40,7 @@ await browser.close();
 | Method | What it does |
 |---|---|
 | `chromium.launch({ maxBrowsers? })` | Start the pool |
-| `browser.newPage()` | Acquire a lease |
+| `browser.newPage({ proxy? })` | Acquire a lease (a fresh context). `proxy: { server, bypass?, username?, password? }` applies to this page only |
 | `page.goto(url, { waitUntil? })` | Navigate. `waitUntil`: `load` (default), `domcontentloaded`, `networkidle`, `commit`. Event-driven, like Playwright |
 | `page.title()` / `page.content()` | Read |
 | `page.click(selector)` / `page.fill(selector, value)` | Scrolls into view, waits until enabled, stable, and not covered. Selector: CSS, `text=Foo`, `text="Exact"`, `role=button[name="Save"]` |

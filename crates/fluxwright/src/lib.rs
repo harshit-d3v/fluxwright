@@ -8,4 +8,6 @@ pub use fluxwright_core::{
     MetricsSnapshot, PageLease, Priority, QueueFullMode, Result,
 };
 
-pub use fluxwright_cdp::{find_chrome, sweep_stale_profiles, LaunchOptions, ResourceType, Selector, WaitUntil};
+pub use fluxwright_cdp::{
+    find_chrome, sweep_stale_profiles, LaunchOptions, Proxy, ResourceType, Selector, WaitUntil,
+};

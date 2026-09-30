@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::connection::{CdpEvent, Connection};
 use crate::error::{Error, LaunchOptions, Result};
 use crate::launch::{launch_chrome, Launched};
-use crate::page::{fetch_patterns, Blocking, CdpPage};
+use crate::page::{fetch_params, CdpPage, ContextSetup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BrowserId(pub Uuid);
@@ -24,6 +24,35 @@ pub struct SessionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TargetId(pub String);
+
+/// A proxy for one browser context (one lease), like Playwright's `newContext({ proxy })`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Proxy {
+    /// `http://host:port`, `socks5://host:port`, ...
+    pub server: String,
+    /// Comma-separated hosts that skip the proxy, e.g. `.internal.example,localhost`.
+    pub bypass: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl Proxy {
+    pub fn new(server: impl Into<String>) -> Self {
+        Self { server: server.into(), ..Self::default() }
+    }
+
+    /// Credentials, answered when the proxy asks (HTTP 407).
+    pub fn auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn bypass(mut self, hosts: impl Into<String>) -> Self {
+        self.bypass = Some(hosts.into());
+        self
+    }
+}
 
 pub(crate) struct TargetState {
     #[allow(dead_code)]
@@ -42,8 +71,9 @@ pub struct CdpBrowser {
     _child: Mutex<Option<Child>>,
     _profile: Option<tempfile::TempDir>,
     targets: Arc<Mutex<HashMap<String, TargetState>>>,
-    /// Resource blocking per browser context, so iframes that attach later get it too.
-    blocking: Arc<Mutex<HashMap<String, Blocking>>>,
+    /// Blocking and proxy credentials per browser context, so iframes that attach later
+    /// get them too.
+    setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
     pub events: broadcast::Sender<CdpEvent>,
 }
 
@@ -63,7 +93,7 @@ impl CdpBrowser {
             _child: Mutex::new(Some(launched.child)),
             _profile: Some(launched.user_data_dir),
             targets: Arc::new(Mutex::new(HashMap::new())),
-            blocking: Default::default(),
+            setups: Default::default(),
             events: fanout.clone(),
         });
 
@@ -143,8 +173,8 @@ impl CdpBrowser {
                 let url = info["url"].as_str().unwrap_or("").to_string();
                 let ctx = info["browserContextId"].as_str().map(|s| s.to_string());
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
-                let blocking = match &ctx {
-                    Some(c) => self.blocking.lock().await.get(c).cloned(),
+                let setup = match &ctx {
+                    Some(c) => self.setups.lock().await.get(c).cloned(),
                     None => None,
                 };
 
@@ -188,7 +218,7 @@ impl CdpBrowser {
                 // page never reaches a caller with its domains still being enabled.
                 let me = self.clone();
                 tokio::spawn(async move {
-                    prepare_session(&me.conn, &session_id, &ty, waiting, blocking).await;
+                    prepare_session(&me.conn, &session_id, &ty, waiting, setup).await;
                     let waiters = match me.targets.lock().await.get_mut(&target_id) {
                         Some(t) => {
                             t.session_id = Some(session_id.clone());
@@ -229,18 +259,30 @@ impl CdpBrowser {
                     }
                 }
             }
-            // Fetch is only enabled for resource blocking, so every paused request is one to
-            // fail. Answered here, on the loop that sees every session and never lags.
+            // Fetch pauses only blocked resource types, unless the context has proxy
+            // credentials: then it pauses everything (Chrome reports auth challenges only for
+            // paused requests) and the rest continue. Answered here, on the loop that sees
+            // every session and never lags.
             "Fetch.requestPaused" => {
-                if let (Some(sid), Some(id)) = (ev.session_id.clone(), ev.params["requestId"].as_str()) {
-                    let conn = self.conn.clone();
-                    let params = json!({ "requestId": id, "errorReason": "BlockedByClient" });
-                    tokio::spawn(async move {
-                        let _ = conn
-                            .call("Fetch.failRequest", params, Some(&sid), Duration::from_secs(5))
-                            .await;
-                    });
-                }
+                let (Some(sid), Some(id)) = (ev.session_id.clone(), ev.params["requestId"].as_str()) else {
+                    return;
+                };
+                let block = match self.setup_for_session(&sid).await {
+                    Some(s) if s.proxy_auth.is_some() => {
+                        let ty = ev.params["resourceType"].as_str().unwrap_or("");
+                        s.types.iter().any(|t| t.as_str() == ty)
+                    }
+                    _ => true,
+                };
+                let (method, params) = if block {
+                    ("Fetch.failRequest", json!({ "requestId": id, "errorReason": "BlockedByClient" }))
+                } else {
+                    ("Fetch.continueRequest", json!({ "requestId": id }))
+                };
+                let conn = self.conn.clone();
+                tokio::spawn(async move {
+                    let _ = conn.call(method, params, Some(&sid), Duration::from_secs(5)).await;
+                });
             }
             // Nothing handles dialogs, and an open one blocks every call on its page until it
             // times out. As Playwright does by default: accept beforeunload so navigation goes
@@ -261,6 +303,39 @@ impl CdpBrowser {
                             .await;
                     });
                 }
+            }
+            // Proxy credentials. A second challenge for the same request means they were
+            // rejected: cancel, or Chrome and the proxy loop forever.
+            "Fetch.authRequired" => {
+                let (Some(sid), Some(id)) =
+                    (ev.session_id.clone(), ev.params["requestId"].as_str().map(String::from))
+                else {
+                    return;
+                };
+                let ctx = self.context_of_session(&sid).await;
+                let mut response = json!({ "response": "Default" });
+                if let (Some(ctx), true) = (ctx, ev.params["authChallenge"]["source"] == "Proxy") {
+                    if let Some(setup) = self.setups.lock().await.get_mut(&ctx) {
+                        if let Some((user, pass)) = setup.proxy_auth.clone() {
+                            response = if setup.answered.insert(id.clone()) {
+                                json!({ "response": "ProvideCredentials", "username": user, "password": pass })
+                            } else {
+                                json!({ "response": "CancelAuth" })
+                            };
+                        }
+                    }
+                }
+                let conn = self.conn.clone();
+                tokio::spawn(async move {
+                    let _ = conn
+                        .call(
+                            "Fetch.continueWithAuth",
+                            json!({ "requestId": id, "authChallengeResponse": response }),
+                            Some(&sid),
+                            Duration::from_secs(5),
+                        )
+                        .await;
+                });
             }
             "Target.targetCrashed" => {
                 warn!(params = %ev.params, "target crashed");
@@ -285,23 +360,30 @@ impl CdpBrowser {
         self.conn.call(method, params, session_id, timeout).await
     }
 
-    pub async fn create_context(&self) -> Result<ContextId> {
+    pub async fn create_context(&self, proxy: Option<&Proxy>) -> Result<ContextId> {
+        let mut params = json!({ "disposeOnDetach": true });
+        if let Some(p) = proxy {
+            params["proxyServer"] = json!(p.server);
+            if let Some(bypass) = &p.bypass {
+                params["proxyBypassList"] = json!(bypass);
+            }
+        }
         let res = self
-            .call(
-                "Target.createBrowserContext",
-                json!({ "disposeOnDetach": true }),
-                None,
-                Duration::from_secs(10),
-            )
+            .call("Target.createBrowserContext", params, None, Duration::from_secs(10))
             .await?;
         let id = res["browserContextId"]
             .as_str()
-            .ok_or_else(|| Error::Other("createBrowserContext: no id".into()))?;
-        Ok(ContextId(id.to_string()))
+            .ok_or_else(|| Error::Other("createBrowserContext: no id".into()))?
+            .to_string();
+        if let Some(Proxy { username: Some(user), password, .. }) = proxy {
+            self.setups.lock().await.entry(id.clone()).or_default().proxy_auth =
+                Some((user.clone(), password.clone().unwrap_or_default()));
+        }
+        Ok(ContextId(id))
     }
 
     pub async fn dispose_context(&self, id: &ContextId) -> Result<()> {
-        self.blocking.lock().await.remove(&id.0);
+        self.setups.lock().await.remove(&id.0);
         let _ = self
             .call(
                 "Target.disposeBrowserContext",
@@ -342,7 +424,7 @@ impl CdpBrowser {
             events: self.events.clone(),
             targets: self.targets.clone(),
             worlds: Default::default(),
-            blocking: self.blocking.clone(),
+            setups: self.setups.clone(),
         })
     }
 
@@ -376,6 +458,20 @@ impl CdpBrowser {
                 Err(_) => Err(Error::timeout("attachToTarget", timeout.as_millis() as u64)),
             }
         }
+    }
+
+    async fn context_of_session(&self, sid: &str) -> Option<String> {
+        self.targets
+            .lock()
+            .await
+            .values()
+            .find(|t| t.session_id.as_deref() == Some(sid))
+            .and_then(|t| t.browser_context_id.clone())
+    }
+
+    async fn setup_for_session(&self, sid: &str) -> Option<ContextSetup> {
+        let ctx = self.context_of_session(sid).await?;
+        self.setups.lock().await.get(&ctx).cloned()
     }
 
     pub(crate) async fn session_for_target(
@@ -420,7 +516,7 @@ async fn prepare_session(
     session_id: &str,
     ty: &str,
     waiting_for_debugger: bool,
-    blocking: Option<Blocking>,
+    setup: Option<ContextSetup>,
 ) {
     let mut calls = vec![(
         "Target.setAutoAttach",
@@ -432,13 +528,13 @@ async fn prepare_session(
         calls.push(("Network.enable", json!({})));
         calls.push(("Page.setLifecycleEventsEnabled", json!({ "enabled": true })));
     }
-    if let Some(b) = blocking.filter(|_| ty == "page" || ty == "iframe") {
-        if !b.types.is_empty() {
-            calls.push(("Fetch.enable", fetch_patterns(&b.types)));
+    if let Some(setup) = setup.filter(|_| ty == "page" || ty == "iframe") {
+        if let Some(params) = fetch_params(&setup) {
+            calls.push(("Fetch.enable", params));
         }
-        if !b.urls.is_empty() {
+        if !setup.urls.is_empty() {
             calls.push(("Network.enable", json!({})));
-            calls.push(("Network.setBlockedURLs", json!({ "urls": b.urls })));
+            calls.push(("Network.setBlockedURLs", json!({ "urls": setup.urls })));
         }
     }
     if waiting_for_debugger {

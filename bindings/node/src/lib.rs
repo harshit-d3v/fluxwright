@@ -141,6 +141,21 @@ pub struct LaunchOptions {
 }
 
 #[napi(object)]
+pub struct ProxyOptions {
+    /// `http://host:port`, `socks5://host:port`, ...
+    pub server: String,
+    /// Comma-separated hosts that skip the proxy.
+    pub bypass: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[napi(object)]
+pub struct NewPageOptions {
+    pub proxy: Option<ProxyOptions>,
+}
+
+#[napi(object)]
 pub struct GotoOptions {
     /// Default "load".
     #[napi(ts_type = "'load' | 'domcontentloaded' | 'networkidle' | 'commit'")]
@@ -183,11 +198,19 @@ impl Chromium {
 
 #[napi]
 impl Browser {
+    /// A fresh browser context. `proxy` applies to this page only.
     #[napi]
-    pub async fn new_page(&self) -> Result<Page> {
+    pub async fn new_page(&self, options: Option<NewPageOptions>) -> Result<Page> {
+        let proxy = options.and_then(|o| o.proxy).map(|p| fluxwright::Proxy {
+            server: p.server,
+            bypass: p.bypass,
+            username: p.username,
+            password: p.password,
+        });
+        let opts = fluxwright::JobOptions { proxy, ..Default::default() };
         let eng = self.inner.clone();
         let lease = RT
-            .spawn(async move { eng.acquire().await })
+            .spawn(async move { eng.acquire_job(&opts).await })
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;

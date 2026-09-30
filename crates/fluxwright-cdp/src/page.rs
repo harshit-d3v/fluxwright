@@ -154,7 +154,7 @@ pub struct CdpPage {
     pub(crate) targets: Arc<Mutex<HashMap<String, TargetState>>>,
     /// Isolated worlds made for same-process iframes, by frame id.
     pub(crate) worlds: Arc<Mutex<HashMap<String, i64>>>,
-    pub(crate) blocking: Arc<Mutex<HashMap<String, Blocking>>>,
+    pub(crate) setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
 }
 
 impl CdpPage {
@@ -524,7 +524,7 @@ impl CdpPage {
 
     /// Blocks requests whose URL matches any pattern, in this page and its iframes.
     pub async fn set_blocked_urls(&self, urls: &[String], timeout: Duration) -> Result<()> {
-        self.blocking.lock().await.entry(self.context_id.0.clone()).or_default().urls = urls.to_vec();
+        self.setups.lock().await.entry(self.context_id.0.clone()).or_default().urls = urls.to_vec();
         self.call("Network.enable", json!({}), timeout).await?;
         self.call("Network.setBlockedURLs", json!({ "urls": urls }), timeout).await?;
         Ok(())
@@ -537,27 +537,47 @@ impl CdpPage {
         if types.is_empty() {
             return Ok(());
         }
-        self.blocking.lock().await.entry(self.context_id.0.clone()).or_default().types = types.to_vec();
-        self.call("Fetch.enable", fetch_patterns(types), timeout).await?;
+        let fetch = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(self.context_id.0.clone()).or_default();
+            setup.types = types.to_vec();
+            fetch_params(setup)
+        };
+        if let Some(params) = fetch {
+            self.call("Fetch.enable", params, timeout).await?;
+        }
         Ok(())
     }
 }
 
-/// What a browser context blocks; applied to each of its sessions as they attach.
+/// Per-context setup, applied to each of the context's sessions as they attach:
+/// resource blocking and proxy credentials.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Blocking {
+pub(crate) struct ContextSetup {
     pub(crate) types: Vec<ResourceType>,
     pub(crate) urls: Vec<String>,
+    pub(crate) proxy_auth: Option<(String, String)>,
+    /// Requests already given credentials: a second challenge means they were rejected.
+    pub(crate) answered: std::collections::HashSet<String>,
 }
 
-pub(crate) fn fetch_patterns(types: &[ResourceType]) -> Value {
-    json!({
-        "patterns": types.iter().map(|t| json!({
-            "urlPattern": "*",
-            "resourceType": t.as_str(),
-            "requestStage": "Request"
-        })).collect::<Vec<_>>()
-    })
+/// `Fetch.enable` for a context, or `None` when it needs no Fetch at all. Proxy credentials
+/// need every request paused: Chrome only reports auth challenges for paused requests (and
+/// rejects an empty pattern list with `handleAuthRequests`).
+pub(crate) fn fetch_params(setup: &ContextSetup) -> Option<Value> {
+    let patterns: Vec<Value> = if setup.proxy_auth.is_some() {
+        vec![json!({ "urlPattern": "*", "requestStage": "Request" })]
+    } else {
+        setup
+            .types
+            .iter()
+            .map(|t| json!({ "urlPattern": "*", "resourceType": t.as_str(), "requestStage": "Request" }))
+            .collect()
+    };
+    if patterns.is_empty() {
+        return None;
+    }
+    Some(json!({ "patterns": patterns, "handleAuthRequests": setup.proxy_auth.is_some() }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

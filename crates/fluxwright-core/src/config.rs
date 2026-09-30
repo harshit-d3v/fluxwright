@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use fluxwright_cdp::LaunchOptions;
+use fluxwright_cdp::{LaunchOptions, Proxy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
@@ -82,6 +82,8 @@ pub struct JobOptions {
     pub block_fonts: bool,
     pub block_media: bool,
     pub block_url_patterns: Vec<String>,
+    /// Proxy for this job's browser context. Other jobs on the same browser are unaffected.
+    pub proxy: Option<Proxy>,
 }
 
 impl Default for JobOptions {
@@ -94,6 +96,7 @@ impl Default for JobOptions {
             block_fonts: false,
             block_media: false,
             block_url_patterns: Vec::new(),
+            proxy: None,
         }
     }
 }
@@ -111,6 +114,11 @@ impl JobOptions {
 
     pub fn retries(mut self, n: u32) -> Self {
         self.retries = n;
+        self
+    }
+
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        self.proxy = Some(proxy);
         self
     }
 }
