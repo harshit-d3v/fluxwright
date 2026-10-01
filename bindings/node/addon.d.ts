@@ -1,5 +1,5 @@
 export * from './index'
-import { Chromium } from './index'
+import { Chromium, StorageState } from './index'
 /** Playwright-style export: `chromium.launch(...)`. Same as `Chromium.launch`. */
 export const chromium: typeof Chromium
 declare const fluxwright: { chromium: typeof Chromium }
@@ -13,5 +13,7 @@ declare module './index' {
      * but not variables from Node.
      */
     evaluate<R, Arg = undefined>(pageFunction: (arg: Arg) => R, arg?: Arg): Promise<Awaited<R>>
+    /** Also writes the state to `path` as JSON, which `newPage({ storageState: path })` reads. */
+    storageState(options?: { path?: string }): Promise<StorageState>
   }
 }

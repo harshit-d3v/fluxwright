@@ -1,5 +1,5 @@
 // Compile-only check of the published typings: `npm run test:types`.
-import fluxwright, { chromium } from '../addon'
+import fluxwright, { chromium, type StorageState } from '../addon'
 
 export async function typed(): Promise<void> {
   const browser = await chromium.launch({ maxBrowsers: 2 })
@@ -13,5 +13,11 @@ export async function typed(): Promise<void> {
   const png: Buffer = await page.screenshot({ fullPage: true })
   await fluxwright.chromium.launch()
   void [title, sum, upper, expression, wrong, png]
+
+  const state: StorageState = await page.storageState({ path: 'state.json' })
+  await browser.newPage({ storageState: state, locale: 'de-DE', colorScheme: 'dark', permissions: ['geolocation'] })
+  await browser.newPage({ storageState: 'state.json', geolocation: { latitude: 1, longitude: 2 } })
+  // @ts-expect-error not a color scheme
+  await browser.newPage({ colorScheme: 'purple' })
   await browser.close()
 }

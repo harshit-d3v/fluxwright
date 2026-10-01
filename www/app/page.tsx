@@ -37,9 +37,9 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "page.getByRole()",
   },
   {
-    name: "A proxy per job",
-    text: "Each job can use its own proxy, with a username and password, on the same browser as jobs that use none.",
-    api: "newPage({ proxy })",
+    name: "Settings per job",
+    text: "Each job can have its own proxy, user agent, locale, timezone and location, and start from a saved login, on the same browser as jobs that use none.",
+    api: "newPage({ storageState })",
   },
   {
     name: "Built for agents",

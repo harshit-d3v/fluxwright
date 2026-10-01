@@ -1,6 +1,6 @@
 {
   "name": "fluxwright-darwin-x64",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "os": [
     "darwin"
   ],
@@ -11,7 +11,7 @@
   "files": [
     "fluxwright.darwin-x64.node"
   ],
-  "description": "In-process Chromium fleet engine (napi-rs). Lease API, not Playwright parity.",
+  "description": "The darwin-x64 binary for fluxwright. Install `fluxwright`, not this package.",
   "keywords": [
     "chromium",
     "chrome",

@@ -9,20 +9,16 @@ The goal is to be the best engine for running many browser jobs on your own mach
 - **Easy to switch:** for the common page API, a Playwright job script runs after changing only the import.
 - **Fast start:** from `npm install` to the first job in under two minutes on Windows, macOS and Linux.
 
-## 0.2.2 (now)
+## Done
 
-- `page.evaluate(fn, arg)`, as in Playwright.
-- A page dropped without `close()` no longer crashes the process, and its slot is returned.
-- Valid TypeScript declarations.
-- README: the page API, and when to use Playwright instead.
+- **0.2.2:** `page.evaluate(fn, arg)` as in Playwright; a page dropped without `close()` no longer crashes the process; valid TypeScript declarations.
+- **0.3.0:** settings per page with Playwright's option names (user agent, locale, timezone, geolocation, permissions, viewport, device scale factor, color scheme), and saved sessions: `page.storageState()` out, `newPage({ storageState })` in, in Playwright's file format.
 
 ## 0.3: jobs that need state and control
 
 Logged-in scraping and automation are where teams give up on hand-rolled pools.
 
-- **Saved sessions:** log in once and reuse cookies and local storage across jobs (`storageState` in and out).
 - **Request control:** `page.route` to fulfill, modify or abort requests. Today Fluxwright can only block them.
-- **Emulation per page:** user agent, locale, timezone, geolocation, permissions and device scale factor.
 - **Element screenshots:** `locator.screenshot()`. This also covers apps that scroll inside a container.
 - **More locators:** `getByLabel`, `getByPlaceholder`, `getByTestId`, `nth` and `filter`.
 - **Downloads:** saved to a folder per job.
