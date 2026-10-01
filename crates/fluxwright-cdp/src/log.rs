@@ -61,23 +61,24 @@ pub enum LogEntry {
     Error(PageError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PageLog {
     pub console: VecDeque<ConsoleMessage>,
     pub errors: VecDeque<PageError>,
-    live: tokio::sync::broadcast::Sender<LogEntry>,
-}
-
-impl Default for PageLog {
-    fn default() -> Self {
-        Self { console: VecDeque::new(), errors: VecDeque::new(), live: tokio::sync::broadcast::channel(256).0 }
-    }
+    /// One queue per listener, so a burst of output never drops an entry.
+    live: Vec<UnboundedSender<LogEntry>>,
 }
 
 impl PageLog {
-    /// Entries from now on, for Playwright's `page.on('console' | 'pageerror')`.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<LogEntry> {
-        self.live.subscribe()
+    /// Every entry from now on, for Playwright's `page.on('console' | 'pageerror')`.
+    pub fn subscribe(&mut self) -> UnboundedReceiver<LogEntry> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.live.push(tx);
+        rx
+    }
+
+    fn tell(&mut self, entry: LogEntry) {
+        self.live.retain(|tx| tx.send(entry.clone()).is_ok());
     }
 }
 
@@ -184,13 +185,13 @@ pub(crate) async fn collect(
                     text: text.unwrap_or_default(),
                 };
                 let mut log = log.lock().unwrap();
-                let _ = log.live.send(LogEntry::Console(msg.clone()));
+                log.tell(LogEntry::Console(msg.clone()));
                 keep(&mut log.console, msg);
             }
             "Runtime.exceptionThrown" if ours => {
                 let err = page_error(&e.params["exceptionDetails"]);
                 let mut log = log.lock().unwrap();
-                let _ = log.live.send(LogEntry::Error(err.clone()));
+                log.tell(LogEntry::Error(err.clone()));
                 keep(&mut log.errors, err);
             }
             _ => {}

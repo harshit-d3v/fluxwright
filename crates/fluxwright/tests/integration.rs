@@ -378,7 +378,7 @@ async fn logs_as_they_happen() {
         .unwrap();
     let mut got = Vec::new();
     while got.len() < 2 {
-        let entry = tokio::time::timeout(Duration::from_secs(5), logs.recv()).await.expect("nothing within 5 s").unwrap();
+        let entry = tokio::time::timeout(Duration::from_secs(5), logs.recv()).await.expect("nothing within 5 s").expect("open");
         got.push(match entry {
             LogEntry::Console(m) => format!("{} {}", m.kind, m.text),
             LogEntry::Error(e) => format!("{} {}", e.name, e.message),

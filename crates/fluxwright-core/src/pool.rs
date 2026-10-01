@@ -70,7 +70,7 @@ pub struct PageLease {
     runtime: tokio::runtime::Handle,
     log: Arc<std::sync::Mutex<PageLog>>,
     log_task: tokio::task::JoinHandle<()>,
-    downloads: Mutex<DownloadQueue>,
+    downloads: Downloads,
     /// Where this page's downloads land; removed when the lease ends.
     download_dir: std::path::PathBuf,
 }
@@ -553,7 +553,7 @@ impl Inner {
             runtime: tokio::runtime::Handle::current(),
             log,
             log_task,
-            downloads: Mutex::new(downloads),
+            downloads: Downloads(Arc::new(Mutex::new(downloads))),
             download_dir,
         })
     }
@@ -839,17 +839,17 @@ impl PageLease {
     /// `timeout`. Downloads that finished before the call are returned too, so starting the
     /// download first is fine. The file is deleted when the page closes: `save_as` it first.
     pub async fn wait_for_download(&self, timeout: Duration) -> Result<Download> {
-        let mut queue = self.downloads.lock().await;
-        match tokio::time::timeout(timeout, queue.recv()).await {
-            Ok(Some(Ok(download))) => Ok(download),
-            Ok(Some(Err(reason))) => Err(Error::Other(reason)),
-            Ok(None) => Err(Error::Other("page closed".into())),
-            Err(_) => Err(Error::Other(format!("no download finished within {} ms", timeout.as_millis()))),
-        }
+        self.downloads.next(timeout).await
     }
 
-    /// Console messages and uncaught errors from now on, as they happen.
-    pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogEntry> {
+    /// A handle on this page's finished downloads that outlives borrows of the lease, for
+    /// callers that must not hold the page while they wait.
+    pub fn downloads(&self) -> Downloads {
+        self.downloads.clone()
+    }
+
+    /// Every console message and uncaught error from now on, as they happen.
+    pub fn subscribe_logs(&self) -> tokio::sync::mpsc::UnboundedReceiver<LogEntry> {
         self.log.lock().unwrap().subscribe()
     }
 
@@ -925,6 +925,23 @@ impl Drop for PageLease {
             let _ = browser.dispose_context(&ctx).await;
             engine.release_slot(&browser, true).await;
         });
+    }
+}
+
+/// A page's finished downloads, oldest first.
+#[derive(Clone)]
+pub struct Downloads(Arc<Mutex<DownloadQueue>>);
+
+impl Downloads {
+    /// The next finished download, waiting up to `timeout`.
+    pub async fn next(&self, timeout: Duration) -> Result<Download> {
+        let mut queue = self.0.lock().await;
+        match tokio::time::timeout(timeout, queue.recv()).await {
+            Ok(Some(Ok(download))) => Ok(download),
+            Ok(Some(Err(reason))) => Err(Error::Other(reason)),
+            Ok(None) => Err(Error::Other("page closed".into())),
+            Err(_) => Err(Error::Other(format!("no download finished within {} ms", timeout.as_millis()))),
+        }
     }
 }
 

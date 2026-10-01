@@ -171,6 +171,50 @@ try {
   assert.equal(await readFile(saved, 'utf8'), 'a,b\n1,2\n')
   await live.close()
 
+  // From review: waiting for a download before the click must not block the click; failed,
+  // missing or invalid answers let the request through; g/y RegExps match every time; a burst
+  // of console output arrives whole.
+  const rv = await browser.newPage()
+  await rv.goto(base)
+  const pending = rv.waitForDownload({ timeout: 10000 })
+  await rv.evaluate(() => {
+    const a = document.createElement('a')
+    a.href = '/report'
+    document.body.append(a)
+    a.click()
+  })
+  assert.equal((await pending).suggestedFilename(), 'report.csv')
+  const quiet = console.error
+  console.error = () => {}
+  try {
+    await rv.route('**/api', (route) => route.fulfill({ path: join(tmpdir(), 'no-such-file-fluxwright') }))
+    assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
+    await rv.unroute('**/api')
+    await rv.route('**/api', () => {}) // answers nothing
+    assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
+    await rv.unroute('**/api')
+    let rejected = null
+    await rv.route('**/api', (route) => route.fulfill({ status: 70000 }).catch((e) => (rejected = e.message)))
+    assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
+    assert.match(rejected, /status must be between 100 and 599/)
+    await rv.unroute('**/api')
+  } finally {
+    console.error = quiet
+  }
+  await rv.route(/\/hdr$/g, (route, request) => route.continue({ headers: { ...request.headers(), 'x-test': 'again' } }))
+  for (let i = 0; i < 2; i++) {
+    await rv.goto(`${base}/hdr`)
+    assert.equal(await rv.evaluate(() => document.body.textContent), 'again')
+  }
+  let count = 0
+  rv.on('console', () => count++)
+  await rv.evaluate(() => {
+    for (let i = 0; i < 600; i++) console.log('n' + i)
+  })
+  for (let i = 0; i < 250 && count < 600; i++) await new Promise((r) => setTimeout(r, 20))
+  assert.equal(count, 600)
+  await rv.close()
+
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
 } finally {

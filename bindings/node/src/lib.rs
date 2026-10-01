@@ -7,7 +7,7 @@ use napi_derive::napi;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("tokio"));
 
@@ -16,7 +16,9 @@ pub struct Browser {
     inner: fluxwright::BrowserEngine,
 }
 
-type LeaseSlot = Arc<Mutex<Option<fluxwright::PageLease>>>;
+/// Read-locked by every page call, so calls run side by side (a download wait and the click
+/// that starts it); write-locked by `close`.
+type LeaseSlot = Arc<RwLock<Option<fluxwright::PageLease>>>;
 
 #[napi]
 pub struct Page {
@@ -117,6 +119,9 @@ impl InterceptedRoute {
     #[napi]
     pub async fn fulfill(&self, options: Option<FulfillOptions>) -> Result<()> {
         let o = options.unwrap_or(FulfillOptions { status: None, headers: None, body: None });
+        if let Some(status) = o.status.filter(|s| !(100..=599).contains(s)) {
+            return Err(Error::from_reason(format!("status must be between 100 and 599, not {status}")));
+        }
         let f = fluxwright::Fulfill {
             status: o.status.map(|s| s as u16),
             headers: o.headers.unwrap_or_default().into_iter().collect(),
@@ -186,7 +191,7 @@ where
         + 'static,
 {
     RT.spawn(async move {
-        let g = lease.lock().await;
+        let g = lease.read().await;
         match g.as_ref() {
             Some(p) => f(p).await.map_err(|e| e.to_string()),
             None => Err("page closed".to_string()),
@@ -686,7 +691,7 @@ impl Browser {
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(Page {
-            lease: Arc::new(Mutex::new(Some(lease))),
+            lease: Arc::new(RwLock::new(Some(lease))),
             routes: Default::default(),
         })
     }
@@ -729,7 +734,7 @@ impl Page {
         };
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.goto_with(&url, wait_until).await.map_err(|e| e.to_string())
             } else {
@@ -745,7 +750,7 @@ impl Page {
     pub async fn title(&self) -> Result<String> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.title().await.map_err(|e| e.to_string())
             } else {
@@ -761,7 +766,7 @@ impl Page {
     pub async fn content(&self) -> Result<String> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.content().await.map_err(|e| e.to_string())
             } else {
@@ -777,7 +782,7 @@ impl Page {
     pub async fn click(&self, selector: String) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.click(&selector).await.map_err(|e| e.to_string())
             } else {
@@ -793,7 +798,7 @@ impl Page {
     pub async fn fill(&self, selector: String, value: String) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.fill(&selector, &value).await.map_err(|e| e.to_string())
             } else {
@@ -809,7 +814,7 @@ impl Page {
     pub async fn evaluate(&self, expression: String) -> Result<serde_json::Value> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.evaluate(&expression).await.map_err(|e| e.to_string())
             } else {
@@ -827,7 +832,7 @@ impl Page {
         let lease = self.lease.clone();
         let bytes = RT
             .spawn(async move {
-                let g = lease.lock().await;
+                let g = lease.read().await;
                 if let Some(p) = g.as_ref() {
                     if full_page { p.screenshot_full_page().await } else { p.screenshot().await }
                         .map_err(|e| e.to_string())
@@ -845,7 +850,7 @@ impl Page {
     pub async fn set_viewport_size(&self, size: ViewportSize) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.set_viewport_size(size.width, size.height)
                     .await
@@ -863,7 +868,7 @@ impl Page {
     pub async fn wait_for_selector(&self, selector: String) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.wait_for_selector(&selector).await.map_err(|e| e.to_string())
             } else {
@@ -918,23 +923,22 @@ impl Page {
         let tsfn = callback::<LogEvent>(&env, handler)?;
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let Some(mut entries) = lease.lock().await.as_ref().map(|p| p.subscribe_logs()) else {
+            let Some(mut entries) = lease.read().await.as_ref().map(|p| p.subscribe_logs()) else {
                 return;
             };
-            loop {
-                let event = match entries.recv().await {
-                    Ok(fluxwright::LogEntry::Console(m)) => LogEvent {
+            // Ends when the page closes.
+            while let Some(entry) = entries.recv().await {
+                let event = match entry {
+                    fluxwright::LogEntry::Console(m) => LogEvent {
                         event: "console".into(),
                         message: Some(ConsoleMessage { kind: m.kind, text: m.text }),
                         error: None,
                     },
-                    Ok(fluxwright::LogEntry::Error(e)) => LogEvent {
+                    fluxwright::LogEntry::Error(e) => LogEvent {
                         event: "pageerror".into(),
                         message: None,
                         error: Some(PageErrorInfo { name: e.name, message: e.message, stack: e.stack }),
                     },
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 tsfn.call(event, ThreadsafeFunctionCallMode::NonBlocking);
             }
@@ -971,7 +975,13 @@ impl Page {
     #[napi(js_name = "_waitForDownload")]
     pub async fn wait_for_download(&self, timeout_ms: Option<u32>) -> Result<DownloadInfo> {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000) as u64);
-        let d = with_page(self.lease.clone(), move |p| Box::pin(async move { p.wait_for_download(timeout).await })).await?;
+        // Hold no page lock while waiting: the click that starts the download needs the page.
+        let downloads = with_page(self.lease.clone(), |p| Box::pin(async move { Ok(p.downloads()) })).await?;
+        let d = RT
+            .spawn(async move { downloads.next(timeout).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)?;
         Ok(DownloadInfo { url: d.url, suggested_filename: d.suggested_filename, path: d.path.to_string_lossy().into_owned() })
     }
 
@@ -993,7 +1003,7 @@ impl Page {
     pub async fn close(&self) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let mut g = lease.lock().await;
+            let mut g = lease.write().await;
             *g = None;
         })
         .await

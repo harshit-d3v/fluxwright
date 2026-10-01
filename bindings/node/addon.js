@@ -70,7 +70,11 @@ function installEvents(Page) {
 // RegExp, or a function of the URL.
 function urlMatcher(pattern) {
   if (typeof pattern === 'function') return (url) => pattern(new URL(url))
-  if (pattern instanceof RegExp) return (url) => pattern.test(url)
+  // A copy without g and y, whose lastIndex would make repeated tests alternate.
+  if (pattern instanceof RegExp) {
+    const regex = new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, ''))
+    return (url) => regex.test(url)
+  }
   let re = ''
   let inGroup = false
   const glob = String(pattern)
@@ -110,41 +114,48 @@ function installRoutes(Page) {
   const dispatch = async (list, native) => {
     for (let i = list.length - 1; i >= 0; i--) {
       if (!list[i].matches(native.url)) continue
-      let decided = null
+      // The first answer wins; it is set when the call starts, so an answer still under way
+      // when the handler returns is waited for, not taken as no answer.
+      let answer = null
+      let fellBack = false
+      const answerWith = (work) => {
+        if (answer || fellBack) return Promise.reject(new Error('route is already handled'))
+        answer = work()
+        return answer
+      }
       const route = {
         request: () => request(native),
-        fulfill: async (o = {}) => {
-          decided = 'handled'
-          const headers = { ...o.headers }
-          let body = o.body
-          if (o.json !== undefined) {
-            body = JSON.stringify(o.json)
-            headers['content-type'] ??= 'application/json'
-          }
-          if (o.path) body = await fs.readFile(o.path)
-          if (o.contentType) headers['content-type'] = o.contentType
-          return native.fulfill({ status: o.status, headers, body })
-        },
-        continue: async (o = {}) => {
-          decided = 'handled'
-          return native.continue({ url: o.url, method: o.method, headers: o.headers, postData: o.postData })
-        },
-        abort: async (errorCode) => {
-          decided = 'handled'
-          return native.abort(errorCode)
-        },
+        fulfill: (o = {}) =>
+          answerWith(async () => {
+            const headers = { ...o.headers }
+            let body = o.body
+            if (o.json !== undefined) {
+              body = JSON.stringify(o.json)
+              headers['content-type'] ??= 'application/json'
+            }
+            if (o.path) body = await fs.readFile(o.path)
+            if (o.contentType) headers['content-type'] = o.contentType
+            return native.fulfill({ status: o.status, headers, body })
+          }),
+        continue: (o = {}) =>
+          answerWith(() => native.continue({ url: o.url, method: o.method, headers: o.headers, postData: o.postData })),
+        abort: (errorCode) => answerWith(() => native.abort(errorCode)),
         fallback: async () => {
-          decided = 'fallback'
+          if (answer) throw new Error('route is already handled')
+          fellBack = true
         },
       }
       try {
         await list[i].handler(route, route.request())
+        if (fellBack && !answer) continue
+        if (answer) await answer
       } catch (err) {
-        console.error('[fluxwright] a route handler threw; the request continues:', err)
-        if (!decided) await native.continue().catch(() => {})
-        return
+        console.error('[fluxwright] a route handler failed; the request continues:', err)
       }
-      if (decided !== 'fallback') return
+      // No answer, or one that failed: let the request through rather than hang the page.
+      // A request already answered refuses this, harmlessly.
+      await native.continue().catch(() => {})
+      return
     }
     await native.continue().catch(() => {})
   }
