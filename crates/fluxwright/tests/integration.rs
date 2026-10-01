@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxwright::{BrowserEngine, JobOptions, Proxy, QueueFullMode, WaitUntil};
+use fluxwright::{BrowserEngine, ColorScheme, JobOptions, Proxy, QueueFullMode, StorageState, WaitUntil};
+use serde_json::json;
 
 fn kill_pid(pid: u32) {
     if cfg!(windows) {
@@ -27,6 +28,119 @@ async fn engine(max_browsers: usize, max_ctx: usize) -> BrowserEngine {
         .build()
         .await
         .expect("engine")
+}
+
+/// Playwright's newContext options: the page and its HTTP requests both see them, and the next
+/// job on the same browser gets Chrome's defaults back.
+#[tokio::test(flavor = "multi_thread")]
+async fn emulation_and_permissions() {
+    let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let eng = engine(1, 2).await;
+    let opts = JobOptions::default()
+        .user_agent("FluxTest/1.0")
+        .locale("de-DE")
+        .timezone("Asia/Tokyo")
+        .geolocation(35.68, 139.69)
+        .permissions(["geolocation"])
+        .viewport(500, 400)
+        .device_scale_factor(2.0)
+        .color_scheme(ColorScheme::Dark);
+    let page = eng.acquire_job(&opts).await.unwrap();
+    page.goto(&format!("{}/headers", srv.base_url)).await.unwrap();
+    let sent = page.evaluate("document.body.innerText").await.unwrap();
+    let sent = sent.as_str().unwrap();
+    assert!(sent.starts_with("FluxTest/1.0\nde-DE"), "request headers: {sent:?}");
+    let seen = page
+        .evaluate(
+            r#"(async () => {
+                const pos = await new Promise((ok, err) => navigator.geolocation.getCurrentPosition(ok, err));
+                return [navigator.userAgent, navigator.language, Intl.DateTimeFormat().resolvedOptions().timeZone,
+                    pos.coords.latitude, pos.coords.longitude, innerWidth, innerHeight, devicePixelRatio,
+                    matchMedia('(prefers-color-scheme: dark)').matches].join('|');
+            })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen, json!("FluxTest/1.0|de-DE|Asia/Tokyo|35.68|139.69|500|400|2|true"));
+    // A popup is a new page in the same context, with a session of its own.
+    let popup = page
+        .evaluate(
+            r#"(async () => {
+                const w = window.open(location.href);
+                for (let i = 0; i < 250 && w.document.readyState !== 'complete'; i++) await new Promise(r => setTimeout(r, 20));
+                return [w.navigator.userAgent, w.innerWidth, w.Intl.DateTimeFormat().resolvedOptions().timeZone].join('|');
+            })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(popup, json!("FluxTest/1.0|500|Asia/Tokyo"));
+    drop(page);
+
+    let plain = eng.acquire().await.unwrap();
+    plain.goto(&format!("{}/headers", srv.base_url)).await.unwrap();
+    assert_ne!(plain.evaluate("navigator.userAgent").await.unwrap(), json!("FluxTest/1.0"));
+    let unknown = eng.acquire_job(&JobOptions::default().permissions(["teleport"])).await;
+    assert!(unknown.is_err(), "an unknown permission must fail the job, not be ignored");
+}
+
+/// An iframe from another site runs in its own process and DevTools session, which gets the
+/// same emulation when it attaches.
+#[tokio::test(flavor = "multi_thread")]
+async fn emulation_reaches_cross_site_iframes() {
+    use axum::{response::Html, routing::get, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let top = format!(r#"<!doctype html><iframe src="http://localhost:{port}/who"></iframe>"#);
+    let who = r#"<!doctype html><script>document.write('<p id=who>' + [navigator.userAgent, navigator.language,
+        Intl.DateTimeFormat().resolvedOptions().timeZone, matchMedia('(prefers-color-scheme: dark)').matches]
+        .join('|') + '</p>')</script>"#;
+    let app = Router::new()
+        .route("/", get(move || async move { Html(top) }))
+        .route("/who", get(move || async move { Html(who) }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = engine(1, 1).await;
+    let opts = JobOptions::default()
+        .user_agent("FluxTest/1.0")
+        .locale("de-DE")
+        .timezone("Asia/Tokyo")
+        .color_scheme(ColorScheme::Dark);
+    let page = eng.acquire_job(&opts).await.unwrap();
+    page.goto(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+    let seen = page.frame_locator("iframe").locator("#who").text_content().await.unwrap();
+    assert_eq!(seen.as_deref(), Some("FluxTest/1.0|de-DE|Asia/Tokyo|true"));
+}
+
+/// Log in once, start the next job from the saved state, and the job after that from nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_state_round_trip() {
+    let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let eng = engine(1, 2).await;
+    let first = eng.acquire().await.unwrap();
+    first.goto(&format!("{}/set-cookie", srv.base_url)).await.unwrap();
+    first.evaluate("localStorage.setItem('token', 'abc')").await.unwrap();
+    let state = first.storage_state().await.unwrap();
+    drop(first);
+    assert!(state.cookies.iter().any(|c| c.name == "fw" && c.value == "secret"), "{state:?}");
+    assert_eq!(state.origins.len(), 1);
+    assert_eq!(state.origins[0].origin, srv.base_url);
+
+    // Through JSON, the way a saved file goes.
+    let state: StorageState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    let restored = eng.acquire_job(&JobOptions::default().storage_state(state)).await.unwrap();
+    restored.goto(&format!("{}/show-cookie", srv.base_url)).await.unwrap();
+    let both = "[document.cookie, localStorage.getItem('token')].join('|')";
+    assert_eq!(restored.evaluate(both).await.unwrap(), json!("fw=secret|abc"));
+    // The page's own change survives a reload: the saved value is restored only once.
+    restored.evaluate("localStorage.removeItem('token')").await.unwrap();
+    restored.goto(&format!("{}/show-cookie", srv.base_url)).await.unwrap();
+    assert_eq!(restored.evaluate("localStorage.getItem('token')").await.unwrap(), json!(null));
+    drop(restored);
+
+    let fresh = eng.acquire().await.unwrap();
+    fresh.goto(&format!("{}/show-cookie", srv.base_url)).await.unwrap();
+    assert_eq!(fresh.evaluate(both).await.unwrap(), json!("|"));
 }
 
 /// Node's garbage collector drops a page that was never closed on its own thread, outside any

@@ -538,6 +538,12 @@ async fn prepare_session(
         calls.push(("Page.setLifecycleEventsEnabled", json!({ "enabled": true })));
     }
     if let Some(setup) = setup.filter(|_| ty == "page" || ty == "iframe") {
+        if let Some(e) = &setup.emulation {
+            calls.extend(e.calls(ty == "page"));
+        }
+        for source in &setup.init_scripts {
+            calls.push(("Page.addScriptToEvaluateOnNewDocument", json!({ "source": source })));
+        }
         if let Some(params) = fetch_params(&setup) {
             calls.push(("Fetch.enable", params));
         }

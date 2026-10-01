@@ -4,9 +4,8 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 
 ## Planned (see [ROADMAP.md](https://github.com/harshit-d3v/fluxwright/blob/main/ROADMAP.md))
 
-- Saved login state: `storageState` import and export
 - `page.route` to fulfill or modify requests (today: blocking by resource type or URL)
-- Emulation: user agent, locale, timezone, geolocation, permissions, `emulateMedia`
+- Mobile and touch emulation (`isMobile`, `hasTouch`), `emulateMedia` after the page opens
 - `locator.screenshot()`
 - `getByLabel`, `getByPlaceholder`, `getByTestId`, `nth`, `filter`
 - Downloads

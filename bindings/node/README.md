@@ -40,7 +40,8 @@ await browser.close();
 | Method | What it does |
 |---|---|
 | `chromium.launch({ maxBrowsers?, executablePath?, headless? })` | Start the pool. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executablePath` overrides |
-| `browser.newPage({ proxy? })` | Acquire a lease (a fresh context). `proxy: { server, bypass?, username?, password? }` applies to this page only |
+| `browser.newPage(options?)` | Acquire a lease (a fresh context). Every option applies to this page only: `proxy: { server, bypass?, username?, password? }`, `userAgent`, `locale`, `timezoneId`, `geolocation: { latitude, longitude, accuracy? }` (with `permissions: ['geolocation']`), `permissions`, `viewport: { width, height }`, `deviceScaleFactor`, `colorScheme`, `storageState` (an object or a file path) |
+| `page.storageState({ path? })` | Every cookie in the context plus localStorage of the current origin, in Playwright's format. With `path`, also saved as JSON for `newPage({ storageState: path })` |
 | `page.goto(url, { waitUntil? })` | Navigate. `waitUntil`: `load` (default), `domcontentloaded`, `networkidle`, `commit`. Event-driven, like Playwright |
 | `page.title()` / `page.content()` | Read |
 | `page.click(selector)` / `page.fill(selector, value)` | Scrolls into view, waits until enabled, stable, and not covered. Selector: CSS, `text=Foo`, `text="Exact"`, `role=button[name="Save"]` |

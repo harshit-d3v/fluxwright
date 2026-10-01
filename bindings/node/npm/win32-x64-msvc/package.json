@@ -1,6 +1,6 @@
 {
   "name": "fluxwright-win32-x64-msvc",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "os": [
     "win32"
   ],
@@ -11,7 +11,7 @@
   "files": [
     "fluxwright.win32-x64-msvc.node"
   ],
-  "description": "In-process Chromium fleet engine (napi-rs). Lease API, not Playwright parity.",
+  "description": "The win32-x64-msvc binary for fluxwright. Install `fluxwright`, not this package.",
   "keywords": [
     "chromium",
     "chrome",

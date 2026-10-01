@@ -154,9 +154,163 @@ pub struct ProxyOptions {
     pub password: Option<String>,
 }
 
+/// Playwright's `newContext` options that Fluxwright supports.
 #[napi(object)]
 pub struct NewPageOptions {
     pub proxy: Option<ProxyOptions>,
+    pub user_agent: Option<String>,
+    /// BCP 47, e.g. `de-DE`: `navigator.language`, `Accept-Language` and `Intl`.
+    pub locale: Option<String>,
+    /// IANA, e.g. `Asia/Tokyo`.
+    pub timezone_id: Option<String>,
+    /// Also needs `permissions: ['geolocation']`, as in Playwright.
+    pub geolocation: Option<Geolocation>,
+    /// `geolocation`, `notifications`, `clipboard-read`, ... granted to every origin.
+    pub permissions: Option<Vec<String>>,
+    pub viewport: Option<ViewportSize>,
+    pub device_scale_factor: Option<f64>,
+    #[napi(ts_type = "'light' | 'dark' | 'no-preference'")]
+    pub color_scheme: Option<String>,
+    /// Cookies and localStorage to start from: what `page.storageState()` returned, or the
+    /// path of the JSON file it saved.
+    #[napi(ts_type = "StorageState | string")]
+    pub storage_state: Option<StorageState>,
+}
+
+#[napi(object)]
+pub struct Geolocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Meters. Default 0.
+    pub accuracy: Option<f64>,
+}
+
+/// Cookies and localStorage, in Playwright's `storageState` format: files work in both.
+#[napi(object)]
+pub struct StorageState {
+    pub cookies: Vec<Cookie>,
+    pub origins: Vec<OriginStorage>,
+}
+
+#[napi(object)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    /// Unix seconds; -1 for a session cookie.
+    pub expires: f64,
+    pub http_only: bool,
+    pub secure: bool,
+    #[napi(ts_type = "'Strict' | 'Lax' | 'None'")]
+    pub same_site: String,
+}
+
+#[napi(object)]
+pub struct OriginStorage {
+    pub origin: String,
+    pub local_storage: Vec<StorageItem>,
+}
+
+#[napi(object)]
+pub struct StorageItem {
+    pub name: String,
+    pub value: String,
+}
+
+impl From<StorageState> for fluxwright::StorageState {
+    fn from(s: StorageState) -> Self {
+        fluxwright::StorageState {
+            cookies: s
+                .cookies
+                .into_iter()
+                .map(|c| fluxwright::Cookie {
+                    name: c.name,
+                    value: c.value,
+                    domain: c.domain,
+                    path: c.path,
+                    expires: c.expires,
+                    http_only: c.http_only,
+                    secure: c.secure,
+                    same_site: c.same_site,
+                })
+                .collect(),
+            origins: s
+                .origins
+                .into_iter()
+                .map(|o| fluxwright::OriginStorage {
+                    origin: o.origin,
+                    local_storage: o
+                        .local_storage
+                        .into_iter()
+                        .map(|i| fluxwright::StorageItem { name: i.name, value: i.value })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<fluxwright::StorageState> for StorageState {
+    fn from(s: fluxwright::StorageState) -> Self {
+        StorageState {
+            cookies: s
+                .cookies
+                .into_iter()
+                .map(|c| Cookie {
+                    name: c.name,
+                    value: c.value,
+                    domain: c.domain,
+                    path: c.path,
+                    expires: c.expires,
+                    http_only: c.http_only,
+                    secure: c.secure,
+                    same_site: c.same_site,
+                })
+                .collect(),
+            origins: s
+                .origins
+                .into_iter()
+                .map(|o| OriginStorage {
+                    origin: o.origin,
+                    local_storage: o.local_storage.into_iter().map(|i| StorageItem { name: i.name, value: i.value }).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
+    let color_scheme = match o.color_scheme.as_deref() {
+        None => None,
+        Some(s) => Some(fluxwright::ColorScheme::parse(s).ok_or_else(|| {
+            Error::from_reason(format!("colorScheme must be light, dark or no-preference, not `{s}`"))
+        })?),
+    };
+    Ok(fluxwright::JobOptions {
+        proxy: o.proxy.map(|p| fluxwright::Proxy {
+            server: p.server,
+            bypass: p.bypass,
+            username: p.username,
+            password: p.password,
+        }),
+        emulation: fluxwright::Emulation {
+            user_agent: o.user_agent,
+            locale: o.locale,
+            timezone_id: o.timezone_id,
+            geolocation: o.geolocation.map(|g| fluxwright::Geolocation {
+                latitude: g.latitude,
+                longitude: g.longitude,
+                accuracy: g.accuracy.unwrap_or(0.0),
+            }),
+            viewport: o.viewport.map(|v| (v.width, v.height)),
+            device_scale_factor: o.device_scale_factor,
+            color_scheme,
+        },
+        permissions: o.permissions.unwrap_or_default(),
+        storage_state: o.storage_state.map(Into::into),
+        ..Default::default()
+    })
 }
 
 #[napi(object)]
@@ -210,16 +364,13 @@ impl Chromium {
 
 #[napi]
 impl Browser {
-    /// A fresh browser context. `proxy` applies to this page only.
+    /// A fresh browser context. Every option applies to this page only.
     #[napi]
     pub async fn new_page(&self, options: Option<NewPageOptions>) -> Result<Page> {
-        let proxy = options.and_then(|o| o.proxy).map(|p| fluxwright::Proxy {
-            server: p.server,
-            bypass: p.bypass,
-            username: p.username,
-            password: p.password,
-        });
-        let opts = fluxwright::JobOptions { proxy, ..Default::default() };
+        let opts = match options {
+            Some(o) => job_options(o)?,
+            None => fluxwright::JobOptions::default(),
+        };
         let eng = self.inner.clone();
         let lease = RT
             .spawn(async move { eng.acquire_job(&opts).await })
@@ -245,6 +396,15 @@ impl Browser {
 
 #[napi]
 impl Page {
+    /// Every cookie in this page's context, plus localStorage of the current origin. Pass it
+    /// (or a file it was saved to) as `newPage({ storageState })` to skip logging in again.
+    #[napi]
+    pub async fn storage_state(&self) -> Result<StorageState> {
+        with_page(self.lease.clone(), |p| Box::pin(async move { p.storage_state().await }))
+            .await
+            .map(Into::into)
+    }
+
     #[napi]
     pub async fn goto(&self, url: String, options: Option<GotoOptions>) -> Result<()> {
         let wait_until = match options.and_then(|o| o.wait_until).as_deref() {

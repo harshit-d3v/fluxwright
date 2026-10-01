@@ -1,5 +1,6 @@
 'use strict'
 
+const fs = require('node:fs/promises')
 const { Script } = require('node:vm')
 
 // Playwright-style `page.evaluate(fn, arg)`. As in Playwright, the function is sent to the page as
@@ -38,6 +39,20 @@ try {
   const evaluate = native.Page.prototype.evaluate
   native.Page.prototype.evaluate = async function (pageFunction, arg) {
     return evaluate.call(this, toExpression(pageFunction, arg))
+  }
+  // As in Playwright, saved storage can live in a JSON file.
+  const newPage = native.Browser.prototype.newPage
+  native.Browser.prototype.newPage = async function (options) {
+    if (typeof options?.storageState === 'string') {
+      options = { ...options, storageState: JSON.parse(await fs.readFile(options.storageState, 'utf8')) }
+    }
+    return newPage.call(this, options)
+  }
+  const storageState = native.Page.prototype.storageState
+  native.Page.prototype.storageState = async function (options) {
+    const state = await storageState.call(this)
+    if (options?.path) await fs.writeFile(options.path, JSON.stringify(state, null, 2))
+    return state
   }
   module.exports = native
   module.exports.chromium = native.Chromium

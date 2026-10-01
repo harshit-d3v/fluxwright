@@ -37,6 +37,7 @@ pub fn router() -> Router {
         .route("/forms", get(forms))
         .route("/javascript", get(javascript))
         .route("/many-elements", get(many_elements))
+        .route("/headers", get(headers))
         .route("/set-cookie", get(set_cookie))
         .route("/show-cookie", get(show_cookie))
         .route("/slow", get(slow))
@@ -97,6 +98,12 @@ async fn set_cookie() -> impl IntoResponse {
         [(axum::http::header::SET_COOKIE, "fw=secret; Path=/")],
         Html("<!doctype html><title>set</title><p>cookie set</p>"),
     )
+}
+
+/// The request's user agent and languages, as the page text.
+async fn headers(h: axum::http::HeaderMap) -> String {
+    let get = |name| h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    format!("{}\n{}", get("user-agent"), get("accept-language"))
 }
 
 async fn show_cookie() -> Html<&'static str> {
