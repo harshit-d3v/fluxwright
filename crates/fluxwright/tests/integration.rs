@@ -67,7 +67,10 @@ async fn emulation_and_permissions() {
         .evaluate(
             r#"(async () => {
                 const w = window.open(location.href);
-                for (let i = 0; i < 250 && w.document.readyState !== 'complete'; i++) await new Promise(r => setTimeout(r, 20));
+                // Not the initial about:blank, which is already "complete" and exists before the
+                // popup's session does.
+                const loaded = () => w.location.href === location.href && w.document.readyState === 'complete';
+                for (let i = 0; i < 250 && !loaded(); i++) await new Promise(r => setTimeout(r, 20));
                 return [w.navigator.userAgent, w.innerWidth, w.Intl.DateTimeFormat().resolvedOptions().timeZone].join('|');
             })()"#,
         )
