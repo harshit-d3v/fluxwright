@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use fluxwright_cdp::{LaunchOptions, Proxy};
+use fluxwright_cdp::{ColorScheme, Emulation, Geolocation, LaunchOptions, Proxy, StorageState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
@@ -84,6 +84,12 @@ pub struct JobOptions {
     pub block_url_patterns: Vec<String>,
     /// Proxy for this job's browser context. Other jobs on the same browser are unaffected.
     pub proxy: Option<Proxy>,
+    /// User agent, locale, timezone, geolocation, viewport, scale, color scheme.
+    pub emulation: Emulation,
+    /// Playwright names: `geolocation`, `notifications`, `clipboard-read`, ...
+    pub permissions: Vec<String>,
+    /// Cookies and localStorage to start from, e.g. saved by `PageLease::storage_state`.
+    pub storage_state: Option<StorageState>,
 }
 
 impl Default for JobOptions {
@@ -97,6 +103,9 @@ impl Default for JobOptions {
             block_media: false,
             block_url_patterns: Vec::new(),
             proxy: None,
+            emulation: Emulation::default(),
+            permissions: Vec::new(),
+            storage_state: None,
         }
     }
 }
@@ -119,6 +128,58 @@ impl JobOptions {
 
     pub fn proxy(mut self, proxy: Proxy) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.emulation.user_agent = Some(ua.into());
+        self
+    }
+
+    /// BCP 47, e.g. `de-DE`.
+    pub fn locale(mut self, locale: impl Into<String>) -> Self {
+        self.emulation.locale = Some(locale.into());
+        self
+    }
+
+    /// IANA, e.g. `Asia/Tokyo`.
+    pub fn timezone(mut self, id: impl Into<String>) -> Self {
+        self.emulation.timezone_id = Some(id.into());
+        self
+    }
+
+    /// Also needs `permissions(["geolocation"])`, as in Playwright.
+    pub fn geolocation(mut self, latitude: f64, longitude: f64) -> Self {
+        self.emulation.geolocation = Some(Geolocation { latitude, longitude, accuracy: 0.0 });
+        self
+    }
+
+    pub fn viewport(mut self, width: u32, height: u32) -> Self {
+        self.emulation.viewport = Some((width, height));
+        self
+    }
+
+    pub fn device_scale_factor(mut self, factor: f64) -> Self {
+        self.emulation.device_scale_factor = Some(factor);
+        self
+    }
+
+    pub fn color_scheme(mut self, scheme: ColorScheme) -> Self {
+        self.emulation.color_scheme = Some(scheme);
+        self
+    }
+
+    pub fn permissions<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.permissions = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn storage_state(mut self, state: StorageState) -> Self {
+        self.storage_state = Some(state);
         self
     }
 }

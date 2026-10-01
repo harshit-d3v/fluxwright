@@ -119,12 +119,19 @@ impl Engine {
         self.acquire_inner(priority, None, timeout).await
     }
 
-    /// A lease set up for `opts`: priority, proxy, and resource blocking.
+    /// A lease set up for `opts`: priority, proxy, resource blocking, permissions, saved
+    /// storage and emulation.
     pub async fn acquire_job(&self, opts: &JobOptions) -> Result<PageLease> {
         let page = self
             .acquire_inner(opts.priority, opts.proxy.clone(), self.inner.config.acquire_timeout)
             .await?;
         apply_blocking(&page, opts).await?;
+        let timeout = Duration::from_secs(5);
+        page.page.grant_permissions(&opts.permissions, timeout).await?;
+        if let Some(state) = &opts.storage_state {
+            page.page.set_storage_state(state, timeout).await?;
+        }
+        page.page.emulate(&opts.emulation, timeout).await?;
         Ok(page)
     }
 
@@ -683,6 +690,13 @@ impl PageLease {
 
     pub fn lease_id(&self) -> Uuid {
         self.lease_id
+    }
+
+    /// Every cookie in this page's context plus localStorage of the current origin, in
+    /// Playwright's `storageState` format. Start a later job from it with
+    /// `JobOptions::storage_state` to skip logging in again.
+    pub async fn storage_state(&self) -> Result<fluxwright_cdp::StorageState> {
+        Ok(self.page.storage_state(self.engine.config.action_timeout).await?)
     }
 
     /// Navigates and waits for the `load` event.

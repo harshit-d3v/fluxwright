@@ -27,8 +27,56 @@ export interface ProxyOptions {
   username?: string
   password?: string
 }
+/** Playwright's `newContext` options that Fluxwright supports. */
 export interface NewPageOptions {
   proxy?: ProxyOptions
+  userAgent?: string
+  /** BCP 47, e.g. `de-DE`: `navigator.language`, `Accept-Language` and `Intl`. */
+  locale?: string
+  /** IANA, e.g. `Asia/Tokyo`. */
+  timezoneId?: string
+  /** Also needs `permissions: ['geolocation']`, as in Playwright. */
+  geolocation?: Geolocation
+  /** `geolocation`, `notifications`, `clipboard-read`, ... granted to every origin. */
+  permissions?: Array<string>
+  viewport?: ViewportSize
+  deviceScaleFactor?: number
+  colorScheme?: 'light' | 'dark' | 'no-preference'
+  /**
+   * Cookies and localStorage to start from: what `page.storageState()` returned, or the
+   * path of the JSON file it saved.
+   */
+  storageState?: StorageState | string
+}
+export interface Geolocation {
+  latitude: number
+  longitude: number
+  /** Meters. Default 0. */
+  accuracy?: number
+}
+/** Cookies and localStorage, in Playwright's `storageState` format: files work in both. */
+export interface StorageState {
+  cookies: Array<Cookie>
+  origins: Array<OriginStorage>
+}
+export interface Cookie {
+  name: string
+  value: string
+  domain: string
+  path: string
+  /** Unix seconds; -1 for a session cookie. */
+  expires: number
+  httpOnly: boolean
+  secure: boolean
+  sameSite: 'Strict' | 'Lax' | 'None'
+}
+export interface OriginStorage {
+  origin: string
+  localStorage: Array<StorageItem>
+}
+export interface StorageItem {
+  name: string
+  value: string
 }
 export interface GotoOptions {
   /** Default "load". */
@@ -43,11 +91,16 @@ export interface ViewportSize {
 }
 export declare function chromium(): Chromium
 export declare class Browser {
-  /** A fresh browser context. `proxy` applies to this page only. */
+  /** A fresh browser context. Every option applies to this page only. */
   newPage(options?: NewPageOptions | undefined | null): Promise<Page>
   close(): Promise<void>
 }
 export declare class Page {
+  /**
+   * Every cookie in this page's context, plus localStorage of the current origin. Pass it
+   * (or a file it was saved to) as `newPage({ storageState })` to skip logging in again.
+   */
+  storageState(): Promise<StorageState>
   goto(url: string, options?: GotoOptions | undefined | null): Promise<void>
   title(): Promise<string>
   content(): Promise<string>

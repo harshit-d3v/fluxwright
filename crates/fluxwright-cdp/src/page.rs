@@ -9,6 +9,7 @@ use tokio::time::sleep;
 
 use crate::browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId, TargetState};
 use crate::connection::{CdpEvent, Connection};
+use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
 use crate::error::{Error, Result};
 
 /// When `goto` returns. Same meanings as Playwright's `waitUntil`.
@@ -405,6 +406,78 @@ impl CdpPage {
         }
     }
 
+    /// Applies `e` to this page now, and to iframes and popups that attach later.
+    pub async fn emulate(&self, e: &Emulation, timeout: Duration) -> Result<()> {
+        if e.is_empty() {
+            return Ok(());
+        }
+        let mut e = e.clone();
+        if e.locale.is_some() && e.user_agent.is_none() {
+            let v = self.browser.call("Browser.getVersion", json!({}), None, timeout).await?;
+            e.user_agent = v["userAgent"].as_str().map(str::to_owned);
+        }
+        self.setups.lock().await.entry(self.context_id.0.clone()).or_default().emulation = Some(e.clone());
+        self.pipeline(e.calls(true), timeout).await
+    }
+
+    /// Grants Playwright-named permissions (`geolocation`, `notifications`, ...) to every origin
+    /// in this page's context.
+    pub async fn grant_permissions(&self, names: &[String], timeout: Duration) -> Result<()> {
+        let permissions = permission_types(names)?;
+        if permissions.is_empty() {
+            return Ok(());
+        }
+        self.browser
+            .call(
+                "Browser.grantPermissions",
+                json!({ "permissions": permissions, "browserContextId": self.context_id.0 }),
+                None,
+                timeout,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Starts this page's context from saved cookies and localStorage. Call it before the
+    /// first navigation.
+    pub async fn set_storage_state(&self, state: &StorageState, timeout: Duration) -> Result<()> {
+        if !state.cookies.is_empty() {
+            let cookies: Vec<Value> = state.cookies.iter().map(Cookie::to_cdp).collect();
+            self.browser
+                .call(
+                    "Storage.setCookies",
+                    json!({ "cookies": cookies, "browserContextId": self.context_id.0 }),
+                    None,
+                    timeout,
+                )
+                .await?;
+        }
+        if let Some(source) = state.restore_script() {
+            self.setups.lock().await.entry(self.context_id.0.clone()).or_default().init_scripts.push(source.clone());
+            self.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": source }), timeout).await?;
+        }
+        Ok(())
+    }
+
+    /// Every cookie in this page's context, plus localStorage of the page's current origin.
+    pub async fn storage_state(&self, timeout: Duration) -> Result<StorageState> {
+        let res = self
+            .browser
+            .call("Storage.getCookies", json!({ "browserContextId": self.context_id.0 }), None, timeout)
+            .await?;
+        let cookies = res["cookies"].as_array().map(|a| a.iter().filter_map(Cookie::from_cdp).collect()).unwrap_or_default();
+        let local: Option<OriginStorage> = serde_json::from_value(self.evaluate(LOCAL_STORAGE_JS, timeout).await?).unwrap_or(None);
+        let origins = local.into_iter().filter(|o| !o.local_storage.is_empty()).collect();
+        Ok(StorageState { cookies, origins })
+    }
+
+    /// Sends `calls` in one round trip (Chrome runs a session's commands in order) and
+    /// returns the first error.
+    async fn pipeline(&self, calls: Vec<(&'static str, Value)>, timeout: Duration) -> Result<()> {
+        let results = futures_util::future::join_all(calls.into_iter().map(|(m, p)| self.call(m, p, timeout))).await;
+        results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(Value::Null)).map(|_| ())
+    }
+
     pub async fn set_viewport(&self, width: u32, height: u32, timeout: Duration) -> Result<()> {
         self.call(
             "Emulation.setDeviceMetricsOverride",
@@ -595,10 +668,12 @@ impl CdpPage {
     }
 }
 
-/// Per-context setup, applied to each of the context's sessions as they attach:
-/// resource blocking and proxy credentials.
+/// Per-context setup, applied to each of the context's sessions as they attach (iframes in
+/// other processes, popups): resource blocking, proxy credentials, emulation, init scripts.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextSetup {
+    pub(crate) emulation: Option<Emulation>,
+    pub(crate) init_scripts: Vec<String>,
     pub(crate) types: Vec<ResourceType>,
     pub(crate) urls: Vec<String>,
     pub(crate) proxy_auth: Option<(String, String)>,
