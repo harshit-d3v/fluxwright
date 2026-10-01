@@ -85,7 +85,8 @@ try {
   const login = await browser.newPage()
   await login.goto(`${base}/login`)
   await login.evaluate(() => localStorage.setItem('token', 't1'))
-  const file = join(tmpdir(), `fluxwright-state-${process.pid}.json`)
+  // A folder that does not exist yet, as with Playwright's `.auth/state.json`.
+  const file = join(tmpdir(), `fluxwright-${process.pid}`, '.auth', 'state.json')
   const state = await login.storageState({ path: file })
   assert.ok(state.cookies.some((c) => c.name === 'sid' && c.value === 's3cret'))
   await login.close()
@@ -93,6 +94,32 @@ try {
   await again.goto(base)
   assert.equal(await again.evaluate(() => `${document.cookie}|${localStorage.getItem('token')}`), 'sid=s3cret|t1')
   await again.close()
+
+  // Locators, element screenshots, boxes, evaluate on an element, console and page errors.
+  const ui = await browser.newPage()
+  await ui.goto(
+    'data:text/html,<body style="margin:0"><label>Email <input id=e></label><input placeholder="Your city" id=c>' +
+      '<b data-testid=total style="position:absolute;left:10px;top:50px;width:40px;height:20px;background:red">7</b>' +
+      '<ul><li>Apple <button onclick="document.title=1">Buy</button></li><li>Pear <button onclick="document.title=2">Buy</button></li></ul>' +
+      '<script>console.log("ready", 1); setTimeout(() => { throw new TypeError("late") }, 0)</script>',
+  )
+  await ui.getByLabel('email').fill('a@b.c')
+  await ui.getByPlaceholder('city').fill('Pune')
+  assert.equal(await ui.evaluate(() => [e.value, c.value].join('|')), 'a@b.c|Pune')
+  assert.equal(await ui.getByTestId('total').textContent(), '7')
+  assert.match(await ui.locator('li').last().textContent(), /^Pear/)
+  await ui.getByRole('listitem').filter({ hasText: 'apple' }).getByRole('button').click()
+  assert.equal(await ui.title(), '1')
+  assert.deepEqual(await ui.getByTestId('total').boundingBox(), { x: 10, y: 50, width: 40, height: 20 })
+  assert.equal(await ui.locator('#e').evaluate((el, suffix) => el.value + suffix, '!'), 'a@b.c!')
+  const png = await ui.getByTestId('total').screenshot({ path: join(tmpdir(), `fluxwright-el-${process.pid}.png`) })
+  assert.deepEqual([png.readUInt32BE(16), png.readUInt32BE(20)], [40, 20]) // PNG width and height
+  for (let i = 0; i < 50 && (await ui.pageErrors()).length === 0; i++) await new Promise((r) => setTimeout(r, 20))
+  assert.ok((await ui.consoleMessages()).some((m) => m.type === 'log' && m.text === 'ready 1'))
+  const [late] = await ui.pageErrors()
+  assert.ok(late instanceof Error && late.name === 'TypeError' && late.message === 'late', String(late))
+  await assert.rejects(ui.goto('not a url'), /invalid URL: not a url/)
+  await ui.close()
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()

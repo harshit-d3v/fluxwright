@@ -1,7 +1,14 @@
 'use strict'
 
 const fs = require('node:fs/promises')
+const { dirname } = require('node:path')
 const { Script } = require('node:vm')
+
+// Like Playwright, `{ path }` creates missing folders (`.auth/state.json`).
+async function save(path, data) {
+  await fs.mkdir(dirname(path), { recursive: true })
+  await fs.writeFile(path, data)
+}
 
 // Playwright-style `page.evaluate(fn, arg)`. As in Playwright, the function is sent to the page as
 // source text, so it can use `arg` but not variables from Node. Strings run as expressions.
@@ -51,8 +58,32 @@ try {
   const storageState = native.Page.prototype.storageState
   native.Page.prototype.storageState = async function (options) {
     const state = await storageState.call(this)
-    if (options?.path) await fs.writeFile(options.path, JSON.stringify(state, null, 2))
+    if (options?.path) await save(options.path, JSON.stringify(state, null, 2))
     return state
+  }
+  // Playwright's locator.evaluate(fn, arg) calls fn(element, arg).
+  const evaluateOn = native.Locator.prototype.evaluate
+  native.Locator.prototype.evaluate = async function (pageFunction, arg) {
+    const source = typeof pageFunction === 'function' ? functionSource(pageFunction) : String(pageFunction)
+    return evaluateOn.call(this, source, arg)
+  }
+  // As Playwright's page.pageErrors(): Error objects.
+  const pageErrors = native.Page.prototype.pageErrors
+  native.Page.prototype.pageErrors = async function () {
+    return (await pageErrors.call(this)).map((e) => {
+      const err = new Error(e.message)
+      if (e.name) err.name = e.name
+      err.stack = e.stack
+      return err
+    })
+  }
+  for (const Class of [native.Page, native.Locator]) {
+    const screenshot = Class.prototype.screenshot
+    Class.prototype.screenshot = async function (options) {
+      const png = await screenshot.call(this, options)
+      if (options?.path) await save(options.path, png)
+      return png
+    }
   }
   module.exports = native
   module.exports.chromium = native.Chromium

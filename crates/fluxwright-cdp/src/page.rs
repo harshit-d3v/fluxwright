@@ -10,6 +10,7 @@ use tokio::time::sleep;
 use crate::browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId, TargetState};
 use crate::connection::{CdpEvent, Connection};
 use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
+use crate::log::PageLog;
 use crate::error::{Error, Result};
 
 /// When `goto` returns. Same meanings as Playwright's `waitUntil`.
@@ -32,9 +33,12 @@ const QUERY_JS: &str = include_str!("query.js");
 /// What an element call acts on: `query`, inside zero or more iframes (`frames`: one CSS
 /// selector per iframe to enter, outermost first).
 ///
-/// `query` engines, as in Playwright: CSS (plain or `css=`), `text=Sign in` (case-insensitive
-/// substring), `text="Sign in"` (exact), `role=button[name="Sign in"]` (case-insensitive
-/// substring of the accessible name; `[name="Sign in"s]` for exact).
+/// `query` engines, as in Playwright: CSS (plain or `css=`), `text=Sign in` or
+/// `text="Sign in"i` (case-insensitive substring), `text="Sign in"` (exact),
+/// `role=button[name="Sign in"]` (case-insensitive substring of the accessible name;
+/// `[name="Sign in"s]` for exact), `label=` and `placeholder=` (matched like `text=`), and
+/// `testid="id"` (`data-testid`). Parts joined by ` >> ` narrow the match: another selector
+/// searched inside each match, `nth=N` (negative counts from the end), or `has-text="..."i`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selector {
     pub frames: Vec<String>,
@@ -42,13 +46,41 @@ pub struct Selector {
 }
 
 impl Selector {
+    /// `engine="text"` (exact) or `engine="text"i` (case-insensitive substring). Quoted either
+    /// way, so a `>>` inside the text does not split the selector.
+    fn matching(engine: &str, text: &str, exact: bool) -> String {
+        format!("{engine}={}{}", serde_json::to_string(text).unwrap(), if exact { "" } else { "i" })
+    }
+
     /// The `text=` query behind `get_by_text`.
     pub fn text(text: &str, exact: bool) -> String {
-        if exact {
-            format!("text={}", serde_json::to_string(text).unwrap())
-        } else {
-            format!("text={text}")
-        }
+        Self::matching("text", text, exact)
+    }
+
+    /// The `label=` query behind `get_by_label`: `<label>`, `aria-labelledby` or `aria-label`.
+    pub fn label(text: &str, exact: bool) -> String {
+        Self::matching("label", text, exact)
+    }
+
+    /// The `placeholder=` query behind `get_by_placeholder`.
+    pub fn placeholder(text: &str, exact: bool) -> String {
+        Self::matching("placeholder", text, exact)
+    }
+
+    /// The `testid=` query behind `get_by_test_id`: `data-testid`, exact.
+    pub fn test_id(id: &str) -> String {
+        format!("testid={}", serde_json::to_string(id).unwrap())
+    }
+
+    /// The `has-text=` part behind `filter({ hasText })`: case-insensitive substring.
+    pub fn has_text(text: &str) -> String {
+        Self::matching("has-text", text, false)
+    }
+
+    /// This selector narrowed by `part`: another selector searched inside each match,
+    /// `nth=N`, or `has-text="..."i`.
+    pub fn then(&self, part: &str) -> Selector {
+        Selector { frames: self.frames.clone(), query: format!("{} >> {part}", self.query) }
     }
 
     /// The `role=` query behind `get_by_role`.
@@ -102,6 +134,19 @@ enum Wait {
     Attached,
     Visible,
     Click,
+    /// Visible, scrolled into view and unmoved across two polls: for element screenshots.
+    Box,
+    /// Attached; reports the box without scrolling, `null` when hidden.
+    Rect,
+}
+
+/// An element's box in CSS pixels, relative to the top-level page's viewport.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct BoundingBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// Where selector JS runs: a CDP session, an execution context in it (`None`: the main world),
@@ -183,7 +228,12 @@ impl CdpPage {
         let mut events = self.browser.subscribe_unbounded();
         let res = self
             .call("Page.navigate", json!({ "url": url }), timeout)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                // "Cannot navigate to invalid URL" names no URL by itself.
+                Error::Command { method, message } => Error::Command { method, message: format!("{message}: {url}") },
+                other => other,
+            })?;
         if let Some(err) = res["errorText"].as_str().filter(|s| !s.is_empty()) {
             return Err(Error::Command {
                 method: "Page.navigate".into(),
@@ -510,6 +560,95 @@ impl CdpPage {
             .map_err(|e| Error::Other(e.to_string()))
     }
 
+    /// The first match's box relative to the top-level viewport, without scrolling; `None`
+    /// when it is not visible. Waits until the element exists.
+    pub async fn bounding_box(&self, sel: &Selector, timeout: Duration) -> Result<Option<BoundingBox>> {
+        let (v, scope) = self.wait_element(sel, Wait::Rect, timeout).await?;
+        let b = &v["box"];
+        if b.is_null() {
+            return Ok(None);
+        }
+        let f = |k: &str| b[k].as_f64().unwrap_or(0.0);
+        Ok(Some(BoundingBox { x: f("x") + scope.dx, y: f("y") + scope.dy, width: f("width"), height: f("height") }))
+    }
+
+    /// Calls `function` (JavaScript source, such as `(el, arg) => el.value`) with the first match
+    /// and `arg`, in the page's own world as Playwright does, and returns its JSON result.
+    pub async fn evaluate_on(&self, sel: &Selector, function: &str, arg: Option<Value>, timeout: Duration) -> Result<Value> {
+        let (_, scope) = self.wait_element(sel, Wait::Attached, timeout).await?;
+        let found = self.eval_in(&scope, &engine_call(&sel.query, "element"), false, timeout).await?;
+        let Some(isolated) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
+            return Err(Error::NotActionable { selector: sel.to_string(), reason: "element went away".into() });
+        };
+        // The engine ran in an isolated world; hand the same node to the page's main world,
+        // where page scripts' globals live.
+        let call = |method: &'static str, params: Value| self.session_call(&scope.session, method, params, timeout);
+        let node = call("DOM.describeNode", json!({ "objectId": isolated })).await?;
+        let main = call("DOM.resolveNode", json!({ "backendNodeId": node["node"]["backendNodeId"] })).await?;
+        let element = main["object"]["objectId"].clone();
+        let mut args = vec![json!({ "objectId": element })];
+        if let Some(arg) = arg {
+            args.push(json!({ "value": arg }));
+        }
+        let res = call(
+            "Runtime.callFunctionOn",
+            json!({ "functionDeclaration": function, "objectId": element, "arguments": args,
+                    "returnByValue": true, "awaitPromise": true }),
+        )
+        .await;
+        for id in [json!(isolated), element] {
+            let _ = call("Runtime.releaseObject", json!({ "objectId": id })).await;
+        }
+        let res = res?;
+        match js_error(&res) {
+            Some(e) => Err(e),
+            None => Ok(res["result"]["value"].clone()),
+        }
+    }
+
+    /// Starts recording console messages and uncaught errors from this page, its popups and its
+    /// iframes. Recording stops when the returned task is aborted.
+    pub fn collect_logs(&self) -> (Arc<std::sync::Mutex<PageLog>>, tokio::task::JoinHandle<()>) {
+        let log = Arc::new(std::sync::Mutex::new(PageLog::default()));
+        let task = tokio::spawn(crate::log::collect(
+            self.browser.subscribe_unbounded(),
+            self.session_id.0.clone(),
+            self.context_id.0.clone(),
+            log.clone(),
+        ));
+        (log, task)
+    }
+
+    /// PNG of the first match, once it is visible and still. Elements in iframes, below the
+    /// fold, or taller than the viewport work too.
+    pub async fn element_screenshot(&self, sel: &Selector, timeout: Duration) -> Result<Vec<u8>> {
+        let (b, _) = self.wait_element(sel, Wait::Box, timeout).await?;
+        // The box is in viewport coordinates; the clip is in document coordinates.
+        let m = self.call("Page.getLayoutMetrics", json!({}), timeout).await?;
+        let vp = if m["cssLayoutViewport"].is_object() { &m["cssLayoutViewport"] } else { &m["layoutViewport"] };
+        let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(0.0);
+        let res = self
+            .call(
+                "Page.captureScreenshot",
+                json!({
+                    "format": "png",
+                    "captureBeyondViewport": true,
+                    "clip": {
+                        "x": f(&b, "x") + f(vp, "pageX"),
+                        "y": f(&b, "y") + f(vp, "pageY"),
+                        "width": f(&b, "width"),
+                        "height": f(&b, "height"),
+                        "scale": 1
+                    }
+                }),
+                timeout,
+            )
+            .await?;
+        let b64 = res["data"].as_str().ok_or_else(|| Error::Other("screenshot: no data".into()))?;
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| Error::Other(e.to_string()))
+    }
+
     /// Waits until the element is visible (Playwright's default `waitForSelector` state):
     /// non-empty box, not `visibility: hidden`. Opacity 0 counts as visible, as in Playwright.
     pub async fn wait_for_selector(&self, sel: &Selector, timeout: Duration) -> Result<Value> {
@@ -528,11 +667,14 @@ impl CdpPage {
     async fn wait_element(&self, sel: &Selector, wait: Wait, timeout: Duration) -> Result<(Value, Scope)> {
         let start = Instant::now();
         let mut last_pos: Option<(f64, f64)> = None;
+        let mut last_box: Option<[f64; 4]> = None;
         let mut last_reason = String::from("never checked");
         let mode = match wait {
             Wait::Attached => "attached",
             Wait::Visible => "visible",
             Wait::Click => "click",
+            Wait::Box => "box",
+            Wait::Rect => "rect",
         };
         let expr = engine_call(&sel.query, mode);
         loop {
@@ -545,7 +687,8 @@ impl CdpPage {
             if self.browser.is_dead() {
                 return Err(Error::BrowserDead { pid: self.browser_pid });
             }
-            let (scope, hops) = match self.scope(&sel.frames, wait == Wait::Click, timeout).await? {
+            let scroll = matches!(wait, Wait::Click | Wait::Box);
+            let (scope, hops) = match self.scope(&sel.frames, scroll, timeout).await? {
                 Ok(found) => found,
                 Err(reason) => {
                     last_reason = reason;
@@ -563,6 +706,17 @@ impl CdpPage {
                 }
             };
             if v["ok"].as_bool() == Some(true) {
+                if wait == Wait::Box {
+                    let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
+                    let rect = [f("x") + scope.dx, f("y") + scope.dy, f("width"), f("height")];
+                    if last_box.is_some_and(|b| b.iter().zip(rect).all(|(a, b)| (a - b).abs() < 1.0)) {
+                        return Ok((json!({ "x": rect[0], "y": rect[1], "width": rect[2], "height": rect[3] }), scope));
+                    }
+                    last_box = Some(rect);
+                    last_reason = "still moving".into();
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
                 if wait != Wait::Click {
                     return Ok((v, scope));
                 }

@@ -12,6 +12,28 @@ export interface GetByRoleOptions {
   name?: string
   exact?: boolean
 }
+export interface FilterOptions {
+  /** Case-insensitive substring of the element's text. */
+  hasText?: string
+}
+/** CSS pixels, relative to the top-level page's viewport. */
+export interface BoundingBox {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+export interface ConsoleMessage {
+  /** `log`, `error`, `warning`, `info`, `debug`, ... */
+  type: string
+  text: string
+}
+/** An exception nothing caught; `page.pageErrors()` turns these into `Error` objects. */
+export interface PageErrorInfo {
+  name: string
+  message: string
+  stack: string
+}
 export interface LaunchOptions {
   maxBrowsers?: number
   /** Browser binary. Default: chrome-headless-shell when headless and installed, else Chrome. */
@@ -69,6 +91,10 @@ export interface Cookie {
   httpOnly: boolean
   secure: boolean
   sameSite: 'Strict' | 'Lax' | 'None'
+  /** Top-level site of a partitioned (CHIPS) cookie. */
+  partitionKey?: string
+  /** The rest of Chrome's partition key, under Playwright's name for it. */
+  _crHasCrossSiteAncestor?: boolean
 }
 export interface OriginStorage {
   origin: string
@@ -114,7 +140,14 @@ export declare class Page {
   locator(selector: string): Locator
   getByText(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
+  getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByTestId(testId: string): Locator
   frameLocator(selector: string): FrameLocator
+  /** Console messages so far from this page, its popups and its iframes (the last 1000). */
+  consoleMessages(): Promise<Array<ConsoleMessage>>
+  /** Exceptions nothing caught so far (the last 1000). */
+  pageErrors(): Promise<Array<PageErrorInfo>>
   close(): Promise<void>
 }
 /** Lazy, like Playwright's: every action runs the query again. */
@@ -124,12 +157,39 @@ export declare class Locator {
   /** Waits until visible. */
   waitFor(): Promise<void>
   textContent(): Promise<string | null>
+  /** The `index`th match (0-based; negative counts from the end). */
+  nth(index: number): Locator
+  first(): Locator
+  last(): Locator
+  /** Keeps matches containing `hasText` (case-insensitive substring), as in Playwright. */
+  filter(options: FilterOptions): Locator
+  /** Searches inside this locator's matches. */
+  locator(selector: string): Locator
+  getByText(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
+  getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByTestId(testId: string): Locator
+  /** PNG of the element, once it is visible and still. */
+  screenshot(): Promise<Buffer>
+  /** The element's box relative to the viewport, without scrolling; null when it is not visible. */
+  boundingBox(): Promise<BoundingBox | null>
+  /**
+   * `function` is JavaScript source taking the element and `arg`; `addon.js` passes a
+   * function's source.
+   */
+  evaluate(functionSource: string, arg?: any | undefined | null): Promise<any>
 }
 /** An iframe, same- or cross-origin, to find elements in. */
 export declare class FrameLocator {
   locator(selector: string): Locator
   getByText(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
+  /** `<label>`, `aria-labelledby` or `aria-label`; case-insensitive substring unless `exact`. */
+  getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
+  /** `data-testid`, exact. */
+  getByTestId(testId: string): Locator
   /** A nested iframe inside this one. */
   frameLocator(selector: string): FrameLocator
 }

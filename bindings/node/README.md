@@ -45,10 +45,12 @@ await browser.close();
 | `page.goto(url, { waitUntil? })` | Navigate. `waitUntil`: `load` (default), `domcontentloaded`, `networkidle`, `commit`. Event-driven, like Playwright |
 | `page.title()` / `page.content()` | Read |
 | `page.click(selector)` / `page.fill(selector, value)` | Scrolls into view, waits until enabled, stable, and not covered. Selector: CSS, `text=Foo`, `text="Exact"`, `role=button[name="Save"]` |
-| `page.getByRole(role, { name?, exact? })` / `page.getByText(text, { exact? })` / `page.locator(selector)` | `Locator` with `click()`, `fill(v)`, `waitFor()`, `textContent()`. Implicit ARIA roles and accessible names; hidden elements never match a role |
+| `page.getByRole(role, { name?, exact? })` / `page.getByText(text, { exact? })` / `page.getByLabel(text, { exact? })` / `page.getByPlaceholder(text, { exact? })` / `page.getByTestId(id)` / `page.locator(selector)` | `Locator` with `click()`, `fill(v)`, `waitFor()`, `textContent()`, `boundingBox()`, `screenshot({ path? })`, and `evaluate((el, arg) => …, arg?)` in the page's own world. Implicit ARIA roles and accessible names; hidden elements never match a role |
+| `locator.nth(i)` / `first()` / `last()` / `filter({ hasText })` / `locator.getByRole(...)` and the other getBy… | Narrow a locator: by position (negative counts from the end), by contained text (case-insensitive), or by searching inside its matches |
 | `page.frameLocator(iframeSelector)` | Same locators inside an iframe, same- or cross-origin; nest with `.frameLocator()` |
 | `page.evaluate(fn, arg?)` / `page.evaluate(expression)` | Runs a function with a JSON-serializable `arg`, or a string expression, in the page. Awaits promises and returns JSON. As in Playwright, the function is sent as source text, so it can't use variables from Node. A thrown JS error rejects with its message and stack |
-| `page.screenshot({ fullPage? })` | PNG `Buffer` |
+| `page.screenshot({ fullPage?, path? })` | PNG `Buffer`, also written to `path` |
+| `page.consoleMessages()` / `page.pageErrors()` | What the page, its popups and iframes logged (`{ type, text }`), and the exceptions nothing caught (`Error` objects), the last 1000 of each. Fail a job with `assert.deepEqual(await page.pageErrors(), [])` |
 | `page.setViewportSize({ width, height })` | CSS-pixel viewport for this page |
 | `page.waitForSelector(selector)` | Waits until visible (Playwright's default state) |
 | `page.close()` / `browser.close()` | Dispose context / shut down |

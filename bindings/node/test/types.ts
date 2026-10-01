@@ -19,5 +19,13 @@ export async function typed(): Promise<void> {
   await browser.newPage({ storageState: 'state.json', geolocation: { latitude: 1, longitude: 2 } })
   // @ts-expect-error not a color scheme
   await browser.newPage({ colorScheme: 'purple' })
+
+  const item = page.getByRole('listitem').filter({ hasText: 'x' }).nth(1).getByTestId('price')
+  const box: { x: number; width: number } | null = await item.boundingBox()
+  const length: number = await item.evaluate((el: { textContent: string }, n: number) => el.textContent.length + n, 1)
+  const shot: Buffer = await page.getByLabel('Email').screenshot({ path: 'el.png' })
+  const errors: Error[] = await page.pageErrors()
+  const logs: { type: string; text: string }[] = await page.consoleMessages()
+  void [box, length, shot, errors, logs, page.getByPlaceholder('city').first().last(), await page.screenshot({ path: 'p.png' })]
   await browser.close()
 }

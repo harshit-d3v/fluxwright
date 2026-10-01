@@ -35,10 +35,11 @@ npx @puppeteer/browsers install chrome-headless-shell@stable
 | Area | API |
 |---|---|
 | Navigate | `goto(url, { waitUntil })` with `load` (default), `domcontentloaded`, `networkidle` or `commit`, event-driven like Playwright |
-| Find | `getByRole(role, { name })`, `getByText(text)`, `locator(css \| "text=…" \| "role=…")`, `frameLocator(iframe)` for same- and cross-origin iframes |
+| Find | `getByRole(role, { name })`, `getByText`, `getByLabel`, `getByPlaceholder`, `getByTestId`, `locator(css \| "text=…" \| "role=…")`, `frameLocator(iframe)` for same- and cross-origin iframes. Narrow with `nth(i)`, `first()`, `last()`, `filter({ hasText })` and chained getBy… calls |
 | Act | `click()` and `fill()` wait until the element is visible, enabled, stable and not covered; `waitFor()`, `waitForSelector()` |
-| Read | `title()`, `content()`, `textContent()`, `evaluate(fn, arg)` or `evaluate("expression")` |
-| Capture | `screenshot({ fullPage })`, `setViewportSize({ width, height })` |
+| Read | `title()`, `content()`, `textContent()`, `evaluate(fn, arg)` or `evaluate("expression")`, `locator.evaluate((el, arg) => …)`, `locator.boundingBox()` |
+| Capture | `screenshot({ fullPage, path })`, `locator.screenshot({ path })` (also inside scrolling containers and iframes), `setViewportSize({ width, height })` |
+| Errors | `consoleMessages()` and `pageErrors()` from the page, its popups and iframes, so a job can fail on JavaScript errors |
 | Emulate | `newPage({ userAgent, locale, timezoneId, geolocation, permissions, viewport, deviceScaleFactor, colorScheme })`, Playwright's option names |
 | Sessions | `page.storageState({ path })` saves cookies and localStorage; `newPage({ storageState })` starts from them, so you log in once. Playwright's file format |
 | Network | a proxy per page, with a username and password; blocking by resource type or URL (Rust `JobOptions`) |

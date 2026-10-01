@@ -6,8 +6,8 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 
 - `page.route` to fulfill or modify requests (today: blocking by resource type or URL)
 - Mobile and touch emulation (`isMobile`, `hasTouch`), `emulateMedia` after the page opens
-- `locator.screenshot()`
-- `getByLabel`, `getByPlaceholder`, `getByTestId`, `nth`, `filter`
+- `page.on('console' | 'pageerror')` callbacks (today: `consoleMessages()` and `pageErrors()`)
+- `getByAltText`, `getByTitle`, `filter({ has })`, strict mode
 - Downloads
 - `connectOverCDP`, to use browsers you already run
 - Python bindings

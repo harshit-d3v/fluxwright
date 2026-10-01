@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fluxwright_cdp::{CdpBrowser, CdpPage, ContextId, Proxy, ResourceType, Selector};
+use fluxwright_cdp::{
+    BoundingBox, CdpBrowser, CdpPage, ConsoleMessage, ContextId, PageError, PageLog, Proxy, ResourceType, Selector,
+};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -64,6 +66,8 @@ pub struct PageLease {
     /// Where `Drop` runs its cleanup: a lease can be dropped outside any runtime (Node's garbage
     /// collector does this), and `tokio::spawn` panics there.
     runtime: tokio::runtime::Handle,
+    log: Arc<std::sync::Mutex<PageLog>>,
+    log_task: tokio::task::JoinHandle<()>,
 }
 
 impl Engine {
@@ -530,6 +534,7 @@ impl Inner {
             "lease granted"
         );
 
+        let (log, log_task) = page.collect_logs();
         Ok(PageLease {
             engine: self.clone(),
             browser,
@@ -538,6 +543,8 @@ impl Inner {
             lease_id: Uuid::new_v4(),
             released: false,
             runtime: tokio::runtime::Handle::current(),
+            log,
+            log_task,
         })
     }
 
@@ -797,6 +804,52 @@ impl PageLease {
         self.locator(Selector::role(role, name, exact))
     }
 
+    /// Like Playwright's `getByLabel`: the text of a `<label>`, `aria-labelledby` or `aria-label`.
+    pub fn get_by_label(&self, text: &str, exact: bool) -> Locator<'_> {
+        self.locator(Selector::label(text, exact))
+    }
+
+    pub fn get_by_placeholder(&self, text: &str, exact: bool) -> Locator<'_> {
+        self.locator(Selector::placeholder(text, exact))
+    }
+
+    /// `data-testid`, exact.
+    pub fn get_by_test_id(&self, id: &str) -> Locator<'_> {
+        self.locator(Selector::test_id(id))
+    }
+
+    /// Console messages so far from this page, its popups and its iframes (the last 1000).
+    pub fn console_messages(&self) -> Vec<ConsoleMessage> {
+        self.log.lock().unwrap().console.iter().cloned().collect()
+    }
+
+    /// Exceptions nothing caught so far (the last 1000). Fail a job on them with
+    /// `assert!(page.page_errors().is_empty())`.
+    pub fn page_errors(&self) -> Vec<PageError> {
+        self.log.lock().unwrap().errors.iter().cloned().collect()
+    }
+
+    /// The first match's box relative to the viewport, without scrolling; `None` when hidden.
+    pub async fn bounding_box(&self, selector: impl Into<Selector>) -> Result<Option<BoundingBox>> {
+        Ok(self.page.bounding_box(&selector.into(), self.engine.config.action_timeout).await?)
+    }
+
+    /// Calls `function` (JavaScript source taking the element and `arg`) on the first match.
+    pub async fn evaluate_on(&self, selector: impl Into<Selector>, function: &str, arg: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        Ok(self
+            .page
+            .evaluate_on(&selector.into(), function, arg, self.engine.config.action_timeout)
+            .await?)
+    }
+
+    /// PNG of the first match, once it is visible and still.
+    pub async fn element_screenshot(&self, selector: impl Into<Selector>) -> Result<Vec<u8>> {
+        Ok(self
+            .page
+            .element_screenshot(&selector.into(), self.engine.config.action_timeout)
+            .await?)
+    }
+
     /// Enters an iframe (same- or cross-origin) by CSS selector.
     pub fn frame_locator(&self, iframe: &str) -> FrameLocator<'_> {
         FrameLocator {
@@ -811,6 +864,7 @@ impl PageLease {
     }
 
     async fn release(&mut self, completed: bool) {
+        self.log_task.abort();
         if self.released {
             return;
         }
@@ -822,6 +876,7 @@ impl PageLease {
 
 impl Drop for PageLease {
     fn drop(&mut self) {
+        self.log_task.abort();
         if self.released {
             return;
         }
@@ -841,9 +896,70 @@ pub struct Locator<'a> {
     selector: Selector,
 }
 
-impl Locator<'_> {
+impl<'a> Locator<'a> {
     pub fn selector(&self) -> &Selector {
         &self.selector
+    }
+
+    fn then(&self, part: &str) -> Locator<'a> {
+        Locator { lease: self.lease, selector: self.selector.then(part) }
+    }
+
+    /// The `n`th match (0-based; negative counts from the end).
+    pub fn nth(&self, n: i32) -> Locator<'a> {
+        self.then(&format!("nth={n}"))
+    }
+
+    pub fn first(&self) -> Locator<'a> {
+        self.nth(0)
+    }
+
+    pub fn last(&self) -> Locator<'a> {
+        self.nth(-1)
+    }
+
+    /// Like Playwright's `filter({ hasText })`: keeps matches containing `text`, case-insensitive.
+    pub fn filter_has_text(&self, text: &str) -> Locator<'a> {
+        self.then(&Selector::has_text(text))
+    }
+
+    /// Searches inside this locator's matches.
+    pub fn locator(&self, query: &str) -> Locator<'a> {
+        self.then(query)
+    }
+
+    pub fn get_by_text(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.then(&Selector::text(text, exact))
+    }
+
+    pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'a> {
+        self.then(&Selector::role(role, name, exact))
+    }
+
+    pub fn get_by_label(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.then(&Selector::label(text, exact))
+    }
+
+    pub fn get_by_placeholder(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.then(&Selector::placeholder(text, exact))
+    }
+
+    pub fn get_by_test_id(&self, id: &str) -> Locator<'a> {
+        self.then(&Selector::test_id(id))
+    }
+
+    /// PNG of the element, once it is visible and still.
+    pub async fn screenshot(&self) -> Result<Vec<u8>> {
+        self.lease.element_screenshot(&self.selector).await
+    }
+
+    pub async fn bounding_box(&self) -> Result<Option<BoundingBox>> {
+        self.lease.bounding_box(&self.selector).await
+    }
+
+    /// `function` is JavaScript source taking the element and `arg`, e.g. `(el, n) => el.value.length > n`.
+    pub async fn evaluate(&self, function: &str, arg: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        self.lease.evaluate_on(&self.selector, function, arg).await
     }
 
     pub async fn click(&self) -> Result<()> {
@@ -887,6 +1003,18 @@ impl<'a> FrameLocator<'a> {
 
     pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'a> {
         self.locator(Selector::role(role, name, exact))
+    }
+
+    pub fn get_by_label(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.locator(Selector::label(text, exact))
+    }
+
+    pub fn get_by_placeholder(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.locator(Selector::placeholder(text, exact))
+    }
+
+    pub fn get_by_test_id(&self, id: &str) -> Locator<'a> {
+        self.locator(Selector::test_id(id))
     }
 
     /// A nested iframe inside this one.

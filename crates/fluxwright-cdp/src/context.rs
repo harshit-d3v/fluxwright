@@ -156,6 +156,12 @@ pub struct Cookie {
     pub secure: bool,
     /// `Strict`, `Lax` or `None`.
     pub same_site: String,
+    /// Top-level site of a partitioned (CHIPS) cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<String>,
+    /// The rest of Chrome's partition key, under Playwright's name for it.
+    #[serde(rename = "_crHasCrossSiteAncestor", default, skip_serializing_if = "Option::is_none")]
+    pub cross_site_ancestor: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,6 +189,9 @@ impl Cookie {
             secure: c["secure"].as_bool().unwrap_or(false),
             // Chrome leaves it out when the site did not set it; Lax is how Chrome treats that.
             same_site: c["sameSite"].as_str().unwrap_or("Lax").into(),
+            // An object in current Chrome, a plain site in older versions.
+            partition_key: c["partitionKey"]["topLevelSite"].as_str().or(c["partitionKey"].as_str()).map(str::to_owned),
+            cross_site_ancestor: c["partitionKey"]["hasCrossSiteAncestor"].as_bool(),
         })
     }
 
@@ -198,6 +207,12 @@ impl Cookie {
         });
         if self.expires >= 0.0 {
             c["expires"] = json!(self.expires);
+        }
+        if let Some(site) = &self.partition_key {
+            c["partitionKey"] = json!({
+                "topLevelSite": site,
+                "hasCrossSiteAncestor": self.cross_site_ancestor.unwrap_or(false)
+            });
         }
         c
     }
@@ -245,6 +260,21 @@ mod tests {
         let c = Cookie::from_cdp(&cdp).unwrap();
         assert_eq!((c.expires, c.same_site.as_str(), c.http_only), (-1.0, "Lax", true));
         assert!(c.to_cdp().get("expires").is_none(), "a session cookie must not get an expiry");
+        assert_eq!(c.partition_key, None);
+        assert!(c.to_cdp().get("partitionKey").is_none());
+    }
+
+    #[test]
+    fn partitioned_cookies_keep_their_partition() {
+        let key = json!({ "topLevelSite": "https://shop.test", "hasCrossSiteAncestor": true });
+        let cdp = json!({ "name": "p", "value": "1", "domain": "w.test", "path": "/", "expires": 9e9,
+            "secure": true, "sameSite": "None", "partitionKey": key });
+        let c = Cookie::from_cdp(&cdp).unwrap();
+        assert_eq!(c.to_cdp()["partitionKey"], key);
+        // Playwright's field names, in and out.
+        let file = serde_json::to_value(&c).unwrap();
+        assert_eq!((&file["partitionKey"], &file["_crHasCrossSiteAncestor"]), (&json!("https://shop.test"), &json!(true)));
+        assert_eq!(serde_json::from_value::<Cookie>(file).unwrap(), c);
     }
 
     #[test]
