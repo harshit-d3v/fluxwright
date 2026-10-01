@@ -112,6 +112,167 @@ async fn emulation_reaches_cross_site_iframes() {
     assert_eq!(seen.as_deref(), Some("FluxTest/1.0|de-DE|Asia/Tokyo|true"));
 }
 
+/// getByLabel, getByPlaceholder, getByTestId, and narrowing with nth, filter and chained locators.
+#[tokio::test(flavor = "multi_thread")]
+async fn more_locators_and_chaining() {
+    let eng = engine(1, 1).await;
+    let page = eng.acquire().await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<title>t</title>",
+        "<label for=e>Email address</label><input id=e>",
+        "<label>Password <input type=password id=p></label>",
+        "<span id=lbl>Search terms</span><input id=s aria-labelledby=lbl>",
+        "<input id=n aria-label=Nickname><input id=c placeholder='Your city'>",
+        "<button data-testid=save-btn>Save</button>",
+        "<ul><li>Apple <button onclick=\"document.title='Apple'\">Buy</button></li>",
+        "<li>Banana <button onclick=\"document.title='Banana'\">Buy</button></li>",
+        "<li>Cherry <button onclick=\"document.title='Cherry'\">Buy</button></li></ul>",
+        "<p>a &gt;&gt; b</p>",
+    ))
+    .await
+    .unwrap();
+
+    page.get_by_label("email ADDRESS", false).fill("e").await.unwrap();
+    page.get_by_label("Password", true).fill("p").await.unwrap();
+    page.get_by_label("search terms", false).fill("s").await.unwrap();
+    page.get_by_label("Nickname", true).fill("n").await.unwrap();
+    page.get_by_placeholder("city", false).fill("c").await.unwrap();
+    let values = page.evaluate("['e','p','s','n','c'].map(id => document.getElementById(id).value).join('')").await.unwrap();
+    assert_eq!(values, json!("epsnc"));
+    assert_eq!(page.get_by_test_id("save-btn").text_content().await.unwrap().as_deref(), Some("Save"));
+
+    let items = page.locator("li");
+    let first_word = |t: Option<String>| t.unwrap().split_whitespace().next().unwrap().to_string();
+    assert_eq!(first_word(items.first().text_content().await.unwrap()), "Apple");
+    assert_eq!(first_word(items.nth(1).text_content().await.unwrap()), "Banana");
+    assert_eq!(first_word(items.nth(-2).text_content().await.unwrap()), "Banana");
+    assert_eq!(first_word(items.last().text_content().await.unwrap()), "Cherry");
+    page.get_by_role("listitem", None, false)
+        .filter_has_text("cherry")
+        .get_by_role("button", Some("Buy"), true)
+        .click()
+        .await
+        .unwrap();
+    assert_eq!(page.title().await.unwrap(), "Cherry");
+    // Quoted, so the >> in the text does not split the selector.
+    assert_eq!(page.get_by_text("a >> b", true).text_content().await.unwrap().as_deref(), Some("a >> b"));
+    let err = page.locator("li >> nth=x").text_content().await.unwrap_err().to_string();
+    assert!(err.contains("nth= expects an integer"), "{err}");
+}
+
+/// The page decodes each PNG itself: exact size, and the element's own colour at its edges,
+/// so an offset of even a pixel or two shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn element_screenshots() {
+    use base64::Engine;
+
+    let eng = engine(1, 1).await;
+    let page = eng.acquire_job(&JobOptions::default().viewport(800, 600)).await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<body style='margin:0;background:%2300f'>",
+        "<div style='height:1500px'></div>",
+        "<div id=red style='width:50px;height:30px;margin-left:70px;background:%23f00'></div>",
+        "<div id=tall style='width:20px;height:1000px;margin-left:5px;background:%230f0'></div>",
+        "<div style='height:1500px'></div>",
+        "<iframe style='width:300px;height:200px;border:0;margin-left:33px' srcdoc=\"<body style='margin:0;background:%23000'>",
+        "<div style='height:900px'></div><div id=yellow style='width:40px;height:20px;margin-left:9px;background:%23ff0'></div>\"></iframe>",
+    ))
+    .await
+    .unwrap();
+
+    let check = |png: Vec<u8>| {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        format!(
+            r#"(async () => {{
+                const img = new Image(); img.src = 'data:image/png;base64,{b64}'; await img.decode();
+                const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+                const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+                const px = (x, y) => [...g.getImageData(x, y, 1, 1).data.slice(0, 3)].join(' ');
+                return [img.width, img.height, px(0, 0), px(img.width - 1, img.height - 1)].join('|');
+            }})()"#
+        )
+    };
+    let red = page.locator("#red").screenshot().await.unwrap();
+    assert_eq!(page.evaluate(&check(red)).await.unwrap(), json!("50|30|255 0 0|255 0 0"));
+    let tall = page.locator("#tall").screenshot().await.unwrap();
+    assert_eq!(page.evaluate(&check(tall)).await.unwrap(), json!("20|1000|0 255 0|0 255 0"));
+    let yellow = page.frame_locator("iframe").locator("#yellow").screenshot().await.unwrap();
+    assert_eq!(page.evaluate(&check(yellow)).await.unwrap(), json!("40|20|255 255 0|255 255 0"));
+}
+
+/// boundingBox needs no scrolling and is relative to the top-level viewport; evaluate runs in
+/// the page's own world, so page globals are there.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounding_box_and_element_evaluate() {
+    let eng = engine(1, 1).await;
+    let page = eng.acquire_job(&JobOptions::default().viewport(800, 600)).await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<body style='margin:0'><script>window.secret = 42</script>",
+        "<input id=q value=hello style='position:absolute;left:30px;top:40px;width:100px;height:20px;border:0;padding:0'>",
+        "<p id=gone style='display:none'>x</p>",
+        "<iframe style='position:absolute;left:200px;top:100px;border:0' srcdoc=\"<body style='margin:0'>",
+        "<div id=inner style='margin:7px;width:10px;height:10px'></div>\"></iframe>",
+    ))
+    .await
+    .unwrap();
+
+    let b = page.locator("#q").bounding_box().await.unwrap().unwrap();
+    assert_eq!((b.x, b.y, b.width, b.height), (30.0, 40.0, 100.0, 20.0));
+    assert!(page.locator("#gone").bounding_box().await.unwrap().is_none());
+    let inner = page.frame_locator("iframe").locator("#inner").bounding_box().await.unwrap().unwrap();
+    assert_eq!((inner.x, inner.y, inner.width), (207.0, 107.0, 10.0));
+
+    let q = page.locator("#q");
+    assert_eq!(q.evaluate("(el, n) => el.value.length + n", Some(json!(10))).await.unwrap(), json!(15));
+    assert_eq!(q.evaluate("el => window.secret", None).await.unwrap(), json!(42));
+    assert_eq!(q.evaluate("async el => el.id.toUpperCase()", None).await.unwrap(), json!("Q"));
+    let err = q.evaluate("el => { throw new Error('nope') }", None).await.unwrap_err().to_string();
+    assert!(err.contains("nope"), "{err}");
+}
+
+/// Console calls and uncaught errors are kept for the job to check, including those from an
+/// iframe in another process; a bad URL names itself in the error.
+#[tokio::test(flavor = "multi_thread")]
+async fn console_messages_and_page_errors() {
+    use axum::{response::Html, routing::get, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let top = format!(
+        r#"<!doctype html><script>console.log('hello', 3, null); console.error('bad');
+        setTimeout(() => null.boom, 0); window.open('/popup')</script>
+        <iframe src="http://localhost:{port}/frame"></iframe>"#
+    );
+    let app = Router::new()
+        .route("/", get(move || async move { Html(top) }))
+        .route("/frame", get(|| async { Html("<script>console.warn('from the iframe')</script>") }))
+        .route("/popup", get(|| async { Html("<script>console.info('from the popup')</script>") }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = engine(1, 1).await;
+    let page = eng.acquire().await.unwrap();
+    page.goto(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+    // Events arrive on their own schedule; give them a moment.
+    for _ in 0..100 {
+        if page.console_messages().len() >= 4 && !page.page_errors().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let console: Vec<(String, String)> = page.console_messages().into_iter().map(|m| (m.kind, m.text)).collect();
+    let wanted = [("log", "hello 3 null"), ("error", "bad"), ("warning", "from the iframe"), ("info", "from the popup")];
+    for want in wanted {
+        assert!(console.contains(&(want.0.into(), want.1.into())), "{want:?} not in {console:?}");
+    }
+    let errors = page.page_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].name, "TypeError");
+    assert!(errors[0].message.contains("null"), "{:?}", errors[0]);
+
+    let err = page.goto("not a url").await.unwrap_err().to_string();
+    assert!(err.contains("Cannot navigate to invalid URL: not a url"), "{err}");
+}
+
 /// Log in once, start the next job from the saved state, and the job after that from nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn storage_state_round_trip() {
@@ -119,10 +280,16 @@ async fn storage_state_round_trip() {
     let eng = engine(1, 2).await;
     let first = eng.acquire().await.unwrap();
     first.goto(&format!("{}/set-cookie", srv.base_url)).await.unwrap();
-    first.evaluate("localStorage.setItem('token', 'abc')").await.unwrap();
+    // A partitioned (CHIPS) cookie too: it must come back in the same partition.
+    first
+        .evaluate("localStorage.setItem('token', 'abc'); document.cookie = 'chip=1; Secure; Partitioned; SameSite=None; Path=/'")
+        .await
+        .unwrap();
     let state = first.storage_state().await.unwrap();
     drop(first);
     assert!(state.cookies.iter().any(|c| c.name == "fw" && c.value == "secret"), "{state:?}");
+    let chip = state.cookies.iter().find(|c| c.name == "chip").expect("partitioned cookie saved");
+    assert!(chip.partition_key.is_some(), "{chip:?}");
     assert_eq!(state.origins.len(), 1);
     assert_eq!(state.origins[0].origin, srv.base_url);
 
@@ -130,8 +297,12 @@ async fn storage_state_round_trip() {
     let state: StorageState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
     let restored = eng.acquire_job(&JobOptions::default().storage_state(state)).await.unwrap();
     restored.goto(&format!("{}/show-cookie", srv.base_url)).await.unwrap();
-    let both = "[document.cookie, localStorage.getItem('token')].join('|')";
-    assert_eq!(restored.evaluate(both).await.unwrap(), json!("fw=secret|abc"));
+    let both = "[document.cookie.split('; ').sort().join(';'), localStorage.getItem('token')].join('|')";
+    assert_eq!(restored.evaluate(both).await.unwrap(), json!("chip=1;fw=secret|abc"));
+    // Visible either way; only a second export shows it went back into its partition.
+    let again = restored.storage_state().await.unwrap();
+    let chip_again = again.cookies.iter().find(|c| c.name == "chip").expect("restored");
+    assert_eq!(chip_again.partition_key, chip.partition_key);
     // The page's own change survives a reload: the saved value is restored only once.
     restored.evaluate("localStorage.removeItem('token')").await.unwrap();
     restored.goto(&format!("{}/show-cookie", srv.base_url)).await.unwrap();

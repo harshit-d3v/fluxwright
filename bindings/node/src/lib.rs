@@ -89,6 +89,133 @@ impl Locator {
         let sel = self.selector.clone();
         with_page(self.lease.clone(), move |p| Box::pin(async move { p.text_content(&sel).await })).await
     }
+
+    /// The `index`th match (0-based; negative counts from the end).
+    #[napi]
+    pub fn nth(&self, index: i32) -> Locator {
+        self.then(format!("nth={index}"))
+    }
+
+    #[napi]
+    pub fn first(&self) -> Locator {
+        self.nth(0)
+    }
+
+    #[napi]
+    pub fn last(&self) -> Locator {
+        self.nth(-1)
+    }
+
+    /// Keeps matches containing `hasText` (case-insensitive substring), as in Playwright.
+    #[napi]
+    pub fn filter(&self, options: FilterOptions) -> Locator {
+        match options.has_text {
+            Some(text) => self.then(fluxwright::Selector::has_text(&text)),
+            None => self.then_selector(self.selector.clone()),
+        }
+    }
+
+    /// Searches inside this locator's matches.
+    #[napi]
+    pub fn locator(&self, selector: String) -> Locator {
+        self.then(selector)
+    }
+
+    #[napi]
+    pub fn get_by_text(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.then(fluxwright::Selector::text(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    #[napi]
+    pub fn get_by_role(&self, role: String, options: Option<GetByRoleOptions>) -> Locator {
+        let (name, exact) = options.map(|o| (o.name, o.exact.unwrap_or(false))).unwrap_or_default();
+        self.then(fluxwright::Selector::role(&role, name.as_deref(), exact))
+    }
+
+    #[napi]
+    pub fn get_by_label(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.then(fluxwright::Selector::label(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    #[napi]
+    pub fn get_by_placeholder(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.then(fluxwright::Selector::placeholder(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    #[napi]
+    pub fn get_by_test_id(&self, test_id: String) -> Locator {
+        self.then(fluxwright::Selector::test_id(&test_id))
+    }
+
+    /// PNG of the element, once it is visible and still.
+    #[napi]
+    pub async fn screenshot(&self) -> Result<Buffer> {
+        let sel = self.selector.clone();
+        let png = with_page(self.lease.clone(), move |p| Box::pin(async move { p.element_screenshot(&sel).await })).await?;
+        Ok(png.into())
+    }
+
+    /// The element's box relative to the viewport, without scrolling; null when it is not visible.
+    #[napi]
+    pub async fn bounding_box(&self) -> Result<Option<BoundingBox>> {
+        let sel = self.selector.clone();
+        let b = with_page(self.lease.clone(), move |p| Box::pin(async move { p.bounding_box(&sel).await })).await?;
+        Ok(b.map(|b| BoundingBox { x: b.x, y: b.y, width: b.width, height: b.height }))
+    }
+
+    /// `function` is JavaScript source taking the element and `arg`; `addon.js` passes a
+    /// function's source.
+    #[napi]
+    pub async fn evaluate(&self, function_source: String, arg: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        let sel = self.selector.clone();
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.evaluate_on(&sel, &function_source, arg).await }))
+            .await
+    }
+}
+
+impl Locator {
+    fn then(&self, part: String) -> Locator {
+        self.then_selector(self.selector.then(&part))
+    }
+
+    fn then_selector(&self, selector: fluxwright::Selector) -> Locator {
+        Locator { lease: self.lease.clone(), selector }
+    }
+}
+
+fn exact(flag: Option<bool>) -> bool {
+    flag.unwrap_or(false)
+}
+
+#[napi(object)]
+pub struct FilterOptions {
+    /// Case-insensitive substring of the element's text.
+    pub has_text: Option<String>,
+}
+
+/// CSS pixels, relative to the top-level page's viewport.
+#[napi(object)]
+pub struct BoundingBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[napi(object)]
+pub struct ConsoleMessage {
+    /// `log`, `error`, `warning`, `info`, `debug`, ...
+    #[napi(js_name = "type")]
+    pub kind: String,
+    pub text: String,
+}
+
+/// An exception nothing caught; `page.pageErrors()` turns these into `Error` objects.
+#[napi(object)]
+pub struct PageErrorInfo {
+    pub name: String,
+    pub message: String,
+    pub stack: String,
 }
 
 /// An iframe, same- or cross-origin, to find elements in.
@@ -124,6 +251,23 @@ impl FrameLocator {
     pub fn get_by_role(&self, role: String, options: Option<GetByRoleOptions>) -> Locator {
         let (name, exact) = options.map(|o| (o.name, o.exact.unwrap_or(false))).unwrap_or_default();
         self.find(fluxwright::Selector::role(&role, name.as_deref(), exact))
+    }
+
+    /// `<label>`, `aria-labelledby` or `aria-label`; case-insensitive substring unless `exact`.
+    #[napi]
+    pub fn get_by_label(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.find(fluxwright::Selector::label(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    #[napi]
+    pub fn get_by_placeholder(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.find(fluxwright::Selector::placeholder(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    /// `data-testid`, exact.
+    #[napi]
+    pub fn get_by_test_id(&self, test_id: String) -> Locator {
+        self.find(fluxwright::Selector::test_id(&test_id))
     }
 
     /// A nested iframe inside this one.
@@ -204,6 +348,11 @@ pub struct Cookie {
     pub secure: bool,
     #[napi(ts_type = "'Strict' | 'Lax' | 'None'")]
     pub same_site: String,
+    /// Top-level site of a partitioned (CHIPS) cookie.
+    pub partition_key: Option<String>,
+    /// The rest of Chrome's partition key, under Playwright's name for it.
+    #[napi(js_name = "_crHasCrossSiteAncestor")]
+    pub cr_has_cross_site_ancestor: Option<bool>,
 }
 
 #[napi(object)]
@@ -233,6 +382,8 @@ impl From<StorageState> for fluxwright::StorageState {
                     http_only: c.http_only,
                     secure: c.secure,
                     same_site: c.same_site,
+                    partition_key: c.partition_key,
+                    cross_site_ancestor: c.cr_has_cross_site_ancestor,
                 })
                 .collect(),
             origins: s
@@ -266,6 +417,8 @@ impl From<fluxwright::StorageState> for StorageState {
                     http_only: c.http_only,
                     secure: c.secure,
                     same_site: c.same_site,
+                    partition_key: c.partition_key,
+                    cr_has_cross_site_ancestor: c.cross_site_ancestor,
                 })
                 .collect(),
             origins: s
@@ -583,8 +736,37 @@ impl Page {
     }
 
     #[napi]
+    pub fn get_by_label(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.top().get_by_label(text, options)
+    }
+
+    #[napi]
+    pub fn get_by_placeholder(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.top().get_by_placeholder(text, options)
+    }
+
+    #[napi]
+    pub fn get_by_test_id(&self, test_id: String) -> Locator {
+        self.top().get_by_test_id(test_id)
+    }
+
+    #[napi]
     pub fn frame_locator(&self, selector: String) -> FrameLocator {
         self.top().frame_locator(selector)
+    }
+
+    /// Console messages so far from this page, its popups and its iframes (the last 1000).
+    #[napi]
+    pub async fn console_messages(&self) -> Result<Vec<ConsoleMessage>> {
+        let all = with_page(self.lease.clone(), |p| Box::pin(async move { Ok(p.console_messages()) })).await?;
+        Ok(all.into_iter().map(|m| ConsoleMessage { kind: m.kind, text: m.text }).collect())
+    }
+
+    /// Exceptions nothing caught so far (the last 1000).
+    #[napi]
+    pub async fn page_errors(&self) -> Result<Vec<PageErrorInfo>> {
+        let all = with_page(self.lease.clone(), |p| Box::pin(async move { Ok(p.page_errors()) })).await?;
+        Ok(all.into_iter().map(|e| PageErrorInfo { name: e.name, message: e.message, stack: e.stack }).collect())
     }
 
     #[napi]
