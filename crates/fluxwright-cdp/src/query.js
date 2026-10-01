@@ -127,6 +127,16 @@
     getComputedStyle(el).visibility !== 'hidden' &&
     !el.closest('[aria-hidden="true"]');
 
+  // Input buttons show their value, not text content.
+  const buttons = 'input[type=button],input[type=submit],input[type=reset]';
+  // An element's text as the page shows it: button values included, scripts and styles left out.
+  const shownText = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+    if (node.nodeType !== Node.ELEMENT_NODE || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(node.tagName)) return '';
+    if (node.matches(buttons)) return ' ' + node.value + ' ';
+    return [...node.childNodes].map(shownText).join('');
+  };
+
   // Each engine returns its matches inside `root` in document order; only the first when `first`.
   const pick = (els, keep, first) => (first ? [els.find(keep)].filter(Boolean) : els.filter(keep));
   const engines = {
@@ -136,9 +146,7 @@
     text: (body, root, first) => {
       const m = matcher(body);
       const skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD)$/;
-      // Input buttons show their value, not text content; they are matched in the same walk so
-      // the first match in DOM order wins.
-      const buttons = 'input[type=button],input[type=submit],input[type=reset]';
+      // Input buttons are matched in the same walk, so the first match in DOM order wins.
       const out = [];
       // True when el or something inside it matched.
       const walk = (el) => {
@@ -210,7 +218,7 @@
         found = [found[n < 0 ? found.length + n : n]].filter(Boolean);
       } else if (engine === 'has-text') {
         const t = matcher(body);
-        found = found.filter((el) => t.has(norm(el.textContent)));
+        found = found.filter((el) => t.has(norm(shownText(el))));
       } else {
         // Only the last part may stop at its first match: later parts need them all.
         const first = i === parts.length - 1;

@@ -20,6 +20,7 @@ Logged-in scraping and automation are where teams give up on hand-rolled pools.
 
 - **Request control:** `page.route` to fulfill, modify or abort requests. Today Fluxwright can only block them.
 - **Events as they happen:** `page.on('console' | 'pageerror' | 'request' | 'response')`.
+- **Transformed iframes:** clicks, boxes and screenshots inside an iframe that CSS scales or rotates use untransformed offsets today; switch to `DOM.getContentQuads`, which accounts for transforms.
 - **Downloads:** saved to a folder per job.
 
 ## 0.4: Python

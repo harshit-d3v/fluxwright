@@ -128,6 +128,7 @@ async fn more_locators_and_chaining() {
         "<li>Banana <button onclick=\"document.title='Banana'\">Buy</button></li>",
         "<li>Cherry <button onclick=\"document.title='Cherry'\">Buy</button></li></ul>",
         "<p>a &gt;&gt; b</p>",
+        "<form id=draft><input type=submit value='Save draft'></form><form id=pub><input type=submit value=Publish></form>",
     ))
     .await
     .unwrap();
@@ -156,6 +157,9 @@ async fn more_locators_and_chaining() {
     assert_eq!(page.title().await.unwrap(), "Cherry");
     // Quoted, so the >> in the text does not split the selector.
     assert_eq!(page.get_by_text("a >> b", true).text_content().await.unwrap().as_deref(), Some("a >> b"));
+    // A button's text is its value, for filter as for getByText.
+    let form = page.locator("form").filter_has_text("publish").evaluate("el => el.id", None).await.unwrap();
+    assert_eq!(form, json!("pub"));
     let err = page.locator("li >> nth=x").text_content().await.unwrap_err().to_string();
     assert!(err.contains("nth= expects an integer"), "{err}");
 }
