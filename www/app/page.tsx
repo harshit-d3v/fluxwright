@@ -33,7 +33,7 @@ const FEATURES: { name: string; text: string; api: string }[] = [
   },
   {
     name: "A Playwright-style API",
-    text: "getByRole, getByText, frameLocator for cross-origin iframes, waitUntil, and clicks that wait until the element can take them.",
+    text: "getByRole, getByText, getByLabel, getByTestId, nth and filter, frameLocator for cross-origin iframes, element screenshots, and clicks that wait until the element can take them.",
     api: "page.getByRole()",
   },
   {
