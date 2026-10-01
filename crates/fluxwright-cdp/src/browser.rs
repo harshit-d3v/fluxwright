@@ -91,8 +91,9 @@ impl CdpBrowser {
             #[cfg(unix)]
             Transport::Pipe { to_chrome, from_chrome } => Connection::from_pipes(to_chrome, from_chrome)?,
         };
-        // Over a pipe nothing has waited for Chrome to start yet.
-        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(20))
+        // Over a pipe nothing has waited for Chrome to start yet. A first, cold start on a busy CI
+        // machine has taken over 20 s.
+        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(60))
             .await
             .map_err(|e| Error::Launch(format!("chromium did not answer on its DevTools connection: {e}")))?;
         let (fanout, _) = broadcast::channel(512);
