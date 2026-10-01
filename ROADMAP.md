@@ -13,15 +13,14 @@ The goal is to be the best engine for running many browser jobs on your own mach
 
 - **0.2.2:** `page.evaluate(fn, arg)` as in Playwright; a page dropped without `close()` no longer crashes the process; valid TypeScript declarations.
 - **0.3.0:** settings per page with Playwright's option names (user agent, locale, timezone, geolocation, permissions, viewport, device scale factor, color scheme); saved sessions (`page.storageState()` out, `newPage({ storageState })` in, in Playwright's file format); `getByLabel`, `getByPlaceholder`, `getByTestId`, `nth`, `first`, `last`, `filter({ hasText })` and chained locators; `locator.screenshot()`, `locator.boundingBox()`, `locator.evaluate()`; `page.consoleMessages()` and `page.pageErrors()`.
+- **0.3.1:** `page.route` with Playwright's `Route` and `Request` (fulfill, continue with changes, abort, fallback; globs, RegExps and functions); `page.on('console' | 'pageerror')`; downloads with `page.waitForDownload()` and `saveAs`.
 
 ## 0.3: jobs that need state and control
 
 Logged-in scraping and automation are where teams give up on hand-rolled pools.
 
-- **Request control:** `page.route` to fulfill, modify or abort requests. Today Fluxwright can only block them.
-- **Events as they happen:** `page.on('console' | 'pageerror' | 'request' | 'response')`.
+- **More events:** `page.on('request' | 'response' | 'popup' | 'dialog')` and `page.waitForResponse`.
 - **Transformed iframes:** clicks, boxes and screenshots inside an iframe that CSS scales or rotates use untransformed offsets today; switch to `DOM.getContentQuads`, which accounts for transforms.
-- **Downloads:** saved to a folder per job.
 
 ## 0.4: Python
 

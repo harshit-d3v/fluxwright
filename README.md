@@ -39,7 +39,9 @@ npx @puppeteer/browsers install chrome-headless-shell@stable
 | Act | `click()` and `fill()` wait until the element is visible, enabled, stable and not covered; `waitFor()`, `waitForSelector()` |
 | Read | `title()`, `content()`, `textContent()`, `evaluate(fn, arg)` or `evaluate("expression")`, `locator.evaluate((el, arg) => …)`, `locator.boundingBox()` |
 | Capture | `screenshot({ fullPage, path })`, `locator.screenshot({ path })` (also inside scrolling containers and iframes), `setViewportSize({ width, height })` |
-| Errors | `consoleMessages()` and `pageErrors()` from the page, its popups and iframes, so a job can fail on JavaScript errors |
+| Errors | `consoleMessages()` and `pageErrors()` from the page, its popups and iframes, so a job can fail on JavaScript errors; `page.on('console' \| 'pageerror', handler)` as they happen |
+| Requests | `page.route(url, handler)` to fulfill, change or abort requests (`route.fulfill({ json })`, `route.continue({ headers })`, `route.abort()`, `route.fallback()`), with globs, RegExps or functions |
+| Downloads | `page.waitForDownload()` then `download.saveAs(path)`; each job's files stay in its own folder until the page closes |
 | Emulate | `newPage({ userAgent, locale, timezoneId, geolocation, permissions, viewport, deviceScaleFactor, colorScheme })`, Playwright's option names |
 | Sessions | `page.storageState({ path })` saves cookies and localStorage; `newPage({ storageState })` starts from them, so you log in once. Playwright's file format |
 | Network | a proxy per page, with a username and password; blocking by resource type or URL (Rust `JobOptions`) |
@@ -60,7 +62,7 @@ The full Node API is in [bindings/node/README.md](bindings/node/README.md).
 - **Firefox or Safari (WebKit):** Fluxwright drives Chromium only.
 - **End-to-end tests:** Playwright Test gives you a runner, `expect`, fixtures, a trace viewer and a recorder. Fluxwright is an engine, not a test framework.
 - **Python, Java or .NET:** Fluxwright has Node and Rust today. Python is on the [roadmap](ROADMAP.md).
-- **Request mocking (`page.route`), touch and mobile emulation, downloads:** not yet. See [MISSING.md](bindings/node/MISSING.md) and the roadmap.
+- **Touch and mobile emulation, request and response events:** not yet. See [MISSING.md](bindings/node/MISSING.md) and the roadmap.
 
 Use Fluxwright when you run many browser jobs, such as scraping, crawling, PDF and screenshot rendering, or automation at volume, and want the fleet handled for you.
 
