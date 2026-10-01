@@ -2,13 +2,27 @@
 // chrome-headless-shell (see the README).
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
+import { readFile } from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import fluxwright from '../addon.js'
 
-// Echoes the user agent and languages; /login sets a cookie.
+// Echoes the user agent and languages; /login sets a cookie; /report is a download; /hdr echoes
+// x-test; /api is the real API that routes stand in for.
 const server = http.createServer((req, res) => {
+  if (req.url === '/report') {
+    res.setHeader('Content-Disposition', 'attachment; filename="report.csv"')
+    return res.end('a,b\n1,2\n')
+  }
+  if (req.url === '/hdr') {
+    res.setHeader('Content-Type', 'text/plain')
+    return res.end(String(req.headers['x-test']))
+  }
+  if (req.url === '/api') {
+    res.setHeader('Content-Type', 'application/json')
+    return res.end('{"real":true}')
+  }
   if (req.url === '/login') res.setHeader('Set-Cookie', 'sid=s3cret; Path=/')
   res.setHeader('Content-Type', 'text/html')
   res.end(`<title>${req.headers['user-agent']}|${req.headers['accept-language']}</title>`)
@@ -120,6 +134,42 @@ try {
   assert.ok(late instanceof Error && late.name === 'TypeError' && late.message === 'late', String(late))
   await assert.rejects(ui.goto('not a url'), /invalid URL: not a url/)
   await ui.close()
+
+  // page.on, page.route (glob, RegExp, function, fallback, unroute) and downloads.
+  const live = await browser.newPage()
+  const seen = []
+  live.on('console', (m) => seen.push(`${m.type}:${m.text}`)).on('pageerror', (e) => seen.push(`${e.name}:${e.message}`))
+  await live.route('**/api', (route) => route.fulfill({ json: { fake: true } }))
+  await live.route('**/api', (route) => route.fallback()) // added last, runs first, passes it on
+  await live.route(/\/hdr$/, (route, request) => route.continue({ headers: { ...request.headers(), 'x-test': 'routed' } }))
+  await live.route((url) => url.pathname === '/gone', (route) => route.abort())
+  await live.goto(`${base}/hdr`)
+  assert.equal(await live.evaluate(() => document.body.textContent), 'routed')
+  assert.equal(await live.evaluate(() => fetch('/api').then((r) => r.text())), '{"fake":true}')
+  assert.equal(await live.evaluate(() => fetch('/gone').then(() => 'loaded', () => 'failed')), 'failed')
+  await live.unroute('**/api')
+  assert.equal(await live.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
+  await live.evaluate(() => {
+    console.warn('careful')
+    setTimeout(() => {
+      throw new SyntaxError('oops')
+    })
+  })
+  for (let i = 0; i < 50 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20))
+  assert.deepEqual(seen, ['warning:careful', 'SyntaxError:oops'])
+  await live.goto(base)
+  await live.evaluate(() => {
+    const a = document.createElement('a')
+    a.href = '/report'
+    document.body.append(a)
+    a.click()
+  })
+  const download = await live.waitForDownload()
+  assert.equal(download.suggestedFilename(), 'report.csv')
+  const saved = join(tmpdir(), `fluxwright-${process.pid}`, 'dl', 'report.csv')
+  await download.saveAs(saved)
+  assert.equal(await readFile(saved, 'utf8'), 'a,b\n1,2\n')
+  await live.close()
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()

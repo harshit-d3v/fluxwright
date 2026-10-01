@@ -27,5 +27,16 @@ export async function typed(): Promise<void> {
   const errors: Error[] = await page.pageErrors()
   const logs: { type: string; text: string }[] = await page.consoleMessages()
   void [box, length, shot, errors, logs, page.getByPlaceholder('city').first().last(), await page.screenshot({ path: 'p.png' })]
+
+  await page.route('**/api/*', (route, request) => route.fulfill({ json: { ok: request.method() === 'GET' } }))
+  await page.route(/\.png$/, (route) => route.abort('blockedbyclient'))
+  await page.route((url) => url.hostname === 'example.com', (route) => route.continue({ headers: { 'x-a': '1' } }))
+  await page.unroute('**/api/*')
+  page.on('console', (m) => void m.text.length).on('pageerror', (e: Error) => void e.message)
+  const download = await page.waitForDownload({ timeout: 5000 })
+  const name: string = download.suggestedFilename()
+  await download.saveAs(`out/${name}`)
+  // @ts-expect-error not an event Fluxwright emits
+  page.on('request', () => {})
   await browser.close()
 }

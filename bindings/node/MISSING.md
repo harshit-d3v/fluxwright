@@ -4,11 +4,9 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 
 ## Planned (see [ROADMAP.md](https://github.com/harshit-d3v/fluxwright/blob/main/ROADMAP.md))
 
-- `page.route` to fulfill or modify requests (today: blocking by resource type or URL)
 - Mobile and touch emulation (`isMobile`, `hasTouch`), `emulateMedia` after the page opens
-- `page.on('console' | 'pageerror')` callbacks (today: `consoleMessages()` and `pageErrors()`)
+- `page.on('request' | 'response' | 'popup' | 'dialog')`, `page.waitForResponse`
 - `getByAltText`, `getByTitle`, `filter({ has })`, strict mode
-- Downloads
 - `connectOverCDP`, to use browsers you already run
 - Python bindings
 

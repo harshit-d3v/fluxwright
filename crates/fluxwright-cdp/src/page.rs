@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,11 @@ use tokio::time::sleep;
 use crate::browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId, TargetState};
 use crate::connection::{CdpEvent, Connection};
 use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
-use crate::log::PageLog;
+use crate::log::{DownloadResult, PageLog};
+
+/// Finished downloads, oldest first.
+pub type DownloadQueue = tokio::sync::mpsc::UnboundedReceiver<DownloadResult>;
+use crate::route::InterceptedRequest;
 use crate::error::{Error, Result};
 
 /// When `goto` returns. Same meanings as Playwright's `waitUntil`.
@@ -606,17 +611,56 @@ impl CdpPage {
         }
     }
 
-    /// Starts recording console messages and uncaught errors from this page, its popups and its
-    /// iframes. Recording stops when the returned task is aborted.
-    pub fn collect_logs(&self) -> (Arc<std::sync::Mutex<PageLog>>, tokio::task::JoinHandle<()>) {
+    /// Hands every request of this page, its popups and iframes to the returned channel, as
+    /// Playwright's `page.route` does. Resource blocking still applies first. Call it before
+    /// navigating; a request dropped unanswered continues.
+    pub async fn intercept(&self, timeout: Duration) -> Result<tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let params = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(self.context_id.0.clone()).or_default();
+            setup.routes = Some(tx);
+            fetch_params(setup)
+        };
+        if let Some(params) = params {
+            // Sessions already open in this context too: iframes in other processes, popups.
+            let mut sessions = CdpBrowser::sessions_in_context(&self.targets, &self.context_id.0).await;
+            if !sessions.iter().any(|s| s == self.sid()) {
+                sessions.push(self.sid().to_string());
+            }
+            for s in sessions {
+                self.session_call(&s, "Fetch.enable", params.clone(), timeout).await?;
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Starts recording console messages, uncaught errors and finished downloads (saved under
+    /// `download_dir`) from this page, its popups and its iframes. Recording stops when the
+    /// returned task is aborted.
+    pub fn collect_logs(&self, download_dir: &Path) -> (Arc<std::sync::Mutex<PageLog>>, DownloadQueue, tokio::task::JoinHandle<()>) {
         let log = Arc::new(std::sync::Mutex::new(PageLog::default()));
-        let task = tokio::spawn(crate::log::collect(
-            self.browser.subscribe_unbounded(),
-            self.session_id.0.clone(),
-            self.context_id.0.clone(),
-            log.clone(),
-        ));
-        (log, task)
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = crate::log::Watch {
+            session: self.session_id.0.clone(),
+            main_frame: self.target_id.0.clone(),
+            context: self.context_id.0.clone(),
+            download_dir: download_dir.to_path_buf(),
+        };
+        let task = tokio::spawn(crate::log::collect(self.browser.subscribe_unbounded(), watch, log.clone(), tx));
+        (log, rx, task)
+    }
+
+    /// Lets this page's context download files into `dir`, named by download id.
+    pub async fn allow_downloads(&self, dir: &Path, timeout: Duration) -> Result<()> {
+        let params = json!({
+            "behavior": "allowAndName",
+            "browserContextId": self.context_id.0,
+            "downloadPath": dir.to_string_lossy(),
+            "eventsEnabled": true
+        });
+        self.browser.call("Browser.setDownloadBehavior", params, None, timeout).await?;
+        Ok(())
     }
 
     /// PNG of the first match, once it is visible and still. Elements in iframes, below the
@@ -826,6 +870,8 @@ impl CdpPage {
 /// other processes, popups): resource blocking, proxy credentials, emulation, init scripts.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextSetup {
+    /// Where paused requests go when the job intercepts them (`page.route`).
+    pub(crate) routes: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub(crate) emulation: Option<Emulation>,
     pub(crate) init_scripts: Vec<String>,
     pub(crate) types: Vec<ResourceType>,
@@ -837,9 +883,10 @@ pub(crate) struct ContextSetup {
 
 /// `Fetch.enable` for a context, or `None` when it needs no Fetch at all. Proxy credentials
 /// need every request paused: Chrome only reports auth challenges for paused requests (and
-/// rejects an empty pattern list with `handleAuthRequests`).
+/// rejects an empty pattern list with `handleAuthRequests`). So does interception, which hands
+/// each request to the job.
 pub(crate) fn fetch_params(setup: &ContextSetup) -> Option<Value> {
-    let patterns: Vec<Value> = if setup.proxy_auth.is_some() {
+    let patterns: Vec<Value> = if setup.proxy_auth.is_some() || setup.routes.is_some() {
         vec![json!({ "urlPattern": "*", "requestStage": "Request" })]
     } else {
         setup
