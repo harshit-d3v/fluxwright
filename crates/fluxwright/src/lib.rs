@@ -4,12 +4,12 @@
 //! or any other tool. See `docs/COMPETITIVE_ANALYSIS.md`.
 
 pub use fluxwright_core::{
-    BrowserInfo, Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, FrameLocator, JobOptions, Locator,
+    BrowserInfo, Downloads, Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, FrameLocator, JobOptions, Locator,
     MetricsSnapshot, PageLease, Priority, QueueFullMode, Result,
 };
 
 pub use fluxwright_cdp::{
-    find_browser, find_chrome, sweep_stale_profiles, BoundingBox, ColorScheme, ConsoleMessage, Cookie, Emulation,
-    Geolocation, LaunchOptions, OriginStorage, PageError, Proxy, ResourceType, Selector, StorageItem, StorageState,
-    WaitUntil,
+    find_browser, find_chrome, sweep_stale_profiles, BoundingBox, ColorScheme, ConsoleMessage, Cookie, Download, Emulation, Fulfill,
+    Geolocation, InterceptedRequest, LaunchOptions, LogEntry, OriginStorage, Overrides, PageError, Proxy, ResourceType,
+    Selector, StorageItem, StorageState, WaitUntil,
 };

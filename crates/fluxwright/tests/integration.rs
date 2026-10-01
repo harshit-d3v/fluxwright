@@ -67,7 +67,10 @@ async fn emulation_and_permissions() {
         .evaluate(
             r#"(async () => {
                 const w = window.open(location.href);
-                for (let i = 0; i < 250 && w.document.readyState !== 'complete'; i++) await new Promise(r => setTimeout(r, 20));
+                // Not the initial about:blank, which is already "complete" and exists before the
+                // popup's session does.
+                const loaded = () => w.location.href === location.href && w.document.readyState === 'complete';
+                for (let i = 0; i < 250 && !loaded(); i++) await new Promise(r => setTimeout(r, 20));
                 return [w.navigator.userAgent, w.innerWidth, w.Intl.DateTimeFormat().resolvedOptions().timeZone].join('|');
             })()"#,
         )
@@ -275,6 +278,116 @@ async fn console_messages_and_page_errors() {
 
     let err = page.goto("not a url").await.unwrap_err().to_string();
     assert!(err.contains("Cannot navigate to invalid URL: not a url"), "{err}");
+}
+
+/// page.route: the job fulfills, changes or aborts requests; one it drops continues, and blocked
+/// resource types never reach it.
+#[tokio::test(flavor = "multi_thread")]
+async fn intercept_requests() {
+    use fluxwright::{Fulfill, Overrides};
+
+    let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let eng = engine(1, 1).await;
+    let page = eng.acquire_job(&JobOptions { block_images: true, ..JobOptions::default() }).await.unwrap();
+    let mut requests = page.intercept().await.unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Some(req) = requests.recv().await {
+            let last = req.url.rsplit('/').next().unwrap_or("").to_string();
+            log.lock().unwrap().push(format!("{} {last}", req.resource_type));
+            match last.as_str() {
+                "api" => {
+                    let json = ("content-type".to_string(), "application/json".to_string());
+                    let body = br#"{"ok":true}"#.to_vec();
+                    req.fulfill(Fulfill { status: Some(201), headers: vec![json], body }).await.unwrap();
+                }
+                "headers" => {
+                    let mut headers = req.headers.clone();
+                    headers.push(("x-test".into(), "from-route".into()));
+                    req.continue_with(Overrides { headers: Some(headers), ..Default::default() }).await.unwrap();
+                }
+                "nope" => req.abort("connectionrefused").await.unwrap(),
+                _ => {} // dropped: it continues
+            }
+        }
+    });
+
+    page.goto(&format!("{}/headers", srv.base_url)).await.unwrap();
+    let text = page.evaluate("document.body.innerText").await.unwrap();
+    assert!(text.as_str().unwrap().ends_with("\nfrom-route"), "{text}");
+    let api = page.evaluate("fetch('/api').then(async r => r.status + ' ' + await r.text())").await.unwrap();
+    assert_eq!(api, json!("201 {\"ok\":true}"));
+    let nope = page.evaluate("fetch('/nope').then(() => 'loaded', () => 'failed')").await.unwrap();
+    assert_eq!(nope, json!("failed"));
+    assert_eq!(page.evaluate("fetch('/set-cookie').then(r => r.status)").await.unwrap(), json!(200));
+    page.evaluate("new Promise(r => { const i = new Image(); i.onload = i.onerror = r; i.src = '/pic.png' })")
+        .await
+        .unwrap();
+    let seen = seen.lock().unwrap().clone();
+    // Chrome reports fetch() as xhr at this stage.
+    for want in ["document headers", "xhr api", "xhr nope", "xhr set-cookie"] {
+        assert!(seen.iter().any(|s| s == want), "{want} not in {seen:?}");
+    }
+    assert!(!seen.iter().any(|s| s.starts_with("image")), "a blocked image reached the job: {seen:?}");
+}
+
+/// A download lands in the page's own temporary folder, reaches only that page, saves where the
+/// job wants, and is cleaned up with the page.
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads() {
+    use axum::{http::header, response::Html, routing::get, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route("/", get(|| async { Html(r#"<a id=dl href="/report">Get report</a>"#) }))
+        .route(
+            "/report",
+            get(|| async { ([(header::CONTENT_DISPOSITION, "attachment; filename=\"report.csv\"")], "a,b\n1,2\n") }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = engine(1, 2).await;
+    let page = eng.acquire().await.unwrap();
+    let other = eng.acquire().await.unwrap();
+    page.goto(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+    page.click("#dl").await.unwrap(); // waiting after the click is fine: finished downloads queue up
+    let d = page.wait_for_download(Duration::from_secs(10)).await.unwrap();
+    assert_eq!(d.suggested_filename, "report.csv");
+    assert!(d.url.ends_with("/report"), "{}", d.url);
+    let dest = std::env::temp_dir().join(format!("fluxwright-test-{}", std::process::id())).join("nested").join("r.csv");
+    d.save_as(&dest).unwrap();
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "a,b\n1,2\n");
+    assert!(other.wait_for_download(Duration::from_millis(500)).await.is_err(), "another page saw the download");
+
+    let temp = d.path.clone();
+    assert!(temp.exists());
+    drop(page);
+    assert!(!temp.exists(), "the download folder outlived the page");
+    let _ = std::fs::remove_dir_all(dest.parent().unwrap().parent().unwrap());
+}
+
+/// Console messages and uncaught errors as they happen, for page.on('console' | 'pageerror').
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_as_they_happen() {
+    use fluxwright::LogEntry;
+
+    let eng = engine(1, 1).await;
+    let page = eng.acquire().await.unwrap();
+    let mut logs = page.subscribe_logs();
+    page.goto("data:text/html,<script>console.info('one'); setTimeout(() => { throw new RangeError('two') })</script>")
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        let entry = tokio::time::timeout(Duration::from_secs(5), logs.recv()).await.expect("nothing within 5 s").expect("open");
+        got.push(match entry {
+            LogEntry::Console(m) => format!("{} {}", m.kind, m.text),
+            LogEntry::Error(e) => format!("{} {}", e.name, e.message),
+        });
+    }
+    assert_eq!(got, ["info one", "RangeError two"]);
 }
 
 /// Log in once, start the next job from the saved state, and the job after that from nothing.

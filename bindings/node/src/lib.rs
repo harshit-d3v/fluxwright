@@ -1,9 +1,13 @@
+use std::collections::HashMap;
+
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::{Env, JsFunction};
 use napi_derive::napi;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("tokio"));
 
@@ -12,11 +16,167 @@ pub struct Browser {
     inner: fluxwright::BrowserEngine,
 }
 
-type LeaseSlot = Arc<Mutex<Option<fluxwright::PageLease>>>;
+/// Read-locked by every page call, so calls run side by side (a download wait and the click
+/// that starts it); write-locked by `close`.
+type LeaseSlot = Arc<RwLock<Option<fluxwright::PageLease>>>;
 
 #[napi]
 pub struct Page {
     lease: LeaseSlot,
+    /// The JavaScript route dispatcher, once `page.route` was called.
+    routes: Arc<std::sync::Mutex<Option<RouteCallback>>>,
+}
+
+type RouteCallback = ThreadsafeFunction<InterceptedRoute, ErrorStrategy::Fatal>;
+
+/// A thread-safe JavaScript callback that does not keep Node running on its own.
+fn callback<T: ToNapiValue + Send + 'static>(env: &Env, f: JsFunction) -> Result<ThreadsafeFunction<T, ErrorStrategy::Fatal>> {
+    let mut tsfn = f.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<T>| Ok(vec![ctx.value]))?;
+    tsfn.unref(env)?;
+    Ok(tsfn)
+}
+
+/// A paused request handed to `page.route` handlers; `addon.js` wraps it in Playwright's
+/// `Route` and `Request`.
+#[napi]
+pub struct InterceptedRoute {
+    request: Arc<Mutex<Option<fluxwright::InterceptedRequest>>>,
+    url: String,
+    method: String,
+    headers: HashMap<String, String>,
+    post_data: Option<String>,
+    resource_type: String,
+}
+
+#[napi(object)]
+pub struct FulfillOptions {
+    pub status: Option<u32>,
+    pub headers: Option<HashMap<String, String>>,
+    pub body: Option<Either<String, Buffer>>,
+}
+
+#[napi(object)]
+pub struct ContinueOptions {
+    pub url: Option<String>,
+    pub method: Option<String>,
+    /// Replaces all headers.
+    pub headers: Option<HashMap<String, String>>,
+    pub post_data: Option<Either<String, Buffer>>,
+}
+
+fn bytes(b: Either<String, Buffer>) -> Vec<u8> {
+    match b {
+        Either::A(text) => text.into_bytes(),
+        Either::B(buf) => buf.to_vec(),
+    }
+}
+
+impl InterceptedRoute {
+    fn new(req: fluxwright::InterceptedRequest) -> Self {
+        InterceptedRoute {
+            url: req.url.clone(),
+            method: req.method.clone(),
+            headers: req.headers.iter().cloned().collect(),
+            post_data: req.post_data.clone(),
+            resource_type: req.resource_type.clone(),
+            request: Arc::new(Mutex::new(Some(req))),
+        }
+    }
+
+    /// Takes the request to answer it; a second answer fails, as in Playwright.
+    async fn take(slot: Arc<Mutex<Option<fluxwright::InterceptedRequest>>>) -> std::result::Result<fluxwright::InterceptedRequest, String> {
+        slot.lock().await.take().ok_or_else(|| "route is already handled".to_string())
+    }
+}
+
+#[napi]
+impl InterceptedRoute {
+    #[napi(getter)]
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    #[napi(getter)]
+    pub fn method(&self) -> String {
+        self.method.clone()
+    }
+
+    #[napi(getter)]
+    pub fn headers(&self) -> HashMap<String, String> {
+        self.headers.clone()
+    }
+
+    #[napi(getter)]
+    pub fn post_data(&self) -> Option<String> {
+        self.post_data.clone()
+    }
+
+    #[napi(getter)]
+    pub fn resource_type(&self) -> String {
+        self.resource_type.clone()
+    }
+
+    #[napi]
+    pub async fn fulfill(&self, options: Option<FulfillOptions>) -> Result<()> {
+        let o = options.unwrap_or(FulfillOptions { status: None, headers: None, body: None });
+        if let Some(status) = o.status.filter(|s| !(100..=599).contains(s)) {
+            return Err(Error::from_reason(format!("status must be between 100 and 599, not {status}")));
+        }
+        let f = fluxwright::Fulfill {
+            status: o.status.map(|s| s as u16),
+            headers: o.headers.unwrap_or_default().into_iter().collect(),
+            body: o.body.map(bytes).unwrap_or_default(),
+        };
+        let slot = self.request.clone();
+        RT.spawn(async move { Self::take(slot).await?.fulfill(f).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+    }
+
+    #[napi(js_name = "continue")]
+    pub async fn continue_request(&self, options: Option<ContinueOptions>) -> Result<()> {
+        let o = options.unwrap_or(ContinueOptions { url: None, method: None, headers: None, post_data: None });
+        let overrides = fluxwright::Overrides {
+            url: o.url,
+            method: o.method,
+            headers: o.headers.map(|h| h.into_iter().collect()),
+            post_data: o.post_data.map(bytes),
+        };
+        let slot = self.request.clone();
+        RT.spawn(async move { Self::take(slot).await?.continue_with(overrides).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+    }
+
+    /// `errorCode` as in Playwright: `failed` (default), `aborted`, `blockedbyclient`, ...
+    #[napi]
+    pub async fn abort(&self, error_code: Option<String>) -> Result<()> {
+        let code = error_code.unwrap_or_else(|| "failed".into());
+        let slot = self.request.clone();
+        RT.spawn(async move { Self::take(slot).await?.abort(&code).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+    }
+}
+
+/// One console message or uncaught error, for `page.on`.
+#[napi(object)]
+pub struct LogEvent {
+    /// `console` or `pageerror`.
+    pub event: String,
+    pub message: Option<ConsoleMessage>,
+    pub error: Option<PageErrorInfo>,
+}
+
+#[napi(object)]
+pub struct DownloadInfo {
+    pub url: String,
+    pub suggested_filename: String,
+    /// Deleted when the page closes.
+    pub path: String,
 }
 
 /// Runs `f` against the page on the engine's runtime; fails with "page closed" after close().
@@ -31,7 +191,7 @@ where
         + 'static,
 {
     RT.spawn(async move {
-        let g = lease.lock().await;
+        let g = lease.read().await;
         match g.as_ref() {
             Some(p) => f(p).await.map_err(|e| e.to_string()),
             None => Err("page closed".to_string()),
@@ -531,7 +691,8 @@ impl Browser {
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(Page {
-            lease: Arc::new(Mutex::new(Some(lease))),
+            lease: Arc::new(RwLock::new(Some(lease))),
+            routes: Default::default(),
         })
     }
 
@@ -573,7 +734,7 @@ impl Page {
         };
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.goto_with(&url, wait_until).await.map_err(|e| e.to_string())
             } else {
@@ -589,7 +750,7 @@ impl Page {
     pub async fn title(&self) -> Result<String> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.title().await.map_err(|e| e.to_string())
             } else {
@@ -605,7 +766,7 @@ impl Page {
     pub async fn content(&self) -> Result<String> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.content().await.map_err(|e| e.to_string())
             } else {
@@ -621,7 +782,7 @@ impl Page {
     pub async fn click(&self, selector: String) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.click(&selector).await.map_err(|e| e.to_string())
             } else {
@@ -637,7 +798,7 @@ impl Page {
     pub async fn fill(&self, selector: String, value: String) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.fill(&selector, &value).await.map_err(|e| e.to_string())
             } else {
@@ -653,7 +814,7 @@ impl Page {
     pub async fn evaluate(&self, expression: String) -> Result<serde_json::Value> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.evaluate(&expression).await.map_err(|e| e.to_string())
             } else {
@@ -671,7 +832,7 @@ impl Page {
         let lease = self.lease.clone();
         let bytes = RT
             .spawn(async move {
-                let g = lease.lock().await;
+                let g = lease.read().await;
                 if let Some(p) = g.as_ref() {
                     if full_page { p.screenshot_full_page().await } else { p.screenshot().await }
                         .map_err(|e| e.to_string())
@@ -689,7 +850,7 @@ impl Page {
     pub async fn set_viewport_size(&self, size: ViewportSize) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.set_viewport_size(size.width, size.height)
                     .await
@@ -707,7 +868,7 @@ impl Page {
     pub async fn wait_for_selector(&self, selector: String) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let g = lease.lock().await;
+            let g = lease.read().await;
             if let Some(p) = g.as_ref() {
                 p.wait_for_selector(&selector).await.map_err(|e| e.to_string())
             } else {
@@ -755,6 +916,75 @@ impl Page {
         self.top().frame_locator(selector)
     }
 
+    /// Calls `handler` with each console message and uncaught error from now on; `addon.js`
+    /// builds `page.on('console' | 'pageerror')` on it.
+    #[napi(js_name = "_onLog")]
+    pub fn on_log(&self, env: Env, handler: JsFunction) -> Result<()> {
+        let tsfn = callback::<LogEvent>(&env, handler)?;
+        let lease = self.lease.clone();
+        RT.spawn(async move {
+            let Some(mut entries) = lease.read().await.as_ref().map(|p| p.subscribe_logs()) else {
+                return;
+            };
+            // Ends when the page closes.
+            while let Some(entry) = entries.recv().await {
+                let event = match entry {
+                    fluxwright::LogEntry::Console(m) => LogEvent {
+                        event: "console".into(),
+                        message: Some(ConsoleMessage { kind: m.kind, text: m.text }),
+                        error: None,
+                    },
+                    fluxwright::LogEntry::Error(e) => LogEvent {
+                        event: "pageerror".into(),
+                        message: None,
+                        error: Some(PageErrorInfo { name: e.name, message: e.message, stack: e.stack }),
+                    },
+                };
+                tsfn.call(event, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    /// Sets the function that receives intercepted requests; `addon.js` passes its route
+    /// dispatcher, then calls `intercept`.
+    #[napi(js_name = "_setRouteHandler")]
+    pub fn set_route_handler(&self, env: Env, handler: JsFunction) -> Result<()> {
+        *self.routes.lock().unwrap() = Some(callback::<InterceptedRoute>(&env, handler)?);
+        Ok(())
+    }
+
+    /// Starts handing this page's requests to the route handler. Resolves once interception
+    /// is on, so a `goto` after it is covered.
+    #[napi(js_name = "_intercept")]
+    pub async fn intercept(&self) -> Result<()> {
+        let Some(tsfn) = self.routes.lock().unwrap().clone() else {
+            return Err(Error::from_reason("set a route handler first"));
+        };
+        let mut requests = with_page(self.lease.clone(), |p| Box::pin(async move { p.intercept().await })).await?;
+        RT.spawn(async move {
+            while let Some(req) = requests.recv().await {
+                tsfn.call(InterceptedRoute::new(req), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    /// The next download this page finished (finished ones queue up), within `timeoutMs`
+    /// (default 30 s).
+    #[napi(js_name = "_waitForDownload")]
+    pub async fn wait_for_download(&self, timeout_ms: Option<u32>) -> Result<DownloadInfo> {
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000) as u64);
+        // Hold no page lock while waiting: the click that starts the download needs the page.
+        let downloads = with_page(self.lease.clone(), |p| Box::pin(async move { Ok(p.downloads()) })).await?;
+        let d = RT
+            .spawn(async move { downloads.next(timeout).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)?;
+        Ok(DownloadInfo { url: d.url, suggested_filename: d.suggested_filename, path: d.path.to_string_lossy().into_owned() })
+    }
+
     /// Console messages so far from this page, its popups and its iframes (the last 1000).
     #[napi]
     pub async fn console_messages(&self) -> Result<Vec<ConsoleMessage>> {
@@ -773,7 +1003,7 @@ impl Page {
     pub async fn close(&self) -> Result<()> {
         let lease = self.lease.clone();
         RT.spawn(async move {
-            let mut g = lease.lock().await;
+            let mut g = lease.write().await;
             *g = None;
         })
         .await

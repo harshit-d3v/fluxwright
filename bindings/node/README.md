@@ -50,6 +50,9 @@ await browser.close();
 | `page.frameLocator(iframeSelector)` | Same locators inside an iframe, same- or cross-origin; nest with `.frameLocator()` |
 | `page.evaluate(fn, arg?)` / `page.evaluate(expression)` | Runs a function with a JSON-serializable `arg`, or a string expression, in the page. Awaits promises and returns JSON. As in Playwright, the function is sent as source text, so it can't use variables from Node. A thrown JS error rejects with its message and stack |
 | `page.screenshot({ fullPage?, path? })` | PNG `Buffer`, also written to `path` |
+| `page.route(url, handler)` / `page.unroute(url, handler?)` | Playwright's request interception: `url` is a glob (`**/api/*`), a RegExp or a function of the URL; the handler gets `(route, request)` and answers with `route.fulfill({ status, headers, body, json, path })`, `route.continue({ url, method, headers, postData })`, `route.abort(code?)` or `route.fallback()`. The handler added last runs first. Requests of popups and iframes too; blocked resource types never reach it |
+| `page.on('console' \| 'pageerror', handler)` / `once` / `off` | Console messages (`{ type, text }`) and uncaught errors (`Error`) as they happen |
+| `page.waitForDownload({ timeout? })` | The next download the page finished (ones that finished earlier queue up, so call it before or after the click): `url()`, `suggestedFilename()`, `path()`, `saveAs(path)`. Files are deleted when the page closes |
 | `page.consoleMessages()` / `page.pageErrors()` | What the page, its popups and iframes logged (`{ type, text }`), and the exceptions nothing caught (`Error` objects), the last 1000 of each. Fail a job with `assert.deepEqual(await page.pageErrors(), [])` |
 | `page.setViewportSize({ width, height })` | CSS-pixel viewport for this page |
 | `page.waitForSelector(selector)` | Waits until visible (Playwright's default state) |

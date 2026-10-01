@@ -100,10 +100,10 @@ async fn set_cookie() -> impl IntoResponse {
     )
 }
 
-/// The request's user agent and languages, as the page text.
+/// The request's user agent, languages and `x-test` header, as the page text.
 async fn headers(h: axum::http::HeaderMap) -> String {
     let get = |name| h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    format!("{}\n{}", get("user-agent"), get("accept-language"))
+    format!("{}\n{}\n{}", get("user-agent"), get("accept-language"), get("x-test"))
 }
 
 async fn show_cookie() -> Html<&'static str> {

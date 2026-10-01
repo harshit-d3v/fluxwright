@@ -12,6 +12,7 @@ use crate::connection::{CdpEvent, Connection};
 use crate::error::{Error, LaunchOptions, Result};
 use crate::launch::{launch_chrome, Launched, Transport};
 use crate::page::{fetch_params, CdpPage, ContextSetup};
+use crate::route::InterceptedRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BrowserId(pub Uuid);
@@ -90,8 +91,9 @@ impl CdpBrowser {
             #[cfg(unix)]
             Transport::Pipe { to_chrome, from_chrome } => Connection::from_pipes(to_chrome, from_chrome)?,
         };
-        // Over a pipe nothing has waited for Chrome to start yet.
-        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(20))
+        // Over a pipe nothing has waited for Chrome to start yet. A first, cold start on a busy CI
+        // machine has taken over 20 s.
+        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(60))
             .await
             .map_err(|e| Error::Launch(format!("chromium did not answer on its DevTools connection: {e}")))?;
         let (fanout, _) = broadcast::channel(512);
@@ -276,13 +278,20 @@ impl CdpBrowser {
                 let (Some(sid), Some(id)) = (ev.session_id.clone(), ev.params["requestId"].as_str()) else {
                     return;
                 };
-                let block = match self.setup_for_session(&sid).await {
-                    Some(s) if s.proxy_auth.is_some() => {
-                        let ty = ev.params["resourceType"].as_str().unwrap_or("");
-                        s.types.iter().any(|t| t.as_str() == ty)
+                let setup = self.setup_for_session(&sid).await;
+                // Paused because its type is blocked, or because everything is paused (proxy
+                // credentials, interception). No setup means the context is gone.
+                let ty = ev.params["resourceType"].as_str().unwrap_or("");
+                let block = setup.as_ref().is_none_or(|s| s.types.iter().any(|t| t.as_str() == ty));
+                if !block {
+                    if let Some(routes) = setup.as_ref().and_then(|s| s.routes.as_ref()) {
+                        // The job answers it; if it can't (gone), dropping it continues it.
+                        if let Some(req) = InterceptedRequest::from_paused(&ev.params, self.conn.clone(), sid.clone()) {
+                            let _ = routes.send(req);
+                            return;
+                        }
                     }
-                    _ => true,
-                };
+                }
                 let (method, params) = if block {
                     ("Fetch.failRequest", json!({ "requestId": id, "errorReason": "BlockedByClient" }))
                 } else {
@@ -488,6 +497,17 @@ impl CdpBrowser {
         target_id: &str,
     ) -> Option<String> {
         targets.lock().await.get(target_id).and_then(|t| t.session_id.clone())
+    }
+
+    /// Sessions of every target in a browser context.
+    pub(crate) async fn sessions_in_context(targets: &Mutex<HashMap<String, TargetState>>, context: &str) -> Vec<String> {
+        targets
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.browser_context_id.as_deref() == Some(context))
+            .filter_map(|t| t.session_id.clone())
+            .collect()
     }
 
     pub async fn iframe_session_for_url(&self, needle: &str) -> Option<String> {
