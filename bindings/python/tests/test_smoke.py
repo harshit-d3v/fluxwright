@@ -2,6 +2,7 @@
 chrome-headless-shell (see the README)."""
 
 import asyncio
+import os
 import re
 import subprocess
 import sys
@@ -111,6 +112,8 @@ async def async_smoke(base: str, tmp: Path) -> None:
         await login.evaluate("() => localStorage.setItem('token', 't1')")
         file = tmp / ".auth" / "state.json"
         state = await login.storage_state(path=file)
+        if os.name == "posix":  # saved cookies are the owner's alone
+            assert file.stat().st_mode & 0o077 == 0 and file.parent.stat().st_mode & 0o077 == 0
         assert any(c["name"] == "sid" and c["value"] == "s3cret" for c in state["cookies"])
         await login.close()
         for saved in (file, str(file), state):

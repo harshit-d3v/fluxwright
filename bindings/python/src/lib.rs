@@ -124,10 +124,38 @@ fn bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 
 /// Writes `data`, creating missing folders, as Playwright does with `.auth/state.json`.
 fn save(path: &Path, data: &[u8]) -> PyResult<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
-    }
+    create_parent(path, &mut std::fs::DirBuilder::new())?;
     Ok(std::fs::write(path, data)?)
+}
+
+/// `save` for saved cookies: new folders and the file are the owner's alone.
+#[cfg(unix)]
+fn save_private(path: &Path, data: &[u8]) -> PyResult<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    create_parent(path, std::fs::DirBuilder::new().mode(0o700))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // A file that already existed keeps its mode on open: narrow it before the cookies go in.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file.write_all(data)?)
+}
+
+/// Windows has no mode bits: a new file takes its folder's access list.
+#[cfg(not(unix))]
+fn save_private(path: &Path, data: &[u8]) -> PyResult<()> {
+    save(path, data)
+}
+
+fn create_parent(path: &Path, folders: &mut std::fs::DirBuilder) -> PyResult<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        folders.recursive(true).create(dir)?;
+    }
+    Ok(())
 }
 
 /// The script for `page.evaluate(expression, arg)`, read as Playwright reads it: a function
@@ -324,9 +352,11 @@ impl Page {
             Some("domcontentloaded") => fluxwright::WaitUntil::DomContentLoaded,
             Some("networkidle") => fluxwright::WaitUntil::NetworkIdle,
             Some("commit") => fluxwright::WaitUntil::Commit,
-            Some(other) => return Err(PyValueError::new_err(format!(
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
                 "wait_until must be load, domcontentloaded, networkidle or commit, not {other:?}"
-            ))),
+            )))
+            }
         };
         run(py, &self.lease, move |p| {
             Box::pin(async move { p.goto_with(&url, wait).await.map(none) })
@@ -434,7 +464,7 @@ impl Page {
             let json =
                 serde_json::to_value(&state).map_err(|e| PyValueError::new_err(e.to_string()))?;
             if let Some(path) = path {
-                save(
+                save_private(
                     &path,
                     serde_json::to_string_pretty(&json).unwrap().as_bytes(),
                 )?;
