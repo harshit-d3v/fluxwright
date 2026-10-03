@@ -1,6 +1,6 @@
 # Fluxwright
 
-Run hundreds of headless Chrome jobs on one machine. Fluxwright pools browsers, queues jobs when every slot is busy, restarts browsers before they bloat, and retries jobs when a browser crashes, behind a Playwright-style API for Node and Rust.
+Run hundreds of headless Chrome jobs on one machine. Fluxwright pools browsers, queues jobs when every slot is busy, restarts browsers before they bloat, and retries jobs when a browser crashes, behind a Playwright-style API for Node, Python and Rust.
 
 It is not a Playwright rewrite. Playwright drives a browser; Fluxwright runs a fleet of them.
 
@@ -30,6 +30,29 @@ Fluxwright uses the Chrome on your machine. For headless jobs, install chrome-he
 npx @puppeteer/browsers install chrome-headless-shell@stable
 ```
 
+## Quick start (Python)
+
+```bash
+pip install fluxwright
+```
+
+```python
+import asyncio
+from fluxwright.async_api import async_playwright
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(max_browsers=4)
+        page = await browser.new_page()
+        await page.goto("https://example.com")
+        print(await page.get_by_role("heading").text_content())  # "Example Domain"
+        await browser.close()
+
+asyncio.run(main())
+```
+
+Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. The names are Playwright's, so a Playwright script for these features runs after changing its import.
+
 ## What a page can do
 
 | Area | API |
@@ -46,7 +69,7 @@ npx @puppeteer/browsers install chrome-headless-shell@stable
 | Sessions | `page.storageState({ path })` saves cookies and localStorage; `newPage({ storageState })` starts from them, so you log in once. Playwright's file format |
 | Network | a proxy per page, with a username and password; blocking by resource type or URL (Rust `JobOptions`) |
 
-The full Node API is in [bindings/node/README.md](bindings/node/README.md).
+The full Node API is in [bindings/node/README.md](bindings/node/README.md) and the Python API, with the same features under Playwright's Python names (`get_by_role`, `wait_until`, `storage_state`, ...), in [bindings/python/README.md](bindings/python/README.md).
 
 ## What the fleet does
 
@@ -61,7 +84,7 @@ The full Node API is in [bindings/node/README.md](bindings/node/README.md).
 
 - **Firefox or Safari (WebKit):** Fluxwright drives Chromium only.
 - **End-to-end tests:** Playwright Test gives you a runner, `expect`, fixtures, a trace viewer and a recorder. Fluxwright is an engine, not a test framework.
-- **Python, Java or .NET:** Fluxwright has Node and Rust today. Python is on the [roadmap](ROADMAP.md).
+- **Java or .NET:** Fluxwright has Node, Python and Rust.
 - **Touch and mobile emulation, request and response events:** not yet. See [MISSING.md](bindings/node/MISSING.md) and the roadmap.
 
 Use Fluxwright when you run many browser jobs, such as scraping, crawling, PDF and screenshot rendering, or automation at volume, and want the fleet handled for you.
@@ -148,6 +171,7 @@ The harness talks to `benchmark-server` (localhost only). Playwright and Puppete
 
 - Site: `cd www && npm install && npm run dev` (http://localhost:3456). Vercel deploys `www/` from `main`.
 - Node binding: `cd bindings/node && npm install && npm run build && npm test`.
+- Python binding: `cd bindings/python && pip install maturin pytest && maturin develop && pytest` (in a virtualenv).
 - Rust tests need Chrome: `cargo test --workspace -- --test-threads=1`.
 - Design notes: `docs/COMPETITIVE_ANALYSIS.md`, `docs/CDP_DECISION.md`, `docs/DECISIONS.md`.
 
