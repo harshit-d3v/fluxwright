@@ -2,10 +2,11 @@
 // chrome-headless-shell (see the README).
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
+import { statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import fluxwright from '../addon.js'
 
 // Echoes the user agent and languages; /login sets a cookie; /report is a download; /hdr echoes
@@ -103,6 +104,11 @@ try {
   const file = join(tmpdir(), `fluxwright-${process.pid}`, '.auth', 'state.json')
   const state = await login.storageState({ path: file })
   assert.ok(state.cookies.some((c) => c.name === 'sid' && c.value === 's3cret'))
+  if (process.platform !== 'win32') {
+    // Saved cookies are the owner's alone.
+    assert.equal(statSync(file).mode & 0o077, 0)
+    assert.equal(statSync(dirname(file)).mode & 0o077, 0)
+  }
   await login.close()
   const again = await browser.newPage({ storageState: file })
   await again.goto(base)
@@ -198,6 +204,13 @@ try {
     assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
     assert.match(rejected, /status must be between 100 and 599/)
     await rv.unroute('**/api')
+    // A URL function that throws is skipped; the request is not left hanging.
+    const broken = () => {
+      throw new Error('matcher broke')
+    }
+    await rv.route(broken, (route) => route.fulfill({ body: 'never' }))
+    assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
+    await rv.unroute(broken)
   } finally {
     console.error = quiet
   }
@@ -214,6 +227,17 @@ try {
   for (let i = 0; i < 250 && count < 600; i++) await new Promise((r) => setTimeout(r, 20))
   assert.equal(count, 600)
   await rv.close()
+
+  // A second route() made while the first is turning interception on returns after it.
+  const race = await browser.newPage()
+  let firstDone = false
+  const first = race.route('**/api', (route) => route.fulfill({ body: 'first' })).then(() => (firstDone = true))
+  await race.route('**/other', (route) => route.abort())
+  assert.ok(firstDone)
+  await first
+  await race.goto(base)
+  assert.equal(await race.evaluate(() => fetch('/api').then((r) => r.text())), 'first')
+  await race.close()
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
