@@ -9,7 +9,7 @@ members = [
     "benchmark-server",
     "benchmarks",
 ]
-exclude = ["bindings/node"]
+exclude = ["bindings/node", "bindings/python"]
 
 [workspace.package]
 version = "0.1.0"

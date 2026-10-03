@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fluxwright"
+dynamic = ["version"]
+description = "Run hundreds of headless Chrome jobs on one machine: pooling, queueing, recycling and crash recovery, with a Playwright-style API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Fluxwright contributors" }]
+keywords = ["chromium", "chrome", "headless", "playwright", "puppeteer", "browser-pool", "browser-automation", "scraping", "cdp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://fluxwright.vercel.app"
+Repository = "https://github.com/harshit-d3v/fluxwright"
+Issues = "https://github.com/harshit-d3v/fluxwright/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "fluxwright._native"
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
