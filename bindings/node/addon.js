@@ -11,6 +11,20 @@ async function save(path, data) {
   await fs.writeFile(path, data)
 }
 
+// `save` for saved cookies: new folders and the file are the owner's alone. Windows has no mode
+// bits; there a new file takes its folder's access list.
+async function savePrivate(path, data) {
+  await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  const file = await fs.open(path, 'w', 0o600)
+  try {
+    // A file that already existed keeps its mode on open: narrow it before the cookies go in.
+    await file.chmod(0o600)
+    await file.writeFile(data)
+  } finally {
+    await file.close()
+  }
+}
+
 // Playwright-style `page.evaluate(fn, arg)`. As in Playwright, the function is sent to the page as
 // source text, so it can use `arg` but not variables from Node. Strings run as expressions.
 function toExpression(pageFunction, arg) {
@@ -112,61 +126,80 @@ function installRoutes(Page) {
     resourceType: () => native.resourceType,
   })
   const dispatch = async (list, native) => {
-    for (let i = list.length - 1; i >= 0; i--) {
-      if (!list[i].matches(native.url)) continue
-      // The first answer wins; it is set when the call starts, so an answer still under way
-      // when the handler returns is waited for, not taken as no answer.
-      let answer = null
-      let fellBack = false
-      const answerWith = (work) => {
-        if (answer || fellBack) return Promise.reject(new Error('route is already handled'))
-        answer = work()
-        return answer
+    try {
+      for (let i = list.length - 1; i >= 0; i--) {
+        // A URL function is user code: one that throws counts as no match.
+        let matched = false
+        try {
+          matched = list[i].matches(native.url)
+        } catch (err) {
+          console.error('[fluxwright] a page.route URL matcher failed:', err)
+        }
+        if (!matched) continue
+        // The first answer wins; it is set when the call starts, so an answer still under way
+        // when the handler returns is waited for, not taken as no answer.
+        let answer = null
+        let fellBack = false
+        const answerWith = (work) => {
+          if (answer || fellBack) return Promise.reject(new Error('route is already handled'))
+          answer = work()
+          return answer
+        }
+        const route = {
+          request: () => request(native),
+          fulfill: (o = {}) =>
+            answerWith(async () => {
+              const headers = { ...o.headers }
+              let body = o.body
+              if (o.json !== undefined) {
+                body = JSON.stringify(o.json)
+                headers['content-type'] ??= 'application/json'
+              }
+              if (o.path) body = await fs.readFile(o.path)
+              if (o.contentType) headers['content-type'] = o.contentType
+              return native.fulfill({ status: o.status, headers, body })
+            }),
+          continue: (o = {}) =>
+            answerWith(() => native.continue({ url: o.url, method: o.method, headers: o.headers, postData: o.postData })),
+          abort: (errorCode) => answerWith(() => native.abort(errorCode)),
+          fallback: async () => {
+            if (answer) throw new Error('route is already handled')
+            fellBack = true
+          },
+        }
+        try {
+          await list[i].handler(route, route.request())
+          if (fellBack && !answer) continue
+          if (answer) await answer
+        } catch (err) {
+          console.error('[fluxwright] a route handler failed; the request continues:', err)
+        }
+        return
       }
-      const route = {
-        request: () => request(native),
-        fulfill: (o = {}) =>
-          answerWith(async () => {
-            const headers = { ...o.headers }
-            let body = o.body
-            if (o.json !== undefined) {
-              body = JSON.stringify(o.json)
-              headers['content-type'] ??= 'application/json'
-            }
-            if (o.path) body = await fs.readFile(o.path)
-            if (o.contentType) headers['content-type'] = o.contentType
-            return native.fulfill({ status: o.status, headers, body })
-          }),
-        continue: (o = {}) =>
-          answerWith(() => native.continue({ url: o.url, method: o.method, headers: o.headers, postData: o.postData })),
-        abort: (errorCode) => answerWith(() => native.abort(errorCode)),
-        fallback: async () => {
-          if (answer) throw new Error('route is already handled')
-          fellBack = true
-        },
-      }
-      try {
-        await list[i].handler(route, route.request())
-        if (fellBack && !answer) continue
-        if (answer) await answer
-      } catch (err) {
-        console.error('[fluxwright] a route handler failed; the request continues:', err)
-      }
+    } finally {
       // No answer, or one that failed: let the request through rather than hang the page.
       // A request already answered refuses this, harmlessly.
       await native.continue().catch(() => {})
-      return
     }
-    await native.continue().catch(() => {})
   }
+  // One interception start per page. Every route() call waits for it, so none returns before
+  // requests are handed over, and a call adds its handler only once the start succeeded (a
+  // failed start is tried again by the next call).
+  const starts = new WeakMap()
   Page.prototype.route = async function (url, handler) {
     let list = routes.get(this)
     if (!list) {
       list = []
       routes.set(this, list)
-      this._setRouteHandler((native) => dispatch(list, native))
-      await this._intercept()
     }
+    let start = starts.get(this)
+    if (!start) {
+      this._setRouteHandler((native) => dispatch(list, native))
+      start = this._intercept()
+      starts.set(this, start)
+      start.catch(() => starts.get(this) === start && starts.delete(this))
+    }
+    await start
     list.push({ url, handler, matches: urlMatcher(url) })
   }
   Page.prototype.unroute = async function (url, handler) {
@@ -222,7 +255,7 @@ try {
   const storageState = native.Page.prototype.storageState
   native.Page.prototype.storageState = async function (options) {
     const state = await storageState.call(this)
-    if (options?.path) await save(options.path, JSON.stringify(state, null, 2))
+    if (options?.path) await savePrivate(options.path, JSON.stringify(state, null, 2))
     return state
   }
   // Playwright's locator.evaluate(fn, arg) calls fn(element, arg).
