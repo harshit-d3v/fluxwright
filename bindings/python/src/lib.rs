@@ -159,8 +159,8 @@ fn create_parent(path: &Path, folders: &mut std::fs::DirBuilder) -> PyResult<()>
 }
 
 /// The script for `page.evaluate(expression, arg)`, read as Playwright reads it: a function
-/// (arrow, `function` or `async`) is called with `arg`; anything else is an expression, or
-/// statements when there is no `arg`.
+/// (arrow, `function` or `async`) is called with `arg`, which is `null` for Python's `None`;
+/// anything else is an expression, or statements when there is no `arg`.
 fn page_function(expression: &str, arg: Option<&serde_json::Value>) -> String {
     let e = expression
         .trim()
@@ -168,7 +168,7 @@ fn page_function(expression: &str, arg: Option<&serde_json::Value>) -> String {
     if arg.is_none() && !looks_like_function(e) {
         return expression.to_string();
     }
-    let arg = arg.map(|a| a.to_string()).unwrap_or_default();
+    let arg = arg.map_or_else(|| "null".to_string(), |a| a.to_string());
     // The newlines keep a trailing `// comment` from swallowing the parenthesis.
     format!(
         "(() => {{ const __fluxwright_fn = (\n{e}\n); \
@@ -659,8 +659,8 @@ impl Locator {
         })
     }
 
-    /// Calls the JavaScript function `expression` with the element and `arg` in the page's own
-    /// world, and returns its result.
+    /// Calls the JavaScript function `expression` with the element and `arg` (`null` for
+    /// Python's `None`, as in Playwright) in the page's own world, and returns its result.
     #[pyo3(signature = (expression, arg=None))]
     fn evaluate<'py>(
         &self,
@@ -668,7 +668,7 @@ impl Locator {
         expression: String,
         arg: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let arg = arg.map(|a| to_json(&a)).transpose()?;
+        let arg = Some(arg.map(|a| to_json(&a)).transpose()?.unwrap_or_default());
         let sel = self.selector.clone();
         run(py, &self.lease, move |p| {
             Box::pin(async move { p.evaluate_on(&sel, &expression, arg).await.map(Json) })

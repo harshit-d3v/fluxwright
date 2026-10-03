@@ -23,7 +23,7 @@ import inspect
 import json as _json
 import logging
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from os import PathLike
 from pathlib import Path
 from typing import (
@@ -256,33 +256,29 @@ class Page(_native.Page):
     """
 
     def __init__(self, lease: _native.Lease) -> None:
-        self._routes: list[_RouteEntry] | None = None
+        self._routes: list[_RouteEntry] = []
+        self._routing = False
+        self._route_lock = asyncio.Lock()
         self._listeners: dict[str, list[tuple[Listener, Listener]]] = {}
-        self._logging: asyncio.Future[None] | None = None
+        self._logging = False
         self._tasks: set[asyncio.Future[Any]] = set()
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
         """Hands matching requests of this page, its popups and iframes to ``handler(route)``
         or ``handler(route, request)``, as Playwright's ``page.route``. The handler added last
         runs first; an unanswered request continues. Call it before navigating."""
-        first = self._routes is None
-        if self._routes is None:
-            self._routes = []
-        self._routes.append(_RouteEntry(url, handler))
-        if first:
-            try:
+        # A call made while another is turning interception on waits for it, so no call returns
+        # before requests are handed over.
+        async with self._route_lock:
+            if not self._routing:
                 stream = await self._intercept()
-            except BaseException:
-                self._routes = None
-                raise
-            self._keep(asyncio.ensure_future(self._serve_routes(stream)))
+                _keep(self._tasks, asyncio.ensure_future(_serve_routes(stream, self._routes, self._tasks)))
+                self._routing = True
+            self._routes.append(_RouteEntry(url, handler))
 
     async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         """Removes the handlers added for ``url`` (only ``handler``, when given)."""
-        if self._routes:
-            self._routes[:] = [
-                r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))
-            ]
+        self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
 
     def on(self, event: str, handler: Listener) -> None:
         """Calls ``handler`` with each ``"console"`` message (a ``ConsoleMessage``) or
@@ -291,19 +287,16 @@ class Page(_native.Page):
 
     def once(self, event: str, handler: Listener) -> None:
         """``on``, for the next event only."""
+        listeners = self._listeners
 
         def call(arg: Any) -> Any:
-            self.remove_listener(event, handler)
+            _remove_listener(listeners, event, handler)
             return handler(arg)
 
         self._add_listener("once", event, handler, call)
 
     def remove_listener(self, event: str, handler: Listener) -> None:
-        listeners = self._listeners.get(event, [])
-        for i, (added, _) in enumerate(listeners):
-            if added == handler:
-                del listeners[i]
-                return
+        _remove_listener(self._listeners, event, handler)
 
     off = remove_listener
 
@@ -327,31 +320,69 @@ class Page(_native.Page):
     def _add_listener(self, method: str, event: str, added: Listener, call: Listener) -> None:
         if event not in ("console", "pageerror"):
             raise ValueError(f"page.{method}: {event!r} is not supported (console, pageerror)")
-        if self._logging is None:
+        if not self._logging:
             # Subscribed here, so nothing logged after this call is missed.
-            self._logging = asyncio.ensure_future(self._serve_logs(self._logs()))
-            self._keep(self._logging)
+            _keep(self._tasks, asyncio.ensure_future(_serve_logs(self._logs(), self._listeners, self._tasks)))
+            self._logging = True
         self._listeners.setdefault(event, []).append((added, call))
 
-    async def _serve_logs(self, stream: _native.LogStream) -> None:
-        while (entry := await stream.next()) is not None:
-            event = "pageerror" if isinstance(entry, Error) else "console"
-            for _, call in list(self._listeners.get(event, ())):
-                try:
-                    result = call(entry)
-                    if inspect.isawaitable(result):
-                        self._keep(asyncio.ensure_future(result))
-                except Exception:
-                    _log.exception("a page.on(%r) listener failed", event)
 
-    async def _serve_routes(self, stream: _native.RouteStream) -> None:
-        while (native := await stream.next()) is not None:
-            self._keep(asyncio.ensure_future(self._dispatch(native)))
+# The loops below run until the page closes. They hold the page's handlers, never the page, so a
+# page nobody holds is still collected and its slot goes back to the pool.
 
-    async def _dispatch(self, native: _native.Route) -> None:
-        request = Request(native)
-        for entry in reversed(list(self._routes or ())):
-            if not entry.matches(native.url):
+
+def _keep(tasks: set[asyncio.Future[Any]], future: asyncio.Future[Any]) -> None:
+    """Holds a background task until it ends, and logs it if it failed."""
+    tasks.add(future)
+
+    def forget(done: asyncio.Future[Any]) -> None:
+        tasks.discard(done)
+        if not done.cancelled() and done.exception() is not None:
+            _log.error("a fluxwright background task failed", exc_info=done.exception())
+
+    future.add_done_callback(forget)
+
+
+def _remove_listener(listeners: dict[str, list[tuple[Listener, Listener]]], event: str, handler: Listener) -> None:
+    entries = listeners.get(event, [])
+    for i, (added, _) in enumerate(entries):
+        if added == handler:
+            del entries[i]
+            return
+
+
+async def _serve_logs(
+    stream: _native.LogStream,
+    listeners: dict[str, list[tuple[Listener, Listener]]],
+    tasks: set[asyncio.Future[Any]],
+) -> None:
+    while (entry := await stream.next()) is not None:
+        event = "pageerror" if isinstance(entry, Error) else "console"
+        for _, call in list(listeners.get(event, ())):
+            try:
+                result = call(entry)
+                if inspect.isawaitable(result):
+                    _keep(tasks, asyncio.ensure_future(result))
+            except Exception:
+                _log.exception("a page.on(%r) listener failed", event)
+
+
+async def _serve_routes(
+    stream: _native.RouteStream, routes: list[_RouteEntry], tasks: set[asyncio.Future[Any]]
+) -> None:
+    while (native := await stream.next()) is not None:
+        _keep(tasks, asyncio.ensure_future(_dispatch(native, routes)))
+
+
+async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
+    request = Request(native)
+    try:
+        for entry in reversed(list(routes)):
+            try:
+                if not entry.matches(native.url):
+                    continue
+            except Exception:
+                _log.exception("a page.route URL matcher failed")
                 continue
             route = Route(native, request)
             try:
@@ -365,21 +396,11 @@ class Page(_native.Page):
             except Exception:
                 _log.exception("a route handler failed; the request continues")
             break
+    finally:
         # No answer, or one that failed: let the request through rather than hang the page. A
         # request already answered refuses this, harmlessly.
-        try:
+        with suppress(Error):
             await native.continue_()
-        except Error:
-            pass
-
-    def _keep(self, future: asyncio.Future[Any]) -> None:
-        self._tasks.add(future)
-        future.add_done_callback(self._forget)
-
-    def _forget(self, future: asyncio.Future[Any]) -> None:
-        self._tasks.discard(future)
-        if not future.cancelled() and future.exception() is not None:
-            _log.error("a fluxwright background task failed", exc_info=future.exception())
 
 
 class Browser:

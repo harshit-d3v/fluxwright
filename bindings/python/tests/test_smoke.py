@@ -2,12 +2,14 @@
 chrome-headless-shell (see the README)."""
 
 import asyncio
+import gc
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -76,6 +78,7 @@ async def async_smoke(base: str, tmp: Path) -> None:
         assert await page.evaluate("async (s) => s.toUpperCase()", "ok") == "OK"
         assert await page.evaluate("xs => xs.map((x) => x * 2)", [1, 2]) == [2, 4]
         assert await page.evaluate("function (x) { return x + 1 }", 1) == 2
+        assert await page.evaluate("x => x === null") is True  # None arrives as null, as in Playwright
         # Statements, a trailing semicolon or a trailing comment: read as written.
         assert await page.evaluate("const n = 2; n * 3") == 6
         assert await page.evaluate("document.title;") == "Hi"
@@ -143,6 +146,7 @@ async def async_smoke(base: str, tmp: Path) -> None:
         assert await ui.title() == "1"
         assert await ui.get_by_test_id("total").bounding_box() == {"x": 10, "y": 50, "width": 40, "height": 20}
         assert await ui.locator("#e").evaluate("(el, suffix) => el.value + suffix", "!") == "a@b.c!"
+        assert await ui.locator("#e").evaluate("(el, x) => x === null") is True
         png = await ui.get_by_test_id("total").screenshot(path=tmp / "el.png")
         assert (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")) == (40, 20)
         assert (tmp / "el.png").read_bytes() == png
@@ -215,6 +219,13 @@ async def async_smoke(base: str, tmp: Path) -> None:
         assert await rv.evaluate(FETCH_API) == '{"real":true}'
         assert "status must be between 100 and 599" in rejected[0]
         await rv.unroute("**/api")
+
+        def broken(url):
+            raise RuntimeError("matcher broke")
+
+        await rv.route(broken, lambda route: route.fulfill(body="never"))
+        assert await rv.evaluate(FETCH_API) == '{"real":true}'  # skipped, not stuck
+        await rv.unroute(broken)
         count = 0
 
         def counted(_):
@@ -231,6 +242,25 @@ async def async_smoke(base: str, tmp: Path) -> None:
         with pytest.raises(TimeoutError):
             await rv.wait_for_download(timeout=100)
         await rv.close()
+
+        # A second route() made while the first is turning interception on returns after it.
+        race = await browser.new_page()
+        first = asyncio.ensure_future(race.route("**/api", lambda route: route.fulfill(body="first")))
+        await asyncio.sleep(0)
+        await race.route("**/other", lambda route: route.abort())
+        assert first.done()
+        await race.goto(base)
+        assert await race.evaluate(FETCH_API) == "first"
+        await race.close()
+
+        # A page with listeners and routes that nobody holds is collected, so its slot comes back.
+        forgotten = await browser.new_page()
+        forgotten.on("console", lambda m: None)
+        await forgotten.route("**/api", lambda route: route.continue_())
+        gone = weakref.ref(forgotten)
+        del forgotten
+        gc.collect()
+        assert gone() is None
 
         # Left open on purpose: the context manager's exit closes the browser under it.
         await browser.new_page()
