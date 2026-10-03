@@ -2,7 +2,7 @@
 // chrome-headless-shell (see the README).
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { statSync } from 'node:fs'
+import { chmodSync, statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
@@ -105,9 +105,12 @@ try {
   const state = await login.storageState({ path: file })
   assert.ok(state.cookies.some((c) => c.name === 'sid' && c.value === 's3cret'))
   if (process.platform !== 'win32') {
-    // Saved cookies are the owner's alone.
+    // Saved cookies are the owner's alone, also when the file already existed with a wider mode.
     assert.equal(statSync(file).mode & 0o077, 0)
     assert.equal(statSync(dirname(file)).mode & 0o077, 0)
+    chmodSync(file, 0o644)
+    await login.storageState({ path: file })
+    assert.equal(statSync(file).mode & 0o077, 0)
   }
   await login.close()
   const again = await browser.newPage({ storageState: file })
@@ -238,6 +241,26 @@ try {
   await race.goto(base)
   assert.equal(await race.evaluate(() => fetch('/api').then((r) => r.text())), 'first')
   await race.close()
+
+  // A failed start rejects route() and keeps its handler out; the next call starts again.
+  const retry = await browser.newPage()
+  retry._intercept = async () => {
+    throw new Error('intercept failed')
+  }
+  await assert.rejects(
+    retry.route('**/api', (route) => route.fulfill({ body: 'stale' })),
+    /intercept failed/,
+  )
+  delete retry._intercept
+  let retried = false
+  await retry.route('**/api', (route) => {
+    retried = true
+    return route.fallback()
+  })
+  await retry.goto(base)
+  assert.equal(await retry.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
+  assert.ok(retried)
+  await retry.close()
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
