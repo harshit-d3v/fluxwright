@@ -11,7 +11,11 @@ _Path = str | PathLike[str]
 class Engine:
     @staticmethod
     def launch(
-        *, max_browsers: int | None = None, executable_path: _Path | None = None, headless: bool | None = None
+        *,
+        max_browsers: int | None = None,
+        executable_path: _Path | None = None,
+        headless: bool | None = None,
+        queue_timeout: float | None = None,
     ) -> Awaitable[Engine]: ...
     def new_page(
         self,

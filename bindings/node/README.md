@@ -39,7 +39,7 @@ await browser.close();
 
 | Method | What it does |
 |---|---|
-| `chromium.launch({ maxBrowsers?, executablePath?, headless? })` | Start the pool. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executablePath` overrides |
+| `chromium.launch({ maxBrowsers?, executablePath?, headless?, queueTimeout? })` | Start the pool. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executablePath` overrides. When every slot is busy, `newPage` waits its turn however long the queue is, so starting every job at once works; with `queueTimeout` (ms) it rejects after that long instead, counting a browser start when one is needed |
 | `browser.newPage(options?)` | Acquire a lease (a fresh context). Every option applies to this page only: `proxy: { server, bypass?, username?, password? }`, `userAgent`, `locale`, `timezoneId`, `geolocation: { latitude, longitude, accuracy? }` (with `permissions: ['geolocation']`), `permissions`, `viewport: { width, height }`, `deviceScaleFactor`, `colorScheme`, `storageState` (an object or a file path) |
 | `page.storageState({ path? })` | Every cookie in the context plus localStorage of the current origin, in Playwright's format. With `path`, also saved as JSON for `newPage({ storageState: path })` |
 | `page.goto(url, { waitUntil? })` | Navigate. `waitUntil`: `load` (default), `domcontentloaded`, `networkidle`, `commit`. Event-driven, like Playwright |

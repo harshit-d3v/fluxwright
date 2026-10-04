@@ -262,6 +262,34 @@ try {
   assert.ok(retried)
   await retry.close()
 
+  // One browser holds 8 pages; the 300 started after them wait their turn instead of failing
+  // (the engine used to refuse jobs past 256 waiting, and give up after 30 s).
+  const held = await Promise.all(Array.from({ length: 8 }, () => browser.newPage()))
+  let settled = 0
+  const waiting = Array.from({ length: 300 }, () =>
+    browser
+      .newPage()
+      .then((page) => page.close())
+      .finally(() => settled++),
+  )
+  await new Promise((resolve) => setTimeout(resolve, 500))
+  assert.equal(settled, 0)
+  await Promise.all(held.map((page) => page.close()))
+  await Promise.all(waiting)
+  // With queueTimeout, a job that cannot get a page in time fails. The limit also covers
+  // starting a browser, so let Chrome come up first.
+  const hurried = await fluxwright.chromium.launch({ maxBrowsers: 1, queueTimeout: 2000 })
+  try {
+    let first = null
+    for (let i = 0; i < 30 && !first; i++) first = await hurried.newPage().catch(() => null)
+    assert.ok(first, 'Chrome did not start')
+    const busy = [first, ...(await Promise.all(Array.from({ length: 7 }, () => hurried.newPage())))]
+    await assert.rejects(hurried.newPage(), /acquire a page lease/)
+    await Promise.all(busy.map((page) => page.close()))
+  } finally {
+    await hurried.close()
+  }
+
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
 } finally {

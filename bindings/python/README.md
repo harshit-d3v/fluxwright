@@ -71,7 +71,7 @@ The sync API runs every call on one event loop in a background thread, so its ob
 
 | Method | What it does |
 |---|---|
-| `chromium.launch(max_browsers=None, executable_path=None, headless=None)` | Start the pool (4 browsers by default). Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executable_path` overrides |
+| `chromium.launch(max_browsers=None, executable_path=None, headless=None, queue_timeout=None)` | Start the pool (4 browsers by default). Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executable_path` overrides. When every slot is busy, `new_page` waits its turn however long the queue is, so starting every job at once works; with `queue_timeout` (ms) it raises `TimeoutError` after that long instead, counting a browser start when one is needed |
 | `browser.new_page(...)` | A fresh browser context. Every option applies to this page only: `proxy={"server", "bypass", "username", "password"}`, `user_agent`, `locale`, `timezone_id`, `geolocation={"latitude", "longitude", "accuracy"}` (with `permissions=["geolocation"]`), `permissions`, `viewport={"width", "height"}`, `device_scale_factor`, `color_scheme`, `storage_state` (a dict or a file path) |
 | `page.storage_state(path=None)` | Every cookie in the context plus localStorage of the current origin, in Playwright's format. With `path`, also saved as JSON for `new_page(storage_state=path)` |
 | `page.goto(url, wait_until=None)` | Navigate. `wait_until`: `load` (default), `domcontentloaded`, `networkidle`, `commit` |
