@@ -266,6 +266,37 @@ async def async_smoke(base: str, tmp: Path) -> None:
         await browser.new_page()
 
 
+def test_queue():
+    asyncio.run(queue_smoke())
+
+
+async def queue_smoke() -> None:
+    async with async_playwright() as p:
+        # One browser holds 8 pages; the 300 started after them wait their turn instead of
+        # failing (the engine used to refuse jobs past 256 waiting, and give up after 30 s).
+        browser = await p.chromium.launch(max_browsers=1)
+        held = [await browser.new_page() for _ in range(8)]
+
+        async def job() -> None:
+            page = await browser.new_page()
+            await page.close()
+
+        waiting = [asyncio.ensure_future(job()) for _ in range(300)]
+        await asyncio.sleep(0.5)
+        assert not any(task.done() for task in waiting)
+        for page in held:
+            await page.close()
+        await asyncio.gather(*waiting)
+
+        # With queue_timeout, a job that cannot get a slot in time raises TimeoutError.
+        hurried = await p.chromium.launch(max_browsers=1, queue_timeout=300)
+        held = [await hurried.new_page() for _ in range(8)]
+        with pytest.raises(TimeoutError, match="acquire a page lease"):
+            await hurried.new_page()
+        for page in held:
+            await page.close()
+
+
 def test_sync_api(base, tmp_path):
     with sync_playwright() as p:
         browser = p.chromium.launch(max_browsers=2)

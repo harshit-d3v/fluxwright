@@ -446,6 +446,18 @@ pub struct LaunchOptions {
     pub executable_path: Option<String>,
     /// Default true.
     pub headless: Option<bool>,
+    /// Milliseconds `newPage` waits for a free slot before it fails. 0 or unset waits as long
+    /// as the queue takes.
+    pub queue_timeout: Option<u32>,
+}
+
+/// `queueTimeout` as the engine's acquire timeout.
+fn queue_wait(ms: Option<u32>) -> std::time::Duration {
+    match ms {
+        Some(ms) if ms > 0 => std::time::Duration::from_millis(ms as u64),
+        // ponytail: a year stands in for "no limit", so deadline arithmetic never overflows.
+        _ => std::time::Duration::from_secs(365 * 24 * 60 * 60),
+    }
 }
 
 #[napi(object)]
@@ -651,15 +663,20 @@ pub struct Chromium {}
 impl Chromium {
     #[napi]
     pub async fn launch(options: Option<LaunchOptions>) -> Result<Browser> {
-        let (max, exe, headless) = match options {
-            Some(o) => (o.max_browsers, o.executable_path, o.headless),
-            None => (None, None, None),
+        let (max, exe, headless, queue_timeout) = match options {
+            Some(o) => (o.max_browsers, o.executable_path, o.headless, o.queue_timeout),
+            None => (None, None, None, None),
         };
         let engine = RT
             .spawn(async move {
+                // newPage waits its turn however long the queue is, so starting every job at
+                // once works; the engine's own default (256 waiting, then an error) is for a
+                // server shedding load.
                 let mut b = fluxwright::BrowserEngine::builder()
                     .max_browsers(max.unwrap_or(4) as usize)
-                    .max_contexts_per_browser(8);
+                    .max_contexts_per_browser(8)
+                    .queue_capacity(usize::MAX)
+                    .acquire_timeout(queue_wait(queue_timeout));
                 if let Some(exe) = exe {
                     b = b.chrome(exe);
                 }
