@@ -215,6 +215,16 @@ fn storage(value: &Bound<'_, PyAny>) -> PyResult<fluxwright::StorageState> {
     }
 }
 
+/// `queue_timeout` (milliseconds) as the engine's acquire timeout, which also covers starting a
+/// browser; `None` or 0 waits as long as the queue takes.
+fn queue_wait(ms: Option<f64>) -> Duration {
+    match ms {
+        Some(ms) if ms > 0.0 => Duration::from_millis(ms as u64),
+        // ponytail: a year stands in for "no limit", so deadline arithmetic never overflows.
+        _ => Duration::from_secs(365 * 24 * 60 * 60),
+    }
+}
+
 /// The engine: a pool of Chrome processes that pages are leased from.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct Engine {
@@ -224,17 +234,23 @@ struct Engine {
 #[pymethods]
 impl Engine {
     #[staticmethod]
-    #[pyo3(signature = (*, max_browsers=None, executable_path=None, headless=None))]
+    #[pyo3(signature = (*, max_browsers=None, executable_path=None, headless=None, queue_timeout=None))]
     fn launch(
         py: Python<'_>,
         max_browsers: Option<usize>,
         executable_path: Option<PathBuf>,
         headless: Option<bool>,
+        queue_timeout: Option<f64>,
     ) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
+            // new_page waits its turn however long the queue is, so starting every job at once
+            // works; the engine's own default (256 waiting, then an error) is for a server
+            // shedding load.
             let mut b = fluxwright::BrowserEngine::builder()
                 .max_browsers(max_browsers.unwrap_or(4))
-                .max_contexts_per_browser(8);
+                .max_contexts_per_browser(8)
+                .queue_capacity(usize::MAX)
+                .acquire_timeout(queue_wait(queue_timeout));
             if let Some(exe) = executable_path {
                 b = b.chrome(exe);
             }

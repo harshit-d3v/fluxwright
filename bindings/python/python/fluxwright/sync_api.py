@@ -529,11 +529,20 @@ class BrowserType:
         headless: bool | None = None,
         executable_path: str | PathLike[str] | None = None,
         max_browsers: int | None = None,
+        queue_timeout: float | None = None,
     ) -> Browser:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
-        4), headless unless ``headless=False``."""
+        4), headless unless ``headless=False``. When every slot is busy, ``new_page`` waits its
+        turn however long the queue is; with ``queue_timeout`` (milliseconds) it raises
+        ``TimeoutError`` after that long instead, counting a browser start when one is needed."""
         return Browser(
-            _run(self._impl.launch, headless=headless, executable_path=executable_path, max_browsers=max_browsers)
+            _run(
+                self._impl.launch,
+                headless=headless,
+                executable_path=executable_path,
+                max_browsers=max_browsers,
+                queue_timeout=queue_timeout,
+            )
         )
 
 

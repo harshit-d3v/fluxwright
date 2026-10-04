@@ -266,6 +266,49 @@ async def async_smoke(base: str, tmp: Path) -> None:
         await browser.new_page()
 
 
+async def first_page(browser):
+    """The first page of a new engine: a slow Chrome start can outlast a short queue timeout."""
+    for _ in range(30):
+        try:
+            return await browser.new_page()
+        except TimeoutError:
+            pass
+    raise AssertionError("Chrome did not start")
+
+
+def test_queue():
+    asyncio.run(queue_smoke())
+
+
+async def queue_smoke() -> None:
+    async with async_playwright() as p:
+        # One browser holds 8 pages; the 300 started after them wait their turn instead of
+        # failing (the engine used to refuse jobs past 256 waiting, and give up after 30 s).
+        browser = await p.chromium.launch(max_browsers=1)
+        held = [await browser.new_page() for _ in range(8)]
+
+        async def job() -> None:
+            page = await browser.new_page()
+            await page.close()
+
+        waiting = [asyncio.ensure_future(job()) for _ in range(300)]
+        await asyncio.sleep(0.5)
+        assert not any(task.done() for task in waiting)
+        for page in held:
+            await page.close()
+        await asyncio.gather(*waiting)
+
+        # With queue_timeout, a job that cannot get a page in time raises TimeoutError. The limit
+        # also covers starting a browser, so let Chrome come up first.
+        hurried = await p.chromium.launch(max_browsers=1, queue_timeout=2000)
+        held = [await first_page(hurried)]
+        held += [await hurried.new_page() for _ in range(7)]
+        with pytest.raises(TimeoutError, match="acquire a page lease"):
+            await hurried.new_page()
+        for page in held:
+            await page.close()
+
+
 def test_sync_api(base, tmp_path):
     with sync_playwright() as p:
         browser = p.chromium.launch(max_browsers=2)
