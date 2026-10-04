@@ -476,7 +476,8 @@ class BrowserType:
         4), headless unless ``headless=False``. Headless uses chrome-headless-shell when it is
         installed, as Playwright does; ``executable_path`` or ``FLUXWRIGHT_CHROMIUM`` picks the
         binary. When every slot is busy, ``new_page`` waits its turn however long the queue is;
-        with ``queue_timeout`` (milliseconds) it raises ``TimeoutError`` after that long instead."""
+        with ``queue_timeout`` (milliseconds) it raises ``TimeoutError`` after that long instead,
+        counting a browser start when one is needed."""
         engine = await _native.Engine.launch(
             max_browsers=max_browsers, executable_path=executable_path, headless=headless, queue_timeout=queue_timeout
         )

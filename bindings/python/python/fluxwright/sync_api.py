@@ -534,7 +534,7 @@ class BrowserType:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
         4), headless unless ``headless=False``. When every slot is busy, ``new_page`` waits its
         turn however long the queue is; with ``queue_timeout`` (milliseconds) it raises
-        ``TimeoutError`` after that long instead."""
+        ``TimeoutError`` after that long instead, counting a browser start when one is needed."""
         return Browser(
             _run(
                 self._impl.launch,

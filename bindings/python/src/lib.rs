@@ -215,8 +215,8 @@ fn storage(value: &Bound<'_, PyAny>) -> PyResult<fluxwright::StorageState> {
     }
 }
 
-/// `queue_timeout` (milliseconds) as the engine's acquire timeout; `None` or 0 waits as long as
-/// the queue takes.
+/// `queue_timeout` (milliseconds) as the engine's acquire timeout, which also covers starting a
+/// browser; `None` or 0 waits as long as the queue takes.
 fn queue_wait(ms: Option<f64>) -> Duration {
     match ms {
         Some(ms) if ms > 0.0 => Duration::from_millis(ms as u64),

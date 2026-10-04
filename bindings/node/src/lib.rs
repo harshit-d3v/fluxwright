@@ -446,8 +446,8 @@ pub struct LaunchOptions {
     pub executable_path: Option<String>,
     /// Default true.
     pub headless: Option<bool>,
-    /// Milliseconds `newPage` waits for a free slot before it fails. 0 or unset waits as long
-    /// as the queue takes.
+    /// Milliseconds `newPage` waits for a page before it fails: for a free slot, and for a
+    /// browser to start when one is needed. 0 or unset waits as long as the queue takes.
     pub queue_timeout: Option<u32>,
 }
 
