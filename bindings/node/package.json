@@ -60,9 +60,9 @@
     "access": "public"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4",
-    "@types/node": "^22.20.4",
-    "typescript": "^5.9.3"
+    "@napi-rs/cli": "^3.10.8",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
   },
   "optionalDependencies": {
     "fluxwright-darwin-arm64": "0.4.1",
