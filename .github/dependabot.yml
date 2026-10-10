@@ -1,0 +1,35 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories:
+      - /bindings/node
+      - /bindings/python
+    schedule:
+      interval: weekly
+    groups:
+      bindings-rust:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directories:
+      - /www
+      - /benchmarks
+      - /bindings/node
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

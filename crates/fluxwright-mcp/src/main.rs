@@ -9,7 +9,7 @@ use base64::Engine as _;
 use fluxwright::{BrowserEngine, PageLease};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
     transport::stdio,
 };
@@ -231,7 +231,7 @@ impl FluxwrightMcp {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-        Ok(CallToolResult::success(vec![Content::image(b64, "image/png")]))
+        Ok(CallToolResult::success(vec![ContentBlock::image(b64, "image/png")]))
     }
 
     #[tool(description = "Close the current page (destroys the browser context).")]
@@ -242,19 +242,16 @@ impl FluxwrightMcp {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for FluxwrightMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("fluxwright-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
                 "Fluxwright Chromium fleet. Tools: open, goto, title, content, click, fill, evaluate, screenshot, close. \
                  Each open() is a fresh browser context. Selectors: CSS, text=Sign in, or role=button[name=\"Sign in\"]. \
-                 Prefer evaluate() to extract prices/text."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+                 Prefer evaluate() to extract prices/text.",
+            )
     }
 }
 
