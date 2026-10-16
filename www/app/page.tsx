@@ -89,6 +89,26 @@ await card.fill("4242 4242 4242 4242");
 await page.close(); // the context is destroyed and the slot is free
 await browser.close();`;
 
+const PY_EXAMPLE = `import asyncio
+from fluxwright.async_api import async_playwright
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(max_browsers=4)
+
+        # A fresh browser context on a pooled Chrome.
+        page = await browser.new_page()
+        await page.goto("https://example.com", wait_until="domcontentloaded")
+        print(await page.title())
+
+        # Locators wait until the element can be used.
+        await page.get_by_role("button", name="Accept").click()
+        await page.get_by_role("textbox", name="Search").fill("chromium")
+
+        await page.close()  # the context is destroyed and the slot is free
+
+asyncio.run(main())`;
+
 const RUST_EXAMPLE = `use fluxwright::{BrowserEngine, JobOptions, Priority};
 
 let engine = BrowserEngine::builder()
@@ -145,7 +165,7 @@ export default function Home() {
             <p className="lead">
               Fluxwright pools Chrome, gives every job a fresh isolated page, queues work when the
               fleet is full, restarts browsers before they bloat, and retries when one crashes. Use
-              it from Node, from Rust, or from an AI agent over MCP.
+              it from Node, Python or Rust, or from an AI agent over MCP.
             </p>
             <CopyCommand command="npm install fluxwright" />
             <div className="actions">
@@ -157,7 +177,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.2.1, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux.
+              Version 0.4.1, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
             </p>
           </div>
           <FleetBoard />
@@ -191,7 +211,7 @@ export default function Home() {
           <div className="container">
             <div className="section-head">
               <h2 id="how-title">How a job runs</h2>
-              <p>The same five steps whether a job comes from Node, Rust or an agent.</p>
+              <p>The same five steps whether a job comes from Node, Python, Rust or an agent.</p>
             </div>
             <ol className="steps">
               {STEPS.map((s) => (
@@ -210,7 +230,7 @@ export default function Home() {
               <h2 id="code-title">The code</h2>
               <p>
                 A small API on purpose: pages you lease, locators that wait, and an engine that
-                handles the fleet. Node gets a native addon, so there is no driver process in between.
+                handles the fleet. Node and Python load a native module, so there is no driver process in between.
               </p>
               <p className="note">
                 The MCP server exposes open, goto, click, fill, evaluate, screenshot and close.
@@ -221,6 +241,7 @@ export default function Home() {
               label="Code examples"
               tabs={[
                 { title: "TypeScript", content: <Code label="TypeScript example">{TS_EXAMPLE}</Code> },
+                { title: "Python", content: <Code label="Python example">{PY_EXAMPLE}</Code> },
                 { title: "Rust", content: <Code label="Rust example">{RUST_EXAMPLE}</Code> },
                 { title: "MCP", content: <Code label="Claude Desktop configuration">{MCP_EXAMPLE}</Code> },
               ]}
@@ -297,6 +318,18 @@ export default function Home() {
                       <p className="note">
                         Prebuilt for Windows x64, macOS on Apple silicon and Intel, and Linux x64
                         (glibc). Node 18 or later.
+                      </p>
+                    </>
+                  ),
+                },
+                {
+                  title: "pip",
+                  content: (
+                    <>
+                      <Code label="pip install">{`pip install fluxwright`}</Code>
+                      <p className="note">
+                        Wheels for Windows x64, macOS on Apple silicon and Intel, and Linux x64
+                        (glibc 2.17 or later). Python 3.10 or later, with asyncio and blocking APIs.
                       </p>
                     </>
                   ),
