@@ -17,14 +17,16 @@ The goal is to be the best engine for running many browser jobs on your own mach
 - **0.4.0:** Python, the biggest audience Fluxwright did not reach: the same API under Playwright's Python names, for asyncio (`fluxwright.async_api`) and blocking code (`fluxwright.sync_api`, whose objects work from any thread), with `async_playwright()` and `sync_playwright()` so Playwright scripts switch by changing the import. Wheels for Windows, macOS and Linux on PyPI. On npm, 0.4.0 saves storage state owner-only on Linux and macOS, and `page.route` no longer hangs when a URL function throws or when two first `route()` calls overlap.
 - **0.4.1:** `newPage` / `new_page` waits for a free slot however long the queue is, so starting every job at once works; it used to fail past 256 waiting jobs or after 30 s. `queueTimeout` / `queue_timeout` fails after a set time instead.
 
-## 0.3: jobs that need state and control
+## 0.5: Playwright scripts without changes
 
-Logged-in scraping and automation are where teams give up on hand-rolled pools.
+The fewer edits a Playwright script needs, the easier it is to try Fluxwright.
 
+- **Contexts:** `browser.newContext()` / `new_context()` and `context.newPage()`, with routes, cookies and storage state on the context. Each context holds one page, so jobs never share cookies. (In progress.)
 - **More events:** `page.on('request' | 'response' | 'popup' | 'dialog')` and `page.waitForResponse`.
 - **Transformed iframes:** clicks, boxes and screenshots inside an iframe that CSS scales or rotates use untransformed offsets today; switch to `DOM.getContentQuads`, which accounts for transforms.
+- **CI on Windows and macOS** for both bindings, not only Linux.
 
-## 0.5: the fleet at scale
+## 0.6: the fleet at scale
 
 - **Auto-tuning:** pick the number of browsers and pages per browser from free RAM and CPU, instead of hand-tuned numbers.
 - **Server mode:** submit jobs over HTTP, so any language can use one fleet.

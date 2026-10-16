@@ -8,12 +8,12 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 - `page.on('request' | 'response' | 'popup' | 'dialog')`, `page.waitForResponse`
 - `getByAltText`, `getByTitle`, `filter({ has })`, strict mode
 - `connectOverCDP`, to use browsers you already run
-- Python bindings
+- `context.addCookies`, `setDefaultTimeout` and `setDefaultNavigationTimeout`
 
 ## Out of scope
 
 - Firefox and WebKit
 - Playwright Test: the runner, fixtures and `expect`
 - Tracing, the trace viewer, codegen and video recording
-- Multiple pages per context
+- Multiple pages per context: each context holds one page, so jobs never share cookies; share a login with `storageState`
 - WebSocket and worker APIs
