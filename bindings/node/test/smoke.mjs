@@ -332,7 +332,9 @@ try {
     let first = null
     for (let i = 0; i < 30 && !first; i++) first = await hurried.newPage().catch(() => null)
     assert.ok(first, 'Chrome did not start')
-    const busy = [first, ...(await Promise.all(Array.from({ length: 7 }, () => hurried.newPage())))]
+    // One at a time: seven contexts made at once can take longer than the limit on a slow runner.
+    const busy = [first]
+    while (busy.length < 8) busy.push(await hurried.newPage())
     await assert.rejects(hurried.newPage(), /acquire a page lease/)
     await Promise.all(busy.map((page) => page.close()))
   } finally {
