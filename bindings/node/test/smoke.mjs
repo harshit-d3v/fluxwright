@@ -262,6 +262,22 @@ try {
   assert.ok(retried)
   await retry.close()
 
+  // browser.newContext(): its options and routes apply to its one page.
+  const context = await browser.newContext({ userAgent: 'CtxSmoke/1' })
+  await context.route('**/api', (route) => route.fulfill({ body: 'from the context' }))
+  assert.deepEqual(context.pages(), [])
+  const inContext = await context.newPage()
+  await inContext.goto(`${base}/login`)
+  assert.match(await inContext.title(), /^CtxSmoke\/1/)
+  assert.equal(await inContext.evaluate(() => fetch('/api').then((r) => r.text())), 'from the context')
+  assert.deepEqual(context.pages(), [inContext])
+  assert.ok((await context.cookies()).some((c) => c.name === 'sid'))
+  await assert.rejects(context.newPage(), /holds one page/)
+  await context.close()
+  assert.ok(inContext.isClosed())
+  assert.deepEqual(context.pages(), [])
+  await assert.rejects(context.newPage(), /context is closed/)
+
   // One browser holds 8 pages; the 300 started after them wait their turn instead of failing
   // (the engine used to refuse jobs past 256 waiting, and give up after 30 s).
   const held = await Promise.all(Array.from({ length: 8 }, () => browser.newPage()))

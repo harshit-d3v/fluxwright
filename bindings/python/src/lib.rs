@@ -543,6 +543,11 @@ impl Page {
         })
     }
 
+    /// Whether `close()` was called (or is under way).
+    fn is_closed(&self) -> bool {
+        self.lease.try_read().map_or(true, |page| page.is_none())
+    }
+
     /// CSS, `text=`, or `role=` selector.
     fn locator(&self, selector: String) -> Locator {
         self.top().locator(selector)

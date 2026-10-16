@@ -199,6 +199,8 @@ export declare class Page {
   /** Exceptions nothing caught so far (the last 1000). */
   pageErrors(): Promise<Array<PageErrorInfo>>
   close(): Promise<void>
+  /** Whether `close()` was called (or is under way). */
+  isClosed(): boolean
 }
 /**
  * A paused request handed to `page.route` handlers; `addon.js` wraps it in Playwright's
