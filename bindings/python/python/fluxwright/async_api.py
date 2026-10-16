@@ -40,6 +40,7 @@ from ._types import FloatRect, Geolocation, ProxySettings, StorageState, URLMatc
 
 __all__ = [
     "Browser",
+    "BrowserContext",
     "BrowserType",
     "ConsoleMessage",
     "Download",
@@ -443,6 +444,36 @@ class Browser:
         )
         return Page(lease)
 
+    async def new_context(
+        self,
+        *,
+        proxy: ProxySettings | None = None,
+        user_agent: str | None = None,
+        locale: str | None = None,
+        timezone_id: str | None = None,
+        geolocation: Geolocation | None = None,
+        permissions: list[str] | None = None,
+        viewport: ViewportSize | None = None,
+        device_scale_factor: float | None = None,
+        color_scheme: str | None = None,
+        storage_state: StorageState | str | PathLike[str] | None = None,
+    ) -> BrowserContext:
+        """A browser context with ``new_page``'s options, as Playwright's ``new_context``. Each
+        context holds one page; see ``BrowserContext``."""
+        options = dict(
+            proxy=proxy,
+            user_agent=user_agent,
+            locale=locale,
+            timezone_id=timezone_id,
+            geolocation=geolocation,
+            permissions=permissions,
+            viewport=viewport,
+            device_scale_factor=device_scale_factor,
+            color_scheme=color_scheme,
+            storage_state=storage_state,
+        )
+        return BrowserContext(self, options)
+
     async def close(self) -> None:
         """Shuts the engine down, and with it every page and Chrome process it started."""
         if not self._closed:
@@ -450,6 +481,92 @@ class Browser:
             await self._engine.close()
 
     async def __aenter__(self) -> Browser:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+
+ONE_PAGE = (
+    "a Fluxwright context holds one page, so jobs never share cookies: open another context, "
+    "and pass it storage_state() from this one to share a login"
+)
+
+
+class BrowserContext:
+    """A browser context, as Playwright's: the options its page opens with.
+
+    Each context holds one page, so one job's cookies and storage never reach another:
+    ``new_page()`` opens it and a second call raises ``Error``. To share a login across pages,
+    pass one page's ``storage_state()`` to the next ``new_context``.
+    """
+
+    def __init__(self, browser: Browser, options: dict[str, Any]) -> None:
+        self._browser = browser
+        self._options = options
+        self._page: Page | None = None
+        self._opening = False
+        self._closed = False
+        self._routes: list[tuple[URLMatch, Callable[..., Any]]] = []
+
+    @property
+    def browser(self) -> Browser:
+        return self._browser
+
+    @property
+    def pages(self) -> list[Page]:
+        return [self._page] if self._page is not None and not self._page.is_closed() else []
+
+    async def new_page(self) -> Page:
+        if self._closed:
+            raise Error("browser_context.new_page: the context is closed")
+        if self._page is not None or self._opening:
+            raise Error(f"browser_context.new_page: {ONE_PAGE}")
+        self._opening = True
+        try:
+            page = await self._browser.new_page(**self._options)
+            try:
+                for url, handler in self._routes:
+                    await page.route(url, handler)
+            except BaseException:
+                await page.close()
+                raise
+            self._page = page
+            return page
+        finally:
+            self._opening = False
+
+    async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
+        """``page.route`` for this context's page; added before ``new_page()``, it applies from
+        the page's first request."""
+        self._routes.append((url, handler))
+        if self._page is not None:
+            await self._page.route(url, handler)
+
+    async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
+        self._routes = [r for r in self._routes if not (r[0] == url and (handler is None or r[1] == handler))]
+        if self._page is not None:
+            await self._page.unroute(url, handler)
+
+    async def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
+        """The cookies and localStorage of this context's page, as ``page.storage_state``."""
+        if self._page is None:
+            raise Error("browser_context.storage_state: call new_page() first")
+        return await self._page.storage_state(path=path)
+
+    async def cookies(self) -> list[dict[str, Any]]:
+        """Every cookie in this context."""
+        state = await self.storage_state()
+        cookies: list[dict[str, Any]] = state["cookies"]
+        return cookies
+
+    async def close(self) -> None:
+        """Closes the context's page; the context opens no other."""
+        self._closed = True
+        if self._page is not None:
+            await self._page.close()
+
+    async def __aenter__(self) -> BrowserContext:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:

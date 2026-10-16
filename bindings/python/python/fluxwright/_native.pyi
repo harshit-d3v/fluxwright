@@ -64,6 +64,8 @@ class Page:
         """The next download this page finished (ones that finished earlier queue up), within
         ``timeout`` milliseconds (default 30 s)."""
     def close(self) -> Awaitable[None]: ...
+    def is_closed(self) -> bool:
+        """Whether ``close()`` was called (or is under way)."""
     def locator(self, selector: str) -> Locator:
         """CSS, ``text=``, or ``role=`` selector."""
     def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator: ...

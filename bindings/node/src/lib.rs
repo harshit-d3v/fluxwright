@@ -1027,6 +1027,12 @@ impl Page {
         .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(())
     }
+
+    /// Whether `close()` was called (or is under way).
+    #[napi]
+    pub fn is_closed(&self) -> bool {
+        self.lease.try_read().map_or(true, |page| page.is_none())
+    }
 }
 
 impl Page {

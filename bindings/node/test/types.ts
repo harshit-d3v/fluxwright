@@ -38,5 +38,12 @@ export async function typed(): Promise<void> {
   await download.saveAs(`out/${name}`)
   // @ts-expect-error not an event Fluxwright emits
   page.on('request', () => {})
+  const context = await browser.newContext({ userAgent: 'Ctx', storageState: 'state.json' })
+  await context.route('**/api', (route) => route.abort())
+  const only = await context.newPage()
+  const closed: boolean = only.isClosed()
+  const cookies: { name: string }[] = await context.cookies()
+  void [closed, cookies, context.pages().length, context.browser()]
+  await context.close()
   await browser.close()
 }

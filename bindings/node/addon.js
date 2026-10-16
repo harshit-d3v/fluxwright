@@ -210,6 +210,78 @@ function installRoutes(Page) {
   }
 }
 
+const ONE_PAGE =
+  'a Fluxwright context holds one page, so jobs never share cookies: open another context, ' +
+  'and pass it storageState() from this one to share a login'
+
+// browser.newContext() and context.newPage(), as in Playwright. Each context holds one page, so
+// one job's cookies and storage never reach another; a login is shared through storageState.
+class BrowserContext {
+  #browser
+  #options
+  #page = null
+  #opening = false
+  #closed = false
+  #routes = []
+
+  constructor(browser, options) {
+    this.#browser = browser
+    this.#options = options
+  }
+
+  browser() {
+    return this.#browser
+  }
+
+  pages() {
+    return this.#page && !this.#page.isClosed() ? [this.#page] : []
+  }
+
+  async newPage() {
+    if (this.#closed) throw new Error('browserContext.newPage: the context is closed')
+    if (this.#page || this.#opening) throw new Error(`browserContext.newPage: ${ONE_PAGE}`)
+    this.#opening = true
+    try {
+      const page = await this.#browser.newPage(this.#options)
+      try {
+        for (const [url, handler] of this.#routes) await page.route(url, handler)
+      } catch (err) {
+        await page.close()
+        throw err
+      }
+      this.#page = page
+      return page
+    } finally {
+      this.#opening = false
+    }
+  }
+
+  // page.route for this context's page; added before newPage(), it applies from the first request.
+  async route(url, handler) {
+    this.#routes.push([url, handler])
+    if (this.#page) await this.#page.route(url, handler)
+  }
+
+  async unroute(url, handler) {
+    this.#routes = this.#routes.filter(([u, h]) => !(u === url && (!handler || h === handler)))
+    if (this.#page) await this.#page.unroute(url, handler)
+  }
+
+  async storageState(options) {
+    if (!this.#page) throw new Error('browserContext.storageState: call newPage() first')
+    return this.#page.storageState(options)
+  }
+
+  async cookies() {
+    return (await this.storageState()).cookies
+  }
+
+  async close() {
+    this.#closed = true
+    if (this.#page) await this.#page.close()
+  }
+}
+
 // page.waitForDownload() with Playwright's Download.
 function installDownloads(Page) {
   Page.prototype.waitForDownload = async function (options) {
@@ -277,11 +349,15 @@ try {
       return png
     }
   }
+  native.Browser.prototype.newContext = async function (options) {
+    return new BrowserContext(this, options)
+  }
   installEvents(native.Page)
   installRoutes(native.Page)
   installDownloads(native.Page)
   module.exports = native
   module.exports.chromium = native.Chromium
+  module.exports.BrowserContext = BrowserContext
   module.exports.default = module.exports
 } catch (err) {
   module.exports = {

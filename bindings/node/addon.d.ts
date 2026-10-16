@@ -1,5 +1,5 @@
 export * from './index'
-import { Chromium, ConsoleMessage, ScreenshotOptions, StorageState } from './index'
+import { Chromium, ConsoleMessage, NewPageOptions, Page, ScreenshotOptions, StorageState, Browser } from './index'
 /** Playwright-style export: `chromium.launch(...)`. Same as `Chromium.launch`. */
 export const chromium: typeof Chromium
 declare const fluxwright: { chromium: typeof Chromium }
@@ -49,7 +49,32 @@ export interface Download {
   failure(): Promise<string | null>
 }
 
+/**
+ * A browser context, as Playwright's: the options its page opens with. Each context holds one page,
+ * so one job's cookies and storage never reach another: `newPage()` opens it and a second call
+ * rejects. To share a login across pages, pass one page's `storageState()` to the next `newContext`.
+ */
+export interface BrowserContext {
+  browser(): Browser
+  /** The context's page while it is open. */
+  pages(): Page[]
+  newPage(): Promise<Page>
+  /** `page.route` for this context's page; added before `newPage()`, it applies from the first request. */
+  route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
+  unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
+  /** The cookies and localStorage of this context's page, as `page.storageState`. */
+  storageState(options?: { path?: string }): Promise<StorageState>
+  /** Every cookie in this context. */
+  cookies(): Promise<StorageState['cookies']>
+  /** Closes the context's page; the context opens no other. */
+  close(): Promise<void>
+}
+
 declare module './index' {
+  interface Browser {
+    /** A browser context with `newPage`'s options, as Playwright's `newContext`. */
+    newContext(options?: NewPageOptions): Promise<BrowserContext>
+  }
   interface Page {
     /**
      * Runs `pageFunction` in the page with `arg` and returns its result, awaiting promises.

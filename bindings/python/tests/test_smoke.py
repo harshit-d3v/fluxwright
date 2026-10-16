@@ -309,6 +309,42 @@ async def queue_smoke() -> None:
             await page.close()
 
 
+def test_contexts(base):
+    asyncio.run(context_smoke(base))
+
+
+async def context_smoke(base: str) -> None:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(max_browsers=1)
+        # new_context(): its options and routes apply to its one page.
+        context = await browser.new_context(user_agent="CtxSmoke/1")
+        await context.route("**/api", lambda route: route.fulfill(body="from the context"))
+        assert context.pages == []
+        page = await context.new_page()
+        await page.goto(f"{base}/login")
+        assert (await page.title()).startswith("CtxSmoke/1")
+        assert await page.evaluate(FETCH_API) == "from the context"
+        assert context.pages == [page]
+        assert any(c["name"] == "sid" for c in await context.cookies())
+        with pytest.raises(Error, match="holds one page"):
+            await context.new_page()
+        await context.close()
+        assert page.is_closed()
+        assert context.pages == []
+        with pytest.raises(Error, match="context is closed"):
+            await context.new_page()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(max_browsers=1)
+        with browser.new_context(locale="de-DE") as context:
+            context.route("**/api", lambda route: route.fulfill(body="sync context"))
+            page = context.new_page()
+            page.goto(base)
+            assert "|de-DE" in page.title()
+            assert page.evaluate(FETCH_API) == "sync context"
+        assert page.is_closed()
+
+
 def test_sync_api(base, tmp_path):
     with sync_playwright() as p:
         browser = p.chromium.launch(max_browsers=2)
