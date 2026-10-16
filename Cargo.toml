@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/harshit-d3v/fluxwright"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 fluxwright-cdp = { path = "crates/fluxwright-cdp", version = "0.1.0" }

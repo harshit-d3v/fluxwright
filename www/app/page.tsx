@@ -341,7 +341,7 @@ export default function Home() {
                       <Code label="Cargo.toml dependency">{`[dependencies]
 fluxwright = { git = "https://github.com/harshit-d3v/fluxwright" }
 tokio = { version = "1", features = ["full"] }`}</Code>
-                      <p className="note">Rust 1.85 or later.</p>
+                      <p className="note">Rust 1.95 or later.</p>
                     </>
                   ),
                 },
