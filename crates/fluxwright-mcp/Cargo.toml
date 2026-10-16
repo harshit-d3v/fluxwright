@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "MCP server for Fluxwright (Claude, Codex, Cursor)"
-rust-version = "1.88" # rmcp 3.5; the other crates keep the workspace 1.85
+rust-version.workspace = true
 
 [[bin]]
 name = "fluxwright-mcp"
