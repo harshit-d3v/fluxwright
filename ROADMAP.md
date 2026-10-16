@@ -16,15 +16,7 @@ The goal is to be the best engine for running many browser jobs on your own mach
 - **0.3.1:** `page.route` with Playwright's `Route` and `Request` (fulfill, continue with changes, abort, fallback; globs, RegExps and functions); `page.on('console' | 'pageerror')`; downloads with `page.waitForDownload()` and `saveAs`.
 - **0.4.0:** Python, the biggest audience Fluxwright did not reach: the same API under Playwright's Python names, for asyncio (`fluxwright.async_api`) and blocking code (`fluxwright.sync_api`, whose objects work from any thread), with `async_playwright()` and `sync_playwright()` so Playwright scripts switch by changing the import. Wheels for Windows, macOS and Linux on PyPI. On npm, 0.4.0 saves storage state owner-only on Linux and macOS, and `page.route` no longer hangs when a URL function throws or when two first `route()` calls overlap.
 - **0.4.1:** `newPage` / `new_page` waits for a free slot however long the queue is, so starting every job at once works; it used to fail past 256 waiting jobs or after 30 s. `queueTimeout` / `queue_timeout` fails after a set time instead.
-
-## 0.5: Playwright scripts without changes
-
-The fewer edits a Playwright script needs, the easier it is to try Fluxwright.
-
-- **Contexts:** `browser.newContext()` / `new_context()` and `context.newPage()`, with routes, cookies and storage state on the context. Each context holds one page, so jobs never share cookies. (Done.)
-- **More events:** `page.on('request' | 'response' | 'requestfinished' | 'requestfailed' | 'dialog')` with `response.body()` / `json()`, and `page.waitForResponse` / `expect_response`. (Done; `popup` needs pages beyond the one a context holds.)
-- **Transformed iframes:** clicks, boxes and screenshots land right inside an iframe that CSS scales, rotates or skews, same- or cross-site. (Done.)
-- **CI on Windows and macOS** for both bindings, not only Linux. (Done.)
+- **0.5.0:** Playwright scripts need fewer changes: `browser.newContext()` / `new_context()` with `context.newPage()`; `page.on('request' | 'response' | 'requestfinished' | 'requestfailed')` with `response.body()` / `json()`, and `page.waitForResponse` / `waitForRequest` (`expect_response` / `expect_request` in Python); `page.on('dialog')` to accept or dismiss alerts, confirms and prompts. Clicks, boxes and screenshots land right inside iframes that CSS scales or rotates. Fixes a crash on Windows under heavy load (a stack overflow while measuring Chrome's memory). Both bindings are tested on Windows, macOS and Linux.
 
 ## 0.6: the fleet at scale
 
