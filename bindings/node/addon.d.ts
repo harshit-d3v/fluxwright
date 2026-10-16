@@ -13,6 +13,38 @@ export interface Request {
   postData(): string | null
   /** `document`, `script`, `stylesheet`, `image`, `xhr`, ... */
   resourceType(): string
+  /** Why a failed request failed (`requestfailed`); null otherwise. */
+  failure(): { errorText: string } | null
+}
+
+/** A response, as `page.on('response')` and `page.waitForResponse` hand it over. */
+export interface Response {
+  url(): string
+  status(): number
+  statusText(): string
+  /** Status 200 to 299. */
+  ok(): boolean
+  /** Names lower-cased. */
+  headers(): Record<string, string>
+  request(): Request
+  /** The body, once the response finished loading. */
+  body(): Promise<Buffer>
+  text(): Promise<string>
+  json(): Promise<any>
+}
+
+/**
+ * A JavaScript dialog, as `page.on('dialog')` hands it over. Answer it with `accept` or
+ * `dismiss`; one no listener answered is dismissed, so the page never hangs.
+ */
+export interface Dialog {
+  type(): 'alert' | 'confirm' | 'prompt' | 'beforeunload'
+  message(): string
+  /** A prompt's default text. */
+  defaultValue(): string
+  /** `promptText` is what a `prompt` returns. */
+  accept(promptText?: string): Promise<void>
+  dismiss(): Promise<void>
 }
 
 /** How a `page.route` handler answers, as in Playwright. Each request takes one answer. */
@@ -97,9 +129,31 @@ declare module './index' {
     unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
     on(event: 'console', handler: (message: ConsoleMessage) => void): this
     on(event: 'pageerror', handler: (error: Error) => void): this
+    on(event: 'request' | 'requestfinished' | 'requestfailed', handler: (request: Request) => void): this
+    on(event: 'response', handler: (response: Response) => void): this
+    on(event: 'dialog', handler: (dialog: Dialog) => unknown): this
     once(event: 'console', handler: (message: ConsoleMessage) => void): this
     once(event: 'pageerror', handler: (error: Error) => void): this
-    off(event: 'console' | 'pageerror', handler: (...args: any[]) => void): this
+    once(event: 'request' | 'requestfinished' | 'requestfailed', handler: (request: Request) => void): this
+    once(event: 'response', handler: (response: Response) => void): this
+    once(event: 'dialog', handler: (dialog: Dialog) => unknown): this
+    off(
+      event: 'console' | 'pageerror' | 'request' | 'response' | 'requestfinished' | 'requestfailed' | 'dialog',
+      handler: (...args: any[]) => unknown,
+    ): this
+    /**
+     * The first response from now on whose URL matches (a glob or RegExp, as in `page.route`) or
+     * that the predicate accepts. Default timeout 30 s; 0 waits forever.
+     */
+    waitForResponse(
+      urlOrPredicate: string | RegExp | ((response: Response) => boolean | Promise<boolean>),
+      options?: { timeout?: number },
+    ): Promise<Response>
+    /** `waitForResponse`, for requests. */
+    waitForRequest(
+      urlOrPredicate: string | RegExp | ((request: Request) => boolean | Promise<boolean>),
+      options?: { timeout?: number },
+    ): Promise<Request>
     /** The next download this page finished; ones that finished earlier queue up. Default timeout 30 s. */
     waitForDownload(options?: { timeout?: number }): Promise<Download>
   }

@@ -75,6 +75,8 @@ class Page:
     def get_by_test_id(self, test_id: str) -> Locator: ...
     def frame_locator(self, selector: str) -> FrameLocator: ...
     def _logs(self) -> LogStream: ...
+    def _network(self) -> NetworkStream: ...
+    def _dialogs(self) -> DialogStream: ...
     def _intercept(self) -> Awaitable[RouteStream]: ...
 
 class Locator:
@@ -164,3 +166,37 @@ class Download:
     def save_as(self, path: _Path) -> Awaitable[None]:
         """Copies the file to ``path``, creating missing folders."""
     def failure(self) -> Awaitable[str | None]: ...
+
+class NetworkRequest:
+    url: str
+    method: str
+    headers: dict[str, str]
+    post_data: str | None
+    resource_type: str
+
+class NetworkResponse:
+    url: str
+    status: int
+    status_text: str
+    headers: dict[str, str]
+    request: NetworkRequest
+    def body(self, *, timeout: float | None = None) -> Awaitable[bytes]: ...
+
+class NetworkEvent:
+    event: str
+    request: NetworkRequest
+    response: NetworkResponse | None
+    failure: str | None
+
+class NetworkStream:
+    def next(self) -> Awaitable[NetworkEvent | None]: ...
+
+class Dialog:
+    type: str
+    message: str
+    default_value: str
+    def accept(self, prompt_text: str | None = None) -> Awaitable[None]: ...
+    def dismiss(self) -> Awaitable[None]: ...
+
+class DialogStream:
+    def next(self) -> Awaitable[Dialog | None]: ...

@@ -37,6 +37,7 @@ __all__ = [
     "BrowserContext",
     "BrowserType",
     "ConsoleMessage",
+    "Dialog",
     "Download",
     "Error",
     "EventInfo",
@@ -49,6 +50,7 @@ __all__ = [
     "PlaywrightContextManager",
     "ProxySettings",
     "Request",
+    "Response",
     "Route",
     "StorageState",
     "TimeoutError",
@@ -107,6 +109,21 @@ def _wait(future: concurrent.futures.Future[T]) -> T:
 
 def _run(fn: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T:
     return _wait(_submit(fn, *args, **kwargs))
+
+
+async def _await(awaitable: Awaitable[T]) -> T:
+    return await awaitable
+
+
+def _to_sync(arg: Any) -> Any:
+    """An async API object as its blocking counterpart, for a listener or predicate."""
+    if isinstance(arg, _a.Response):
+        return Response(arg)
+    if isinstance(arg, _a.Request):
+        return Request(arg)
+    if isinstance(arg, _a.Dialog):
+        return Dialog(arg)
+    return arg
 
 
 def _listen(handler: Callable[[Any], Any], arg: Any) -> None:
@@ -265,6 +282,88 @@ class Request:
     def resource_type(self) -> str:
         return self._impl.resource_type
 
+    @property
+    def failure(self) -> str | None:
+        """Why the request failed (``net::ERR_FAILED``, ...), for ``requestfailed``."""
+        return self._impl.failure
+
+
+class Response:
+    """A response, as ``page.on("response")`` and ``expect_response`` hand it over."""
+
+    def __init__(self, impl: _a.Response) -> None:
+        self._impl = impl
+
+    def __repr__(self) -> str:
+        return repr(self._impl)
+
+    @property
+    def url(self) -> str:
+        return self._impl.url
+
+    @property
+    def status(self) -> int:
+        return self._impl.status
+
+    @property
+    def status_text(self) -> str:
+        return self._impl.status_text
+
+    @property
+    def ok(self) -> bool:
+        """Status 200 to 299."""
+        return self._impl.ok
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """Names lower-cased."""
+        return self._impl.headers
+
+    @property
+    def request(self) -> Request:
+        return Request(self._impl.request)
+
+    def body(self) -> bytes:
+        """The body, once the response finished loading."""
+        return _run(self._impl.body)
+
+    def text(self) -> str:
+        return _run(self._impl.text)
+
+    def json(self) -> Any:
+        return _run(self._impl.json)
+
+
+class Dialog:
+    """A JavaScript dialog, as ``page.on("dialog")`` hands it over. Answer it with ``accept`` or
+    ``dismiss``; one no listener answered is dismissed, so the page never hangs on it."""
+
+    def __init__(self, impl: _a.Dialog) -> None:
+        self._impl = impl
+
+    def __repr__(self) -> str:
+        return repr(self._impl)
+
+    @property
+    def type(self) -> str:
+        """``alert``, ``confirm``, ``prompt`` or ``beforeunload``."""
+        return self._impl.type
+
+    @property
+    def message(self) -> str:
+        return self._impl.message
+
+    @property
+    def default_value(self) -> str:
+        return self._impl.default_value
+
+    def accept(self, prompt_text: str | None = None) -> None:
+        """``prompt_text`` is what a ``prompt`` returns."""
+        _run(self._impl.accept, prompt_text)
+
+    def dismiss(self) -> None:
+        _run(self._impl.dismiss)
+
 
 class Route:
     """How a route handler answers a request, as Playwright's ``Route``. Each request takes one
@@ -417,8 +516,10 @@ class Page(_Finders):
                 _run(self._impl.unroute, url, entry[2])
 
     def on(self, event: str, handler: Callable[[Any], Any]) -> None:
-        """Calls ``handler`` with each ``"console"`` message (a ``ConsoleMessage``) or
-        ``"pageerror"`` (an ``Error``) from now on."""
+        """Calls ``handler`` from now on with each ``"console"`` message (a ``ConsoleMessage``),
+        ``"pageerror"`` (an ``Error``), ``"request"``, ``"requestfinished"`` and
+        ``"requestfailed"`` (a ``Request``), ``"response"`` (a ``Response``) or ``"dialog"`` (a
+        ``Dialog``, to accept or dismiss)."""
         self._listen("on", event, handler)
 
     def once(self, event: str, handler: Callable[[Any], Any]) -> None:
@@ -452,6 +553,53 @@ class Page(_Finders):
             raise
         _wait(future)  # as Playwright does: a failed or late download raises here
 
+    @contextmanager
+    def expect_response(
+        self, url_or_predicate: URLMatch | Callable[[Response], bool], *, timeout: float | None = None
+    ) -> Iterator[EventInfo[Response]]:
+        """Waits for the first response from now on whose URL matches (a glob or regex, as in
+        ``route``) or that the predicate accepts (``timeout`` in milliseconds, default 30 s), as
+        Playwright's ``page.expect_response``::
+
+            with page.expect_response("**/api/items") as info:
+                page.get_by_text("Load").click()
+            items = info.value.json()
+        """
+        with self._expect(self._impl.expect_response, url_or_predicate, timeout, Response) as info:
+            yield info
+
+    @contextmanager
+    def expect_request(
+        self, url_or_predicate: URLMatch | Callable[[Request], bool], *, timeout: float | None = None
+    ) -> Iterator[EventInfo[Request]]:
+        """``expect_response``, for requests."""
+        with self._expect(self._impl.expect_request, url_or_predicate, timeout, Request) as info:
+            yield info
+
+    @contextmanager
+    def _expect(
+        self, start: Callable[..., Any], url_or_predicate: Any, timeout: float | None, wrap: Callable[[Any], T]
+    ) -> Iterator[EventInfo[T]]:
+        if callable(url_or_predicate):
+            predicate = url_or_predicate
+
+            def matcher(r: Any) -> bool:
+                return bool(predicate(_to_sync(r)))
+        else:
+            matcher = url_or_predicate
+        manager = start(matcher, timeout=timeout)
+        info = _run(manager.__aenter__)
+        future = asyncio.run_coroutine_threadsafe(_await(info.value), _event_loop())
+        try:
+            yield EventInfo(future, wrap)
+        except BaseException as e:
+            try:
+                _run(manager.__aexit__, type(e), e, e.__traceback__)
+            finally:
+                future.cancel()
+            raise
+        _run(manager.__aexit__, None, None, None)
+
     def wait_for_download(self, *, timeout: float | None = None) -> Download:
         """The next download this page finished; ones that finished earlier queue up."""
         return Download(_run(self._impl.wait_for_download, timeout=timeout))
@@ -463,8 +611,11 @@ class Page(_Finders):
         return self._impl.is_closed()
 
     def _listen(self, method: str, event: str, handler: Callable[[Any], Any]) -> None:
-        def bridge(arg: Any) -> None:
-            _listeners.submit(_listen, handler, arg)
+        loop = _event_loop()
+
+        def bridge(arg: Any) -> Any:
+            # A future, so the dialog loop waits for the handler's answer.
+            return loop.run_in_executor(_listeners, _listen, handler, _to_sync(arg))
 
         _run(_on_loop, getattr(self._impl, method), event, bridge)
         self._listener_bridges.append((event, handler, bridge))

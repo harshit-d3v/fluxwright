@@ -52,30 +52,151 @@ function toError(e) {
   return err
 }
 
-// page.on / off / once for 'console' and 'pageerror', as in Playwright.
+// Playwright's Request, Response and Dialog over the native objects.
+function toRequest(native, failure = null) {
+  return {
+    url: () => native.url,
+    method: () => native.method,
+    headers: () => ({ ...native.headers }),
+    postData: () => native.postData ?? null,
+    resourceType: () => native.resourceType,
+    failure: () => (failure === null ? null : { errorText: failure }),
+  }
+}
+
+function toResponse(native) {
+  const request = toRequest(native.request)
+  const text = async () => (await native.body()).toString('utf8')
+  return {
+    url: () => native.url,
+    status: () => native.status,
+    statusText: () => native.statusText,
+    ok: () => native.status >= 200 && native.status <= 299,
+    headers: () => ({ ...native.headers }),
+    request: () => request,
+    body: () => native.body(),
+    text,
+    json: async () => JSON.parse(await text()),
+  }
+}
+
+function toDialog(native) {
+  const dialog = {
+    answered: false,
+    type: () => native.type,
+    message: () => native.message,
+    defaultValue: () => native.defaultValue,
+    accept: (promptText) => {
+      dialog.answered = true
+      return native.accept(promptText)
+    },
+    dismiss: () => {
+      dialog.answered = true
+      return native.dismiss()
+    },
+  }
+  return dialog
+}
+
+// Every dialog listener runs, and their promises are awaited. A dialog none of them answered is
+// dismissed, so the page never hangs on it.
+async function answerDialog(em, dialog) {
+  const pending = em.rawListeners('dialog').map(async (handler) => handler(dialog))
+  for (const r of await Promise.allSettled(pending)) {
+    if (r.status === 'rejected') console.error('[fluxwright] a dialog listener failed:', r.reason)
+  }
+  if (!dialog.answered) await dialog.dismiss().catch(() => {})
+}
+
+// page.on / once / off as in Playwright, for console messages, page errors, network events and
+// dialogs. Each source starts with its first listener.
 function installEvents(Page) {
   const emitters = new WeakMap()
-  const events = ['console', 'pageerror']
-  const emitter = (page) => {
-    let em = emitters.get(page)
-    if (!em) {
-      em = new EventEmitter()
-      emitters.set(page, em)
-      page._onLog((e) => (e.event === 'console' ? em.emit('console', e.message) : em.emit('pageerror', toError(e.error))))
+  const sources = {
+    console: 'log',
+    pageerror: 'log',
+    request: 'network',
+    response: 'network',
+    requestfinished: 'network',
+    requestfailed: 'network',
+    dialog: 'dialog',
+  }
+  const events = Object.keys(sources)
+  const emitter = (page, event) => {
+    let state = emitters.get(page)
+    if (!state) {
+      const em = new EventEmitter()
+      em.setMaxListeners(0) // waitForResponse adds one per call
+      state = { em, started: new Set() }
+      emitters.set(page, state)
+    }
+    const { em, started } = state
+    const source = sources[event]
+    if (!started.has(source)) {
+      started.add(source)
+      if (source === 'log') {
+        page._onLog((e) => (e.event === 'console' ? em.emit('console', e.message) : em.emit('pageerror', toError(e.error))))
+      } else if (source === 'network') {
+        page._onNetwork((e) =>
+          em.emit(e.event, e.event === 'response' ? toResponse(e.response) : toRequest(e.request, e.failure ?? null)),
+        )
+      } else {
+        page._onDialog((native) => answerDialog(em, toDialog(native)))
+      }
     }
     return em
   }
   for (const method of ['on', 'once', 'addListener']) {
     Page.prototype[method] = function (event, handler) {
       if (!events.includes(event)) throw new Error(`page.${method}: '${event}' is not supported (${events.join(', ')})`)
-      emitter(this)[method === 'addListener' ? 'on' : method](event, handler)
+      emitter(this, event)[method === 'addListener' ? 'on' : method](event, handler)
       return this
     }
   }
   for (const method of ['off', 'removeListener']) {
     Page.prototype[method] = function (event, handler) {
-      emitters.get(this)?.off(event, handler)
+      emitters.get(this)?.em.off(event, handler)
       return this
+    }
+  }
+  // page.waitForResponse / waitForRequest: the first match from now on, within `timeout` ms
+  // (default 30 s, 0 for none). A string or RegExp matches the URL as page.route does; a function
+  // gets the Response or Request and may return a promise.
+  for (const [method, event] of [
+    ['waitForResponse', 'response'],
+    ['waitForRequest', 'request'],
+  ]) {
+    Page.prototype[method] = function (urlOrPredicate, options) {
+      const timeout = options?.timeout ?? 30000
+      let matches = urlOrPredicate
+      if (typeof urlOrPredicate !== 'function') {
+        const url = urlMatcher(urlOrPredicate)
+        matches = (r) => url(r.url())
+      }
+      return new Promise((resolve, reject) => {
+        let timer = null
+        const done = () => {
+          this.off(event, listener)
+          clearTimeout(timer)
+        }
+        const listener = async (r) => {
+          try {
+            if (!(await matches(r))) return
+          } catch (err) {
+            done()
+            return reject(err)
+          }
+          done()
+          resolve(r)
+        }
+        this.on(event, listener)
+        if (timeout > 0) {
+          timer = setTimeout(() => {
+            done()
+            reject(new Error(`page.${method}: timeout ${timeout}ms exceeded`))
+          }, timeout)
+        }
+      })
     }
   }
 }
@@ -118,13 +239,7 @@ function urlMatcher(pattern) {
 // route.fallback() passes the request to the next matching one, and unmatched requests continue.
 function installRoutes(Page) {
   const routes = new WeakMap()
-  const request = (native) => ({
-    url: () => native.url,
-    method: () => native.method,
-    headers: () => ({ ...native.headers }),
-    postData: () => native.postData ?? null,
-    resourceType: () => native.resourceType,
-  })
+  const request = (native) => toRequest(native)
   const dispatch = async (list, native) => {
     try {
       for (let i = list.length - 1; i >= 0; i--) {

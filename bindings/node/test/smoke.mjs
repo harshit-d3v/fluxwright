@@ -262,6 +262,39 @@ try {
   assert.ok(retried)
   await retry.close()
 
+  // Network events, waitForResponse / waitForRequest, and dialogs.
+  const net = await browser.newPage()
+  const seenNet = []
+  const path = (r) => new URL(r.url()).pathname
+  net.on('request', (r) => seenNet.push(`request ${r.method()} ${path(r)}`))
+  net.on('response', (r) => seenNet.push(`response ${r.status()} ${path(r)}`))
+  net.on('requestfinished', (r) => seenNet.push(`finished ${path(r)}`))
+  net.on('requestfailed', (r) => seenNet.push(`failed ${path(r)} ${r.failure()?.errorText}`))
+  await net.goto(base)
+  const [api] = await Promise.all([net.waitForResponse('**/api'), net.evaluate(() => fetch('/api').then((r) => r.text()))])
+  assert.equal(api.status(), 200)
+  assert.ok(api.ok())
+  assert.deepEqual(await api.json(), { real: true })
+  assert.equal(api.request().method(), 'GET')
+  assert.equal(api.headers()['content-type'], 'application/json')
+  await net.route('**/gone', (route) => route.abort())
+  await net.evaluate(() => fetch('/gone').catch(() => 'failed'))
+  for (let i = 0; i < 50 && !seenNet.some((e) => e.startsWith('failed')); i++) await new Promise((r) => setTimeout(r, 20))
+  assert.ok(seenNet.includes('request GET /'), seenNet.join('\n'))
+  assert.ok(seenNet.includes('response 200 /api'), seenNet.join('\n'))
+  assert.ok(seenNet.includes('finished /api'), seenNet.join('\n'))
+  assert.ok(seenNet.includes('failed /gone net::ERR_FAILED'), seenNet.join('\n'))
+  const byPredicate = net.waitForRequest((r) => r.url().endsWith('/hdr'))
+  await net.evaluate(() => fetch('/hdr'))
+  assert.equal((await byPredicate).method(), 'GET')
+  await assert.rejects(net.waitForResponse('**/never', { timeout: 200 }), /timeout 200ms exceeded/)
+  // Without a listener a dialog is dismissed; a listener answers it; one it leaves is dismissed.
+  assert.equal(await net.evaluate(() => confirm('sure?')), false)
+  net.on('dialog', (d) => (d.type() === 'prompt' ? d.accept(`${d.message()}!`) : undefined))
+  assert.equal(await net.evaluate(() => prompt('name')), 'name!')
+  assert.equal(await net.evaluate(() => confirm('sure?')), false)
+  await net.close()
+
   // browser.newContext(): its options and routes apply to its one page.
   const context = await browser.newContext({ userAgent: 'CtxSmoke/1' })
   await context.route('**/api', (route) => route.fulfill({ body: 'from the context' }))
