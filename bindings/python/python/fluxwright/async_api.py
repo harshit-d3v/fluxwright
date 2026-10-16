@@ -43,6 +43,7 @@ __all__ = [
     "BrowserContext",
     "BrowserType",
     "ConsoleMessage",
+    "Dialog",
     "Download",
     "Error",
     "EventInfo",
@@ -55,6 +56,7 @@ __all__ = [
     "PlaywrightContextManager",
     "ProxySettings",
     "Request",
+    "Response",
     "Route",
     "StorageState",
     "TimeoutError",
@@ -114,10 +116,11 @@ def _settled(result: Any = None, error: BaseException | None = None) -> asyncio.
 
 
 class Request:
-    """A request as a route handler sees it."""
+    """A request, as route handlers and network events see it."""
 
-    def __init__(self, native: _native.Route) -> None:
+    def __init__(self, native: _native.Route | _native.NetworkRequest, failure: str | None = None) -> None:
         self._native = native
+        self._failure = failure
 
     @property
     def url(self) -> str:
@@ -140,8 +143,95 @@ class Request:
         """``document``, ``script``, ``stylesheet``, ``image``, ``xhr``, ..."""
         return self._native.resource_type
 
+    @property
+    def failure(self) -> str | None:
+        """Why the request failed (``net::ERR_FAILED``, ...), for ``requestfailed``."""
+        return self._failure
+
     def __repr__(self) -> str:
         return f"<Request method={self.method!r} url={self.url!r}>"
+
+
+class Response:
+    """A response, as ``page.on("response")`` and ``expect_response`` hand it over."""
+
+    def __init__(self, native: _native.NetworkResponse) -> None:
+        self._native = native
+        self._request = Request(native.request)
+
+    @property
+    def url(self) -> str:
+        return self._native.url
+
+    @property
+    def status(self) -> int:
+        return self._native.status
+
+    @property
+    def status_text(self) -> str:
+        return self._native.status_text
+
+    @property
+    def ok(self) -> bool:
+        """Status 200 to 299."""
+        return 200 <= self.status <= 299
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """Names lower-cased."""
+        return self._native.headers
+
+    @property
+    def request(self) -> Request:
+        return self._request
+
+    async def body(self) -> bytes:
+        """The body, once the response finished loading."""
+        return await self._native.body()
+
+    async def text(self) -> str:
+        return (await self.body()).decode("utf-8", errors="replace")
+
+    async def json(self) -> Any:
+        return _json.loads(await self.body())
+
+    def __repr__(self) -> str:
+        return f"<Response status={self.status} url={self.url!r}>"
+
+
+class Dialog:
+    """A JavaScript dialog, as ``page.on("dialog")`` hands it over. Answer it with ``accept`` or
+    ``dismiss``; one no listener answered is dismissed, so the page never hangs on it."""
+
+    def __init__(self, native: _native.Dialog) -> None:
+        self._native = native
+        self._answered = False
+
+    @property
+    def type(self) -> str:
+        """``alert``, ``confirm``, ``prompt`` or ``beforeunload``."""
+        return self._native.type
+
+    @property
+    def message(self) -> str:
+        return self._native.message
+
+    @property
+    def default_value(self) -> str:
+        """A prompt's default text."""
+        return self._native.default_value
+
+    async def accept(self, prompt_text: str | None = None) -> None:
+        """``prompt_text`` is what a ``prompt`` returns."""
+        self._answered = True
+        await self._native.accept(prompt_text)
+
+    async def dismiss(self) -> None:
+        self._answered = True
+        await self._native.dismiss()
+
+    def __repr__(self) -> str:
+        return f"<Dialog type={self.type!r} message={self.message!r}>"
 
 
 class Route:
@@ -262,6 +352,8 @@ class Page(_native.Page):
         self._route_lock = asyncio.Lock()
         self._listeners: dict[str, list[tuple[Listener, Listener]]] = {}
         self._logging = False
+        self._watching_network = False
+        self._answering_dialogs = False
         self._tasks: set[asyncio.Future[Any]] = set()
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
@@ -282,8 +374,10 @@ class Page(_native.Page):
         self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
 
     def on(self, event: str, handler: Listener) -> None:
-        """Calls ``handler`` with each ``"console"`` message (a ``ConsoleMessage``) or
-        ``"pageerror"`` (an ``Error``) from now on. Calls of a coroutine function run as tasks."""
+        """Calls ``handler`` from now on with each ``"console"`` message (a ``ConsoleMessage``),
+        ``"pageerror"`` (an ``Error``), ``"request"``, ``"requestfinished"`` and
+        ``"requestfailed"`` (a ``Request``), ``"response"`` (a ``Response``) or ``"dialog"`` (a
+        ``Dialog``, to accept or dismiss). Calls of a coroutine function run as tasks."""
         self._add_listener("on", event, handler, handler)
 
     def once(self, event: str, handler: Listener) -> None:
@@ -318,14 +412,77 @@ class Page(_native.Page):
             raise
         await future
 
+    @asynccontextmanager
+    async def expect_response(
+        self, url_or_predicate: URLMatch | Callable[[Response], bool], *, timeout: float | None = None
+    ) -> AsyncIterator[EventInfo[Response]]:
+        """Waits for the first response from now on whose URL matches (a glob or regex, as in
+        ``route``) or that the predicate accepts (``timeout`` in milliseconds, default 30 s; 0
+        waits forever), as Playwright's ``page.expect_response``::
+
+            async with page.expect_response("**/api/items") as info:
+                await page.get_by_text("Load").click()
+            items = await (await info.value).json()
+        """
+        async with self._expect("response", url_or_predicate, timeout) as info:
+            yield info
+
+    @asynccontextmanager
+    async def expect_request(
+        self, url_or_predicate: URLMatch | Callable[[Request], bool], *, timeout: float | None = None
+    ) -> AsyncIterator[EventInfo[Request]]:
+        """``expect_response``, for requests."""
+        async with self._expect("request", url_or_predicate, timeout) as info:
+            yield info
+
+    @asynccontextmanager
+    async def _expect(self, event: str, url_or_predicate: Any, timeout: float | None) -> AsyncIterator[EventInfo[Any]]:
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        if callable(url_or_predicate):
+            matches = url_or_predicate
+        else:
+            url = _url_matcher(url_or_predicate)
+
+            def matches(r: Any) -> bool:
+                return url(r.url)
+
+        def listener(arg: Any) -> None:
+            if future.done():
+                return
+            try:
+                if matches(arg):
+                    future.set_result(arg)
+            except Exception as e:
+                future.set_exception(e)
+
+        self.on(event, listener)
+        try:
+            yield EventInfo(future)
+            limit = 30_000 if timeout is None else timeout
+            try:
+                await asyncio.wait_for(asyncio.shield(future), limit / 1000 if limit > 0 else None)
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"page.expect_{event}: timeout {limit:g}ms exceeded") from None
+        finally:
+            self.remove_listener(event, listener)
+
     def _add_listener(self, method: str, event: str, added: Listener, call: Listener) -> None:
-        if event not in ("console", "pageerror"):
-            raise ValueError(f"page.{method}: {event!r} is not supported (console, pageerror)")
-        if not self._logging:
-            # Subscribed here, so nothing logged after this call is missed.
+        if event not in _EVENTS:
+            raise ValueError(f"page.{method}: {event!r} is not supported ({', '.join(_EVENTS)})")
+        # Each source is subscribed here, so nothing after this call is missed.
+        if event in ("console", "pageerror") and not self._logging:
             _keep(self._tasks, asyncio.ensure_future(_serve_logs(self._logs(), self._listeners, self._tasks)))
             self._logging = True
+        elif event == "dialog" and not self._answering_dialogs:
+            _keep(self._tasks, asyncio.ensure_future(_serve_dialogs(self._dialogs(), self._listeners)))
+            self._answering_dialogs = True
+        elif event in ("request", "response", "requestfinished", "requestfailed") and not self._watching_network:
+            _keep(self._tasks, asyncio.ensure_future(_serve_network(self._network(), self._listeners, self._tasks)))
+            self._watching_network = True
         self._listeners.setdefault(event, []).append((added, call))
+
+
+_EVENTS = ("console", "pageerror", "request", "response", "requestfinished", "requestfailed", "dialog")
 
 
 # The loops below run until the page closes. They hold the page's handlers, never the page, so a
@@ -352,20 +509,57 @@ def _remove_listener(listeners: dict[str, list[tuple[Listener, Listener]]], even
             return
 
 
+def _emit(
+    listeners: dict[str, list[tuple[Listener, Listener]]], event: str, arg: Any, tasks: set[asyncio.Future[Any]]
+) -> None:
+    for _, call in list(listeners.get(event, ())):
+        try:
+            result = call(arg)
+            if inspect.isawaitable(result):
+                _keep(tasks, asyncio.ensure_future(result))
+        except Exception:
+            _log.exception("a page.on(%r) listener failed", event)
+
+
 async def _serve_logs(
     stream: _native.LogStream,
     listeners: dict[str, list[tuple[Listener, Listener]]],
     tasks: set[asyncio.Future[Any]],
 ) -> None:
     while (entry := await stream.next()) is not None:
-        event = "pageerror" if isinstance(entry, Error) else "console"
-        for _, call in list(listeners.get(event, ())):
+        _emit(listeners, "pageerror" if isinstance(entry, Error) else "console", entry, tasks)
+
+
+async def _serve_network(
+    stream: _native.NetworkStream,
+    listeners: dict[str, list[tuple[Listener, Listener]]],
+    tasks: set[asyncio.Future[Any]],
+) -> None:
+    while (e := await stream.next()) is not None:
+        response = e.response
+        arg = Response(response) if response is not None else Request(e.request, e.failure)
+        _emit(listeners, e.event, arg, tasks)
+
+
+async def _serve_dialogs(stream: _native.DialogStream, listeners: dict[str, list[tuple[Listener, Listener]]]) -> None:
+    # Every listener runs and is awaited; a dialog none of them answered is dismissed, so the
+    # page never hangs on it.
+    while (native := await stream.next()) is not None:
+        dialog = Dialog(native)
+        pending = []
+        for _, call in list(listeners.get("dialog", ())):
             try:
-                result = call(entry)
+                result = call(dialog)
                 if inspect.isawaitable(result):
-                    _keep(tasks, asyncio.ensure_future(result))
+                    pending.append(result)
             except Exception:
-                _log.exception("a page.on(%r) listener failed", event)
+                _log.exception("a page.on('dialog') listener failed")
+        for outcome in await asyncio.gather(*pending, return_exceptions=True):
+            if isinstance(outcome, BaseException):
+                _log.error("a page.on('dialog') listener failed", exc_info=outcome)
+        if not dialog._answered:
+            with suppress(Error):
+                await dialog.dismiss()
 
 
 async def _serve_routes(

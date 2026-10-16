@@ -590,6 +590,23 @@ impl Page {
         Ok(LogStream(Arc::new(Mutex::new(p.subscribe_logs()))))
     }
 
+    /// Network events from now on: subscribed before this returns, so a navigation right after
+    /// it is seen whole.
+    #[pyo3(name = "_network")]
+    fn network(&self) -> PyResult<NetworkStream> {
+        let page = self.lease.try_read().map_err(|_| closed())?;
+        let p = page.as_ref().ok_or_else(closed)?;
+        Ok(NetworkStream(Arc::new(Mutex::new(p.subscribe_network()))))
+    }
+
+    /// Dialogs from now on, for the caller to answer instead of the engine dismissing them.
+    #[pyo3(name = "_dialogs")]
+    fn dialogs(&self) -> PyResult<DialogStream> {
+        let page = self.lease.try_read().map_err(|_| closed())?;
+        let p = page.as_ref().ok_or_else(closed)?;
+        Ok(DialogStream(Arc::new(Mutex::new(p.subscribe_dialogs()))))
+    }
+
     /// Starts handing this page's requests over; resolves once interception is on, so a `goto`
     /// after it is covered.
     #[pyo3(name = "_intercept")]
@@ -959,6 +976,215 @@ impl Route {
     }
 }
 
+/// A request, as network events hand it over; `fluxwright.async_api` wraps it in `Request`.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct NetworkRequest {
+    #[pyo3(get)]
+    url: String,
+    #[pyo3(get)]
+    method: String,
+    /// Names lower-cased, as Playwright reports them.
+    #[pyo3(get)]
+    headers: HashMap<String, String>,
+    #[pyo3(get)]
+    post_data: Option<String>,
+    #[pyo3(get)]
+    resource_type: String,
+}
+
+impl From<fluxwright::NetRequest> for NetworkRequest {
+    fn from(r: fluxwright::NetRequest) -> Self {
+        NetworkRequest {
+            url: r.url,
+            method: r.method,
+            headers: r.headers.into_iter().collect(),
+            post_data: r.post_data,
+            resource_type: r.resource_type,
+        }
+    }
+}
+
+/// A response; `fluxwright.async_api` wraps it in `Response`.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct NetworkResponse {
+    inner: fluxwright::NetResponse,
+}
+
+#[pymethods]
+impl NetworkResponse {
+    #[getter]
+    fn url(&self) -> String {
+        self.inner.url.clone()
+    }
+
+    #[getter]
+    fn status(&self) -> u16 {
+        self.inner.status
+    }
+
+    #[getter]
+    fn status_text(&self) -> String {
+        self.inner.status_text.clone()
+    }
+
+    #[getter]
+    fn headers(&self) -> HashMap<String, String> {
+        self.inner.headers.iter().cloned().collect()
+    }
+
+    #[getter]
+    fn request(&self) -> NetworkRequest {
+        self.inner.request.clone().into()
+    }
+
+    /// The body, once the response finished loading, within `timeout` milliseconds (default
+    /// 30 s).
+    #[pyo3(signature = (*, timeout=None))]
+    fn body<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let timeout = Duration::from_millis(timeout.unwrap_or(30_000.0).max(0.0) as u64);
+        future_into_py(py, async move { inner.body(timeout).await.map_err(error) })
+    }
+}
+
+/// One network event: `request`, `response`, `requestfinished` or `requestfailed`.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct NetworkEvent {
+    #[pyo3(get)]
+    event: String,
+    request: fluxwright::NetRequest,
+    response: Option<fluxwright::NetResponse>,
+    /// Why a failed request failed (`net::ERR_FAILED`, ...).
+    #[pyo3(get)]
+    failure: Option<String>,
+}
+
+#[pymethods]
+impl NetworkEvent {
+    #[getter]
+    fn request(&self) -> NetworkRequest {
+        self.request.clone().into()
+    }
+
+    #[getter]
+    fn response(&self) -> Option<NetworkResponse> {
+        self.response.clone().map(|inner| NetworkResponse { inner })
+    }
+}
+
+impl From<fluxwright::NetEvent> for NetworkEvent {
+    fn from(e: fluxwright::NetEvent) -> Self {
+        let (event, request, response, failure) = match e {
+            fluxwright::NetEvent::Request(r) => ("request", r, None, None),
+            fluxwright::NetEvent::Response(r) => ("response", r.request.clone(), Some(r), None),
+            fluxwright::NetEvent::Finished(r) => ("requestfinished", r, None, None),
+            fluxwright::NetEvent::Failed(r, why) => ("requestfailed", r, None, Some(why)),
+        };
+        NetworkEvent {
+            event: event.into(),
+            request,
+            response,
+            failure,
+        }
+    }
+}
+
+/// A page's network events, in order.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct NetworkStream(Arc<Mutex<UnboundedReceiver<fluxwright::NetEvent>>>);
+
+#[pymethods]
+impl NetworkStream {
+    /// The next event, or `None` once the page closed.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx.lock().await.recv().await.map(NetworkEvent::from))
+        })
+    }
+}
+
+/// A dialog waiting for an answer; `fluxwright.async_api` wraps it in `Dialog`. One dropped
+/// unanswered is dismissed (`beforeunload` accepted).
+#[pyclass(frozen, module = "fluxwright._native")]
+struct Dialog {
+    inner: Arc<Mutex<Option<fluxwright::Dialog>>>,
+    /// `alert`, `confirm`, `prompt` or `beforeunload`.
+    #[pyo3(get, name = "type")]
+    kind: String,
+    #[pyo3(get)]
+    message: String,
+    #[pyo3(get)]
+    default_value: String,
+}
+
+impl Dialog {
+    fn new(d: fluxwright::Dialog) -> Self {
+        Dialog {
+            kind: d.kind.clone(),
+            message: d.message.clone(),
+            default_value: d.default_value.clone(),
+            inner: Arc::new(Mutex::new(Some(d))),
+        }
+    }
+
+    /// Takes the dialog to answer it; a second answer fails, as in Playwright.
+    async fn take(slot: &Mutex<Option<fluxwright::Dialog>>) -> PyResult<fluxwright::Dialog> {
+        slot.lock()
+            .await
+            .take()
+            .ok_or_else(|| raise("Error", "dialog is already handled".into()))
+    }
+}
+
+#[pymethods]
+impl Dialog {
+    /// `prompt_text` is what a `prompt` returns.
+    #[pyo3(signature = (prompt_text=None))]
+    fn accept<'py>(
+        &self,
+        py: Python<'py>,
+        prompt_text: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let slot = self.inner.clone();
+        future_into_py(py, async move {
+            Dialog::take(&slot)
+                .await?
+                .accept(prompt_text)
+                .await
+                .map(none)
+                .map_err(error)
+        })
+    }
+
+    fn dismiss<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let slot = self.inner.clone();
+        future_into_py(py, async move {
+            Dialog::take(&slot)
+                .await?
+                .dismiss()
+                .await
+                .map(none)
+                .map_err(error)
+        })
+    }
+}
+
+/// A page's dialogs, in order.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct DialogStream(Arc<Mutex<UnboundedReceiver<fluxwright::Dialog>>>);
+
+#[pymethods]
+impl DialogStream {
+    /// The next dialog, or `None` once the page closed.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx.lock().await.recv().await.map(Dialog::new))
+        })
+    }
+}
+
 /// Requests `page.route` intercepted, in order.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct RouteStream(Arc<Mutex<UnboundedReceiver<fluxwright::InterceptedRequest>>>);
@@ -1102,5 +1328,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LogStream>()?;
     m.add_class::<ConsoleMessage>()?;
     m.add_class::<Download>()?;
+    m.add_class::<NetworkRequest>()?;
+    m.add_class::<NetworkResponse>()?;
+    m.add_class::<NetworkEvent>()?;
+    m.add_class::<NetworkStream>()?;
+    m.add_class::<Dialog>()?;
+    m.add_class::<DialogStream>()?;
     Ok(())
 }

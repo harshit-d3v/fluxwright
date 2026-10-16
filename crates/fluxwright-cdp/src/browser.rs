@@ -307,6 +307,12 @@ impl CdpBrowser {
             // on, dismiss alert/confirm/prompt.
             "Page.javascriptDialogOpening" => {
                 if let Some(sid) = ev.session_id.clone() {
+                    // The job answers it (page.on('dialog')). A dialog it cannot take is
+                    // dropped, which answers it as below.
+                    if let Some(tx) = self.setup_for_session(&sid).await.and_then(|s| s.dialogs) {
+                        let _ = tx.send(crate::events::Dialog::new(&ev.params, self.conn.clone(), sid));
+                        return;
+                    }
                     let accept = ev.params["type"] == "beforeunload";
                     debug!(message = %ev.params["message"], accept, "answering dialog");
                     let conn = self.conn.clone();

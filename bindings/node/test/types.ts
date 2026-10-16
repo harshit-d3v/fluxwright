@@ -37,7 +37,13 @@ export async function typed(): Promise<void> {
   const name: string = download.suggestedFilename()
   await download.saveAs(`out/${name}`)
   // @ts-expect-error not an event Fluxwright emits
-  page.on('request', () => {})
+  page.on('popup', () => {})
+  page.on('response', (r) => void r.status()).on('requestfailed', (r) => void r.failure()?.errorText)
+  page.on('dialog', (d) => d.accept(d.defaultValue()))
+  const resp = await page.waitForResponse('**/api', { timeout: 1000 })
+  const data: unknown = await resp.json()
+  const req = await page.waitForRequest((r) => r.method() === 'POST')
+  void [data, req.postData()]
   const context = await browser.newContext({ userAgent: 'Ctx', storageState: 'state.json' })
   await context.route('**/api', (route) => route.abort())
   const only = await context.newPage()

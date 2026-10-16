@@ -13,6 +13,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
@@ -307,6 +308,69 @@ async def queue_smoke() -> None:
             await hurried.new_page()
         for page in held:
             await page.close()
+
+
+def test_events(base):
+    asyncio.run(event_smoke(base))
+
+
+async def event_smoke(base: str) -> None:
+    def path(r):
+        return urlparse(r.url).path
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(max_browsers=1)
+        page = await browser.new_page()
+        seen = []
+        page.on("request", lambda r: seen.append(f"request {r.method} {path(r)}"))
+        page.on("response", lambda r: seen.append(f"response {r.status} {path(r)}"))
+        page.on("requestfinished", lambda r: seen.append(f"finished {path(r)}"))
+        page.on("requestfailed", lambda r: seen.append(f"failed {path(r)} {r.failure}"))
+        await page.goto(base)
+        async with page.expect_response("**/api") as info:
+            await page.evaluate(FETCH_API)
+        api = await info.value
+        assert api.status == 200 and api.ok
+        assert await api.json() == {"real": True}
+        assert api.request.method == "GET"
+        assert api.headers["content-type"] == "application/json"
+        await page.route("**/gone", lambda route: route.abort())
+        await page.evaluate("() => fetch('/gone').catch(() => 'failed')")
+        for _ in range(50):
+            if any(e.startswith("failed") for e in seen):
+                break
+            await asyncio.sleep(0.02)
+        assert "request GET /" in seen, seen
+        assert "response 200 /api" in seen, seen
+        assert "finished /api" in seen, seen
+        assert "failed /gone net::ERR_FAILED" in seen, seen
+        async with page.expect_request(lambda r: r.url.endswith("/hdr")) as request:
+            await page.evaluate("() => fetch('/hdr')")
+        assert (await request.value).method == "GET"
+        with pytest.raises(TimeoutError, match="timeout 200ms exceeded"):
+            async with page.expect_response("**/never", timeout=200):
+                pass
+
+        # Without a listener a dialog is dismissed; a listener answers it; one it leaves is dismissed.
+        assert await page.evaluate("() => confirm('sure?')") is False
+
+        async def on_dialog(dialog):
+            if dialog.type == "prompt":
+                await dialog.accept(dialog.message + "!")
+
+        page.on("dialog", on_dialog)
+        assert await page.evaluate("() => prompt('name')") == "name!"
+        assert await page.evaluate("() => confirm('sure?')") is False
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(max_browsers=1)
+        page = browser.new_page()
+        page.goto(base)
+        with page.expect_response(lambda r: r.url.endswith("/api")) as info:
+            page.evaluate(FETCH_API)
+        assert info.value.json() == {"real": True}
+        page.on("dialog", lambda dialog: dialog.accept("sync!"))
+        assert page.evaluate("() => prompt('q')") == "sync!"
 
 
 def test_contexts(base):
