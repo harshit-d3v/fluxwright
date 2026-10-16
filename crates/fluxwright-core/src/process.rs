@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -24,26 +24,40 @@ pub fn process_tree_memory_map(roots: &[u32]) -> HashMap<u32, u64> {
     roots
         .iter()
         .copied()
-        .map(|r| (r, walk(&sys, Pid::from_u32(r))))
+        .map(|r| (r, walk(&sys, r)))
         .collect()
 }
 
-fn walk(sys: &System, pid: Pid) -> u64 {
-    let mut sum = 0u64;
-    if let Some(p) = sys.process(pid) {
-        sum += footprint(pid.as_u32(), p.memory());
-    }
+fn walk(sys: &System, root: u32) -> u64 {
     // Linux lists threads as processes: parent() is their thread-group leader
     // and memory() is the whole process RSS, so counting them multiplies a
     // browser's footprint by its thread count.
-    let children: Vec<Pid> = sys
+    let procs: Vec<(u32, Option<u32>, u64)> = sys
         .processes()
-        .iter()
-        .filter(|(_, proc)| proc.thread_kind().is_none() && proc.parent() == Some(pid))
-        .map(|(id, _)| *id)
+        .values()
+        .filter(|p| p.thread_kind().is_none())
+        .map(|p| (p.pid().as_u32(), p.parent().map(|q| q.as_u32()), p.start_time()))
         .collect();
-    for c in children {
-        sum += walk(sys, c);
+    tree_sum(&procs, root, |pid| sys.process(Pid::from_u32(pid)).map_or(0, |p| footprint(pid, p.memory())))
+}
+
+/// `cost` summed over `root` and its descendants; `procs` holds (pid, parent, start time).
+/// Windows keeps a dead parent's pid on its children, and a new process can reuse that pid:
+/// such a link points at a process younger than the child, and can close a cycle (the old
+/// recursive walk overflowed the stack on one). So a child must not predate its parent, and
+/// each process counts once.
+fn tree_sum(procs: &[(u32, Option<u32>, u64)], root: u32, cost: impl Fn(u32) -> u64) -> u64 {
+    let start = |pid: u32| procs.iter().find(|p| p.0 == pid).map_or(0, |p| p.2);
+    let mut seen = HashSet::new();
+    let mut todo = vec![root];
+    let mut sum = 0;
+    while let Some(pid) = todo.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        sum += cost(pid);
+        let born = start(pid);
+        todo.extend(procs.iter().filter(|p| p.1 == Some(pid) && p.2 >= born).map(|p| p.0));
     }
     sum
 }
@@ -113,6 +127,16 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn tree_sum_survives_reused_pids() {
+        // 1 is the root, 2 and 3 its children, 4 a grandchild. 9 claims parent 1 but started
+        // before it (its real parent died and 1 reused the pid). 5 is 2's child and also 1's
+        // recorded parent, which closes a cycle.
+        let procs = [(1, Some(5), 100), (2, Some(1), 100), (3, Some(1), 120), (4, Some(3), 130),
+            (9, Some(1), 50), (5, Some(2), 100)];
+        assert_eq!(tree_sum(&procs, 1, |pid| 1 << pid), 0b111110);
+    }
 
     #[test]
     fn tree_rss_does_not_multiply_by_thread_count() {
