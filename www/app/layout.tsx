@@ -27,7 +27,7 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://fluxwright.vercel.app"),
   title: "Fluxwright: run a fleet of headless Chrome",
   description:
-    "A Rust engine that pools Chrome, gives every job a fresh isolated page, queues work when the fleet is full, recycles bloated browsers and retries crashes. For Node, Rust and AI agents over MCP.",
+    "A Rust engine that pools Chrome, gives every job a fresh isolated page, queues work when the fleet is full, recycles bloated browsers and retries crashes. For Node, Python, Rust and AI agents over MCP.",
   icons: { icon: "/favicon.svg" },
   openGraph: {
     title: "Fluxwright: run a fleet of headless Chrome",
