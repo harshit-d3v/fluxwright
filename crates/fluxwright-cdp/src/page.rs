@@ -155,15 +155,61 @@ pub struct BoundingBox {
 }
 
 /// Where selector JS runs: a CDP session, an execution context in it (`None`: the main world),
-/// and that frame's viewport offset in top-level page coordinates.
+/// and how that frame's viewport maps onto the top-level one.
 #[derive(Clone)]
 struct Scope {
     session: String,
     context: Option<i64>,
     /// Frame id of a cached isolated world, so a dead one can be dropped.
     world_of: Option<String>,
-    dx: f64,
-    dy: f64,
+    /// This frame's viewport to the top-level viewport.
+    map: Affine,
+    /// Same for the session's root frame, whose viewport is what the DOM domain reports in.
+    root: Affine,
+}
+
+/// `x' = a·x + c·y + e`, `y' = b·x + d·y + f`, as in DOMMatrix: enough for iframes that CSS
+/// scales, rotates or skews. ponytail: a perspective (3D) transform is not affine; such a frame
+/// gets the map through three of its four corners.
+#[derive(Clone, Copy)]
+struct Affine([f64; 6]);
+
+impl Affine {
+    const ID: Self = Self([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+
+    fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        let [a, b, c, d, e, f] = self.0;
+        (a * x + c * y + e, b * x + d * y + f)
+    }
+
+    fn invert(&self, x: f64, y: f64) -> (f64, f64) {
+        let [a, b, c, d, e, f] = self.0;
+        let (x, y, det) = (x - e, y - f, a * d - b * c);
+        ((d * x - c * y) / det, (a * y - b * x) / det)
+    }
+
+    /// The map taking the `w`×`h` rectangle at the origin onto quad `q`, corners clockwise from
+    /// the top-left one, as CDP gives quads.
+    fn onto(q: [(f64, f64); 4], w: f64, h: f64) -> Self {
+        let [(x1, y1), (x2, y2), _, (x4, y4)] = q;
+        Self([(x2 - x1) / w, (y2 - y1) / w, (x4 - x1) / h, (y4 - y1) / h, x1, y1])
+    }
+
+    /// The same map moved so that this frame's origin lands on `(x, y)` of its own viewport.
+    fn shifted(&self, x: f64, y: f64) -> Self {
+        let [a, b, c, d, ..] = self.0;
+        let (e, f) = self.apply(x, y);
+        Self([a, b, c, d, e, f])
+    }
+
+    /// Box around the mapped rectangle: x, y, width, height.
+    fn rect(&self, x: f64, y: f64, w: f64, h: f64) -> [f64; 4] {
+        let pts = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)].map(|(x, y)| self.apply(x, y));
+        let min = |v: [f64; 4]| v.into_iter().fold(f64::INFINITY, f64::min);
+        let max = |v: [f64; 4]| v.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        let (xs, ys) = (pts.map(|p| p.0), pts.map(|p| p.1));
+        [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+    }
 }
 
 fn engine_call(query: &str, mode: &str) -> String {
@@ -190,9 +236,12 @@ fn js_error(res: &Value) -> Option<Error> {
     Some(Error::JavaScript(msg))
 }
 
-/// Content-box origin of an iframe element, in its parent's viewport.
-const FRAME_ORIGIN_JS: &str = "function() { const r = this.getBoundingClientRect(), s = getComputedStyle(this); \
-    return [r.left + this.clientLeft + parseFloat(s.paddingLeft), r.top + this.clientTop + parseFloat(s.paddingTop)]; }";
+/// An iframe element's content box before transforms: width and height (its frame's viewport),
+/// then its origin in the parent's viewport, which is right only when nothing transforms it.
+const FRAME_BOX_JS: &str = "function() { const r = this.getBoundingClientRect(), s = getComputedStyle(this), \
+    px = (k) => parseFloat(s[k]); \
+    return [this.clientWidth - px('paddingLeft') - px('paddingRight'), this.clientHeight - px('paddingTop') - px('paddingBottom'), \
+        r.left + this.clientLeft + px('paddingLeft'), r.top + this.clientTop + px('paddingTop')]; }";
 
 #[derive(Clone)]
 pub struct CdpPage {
@@ -330,7 +379,7 @@ impl CdpPage {
     }
 
     fn main_scope(&self) -> Scope {
-        Scope { session: self.sid().into(), context: None, world_of: None, dx: 0.0, dy: 0.0 }
+        Scope { session: self.sid().into(), context: None, world_of: None, map: Affine::ID, root: Affine::ID }
     }
 
     async fn session_call(&self, session: &str, method: &str, params: Value, timeout: Duration) -> Result<Value> {
@@ -365,7 +414,7 @@ impl CdpPage {
         timeout: Duration,
     ) -> Result<std::result::Result<(Scope, Vec<(Scope, String)>), String>> {
         // A page target's main frame id is its target id.
-        let Some(mut scope) = self.world(self.sid(), &self.target_id.0, 0.0, 0.0, timeout).await else {
+        let Some(mut scope) = self.world(self.sid(), &self.target_id.0, Affine::ID, Affine::ID, timeout).await else {
             return Ok(Err("page not ready".into()));
         };
         let mut hops = Vec::new();
@@ -389,24 +438,38 @@ impl CdpPage {
                 return Ok(Err(format!("no iframe matches {css}")));
             };
             let s = scope.session.clone();
-            let origin = self
+            let size = self
                 .session_call(&s, "Runtime.callFunctionOn",
-                    json!({ "objectId": obj, "returnByValue": true, "functionDeclaration": FRAME_ORIGIN_JS }), timeout)
+                    json!({ "objectId": obj, "returnByValue": true, "functionDeclaration": FRAME_BOX_JS }), timeout)
                 .await;
             let node = self.session_call(&s, "DOM.describeNode", json!({ "objectId": obj }), timeout).await;
+            // The content box as drawn, transforms included, in the session root's viewport.
+            let model = self.session_call(&s, "DOM.getBoxModel", json!({ "objectId": obj }), timeout).await;
             let _ = self.session_call(&s, "Runtime.releaseObject", json!({ "objectId": obj }), timeout).await;
-            let (Ok(origin), Ok(node)) = (origin, node) else {
+            let (Ok(size), Ok(node)) = (size, node) else {
                 return Ok(Err(format!("{css} went away")));
             };
             let Some(frame_id) = node["node"]["frameId"].as_str().map(String::from) else {
                 return Ok(Err(format!("{css} is not an iframe, or has not loaded")));
             };
-            let o = &origin["result"]["value"];
-            let dx = scope.dx + o[0].as_f64().unwrap_or(0.0);
-            let dy = scope.dy + o[1].as_f64().unwrap_or(0.0);
-            // A cross-site iframe runs in its own process: its own target and session.
-            let session = CdpBrowser::session_for_target(&self.targets, &frame_id).await.unwrap_or(s);
-            match self.world(&session, &frame_id, dx, dy, timeout).await {
+            let b = &size["result"]["value"];
+            let b = |i: usize| b[i].as_f64().unwrap_or(0.0);
+            let quad: Vec<f64> = model.ok().and_then(|m| m["model"]["content"].as_array().cloned())
+                .unwrap_or_default().iter().filter_map(Value::as_f64).collect();
+            let map = if quad.len() == 8 && b(0) > 0.0 && b(1) > 0.0 {
+                let pt = |i: usize| scope.root.apply(quad[2 * i], quad[2 * i + 1]);
+                Affine::onto([pt(0), pt(1), pt(2), pt(3)], b(0), b(1))
+            } else {
+                // No box (display: none, zero size): what is inside can still be read.
+                scope.map.shifted(b(2), b(3))
+            };
+            // A cross-site iframe runs in its own process: its own target and session, whose
+            // root frame it is.
+            let (session, root) = match CdpBrowser::session_for_target(&self.targets, &frame_id).await {
+                Some(own) => (own, map),
+                None => (s, scope.root),
+            };
+            match self.world(&session, &frame_id, map, root, timeout).await {
                 Some(next) => hops.push((std::mem::replace(&mut scope, next), css.clone())),
                 // Still loading, or a cross-site frame whose session is not attached yet.
                 None => return Ok(Err(format!("{css}: frame not ready"))),
@@ -420,11 +483,10 @@ impl CdpPage {
     async fn covered(&self, hops: &[(Scope, String)], x: f64, y: f64, timeout: Duration) -> Option<String> {
         for (parent, css) in hops {
             let css = serde_json::to_string(css).unwrap();
+            let (px, py) = parent.map.invert(x, y);
             let expr = format!(
-                "(() => {{ const f = document.querySelector({css}); const h = document.elementFromPoint({}, {}); \
-                 return f && h === f ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over ' + {css}; }})()",
-                x - parent.dx,
-                y - parent.dy
+                "(() => {{ const f = document.querySelector({css}); const h = document.elementFromPoint({px}, {py}); \
+                 return f && h === f ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over ' + {css}; }})()"
             );
             match self.eval_in(parent, &expr, true, timeout).await {
                 Ok(v) if v["value"] == "" => {}
@@ -436,7 +498,7 @@ impl CdpPage {
     }
 
     /// The isolated world of `frame_id`, made once per document and cached.
-    async fn world(&self, session: &str, frame_id: &str, dx: f64, dy: f64, timeout: Duration) -> Option<Scope> {
+    async fn world(&self, session: &str, frame_id: &str, map: Affine, root: Affine, timeout: Duration) -> Option<Scope> {
         let cached = self.worlds.lock().await.get(frame_id).copied();
         let id = match cached {
             Some(id) => id,
@@ -451,7 +513,7 @@ impl CdpPage {
                 id
             }
         };
-        Some(Scope { session: session.to_string(), context: Some(id), world_of: Some(frame_id.to_string()), dx, dy })
+        Some(Scope { session: session.to_string(), context: Some(id), world_of: Some(frame_id.to_string()), map, root })
     }
 
     /// Navigation destroys isolated worlds; drop a dead one so the next poll makes a new one.
@@ -574,7 +636,8 @@ impl CdpPage {
             return Ok(None);
         }
         let f = |k: &str| b[k].as_f64().unwrap_or(0.0);
-        Ok(Some(BoundingBox { x: f("x") + scope.dx, y: f("y") + scope.dy, width: f("width"), height: f("height") }))
+        let [x, y, width, height] = scope.map.rect(f("x"), f("y"), f("width"), f("height"));
+        Ok(Some(BoundingBox { x, y, width, height }))
     }
 
     /// Calls `function` (JavaScript source, such as `(el, arg) => el.value`) with the first match
@@ -761,7 +824,7 @@ impl CdpPage {
             if v["ok"].as_bool() == Some(true) {
                 if wait == Wait::Box {
                     let f = |k: &str| v[k].as_f64().unwrap_or(0.0);
-                    let rect = [f("x") + scope.dx, f("y") + scope.dy, f("width"), f("height")];
+                    let rect = scope.map.rect(f("x"), f("y"), f("width"), f("height"));
                     if last_box.is_some_and(|b| b.iter().zip(rect).all(|(a, b)| (a - b).abs() < 1.0)) {
                         return Ok((json!({ "x": rect[0], "y": rect[1], "width": rect[2], "height": rect[3] }), scope));
                     }
@@ -773,8 +836,7 @@ impl CdpPage {
                 if wait != Wait::Click {
                     return Ok((v, scope));
                 }
-                let x = v["x"].as_f64().unwrap_or(0.0) + scope.dx;
-                let y = v["y"].as_f64().unwrap_or(0.0) + scope.dy;
+                let (x, y) = scope.map.apply(v["x"].as_f64().unwrap_or(0.0), v["y"].as_f64().unwrap_or(0.0));
                 let stable = last_pos.is_some_and(|(px, py)| (px - x).abs() < 1.0 && (py - y).abs() < 1.0);
                 last_pos = Some((x, y));
                 if !stable {
