@@ -647,8 +647,17 @@ impl CdpPage {
             context: self.context_id.0.clone(),
             download_dir: download_dir.to_path_buf(),
         };
-        let task = tokio::spawn(crate::log::collect(self.browser.subscribe_unbounded(), watch, log.clone(), tx));
+        let events = self.browser.subscribe_unbounded();
+        let task = tokio::spawn(crate::log::collect(events, watch, log.clone(), tx, self.browser.clone()));
         (log, rx, task)
+    }
+
+    /// Hands dialogs of this page, its popups and iframes to the returned queue instead of
+    /// answering them; one the queue drops is answered as before (see [`Dialog`](crate::Dialog)).
+    pub async fn dialogs(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::events::Dialog> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.setups.lock().await.entry(self.context_id.0.clone()).or_default().dialogs = Some(tx);
+        rx
     }
 
     /// Lets this page's context download files into `dir`, named by download id.
@@ -872,6 +881,8 @@ impl CdpPage {
 pub(crate) struct ContextSetup {
     /// Where paused requests go when the job intercepts them (`page.route`).
     pub(crate) routes: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    /// Where dialogs go when the job answers them (`page.on('dialog')`).
+    pub(crate) dialogs: Option<tokio::sync::mpsc::UnboundedSender<crate::events::Dialog>>,
     pub(crate) emulation: Option<Emulation>,
     pub(crate) init_scripts: Vec<String>,
     pub(crate) types: Vec<ResourceType>,

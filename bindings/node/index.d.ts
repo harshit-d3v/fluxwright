@@ -15,6 +15,24 @@ export interface ContinueOptions {
   headers?: Record<string, string>
   postData?: string | Buffer
 }
+/** A request, as network events hand it over; `addon.js` wraps it in Playwright's `Request`. */
+export interface NetworkRequest {
+  url: string
+  method: string
+  /** Names lower-cased, as Playwright reports them. */
+  headers: Record<string, string>
+  postData?: string
+  resourceType: string
+}
+/** One network event, for `page.on`. */
+export interface NetworkEvent {
+  /** `request`, `response`, `requestfinished` or `requestfailed`. */
+  event: string
+  request: NetworkRequest
+  response?: NetworkResponse
+  /** Why a failed request failed (`net::ERR_FAILED`, ...). */
+  failure?: string
+}
 /** One console message or uncaught error, for `page.on`. */
 export interface LogEvent {
   /** `console` or `pageerror`. */
@@ -182,7 +200,16 @@ export declare class Page {
   /**
    * Sets the function that receives intercepted requests; `addon.js` passes its route
    * dispatcher, then calls `intercept`.
+   * Calls `handler` with each network event from now on; `addon.js` builds
+   * `page.on('request' | 'response' | 'requestfinished' | 'requestfailed')` on it. Subscribed
+   * before this returns, so a navigation right after it is seen whole.
    */
+  _onNetwork(handler: (...args: any[]) => any): void
+  /**
+   * Hands this page's dialogs to `handler` instead of dismissing them, from before this
+   * returns; `addon.js` builds `page.on('dialog')` on it.
+   */
+  _onDialog(handler: (...args: any[]) => any): void
   _setRouteHandler(handler: (...args: any[]) => any): void
   /**
    * Starts handing this page's requests to the route handler. Resolves once interception
@@ -216,6 +243,29 @@ export declare class InterceptedRoute {
   continue(options?: ContinueOptions | undefined | null): Promise<void>
   /** `errorCode` as in Playwright: `failed` (default), `aborted`, `blockedbyclient`, ... */
   abort(errorCode?: string | undefined | null): Promise<void>
+}
+/** A response; `addon.js` wraps it in Playwright's `Response`. */
+export declare class NetworkResponse {
+  get url(): string
+  get status(): number
+  get statusText(): string
+  get headers(): Record<string, string>
+  get request(): NetworkRequest
+  /** The body, once the response finished loading, within `timeoutMs` (default 30 s). */
+  body(timeoutMs?: number | undefined | null): Promise<Buffer>
+}
+/**
+ * A dialog waiting for an answer; `addon.js` wraps it in Playwright's `Dialog`. One dropped
+ * unanswered is dismissed (`beforeunload` accepted).
+ */
+export declare class PendingDialog {
+  /** `alert`, `confirm`, `prompt` or `beforeunload`. */
+  get type(): string
+  get message(): string
+  get defaultValue(): string
+  /** `promptText` is what a `prompt` returns. */
+  accept(promptText?: string | undefined | null): Promise<void>
+  dismiss(): Promise<void>
 }
 /** Lazy, like Playwright's: every action runs the query again. */
 export declare class Locator {

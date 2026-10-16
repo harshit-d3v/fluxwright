@@ -162,6 +162,163 @@ impl InterceptedRoute {
     }
 }
 
+/// A request, as network events hand it over; `addon.js` wraps it in Playwright's `Request`.
+#[napi(object)]
+pub struct NetworkRequest {
+    pub url: String,
+    pub method: String,
+    /// Names lower-cased, as Playwright reports them.
+    pub headers: HashMap<String, String>,
+    pub post_data: Option<String>,
+    pub resource_type: String,
+}
+
+impl From<fluxwright::NetRequest> for NetworkRequest {
+    fn from(r: fluxwright::NetRequest) -> Self {
+        NetworkRequest {
+            url: r.url,
+            method: r.method,
+            headers: r.headers.into_iter().collect(),
+            post_data: r.post_data,
+            resource_type: r.resource_type,
+        }
+    }
+}
+
+/// A response; `addon.js` wraps it in Playwright's `Response`.
+#[napi]
+pub struct NetworkResponse {
+    inner: fluxwright::NetResponse,
+}
+
+#[napi]
+impl NetworkResponse {
+    #[napi(getter)]
+    pub fn url(&self) -> String {
+        self.inner.url.clone()
+    }
+
+    #[napi(getter)]
+    pub fn status(&self) -> u32 {
+        self.inner.status as u32
+    }
+
+    #[napi(getter)]
+    pub fn status_text(&self) -> String {
+        self.inner.status_text.clone()
+    }
+
+    #[napi(getter)]
+    pub fn headers(&self) -> HashMap<String, String> {
+        self.inner.headers.iter().cloned().collect()
+    }
+
+    #[napi(getter)]
+    pub fn request(&self) -> NetworkRequest {
+        self.inner.request.clone().into()
+    }
+
+    /// The body, once the response finished loading, within `timeoutMs` (default 30 s).
+    #[napi]
+    pub async fn body(&self, timeout_ms: Option<u32>) -> Result<Buffer> {
+        let inner = self.inner.clone();
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000) as u64);
+        let body = RT
+            .spawn(async move { inner.body(timeout).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)?;
+        Ok(body.into())
+    }
+}
+
+/// One network event, for `page.on`.
+#[napi(object, object_from_js = false)]
+pub struct NetworkEvent {
+    /// `request`, `response`, `requestfinished` or `requestfailed`.
+    pub event: String,
+    pub request: NetworkRequest,
+    pub response: Option<NetworkResponse>,
+    /// Why a failed request failed (`net::ERR_FAILED`, ...).
+    pub failure: Option<String>,
+}
+
+impl From<fluxwright::NetEvent> for NetworkEvent {
+    fn from(e: fluxwright::NetEvent) -> Self {
+        let (event, request, response, failure) = match e {
+            fluxwright::NetEvent::Request(r) => ("request", r, None, None),
+            fluxwright::NetEvent::Response(r) => ("response", r.request.clone(), Some(NetworkResponse { inner: r }), None),
+            fluxwright::NetEvent::Finished(r) => ("requestfinished", r, None, None),
+            fluxwright::NetEvent::Failed(r, why) => ("requestfailed", r, None, Some(why)),
+        };
+        NetworkEvent { event: event.into(), request: request.into(), response, failure }
+    }
+}
+
+/// A dialog waiting for an answer; `addon.js` wraps it in Playwright's `Dialog`. One dropped
+/// unanswered is dismissed (`beforeunload` accepted).
+#[napi]
+pub struct PendingDialog {
+    inner: Arc<Mutex<Option<fluxwright::Dialog>>>,
+    kind: String,
+    message: String,
+    default_value: String,
+}
+
+#[napi]
+impl PendingDialog {
+    /// `alert`, `confirm`, `prompt` or `beforeunload`.
+    #[napi(getter, js_name = "type")]
+    pub fn kind(&self) -> String {
+        self.kind.clone()
+    }
+
+    #[napi(getter)]
+    pub fn message(&self) -> String {
+        self.message.clone()
+    }
+
+    #[napi(getter)]
+    pub fn default_value(&self) -> String {
+        self.default_value.clone()
+    }
+
+    /// `promptText` is what a `prompt` returns.
+    #[napi]
+    pub async fn accept(&self, prompt_text: Option<String>) -> Result<()> {
+        let slot = self.inner.clone();
+        RT.spawn(async move { Self::take(slot).await?.accept(prompt_text).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+    }
+
+    #[napi]
+    pub async fn dismiss(&self) -> Result<()> {
+        let slot = self.inner.clone();
+        RT.spawn(async move { Self::take(slot).await?.dismiss().await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
+    }
+}
+
+impl PendingDialog {
+    fn new(d: fluxwright::Dialog) -> Self {
+        PendingDialog {
+            kind: d.kind.clone(),
+            message: d.message.clone(),
+            default_value: d.default_value.clone(),
+            inner: Arc::new(Mutex::new(Some(d))),
+        }
+    }
+
+    /// Takes the dialog to answer it; a second answer fails, as in Playwright.
+    async fn take(slot: Arc<Mutex<Option<fluxwright::Dialog>>>) -> std::result::Result<fluxwright::Dialog, String> {
+        slot.lock().await.take().ok_or_else(|| "dialog is already handled".to_string())
+    }
+}
+
 /// One console message or uncaught error, for `page.on`.
 #[napi(object)]
 pub struct LogEvent {
@@ -965,6 +1122,42 @@ impl Page {
 
     /// Sets the function that receives intercepted requests; `addon.js` passes its route
     /// dispatcher, then calls `intercept`.
+    /// Calls `handler` with each network event from now on; `addon.js` builds
+    /// `page.on('request' | 'response' | 'requestfinished' | 'requestfailed')` on it. Subscribed
+    /// before this returns, so a navigation right after it is seen whole.
+    #[napi(js_name = "_onNetwork")]
+    pub fn on_network(&self, env: Env, handler: JsFunction) -> Result<()> {
+        let tsfn = callback::<NetworkEvent>(&env, handler)?;
+        let mut events = {
+            let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
+            page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_network()
+        };
+        RT.spawn(async move {
+            // Ends when the page closes.
+            while let Some(e) = events.recv().await {
+                tsfn.call(e.into(), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    /// Hands this page's dialogs to `handler` instead of dismissing them, from before this
+    /// returns; `addon.js` builds `page.on('dialog')` on it.
+    #[napi(js_name = "_onDialog")]
+    pub fn on_dialog(&self, env: Env, handler: JsFunction) -> Result<()> {
+        let tsfn = callback::<PendingDialog>(&env, handler)?;
+        let mut dialogs = {
+            let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
+            page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_dialogs()
+        };
+        RT.spawn(async move {
+            while let Some(d) = dialogs.recv().await {
+                tsfn.call(PendingDialog::new(d), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
     #[napi(js_name = "_setRouteHandler")]
     pub fn set_route_handler(&self, env: Env, handler: JsFunction) -> Result<()> {
         *self.routes.lock().unwrap() = Some(callback::<InterceptedRoute>(&env, handler)?);

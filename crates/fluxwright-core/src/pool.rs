@@ -73,6 +73,30 @@ pub struct PageLease {
     downloads: Downloads,
     /// Where this page's downloads land; removed when the lease ends.
     download_dir: std::path::PathBuf,
+    /// Who answers this page's dialogs; with nobody, a dialog is dismissed as before.
+    dialog_listeners: DialogListeners,
+}
+
+type DialogListeners = Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<fluxwright_cdp::Dialog>>>>;
+
+/// Routes a page's dialogs to its newest listener still there. A dialog nobody takes is dropped,
+/// which answers it (`beforeunload` accepted, the rest dismissed). Ends with the context.
+fn route_dialogs(mut dialogs: tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::Dialog>, listeners: DialogListeners) {
+    tokio::spawn(async move {
+        while let Some(dialog) = dialogs.recv().await {
+            let mut dialog = Some(dialog);
+            let mut listeners = listeners.lock().unwrap();
+            while let (Some(tx), Some(d)) = (listeners.last(), dialog.take()) {
+                match tx.send(d) {
+                    Ok(()) => break,
+                    Err(back) => {
+                        dialog = Some(back.0);
+                        listeners.pop();
+                    }
+                }
+            }
+        }
+    });
 }
 
 impl Engine {
@@ -543,6 +567,8 @@ impl Inner {
         let (log, downloads, log_task) = page.collect_logs(&download_dir);
         // Best effort: a Chrome that refuses only loses downloads.
         let _ = page.allow_downloads(&download_dir, Duration::from_secs(5)).await;
+        let dialog_listeners = DialogListeners::default();
+        route_dialogs(page.dialogs().await, dialog_listeners.clone());
         Ok(PageLease {
             engine: self.clone(),
             browser,
@@ -555,6 +581,7 @@ impl Inner {
             log_task,
             downloads: Downloads(Arc::new(Mutex::new(downloads))),
             download_dir,
+            dialog_listeners,
         })
     }
 
@@ -849,6 +876,20 @@ impl PageLease {
     }
 
     /// Every console message and uncaught error from now on, as they happen.
+    /// Network events of this page, its popups and iframes from now on: requests, responses,
+    /// finished and failed requests.
+    pub fn subscribe_network(&self) -> tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::NetEvent> {
+        self.log.lock().unwrap().subscribe_network()
+    }
+
+    /// Dialogs of this page, its popups and iframes from now on, for the job to answer instead
+    /// of the engine dismissing them. The newest subscriber gets each one.
+    pub fn subscribe_dialogs(&self) -> tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::Dialog> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.dialog_listeners.lock().unwrap().push(tx);
+        rx
+    }
+
     pub fn subscribe_logs(&self) -> tokio::sync::mpsc::UnboundedReceiver<LogEntry> {
         self.log.lock().unwrap().subscribe()
     }

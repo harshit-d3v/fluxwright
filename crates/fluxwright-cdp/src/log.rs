@@ -10,7 +10,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::connection::CdpEvent;
+use crate::connection::{CdpEvent, Connection};
+use crate::events::{BodySource, Loaded, NetEvent, NetRequest, NetResponse};
 
 /// Per kind; older entries are dropped first.
 const KEEP: usize = 1000;
@@ -67,6 +68,8 @@ pub struct PageLog {
     pub errors: VecDeque<PageError>,
     /// One queue per listener, so a burst of output never drops an entry.
     live: Vec<UnboundedSender<LogEntry>>,
+    /// The same for network events; requests are tracked only while one is listening.
+    net_live: Vec<UnboundedSender<NetEvent>>,
 }
 
 impl PageLog {
@@ -79,6 +82,17 @@ impl PageLog {
 
     fn tell(&mut self, entry: LogEntry) {
         self.live.retain(|tx| tx.send(entry.clone()).is_ok());
+    }
+
+    /// Every network event from now on, for `page.on('request' | 'response' | ...)`.
+    pub fn subscribe_network(&mut self) -> UnboundedReceiver<NetEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.net_live.push(tx);
+        rx
+    }
+
+    fn tell_net(&mut self, event: NetEvent) {
+        self.net_live.retain(|tx| tx.send(event.clone()).is_ok());
     }
 }
 
@@ -122,6 +136,9 @@ fn page_error(details: &Value) -> PageError {
     PageError { name, message, stack }
 }
 
+/// Requests in flight, by session and request id, with the sender that marks their body loaded.
+type InFlight = HashMap<(String, String), (NetRequest, Option<tokio::sync::watch::Sender<Loaded>>)>;
+
 /// What the collector watches: the page's first session and main frame, its context, and
 /// where its downloads land.
 pub(crate) struct Watch {
@@ -139,12 +156,16 @@ pub(crate) async fn collect(
     watch: Watch,
     log: Arc<Mutex<PageLog>>,
     downloads: UnboundedSender<DownloadResult>,
+    conn: Arc<Connection>,
 ) {
     let context = watch.context;
     let mut sessions = HashSet::from([watch.session]);
     // Download events are browser-wide; the frame that started one tells whose it is.
     let mut frames = HashSet::from([watch.main_frame]);
     let mut started: HashMap<String, (String, String)> = HashMap::new();
+    // Requests in flight, by session and request id, with the sender that marks their body
+    // loaded once a response arrived.
+    let mut requests: InFlight = HashMap::new();
     while let Some(e) = events.recv().await {
         let ours = e.session_id.as_ref().is_some_and(|s| sessions.contains(s));
         let browser_wide = e.session_id.is_none();
@@ -187,6 +208,58 @@ pub(crate) async fn collect(
                 let mut log = log.lock().unwrap();
                 log.tell(LogEntry::Console(msg.clone()));
                 keep(&mut log.console, msg);
+            }
+            "Network.requestWillBeSent" | "Network.responseReceived" | "Network.loadingFinished" | "Network.loadingFailed"
+                if ours =>
+            {
+                let mut log = log.lock().unwrap();
+                if log.net_live.is_empty() {
+                    continue;
+                }
+                let sid = e.session_id.clone().unwrap_or_default();
+                let key = (sid.clone(), str_of("requestId"));
+                match e.method.as_str() {
+                    "Network.requestWillBeSent" => {
+                        // A redirect reuses the request id: the previous hop got its response.
+                        if e.params["redirectResponse"].is_object() {
+                            if let Some((prev, _)) = requests.remove(&key) {
+                                let (_, done) = tokio::sync::watch::channel(Some(Ok(())));
+                                let body = BodySource { conn: conn.clone(), session: sid, request_id: key.1.clone(), done };
+                                let redirect = serde_json::json!({ "response": e.params["redirectResponse"] });
+                                log.tell_net(NetEvent::Response(NetResponse::from_received(prev.clone(), &redirect, body)));
+                                log.tell_net(NetEvent::Finished(prev));
+                            }
+                        }
+                        let req = NetRequest::from_sent(&e.params);
+                        requests.insert(key, (req.clone(), None));
+                        log.tell_net(NetEvent::Request(req));
+                    }
+                    "Network.responseReceived" => {
+                        if let Some((req, loaded)) = requests.get_mut(&key) {
+                            let (tx, done) = tokio::sync::watch::channel(None);
+                            *loaded = Some(tx);
+                            let body = BodySource { conn: conn.clone(), session: sid, request_id: key.1.clone(), done };
+                            log.tell_net(NetEvent::Response(NetResponse::from_received(req.clone(), &e.params, body)));
+                        }
+                    }
+                    "Network.loadingFinished" => {
+                        if let Some((req, loaded)) = requests.remove(&key) {
+                            if let Some(tx) = loaded {
+                                let _ = tx.send(Some(Ok(())));
+                            }
+                            log.tell_net(NetEvent::Finished(req));
+                        }
+                    }
+                    _ => {
+                        if let Some((req, loaded)) = requests.remove(&key) {
+                            let reason = str_of("errorText");
+                            if let Some(tx) = loaded {
+                                let _ = tx.send(Some(Err(reason.clone())));
+                            }
+                            log.tell_net(NetEvent::Failed(req, reason));
+                        }
+                    }
+                }
             }
             "Runtime.exceptionThrown" if ours => {
                 let err = page_error(&e.params["exceptionDetails"]);
