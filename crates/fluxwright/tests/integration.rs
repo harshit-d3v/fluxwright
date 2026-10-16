@@ -842,6 +842,56 @@ async fn selectors_and_frames() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+/// Scaled and rotated iframes, same-site and cross-site (its own process): clicks land on the
+/// element and boxes are the element's box on screen, as in Playwright.
+#[tokio::test(flavor = "multi_thread")]
+async fn transformed_frames() {
+    use axum::{response::Html, routing::get, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // scale(0.5) rotate(90deg) about the top-left corner: (x, y) inside lands on
+    // (left - y / 2, top + x / 2).
+    const FRAME: &str = "position:absolute;top:50px;width:300px;height:200px;border:0;\
+        transform:scale(0.5) rotate(90deg);transform-origin:0 0";
+    let top = format!(
+        r#"<!doctype html><body style="margin:0">
+        <iframe id="same" src="/inner" style="{FRAME};left:400px"></iframe>
+        <iframe id="cross" src="http://localhost:{port}/inner" style="{FRAME};left:700px"></iframe>"#
+    );
+    const INNER: &str = r#"<!doctype html><body style="margin:0">
+        <button style="position:absolute;left:20px;top:30px;width:60px;height:40px;border:0;padding:0"
+            onclick="this.textContent = 'hit'">Go</button>"#;
+    let app = Router::new()
+        .route("/", get(move || async move { Html(top) }))
+        .route("/inner", get(|| async { Html(INNER) }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(3))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire_job(&JobOptions::default().viewport(800, 600)).await.unwrap();
+    page.goto(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+
+    for (frame, left) in [("#same", 400.0), ("#cross", 700.0)] {
+        let button = page.frame_locator(frame).locator("button");
+        let b = button.bounding_box().await.unwrap().unwrap();
+        let got = [b.x, b.y, b.width, b.height].map(|v| (v * 10.0).round() / 10.0);
+        assert_eq!(got, [left - 35.0, 60.0, 20.0, 30.0], "box in {frame}");
+        let png = button.screenshot().await.unwrap();
+        let size = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+        assert_eq!((size(16), size(20)), (20, 30), "screenshot in {frame}");
+        button.click().await.unwrap();
+        assert_eq!(button.text_content().await.unwrap().as_deref(), Some("hit"), "click in {frame}");
+    }
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// block_images must hold in cross-origin iframes (their own CDP sessions) and on every job
 /// on a browser, and leave no per-job task behind.
 #[tokio::test(flavor = "multi_thread")]
