@@ -268,7 +268,8 @@ async def async_smoke(base: str, tmp: Path) -> None:
 
 
 async def first_page(browser):
-    """The first page of a new engine: a slow Chrome start can outlast a short queue timeout."""
+    """A page from an engine with a short queue timeout, which a Chrome start or a slow runner
+    making one context can outlast. A late page is released when it arrives."""
     for _ in range(30):
         try:
             return await browser.new_page()
@@ -300,10 +301,9 @@ async def queue_smoke() -> None:
         await asyncio.gather(*waiting)
 
         # With queue_timeout, a job that cannot get a page in time raises TimeoutError. The limit
-        # also covers starting a browser, so let Chrome come up first.
+        # also covers starting a browser and making the context, so fill the slots with retries.
         hurried = await p.chromium.launch(max_browsers=1, queue_timeout=2000)
-        held = [await first_page(hurried)]
-        held += [await hurried.new_page() for _ in range(7)]
+        held = [await first_page(hurried) for _ in range(8)]
         with pytest.raises(TimeoutError, match="acquire a page lease"):
             await hurried.new_page()
         for page in held:

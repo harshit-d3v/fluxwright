@@ -33,10 +33,15 @@ jobs:
       - name: Test
         run: cargo test --workspace -- --test-threads=1
 
+  # Chrome comes preinstalled on all three runners, where the engine finds it by itself.
   node:
-    name: node binding
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    name: node binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       FLUXWRIGHT_NO_SANDBOX: "1"
     defaults:
@@ -53,22 +58,25 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: bindings/node/package-lock.json
-      - name: Locate Chrome
-        run: echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npm run test:types
       - run: npm run build:debug
       - run: npm test
 
   python:
-    name: python binding
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    name: python binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       FLUXWRIGHT_NO_SANDBOX: "1"
     defaults:
       run:
         working-directory: bindings/python
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -78,11 +86,13 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Locate Chrome
-        run: echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
-      - run: python -m venv .venv && .venv/bin/pip install maturin pytest
-      - run: VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop
-      - run: .venv/bin/python -m pytest -q tests
+      - name: Build and test
+        run: |
+          python -m venv .venv
+          bin=.venv/bin; [ -d .venv/Scripts ] && bin=.venv/Scripts
+          "$bin/python" -m pip install maturin pytest
+          VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop
+          "$bin/python" -m pytest -q tests
 
   site:
     name: website
