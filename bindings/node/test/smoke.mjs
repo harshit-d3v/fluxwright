@@ -326,13 +326,16 @@ try {
   await Promise.all(held.map((page) => page.close()))
   await Promise.all(waiting)
   // With queueTimeout, a job that cannot get a page in time fails. The limit also covers
-  // starting a browser, so let Chrome come up first.
+  // starting a browser and making the context, which a slow runner can outlast, so fill the
+  // slots one at a time with retries; a page that arrives late is released.
   const hurried = await fluxwright.chromium.launch({ maxBrowsers: 1, queueTimeout: 2000 })
   try {
-    let first = null
-    for (let i = 0; i < 30 && !first; i++) first = await hurried.newPage().catch(() => null)
-    assert.ok(first, 'Chrome did not start')
-    const busy = [first, ...(await Promise.all(Array.from({ length: 7 }, () => hurried.newPage())))]
+    const busy = []
+    for (let tries = 0; busy.length < 8 && tries < 30; tries++) {
+      const page = await hurried.newPage().catch(() => null)
+      if (page) busy.push(page)
+    }
+    assert.equal(busy.length, 8, 'could not fill the browser')
     await assert.rejects(hurried.newPage(), /acquire a page lease/)
     await Promise.all(busy.map((page) => page.close()))
   } finally {
