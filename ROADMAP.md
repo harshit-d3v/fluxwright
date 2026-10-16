@@ -24,7 +24,7 @@ The fewer edits a Playwright script needs, the easier it is to try Fluxwright.
 - **Contexts:** `browser.newContext()` / `new_context()` and `context.newPage()`, with routes, cookies and storage state on the context. Each context holds one page, so jobs never share cookies. (In progress.)
 - **More events:** `page.on('request' | 'response' | 'requestfinished' | 'requestfailed' | 'dialog')` with `response.body()` / `json()`, and `page.waitForResponse` / `expect_response`. (In progress; `popup` needs pages beyond the one a context holds.)
 - **Transformed iframes:** clicks, boxes and screenshots inside an iframe that CSS scales or rotates use untransformed offsets today; switch to `DOM.getContentQuads`, which accounts for transforms.
-- **CI on Windows and macOS** for both bindings, not only Linux.
+- **CI on Windows and macOS** for both bindings, not only Linux. (Done.)
 
 ## 0.6: the fleet at scale
 
