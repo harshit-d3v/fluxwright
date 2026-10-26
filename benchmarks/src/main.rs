@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -148,38 +150,60 @@ async fn run_fluxwright(
             .await;
     }
 
-    let mut latencies = Vec::new();
-    let mut failures = 0u32;
+    // Memory on its own clock: a process-table refresh per finished job (30-200 ms each) used to
+    // sit inside the timed run.
+    let peak = Arc::new(AtomicU64::new(current_rss_mb()));
+    let sampler = tokio::spawn({
+        let peak = peak.clone();
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let mb = tokio::task::spawn_blocking(current_rss_mb).await.unwrap_or(0);
+                peak.fetch_max(mb, Ordering::Relaxed);
+            }
+        }
+    });
+    // As node-runner.mjs does: min(jobs, slots, 24) workers, each timing only its own job. Spawning
+    // every job at once timed the queue too, so these latencies were not comparable.
+    let workers = (jobs as usize).min(max_browsers * max_ctx).clamp(1, 24);
+    let next = Arc::new(AtomicU32::new(0));
     let start = Instant::now();
-    let mut peak = current_rss_mb();
     let mut joins = Vec::new();
-    for _ in 0..jobs {
-        let engine = engine.clone();
-        let url = url.to_string();
+    for _ in 0..workers {
+        let (engine, url, next) = (engine.clone(), url.to_string(), next.clone());
         joins.push(tokio::spawn(async move {
-            let t0 = Instant::now();
-            let r = engine
-                .run(JobOptions::default().timeout(Duration::from_secs(180)), move |page| {
-                    let url = url.clone();
-                    async move {
-                        page.goto(&url).await?;
-                        let _ = page.title().await?;
-                        Ok(())
-                    }
-                })
-                .await;
-            (r.is_ok(), t0.elapsed())
+            let mut done = Vec::new();
+            while next.fetch_add(1, Ordering::Relaxed) < jobs {
+                let url = url.clone();
+                let t0 = Instant::now();
+                let r = engine
+                    .run(JobOptions::default().timeout(Duration::from_secs(180)), move |page| {
+                        let url = url.clone();
+                        async move {
+                            page.goto(&url).await?;
+                            let _ = page.title().await?;
+                            Ok(())
+                        }
+                    })
+                    .await;
+                done.push((r.is_ok(), t0.elapsed()));
+            }
+            done
         }));
     }
+    let mut latencies = Vec::new();
+    let mut failures = 0u32;
     for j in joins {
-        let (ok, d) = j.await?;
-        if !ok {
-            failures += 1;
+        for (ok, d) in j.await? {
+            if !ok {
+                failures += 1;
+            }
+            latencies.push(d.as_millis());
         }
-        latencies.push(d.as_millis());
-        peak = peak.max(current_rss_mb());
     }
     let duration = start.elapsed();
+    sampler.abort();
+    let peak = peak.load(Ordering::Relaxed);
     latencies.sort();
     let p95 = latencies
         .get(latencies.len().saturating_mul(95) / 100)
