@@ -293,6 +293,13 @@ try {
   net.on('dialog', (d) => (d.type() === 'prompt' ? d.accept(`${d.message()}!`) : undefined))
   assert.equal(await net.evaluate(() => prompt('name')), 'name!')
   assert.equal(await net.evaluate(() => confirm('sure?')), false)
+  // A beforeunload one it leaves is accepted, as with no listener: leaving the page works (the
+  // click arms it: Chrome wants a user gesture).
+  const arm = `<button onclick="onbeforeunload = (e) => { e.preventDefault(); e.returnValue = '' }">arm</button>`
+  await net.goto(`data:text/html,${encodeURIComponent(arm)}`)
+  await net.click('button')
+  await net.goto('data:text/html,<title>left</title>')
+  assert.equal(await net.title(), 'left')
   await net.close()
 
   // browser.newContext(): its options and routes apply to its one page.

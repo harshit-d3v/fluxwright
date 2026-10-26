@@ -558,8 +558,10 @@ async def _serve_dialogs(stream: _native.DialogStream, listeners: dict[str, list
             if isinstance(outcome, BaseException):
                 _log.error("a page.on('dialog') listener failed", exc_info=outcome)
         if not dialog._answered:
+            # As with no listener at all: beforeunload is accepted (dismissing it would cancel
+            # the navigation), the rest dismissed.
             with suppress(Error):
-                await dialog.dismiss()
+                await (dialog.accept() if dialog.type == "beforeunload" else dialog.dismiss())
 
 
 async def _serve_routes(
@@ -722,6 +724,10 @@ class BrowserContext:
             try:
                 for url, handler in self._routes:
                     await page.route(url, handler)
+                # close() ran while the page was coming: it would otherwise stay open on a closed
+                # context.
+                if self._closed:
+                    raise Error("browser_context.new_page: the context is closed")
             except BaseException:
                 await page.close()
                 raise
@@ -782,15 +788,22 @@ class BrowserType:
         executable_path: str | PathLike[str] | None = None,
         max_browsers: int | None = None,
         queue_timeout: float | None = None,
+        memory_ceiling_mb: int | None = None,
     ) -> Browser:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
-        4), headless unless ``headless=False``. Headless uses chrome-headless-shell when it is
-        installed, as Playwright does; ``executable_path`` or ``FLUXWRIGHT_CHROMIUM`` picks the
-        binary. When every slot is busy, ``new_page`` waits its turn however long the queue is;
-        with ``queue_timeout`` (milliseconds) it raises ``TimeoutError`` after that long instead,
+        one per 4 CPUs, 8 pages each), headless unless ``headless=False``. New pages wait while
+        all Chrome processes together use more than ``memory_ceiling_mb`` (default 75% of the
+        memory free at launch). Headless uses chrome-headless-shell when it is installed, as
+        Playwright does; ``executable_path`` or ``FLUXWRIGHT_CHROMIUM`` picks the binary. When
+        every slot is busy, ``new_page`` waits its turn however long the queue is; with
+        ``queue_timeout`` (milliseconds) it raises ``TimeoutError`` after that long instead,
         counting a browser start when one is needed."""
         engine = await _native.Engine.launch(
-            max_browsers=max_browsers, executable_path=executable_path, headless=headless, queue_timeout=queue_timeout
+            max_browsers=max_browsers,
+            executable_path=executable_path,
+            headless=headless,
+            queue_timeout=queue_timeout,
+            memory_ceiling_mb=memory_ceiling_mb,
         )
         browser = Browser(engine)
         if self._launched is not None:

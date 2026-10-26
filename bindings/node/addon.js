@@ -99,13 +99,16 @@ function toDialog(native) {
 }
 
 // Every dialog listener runs, and their promises are awaited. A dialog none of them answered is
-// dismissed, so the page never hangs on it.
+// dismissed, so the page never hangs on it; a beforeunload one is accepted, as with no listener at
+// all (dismissing it would cancel the navigation).
 async function answerDialog(em, dialog) {
   const pending = em.rawListeners('dialog').map(async (handler) => handler(dialog))
   for (const r of await Promise.allSettled(pending)) {
     if (r.status === 'rejected') console.error('[fluxwright] a dialog listener failed:', r.reason)
   }
-  if (!dialog.answered) await dialog.dismiss().catch(() => {})
+  if (!dialog.answered) {
+    await (dialog.type() === 'beforeunload' ? dialog.accept() : dialog.dismiss()).catch(() => {})
+  }
 }
 
 // page.on / once / off as in Playwright, for console messages, page errors, network events and
@@ -360,6 +363,8 @@ class BrowserContext {
       const page = await this.#browser.newPage(this.#options)
       try {
         for (const [url, handler] of this.#routes) await page.route(url, handler)
+        // close() ran while the page was coming: it would otherwise stay open on a closed context.
+        if (this.#closed) throw new Error('browserContext.newPage: the context is closed')
       } catch (err) {
         await page.close()
         throw err

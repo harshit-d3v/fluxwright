@@ -216,11 +216,12 @@ impl NetworkResponse {
         self.inner.request.clone().into()
     }
 
-    /// The body, once the response finished loading, within `timeoutMs` (default 30 s).
+    /// The body, once the response finished loading, within `timeoutMs` (default 30 s; 0 waits
+    /// as long as it takes).
     #[napi]
     pub async fn body(&self, timeout_ms: Option<u32>) -> Result<Buffer> {
         let inner = self.inner.clone();
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000) as u64);
+        let timeout = queue_wait(Some(timeout_ms.unwrap_or(30_000)));
         let body = RT
             .spawn(async move { inner.body(timeout).await.map_err(|e| e.to_string()) })
             .await
@@ -606,6 +607,9 @@ pub struct LaunchOptions {
     /// Milliseconds `newPage` waits for a page before it fails: for a free slot, and for a
     /// browser to start when one is needed. 0 or unset waits as long as the queue takes.
     pub queue_timeout: Option<u32>,
+    /// Memory budget in MB for all Chrome processes together: new pages wait while they use
+    /// more. Default: 75% of the memory free at launch.
+    pub memory_ceiling_mb: Option<u32>,
 }
 
 /// `queueTimeout` as the engine's acquire timeout.
@@ -820,9 +824,9 @@ pub struct Chromium {}
 impl Chromium {
     #[napi]
     pub async fn launch(options: Option<LaunchOptions>) -> Result<Browser> {
-        let (max, exe, headless, queue_timeout) = match options {
-            Some(o) => (o.max_browsers, o.executable_path, o.headless, o.queue_timeout),
-            None => (None, None, None, None),
+        let (max, exe, headless, queue_timeout, ceiling) = match options {
+            Some(o) => (o.max_browsers, o.executable_path, o.headless, o.queue_timeout, o.memory_ceiling_mb),
+            None => (None, None, None, None, None),
         };
         let engine = RT
             .spawn(async move {
@@ -835,6 +839,9 @@ impl Chromium {
                     .acquire_timeout(queue_wait(queue_timeout));
                 if let Some(n) = max {
                     b = b.max_browsers(n as usize);
+                }
+                if let Some(mb) = ceiling {
+                    b = b.memory_ceiling_mb(mb as u64);
                 }
                 if let Some(exe) = exe {
                     b = b.chrome(exe);
@@ -1097,11 +1104,13 @@ impl Page {
     #[napi(js_name = "_onLog")]
     pub fn on_log(&self, handler: Function<LogEvent, ()>) -> Result<()> {
         let tsfn = callback(handler)?;
-        let lease = self.lease.clone();
+        // Subscribed before this returns (a message logged right after it is seen), and the task
+        // holds only the subscription: holding the lease kept a page never closed alive.
+        let mut entries = {
+            let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
+            page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_logs()
+        };
         RT.spawn(async move {
-            let Some(mut entries) = lease.read().await.as_ref().map(|p| p.subscribe_logs()) else {
-                return;
-            };
             // Ends when the page closes.
             while let Some(entry) = entries.recv().await {
                 let event = match entry {
@@ -1186,7 +1195,8 @@ impl Page {
     /// (default 30 s).
     #[napi(js_name = "_waitForDownload")]
     pub async fn wait_for_download(&self, timeout_ms: Option<u32>) -> Result<DownloadInfo> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000) as u64);
+        // 0 waits as long as it takes, as in Playwright (it used to fail at once).
+        let timeout = queue_wait(Some(timeout_ms.unwrap_or(30_000)));
         // Hold no page lock while waiting: the click that starts the download needs the page.
         let downloads = with_page(self.lease.clone(), |p| Box::pin(async move { Ok(p.downloads()) })).await?;
         let d = RT
@@ -1213,6 +1223,9 @@ impl Page {
 
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        // The route callback holds the JS dispatcher, which holds this page: kept, the page could
+        // never be garbage-collected.
+        self.routes.lock().unwrap().take();
         let lease = self.lease.clone();
         RT.spawn(async move {
             let mut g = lease.write().await;
