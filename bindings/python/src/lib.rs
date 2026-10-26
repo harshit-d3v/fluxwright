@@ -6,14 +6,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-use pyo3_async_runtimes::tokio::future_into_py;
+use pyo3::types::{PyBytes, PyCFunction};
+use pyo3::IntoPyObjectExt;
 use serde::Deserialize;
+use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex, RwLock};
 
@@ -82,6 +84,80 @@ where
 {
     let lease = lease.clone();
     future_into_py(py, async move { with_page(&lease, f).await })
+}
+
+static RT: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio"));
+
+/// Results being handed to Python right now, on Tokio's blocking threads.
+static HANDING_OVER: AtomicUsize = AtomicUsize::new(0);
+
+/// `fut` as an asyncio future on the running loop; cancelling that future drops `fut`.
+///
+/// Counts its hand-overs for `wait_for_hand_overs`: a hand-over releases the GIL midway
+/// (`call_soon_threadsafe` writes to the loop's wake-up socket), so the script can finish in
+/// that gap, and if the interpreter is shutting down when the thread takes the GIL back, Python
+/// 3.10-3.13 end the thread and the process crashes (SIGSEGV) while Rust unwinds it.
+fn future_into_py<'py, T, F>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+{
+    let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
+    let future = event_loop.call_method0("create_future")?;
+    let task = RT.spawn(fut);
+    let abort = task.abort_handle();
+    let on_done = PyCFunction::new_closure(py, None, None, move |args, _| -> PyResult<()> {
+        if args.get_item(0)?.call_method0("cancelled")?.is_truthy()? {
+            abort.abort();
+        }
+        Ok(())
+    })?;
+    future.call_method1("add_done_callback", (on_done,))?;
+    let (event_loop, target) = (event_loop.unbind(), future.clone().unbind());
+    RT.spawn(async move {
+        let result = match task.await {
+            Ok(result) => result,
+            Err(e) if e.is_panic() => Err(PyRuntimeError::new_err("the Rust future panicked")),
+            Err(_) => return, // cancelled from Python
+        };
+        // Not on a Tokio worker: waiting there for the GIL would hold up its other tasks.
+        RT.spawn_blocking(move || {
+            HANDING_OVER.fetch_add(1, Ordering::SeqCst);
+            Python::attach(move |py| {
+                let (method, value) = match result.and_then(|v| v.into_bound_py_any(py)) {
+                    Ok(v) => ("set_result", v),
+                    Err(e) => ("set_exception", e.into_value(py).into_bound(py).into_any()),
+                };
+                // Fails when the loop is closed: then nothing waits for the result.
+                let _ = wrap_pyfunction!(hand_over, py).and_then(|f| {
+                    event_loop.call_method1(py, "call_soon_threadsafe", (f, target.bind(py), method, value))
+                });
+            });
+            HANDING_OVER.fetch_sub(1, Ordering::SeqCst);
+        });
+    });
+    Ok(future)
+}
+
+/// Sets `future`'s result or exception (`method`), unless it was cancelled meanwhile.
+#[pyfunction]
+fn hand_over(future: &Bound<'_, PyAny>, method: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    if !future.call_method0("done")?.is_truthy()? {
+        future.call_method1(method, (value,))?;
+    }
+    Ok(())
+}
+
+/// Runs at exit (`atexit`, while the interpreter is still whole): lets hand-overs in progress
+/// finish, for at most 2 s.
+#[pyfunction]
+fn wait_for_hand_overs(py: Python<'_>) {
+    py.detach(|| {
+        let give_up = Instant::now() + Duration::from_secs(2);
+        while HANDING_OVER.load(Ordering::SeqCst) > 0 && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
 }
 
 /// A JSON value as what `json.loads` makes of it.
@@ -1334,5 +1410,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NetworkStream>()?;
     m.add_class::<Dialog>()?;
     m.add_class::<DialogStream>()?;
+    m.py().import("atexit")?.call_method1("register", (wrap_pyfunction!(wait_for_hand_overs, m)?,))?;
     Ok(())
 }
