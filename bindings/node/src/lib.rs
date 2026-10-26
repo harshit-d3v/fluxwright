@@ -596,6 +596,8 @@ impl FrameLocator {
 
 #[napi(object)]
 pub struct LaunchOptions {
+    /// Default: one per 4 CPUs, with 8 pages each. The fleet's memory budget is 75% of the
+    /// memory free at launch: new pages wait while Chrome uses more.
     pub max_browsers: Option<u32>,
     /// Browser binary. Default: chrome-headless-shell when headless and installed, else Chrome.
     pub executable_path: Option<String>,
@@ -828,10 +830,12 @@ impl Chromium {
                 // once works; the engine's own default (256 waiting, then an error) is for a
                 // server shedding load.
                 let mut b = fluxwright::BrowserEngine::builder()
-                    .max_browsers(max.unwrap_or(4) as usize)
                     .max_contexts_per_browser(8)
                     .queue_capacity(usize::MAX)
                     .acquire_timeout(queue_wait(queue_timeout));
+                if let Some(n) = max {
+                    b = b.max_browsers(n as usize);
+                }
                 if let Some(exe) = exe {
                     b = b.chrome(exe);
                 }

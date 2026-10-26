@@ -250,6 +250,10 @@ export interface GotoOptions {
 }
 
 export interface LaunchOptions {
+  /**
+   * Default: one per 4 CPUs, with 8 pages each. The fleet's memory budget is 75% of the
+   * memory free at launch: new pages wait while Chrome uses more.
+   */
   maxBrowsers?: number
   /** Browser binary. Default: chrome-headless-shell when headless and installed, else Chrome. */
   executablePath?: string
