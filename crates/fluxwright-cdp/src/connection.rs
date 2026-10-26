@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use tracing::{debug, warn};
@@ -40,10 +40,8 @@ pub struct Connection {
     next_id: AtomicU64,
     tx: mpsc::UnboundedSender<Outgoing>,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
-    events: broadcast::Sender<CdpEvent>,
     watchers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>>,
     dead: Arc<AtomicBool>,
-    dead_notify: tokio::sync::Notify,
 }
 
 enum Outgoing {
@@ -138,7 +136,6 @@ impl Connection {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Outgoing>();
         let inbound = Inbound {
             pending: Arc::new(Mutex::new(HashMap::new())),
-            events: broadcast::channel(16_384).0,
             watchers: Arc::new(std::sync::Mutex::new(Vec::new())),
             dead: Arc::new(AtomicBool::new(false)),
         };
@@ -146,10 +143,8 @@ impl Connection {
             next_id: AtomicU64::new(1),
             tx: out_tx,
             pending: inbound.pending.clone(),
-            events: inbound.events.clone(),
             watchers: inbound.watchers.clone(),
             dead: inbound.dead.clone(),
-            dead_notify: tokio::sync::Notify::new(),
         });
         (conn, out_rx, inbound)
     }
@@ -158,14 +153,15 @@ impl Connection {
         self.dead.load(Ordering::SeqCst)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
-        self.events.subscribe()
-    }
-
-    /// Never-lagging event stream for the browser session state machine.
+    /// Never-lagging event stream for the browser session state machine. Ends when the
+    /// connection does (at once if it already has).
     pub fn subscribe_unbounded(&self) -> mpsc::UnboundedReceiver<CdpEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.watchers.lock().unwrap().push(tx);
+        let mut watchers = self.watchers.lock().unwrap();
+        // Checked under the lock `closed` clears the list with, so no sender outlives it.
+        if !self.is_dead() {
+            watchers.push(tx);
+        }
         rx
     }
 
@@ -176,18 +172,23 @@ impl Connection {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value> {
-        if self.is_dead() {
-            return Err(Error::WebSocket("connection closed".into()));
-        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(
-            id,
-            Pending {
-                method: method.to_string(),
-                tx,
-            },
-        );
+        {
+            // Checked under the lock `closed` drains the map with: a call that lands as the
+            // connection dies fails now instead of waiting out its timeout.
+            let mut pending = self.pending.lock().await;
+            if self.is_dead() {
+                return Err(Error::WebSocket("connection closed".into()));
+            }
+            pending.insert(
+                id,
+                Pending {
+                    method: method.to_string(),
+                    tx,
+                },
+            );
+        }
         let mut body = json!({ "id": id, "method": method, "params": params });
         if let Some(sid) = session_id {
             body["sessionId"] = json!(sid);
@@ -207,26 +208,26 @@ impl Connection {
 
     pub fn mark_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
-        self.dead_notify.notify_waiters();
     }
 }
 
 /// The reader's half of a connection, whatever the transport.
 struct Inbound {
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
-    events: broadcast::Sender<CdpEvent>,
     watchers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>>,
     dead: Arc<AtomicBool>,
 }
 
 impl Inbound {
     async fn handle(&self, text: &str) {
-        if let Err(e) = dispatch(text, &self.pending, &self.events, &self.watchers).await {
+        if let Err(e) = dispatch(text, &self.pending, &self.watchers).await {
             warn!(error = %e, "cdp dispatch");
         }
     }
 
-    /// The browser end went away: fail every pending call and tell subscribers.
+    /// The browser end went away: fail every pending call, tell subscribers, then drop their
+    /// senders so their loops end. The browser's own loop holds the browser: without this,
+    /// a closed browser (its profile folder, tasks and pipes) is never freed.
     async fn closed(&self) {
         self.dead.store(true, Ordering::SeqCst);
         fail_all(&self.pending, Error::WebSocket("connection closed".into())).await;
@@ -235,8 +236,10 @@ impl Inbound {
             params: json!({}),
             session_id: None,
         };
-        let _ = self.events.send(ev.clone());
-        fanout(&self.watchers, ev);
+        let mut watchers = self.watchers.lock().unwrap();
+        for tx in watchers.drain(..) {
+            let _ = tx.send(ev.clone());
+        }
     }
 }
 
@@ -253,7 +256,6 @@ fn fanout(
 async fn dispatch(
     text: &str,
     pending: &Mutex<HashMap<u64, Pending>>,
-    events: &broadcast::Sender<CdpEvent>,
     watchers: &std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>,
 ) -> Result<()> {
     let msg: Incoming = serde_json::from_str(text)?;
@@ -283,7 +285,6 @@ async fn dispatch(
             params: msg.params.unwrap_or(Value::Null),
             session_id: msg.session_id,
         };
-        let _ = events.send(ev.clone());
         fanout(watchers, ev);
     }
     Ok(())

@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId, TargetState};
-use crate::connection::{CdpEvent, Connection};
+use crate::connection::Connection;
 use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
 use crate::log::{DownloadResult, PageLog};
 
@@ -251,7 +251,6 @@ pub struct CdpPage {
     pub context_id: ContextId,
     pub target_id: TargetId,
     pub session_id: SessionId,
-    pub events: tokio::sync::broadcast::Sender<CdpEvent>,
     pub(crate) targets: Arc<Mutex<HashMap<String, TargetState>>>,
     /// Isolated worlds made for same-process iframes, by frame id.
     pub(crate) worlds: Arc<Mutex<HashMap<String, i64>>>,

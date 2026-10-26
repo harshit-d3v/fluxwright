@@ -1257,3 +1257,126 @@ async fn two_hundred_leases_five_browsers_no_deadlock() {
     }
     eng.shutdown(Duration::from_secs(15)).await.unwrap();
 }
+
+/// A recycling browser no longer counts toward max_browsers: its replacement starts while its
+/// last job runs. With one browser, nothing used to be served until that job ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn recycling_does_not_stall_the_pool() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .recycle_after_jobs(1)
+        .memory_ceiling_mb(16_384)
+        .build()
+        .await
+        .unwrap();
+    let held = eng.acquire().await.unwrap();
+    // One finished job: the browser starts draining while `held` still runs on it.
+    eng.acquire().await.unwrap().close().await.unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(20), eng.acquire())
+        .await
+        .expect("acquire waited for the draining browser's last job")
+        .unwrap();
+    assert_eq!(eng.browsers().await.len(), 2, "the replacement runs beside the draining browser");
+    held.goto("about:blank").await.expect("the draining browser still serves its lease");
+    held.close().await.unwrap();
+    next.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// A caller that timed out leaves the queue: it no longer fills queue_capacity, and no page is
+/// built for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn timed_out_waiters_leave_the_queue() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .queue_capacity(1)
+        .queue_full_mode(QueueFullMode::Error)
+        .memory_ceiling_mb(16_384)
+        .build()
+        .await
+        .unwrap();
+    let held = eng.acquire().await.unwrap();
+    let gave_up = eng.acquire_with(fluxwright::Priority::Normal, Duration::from_millis(300)).await;
+    assert!(matches!(gave_up, Err(fluxwright::Error::AcquireTimeout)), "{:?}", gave_up.err());
+    // The queue holds one: with the timed-out caller still in it, this failed with QueueFull.
+    let waiting = tokio::spawn({
+        let eng = eng.clone();
+        async move { eng.acquire_with(fluxwright::Priority::Normal, Duration::from_secs(30)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held.close().await.unwrap();
+    let lease = waiting.await.unwrap().expect("the live caller gets the page");
+    lease.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+/// Idle browsers close without new traffic (the pool only looked when a job came), but never
+/// below min_browsers.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_browsers_close_without_traffic() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .idle_timeout(Duration::from_secs(1))
+        .memory_ceiling_mb(16_384)
+        .build()
+        .await
+        .unwrap();
+    eng.acquire().await.unwrap().close().await.unwrap();
+    assert_eq!(eng.browsers().await.len(), 1);
+    let warm = BrowserEngine::builder()
+        .min_browsers(1)
+        .max_browsers(1)
+        .idle_timeout(Duration::from_secs(1))
+        .memory_ceiling_mb(16_384)
+        .build()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(eng.browsers().await.is_empty(), "the idle browser is still open");
+    assert_eq!(warm.browsers().await.len(), 1, "min_browsers stay warm");
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    warm.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+fn process_alive(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+}
+
+/// Chrome does not outlive its engine: a browser still starting when shutdown() runs never
+/// serves, and an engine dropped without shutdown() kills its browsers.
+#[tokio::test(flavor = "multi_thread")]
+async fn browsers_do_not_outlive_the_engine() {
+    let eng = BrowserEngine::builder().max_browsers(1).memory_ceiling_mb(16_384).build().await.unwrap();
+    let starting = tokio::spawn({
+        let eng = eng.clone();
+        async move { eng.acquire().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    eng.shutdown(Duration::ZERO).await.unwrap();
+    assert!(starting.await.unwrap().is_err(), "a lease was granted after shutdown()");
+    assert!(eng.browsers().await.is_empty());
+
+    let eng = BrowserEngine::builder()
+        .min_browsers(1)
+        .max_browsers(1)
+        .memory_ceiling_mb(16_384)
+        .build()
+        .await
+        .unwrap();
+    let pid = eng.browsers().await[0].pid;
+    drop(eng);
+    let mut alive = true;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !process_alive(pid) {
+            alive = false;
+            break;
+        }
+    }
+    assert!(!alive, "Chrome {pid} outlived its dropped engine");
+}
