@@ -91,7 +91,7 @@ Use Fluxwright when you run many browser jobs, such as scraping, crawling, PDF a
 
 ## Speed
 
-Measured on one Windows machine (2026-09-30): both tools on the same chrome-headless-shell binary, alternating runs, 10 concurrent jobs loading a small local page. Fluxwright ran 54–70 jobs/s, Playwright 42–51. On Chrome's new headless mode the two were level (about 13 jobs/s each with 5 browsers). One machine and one page shape say little about yours, so measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
+Measured on GitHub's ubuntu-latest runner (three runs, 2026-10-27): every tool on the same chrome-headless-shell 156 binary, loading a small local page with the same number of jobs in flight. With 1 browser and 10 pages, Fluxwright ran 34–40 jobs/s, Playwright 27–34 and Puppeteer 27–36; with 1,000 jobs on 4 browsers, 36–44, 30–38 and 34–46. No job failed. A shared cloud machine varies by up to a third from run to run, so rerun it (Actions → benchmarks) and measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
 
 ## Rust
 
