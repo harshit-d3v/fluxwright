@@ -258,7 +258,13 @@ async fn dispatch(
     pending: &Mutex<HashMap<u64, Pending>>,
     watchers: &std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>,
 ) -> Result<()> {
-    let msg: Incoming = serde_json::from_str(text)?;
+    let msg: Incoming = match serde_json::from_str(text) {
+        Ok(msg) => msg,
+        Err(e) => match replace_lone_surrogates(text) {
+            Some(fixed) => serde_json::from_str(&fixed)?,
+            None => return Err(e.into()),
+        },
+    };
     if let Some(id) = msg.id {
         if let Some(p) = pending.lock().await.remove(&id) {
             let res = if let Some(err) = msg.error {
@@ -294,5 +300,72 @@ async fn fail_all(pending: &Mutex<HashMap<u64, Pending>>, err: Error) {
     let mut map = pending.lock().await;
     for (_, p) in map.drain() {
         let _ = p.tx.send(Err(Error::WebSocket(err.to_string())));
+    }
+}
+
+/// Chrome writes each UTF-16 unit of a JS string as its own `\uXXXX`, so a string cut through
+/// an emoji arrives with a lone surrogate, which serde_json rejects, and with it the whole
+/// message (the call then waited out its timeout). Replaces lone surrogate escapes with
+/// U+FFFD, as a JS-to-UTF-8 conversion does; `None` when there are none. In JSON text every
+/// backslash starts an escape inside a string, so no string tracking is needed.
+fn replace_lone_surrogates(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let unit = |at: usize| -> Option<u32> {
+        if bytes.get(at) != Some(&b'\\') || bytes.get(at + 1) != Some(&b'u') {
+            return None;
+        }
+        let hex = std::str::from_utf8(bytes.get(at + 2..at + 6)?).ok()?;
+        u32::from_str_radix(hex, 16).ok()
+    };
+    let (mut out, mut copied, mut i) = (String::new(), 0, 0);
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let lone = match unit(i) {
+            Some(0xD800..=0xDBFF) => !matches!(unit(i + 6), Some(0xDC00..=0xDFFF)),
+            Some(0xDC00..=0xDFFF) => true,
+            _ => false,
+        };
+        if lone {
+            out.push_str(&text[copied..i]);
+            out.push_str("\\ufffd");
+            copied = i + 6;
+            i += 6;
+        } else if matches!(unit(i), Some(0xD800..=0xDBFF)) {
+            i += 12; // a valid pair
+        } else {
+            i += 2; // any other escape, `\\` included
+        }
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_lone_surrogates as fix;
+
+    /// JSON text with `%` standing for a backslash, so the escapes stay escapes in this file.
+    fn json(s: &str) -> String {
+        s.replace('%', "\\")
+    }
+
+    #[test]
+    fn lone_surrogates_become_replacement_characters() {
+        let case = |input: &str| fix(&json(input));
+        assert_eq!(case(r#"{"a":"%ude00 hi"}"#), Some(json(r#"{"a":"%ufffd hi"}"#)));
+        assert_eq!(case(r#"{"a":"x%ud83d"}"#), Some(json(r#"{"a":"x%ufffd"}"#)));
+        assert_eq!(case(r#"{"a":"%ud83d%u0041"}"#), Some(json(r#"{"a":"%ufffd%u0041"}"#)));
+        // A valid pair, an escaped backslash and plain text are left alone.
+        assert_eq!(case(r#"{"a":"%ud83d%ude00"}"#), None);
+        assert_eq!(case(r#"{"a":"%%ud83d é"}"#), None);
+        let fixed = case(r#"{"result":{"value":"%ude00 tail"}}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["result"]["value"], "\u{FFFD} tail");
     }
 }

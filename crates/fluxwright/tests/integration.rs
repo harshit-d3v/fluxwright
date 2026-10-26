@@ -303,9 +303,18 @@ async fn intercept_requests() {
                     req.fulfill(Fulfill { status: Some(201), headers: vec![json], body }).await.unwrap();
                 }
                 "headers" => {
+                    // Lower-cased, as Playwright gives them.
+                    let ua = req.headers.iter().any(|(k, _)| k == "user-agent");
+                    log.lock().unwrap().push(format!("lower-case user-agent {ua}"));
                     let mut headers = req.headers.clone();
                     headers.push(("x-test".into(), "from-route".into()));
                     req.continue_with(Overrides { headers: Some(headers), ..Default::default() }).await.unwrap();
+                }
+                "bad-reply" => {
+                    // Chrome rejects the header name; the request must still go through.
+                    let bad = Fulfill { status: Some(200), headers: vec![("bad name".into(), "x".into())], body: vec![] };
+                    let rejected = req.fulfill(bad).await.is_err();
+                    log.lock().unwrap().push(format!("bad reply rejected {rejected}"));
                 }
                 "nope" => req.abort("connectionrefused").await.unwrap(),
                 _ => {} // dropped: it continues
@@ -320,13 +329,22 @@ async fn intercept_requests() {
     assert_eq!(api, json!("201 {\"ok\":true}"));
     let nope = page.evaluate("fetch('/nope').then(() => 'loaded', () => 'failed')").await.unwrap();
     assert_eq!(nope, json!("failed"));
+    let bad = page.evaluate("fetch('/bad-reply').then(r => 'answered')").await.expect("request stayed paused");
+    assert_eq!(bad, json!("answered"));
     assert_eq!(page.evaluate("fetch('/set-cookie').then(r => r.status)").await.unwrap(), json!(200));
     page.evaluate("new Promise(r => { const i = new Image(); i.onload = i.onerror = r; i.src = '/pic.png' })")
         .await
         .unwrap();
     let seen = seen.lock().unwrap().clone();
     // Chrome reports fetch() as xhr at this stage.
-    for want in ["document headers", "xhr api", "xhr nope", "xhr set-cookie"] {
+    for want in [
+        "document headers",
+        "xhr api",
+        "xhr nope",
+        "xhr set-cookie",
+        "lower-case user-agent true",
+        "bad reply rejected true",
+    ] {
         assert!(seen.iter().any(|s| s == want), "{want} not in {seen:?}");
     }
     assert!(!seen.iter().any(|s| s.starts_with("image")), "a blocked image reached the job: {seen:?}");
@@ -1379,4 +1397,18 @@ async fn browsers_do_not_outlive_the_engine() {
         }
     }
     assert!(!alive, "Chrome {pid} outlived its dropped engine");
+}
+
+/// Text cut through an emoji reaches us as a lone UTF-16 surrogate. The whole message used to
+/// be dropped, so the call waited out its timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn lone_surrogates_do_not_drop_messages() {
+    let eng = engine(1, 1).await;
+    let page = eng.acquire().await.unwrap();
+    let start = std::time::Instant::now();
+    let cut = page.evaluate("'\u{1F600}'.slice(1) + ' tail'").await.expect("the answer was dropped");
+    assert_eq!(cut, json!("\u{FFFD} tail"));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }

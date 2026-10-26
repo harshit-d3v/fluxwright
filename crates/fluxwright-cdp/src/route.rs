@@ -49,9 +49,11 @@ struct Reply {
 
 impl Reply {
     async fn send(&mut self, method: &str, mut params: Value) -> Result<()> {
-        self.done = true;
         params["requestId"] = json!(self.request_id);
         self.conn.call(method, params, Some(&self.session), Duration::from_secs(10)).await?;
+        // Only once Chrome took the answer: a rejected one (a bad header, say) leaves Drop to
+        // continue the request, which would otherwise stay paused for good.
+        self.done = true;
         Ok(())
     }
 }
@@ -89,7 +91,9 @@ impl InterceptedRequest {
         let request = &params["request"];
         let headers = request["headers"]
             .as_object()
-            .map(|h| h.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+            // Lower-cased, as Playwright and our network events give them: Chrome sends
+            // `User-Agent`, and `{...headers, 'user-agent': x}` then carried both.
+            .map(|h| h.iter().map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("").to_string())).collect())
             .unwrap_or_default();
         Some(InterceptedRequest {
             url: request["url"].as_str()?.to_string(),
