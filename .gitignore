@@ -23,3 +23,6 @@ Cargo.lock
 # Keep lockfile for an application workspace
 !/Cargo.lock
 *.tsbuildinfo
+
+# Release build downloads (gh run download), staged by hand, never committed.
+bindings/node/artifacts*/
