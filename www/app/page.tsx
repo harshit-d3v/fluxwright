@@ -177,7 +177,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.5.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
+              Version 0.6.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
             </p>
           </div>
           <FleetBoard />
