@@ -323,10 +323,12 @@ impl Engine {
             // works; the engine's own default (256 waiting, then an error) is for a server
             // shedding load.
             let mut b = fluxwright::BrowserEngine::builder()
-                .max_browsers(max_browsers.unwrap_or(4))
                 .max_contexts_per_browser(8)
                 .queue_capacity(usize::MAX)
                 .acquire_timeout(queue_wait(queue_timeout));
+            if let Some(n) = max_browsers {
+                b = b.max_browsers(n);
+            }
             if let Some(exe) = executable_path {
                 b = b.chrome(exe);
             }
