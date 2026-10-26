@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Playwright / Puppeteer adapters for Fluxwright like-for-like benches",
   "dependencies": {
-    "playwright": "^1.55.0",
+    "playwright": "^1.64.1",
     "puppeteer": "^25.12.0"
   }
 }
