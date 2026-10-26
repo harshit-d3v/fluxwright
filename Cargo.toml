@@ -45,5 +45,3 @@ anyhow = "1.0"
 parking_lot = "0.12"
 async-trait = "0.1"
 base64 = "0.23"
-napi = { version = "2.16", default-features = false, features = ["napi8", "async", "serde-json"] }
-napi-derive = "2.16"
