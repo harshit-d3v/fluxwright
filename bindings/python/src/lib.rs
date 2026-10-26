@@ -310,13 +310,14 @@ struct Engine {
 #[pymethods]
 impl Engine {
     #[staticmethod]
-    #[pyo3(signature = (*, max_browsers=None, executable_path=None, headless=None, queue_timeout=None))]
+    #[pyo3(signature = (*, max_browsers=None, executable_path=None, headless=None, queue_timeout=None, memory_ceiling_mb=None))]
     fn launch(
         py: Python<'_>,
         max_browsers: Option<usize>,
         executable_path: Option<PathBuf>,
         headless: Option<bool>,
         queue_timeout: Option<f64>,
+        memory_ceiling_mb: Option<u64>,
     ) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
             // new_page waits its turn however long the queue is, so starting every job at once
@@ -328,6 +329,9 @@ impl Engine {
                 .acquire_timeout(queue_wait(queue_timeout));
             if let Some(n) = max_browsers {
                 b = b.max_browsers(n);
+            }
+            if let Some(mb) = memory_ceiling_mb {
+                b = b.memory_ceiling_mb(mb);
             }
             if let Some(exe) = executable_path {
                 b = b.chrome(exe);
@@ -599,7 +603,8 @@ impl Page {
         py: Python<'py>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let timeout = Duration::from_millis(timeout.unwrap_or(30_000.0).max(0.0) as u64);
+        // 0 waits as long as it takes, as in Playwright (it used to fail at once).
+        let timeout = queue_wait(Some(timeout.unwrap_or(30_000.0)));
         let lease = self.lease.clone();
         future_into_py(py, async move {
             // Hold no page lock while waiting, or close() would wait for the download too.
@@ -1120,7 +1125,8 @@ impl NetworkResponse {
     #[pyo3(signature = (*, timeout=None))]
     fn body<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let timeout = Duration::from_millis(timeout.unwrap_or(30_000.0).max(0.0) as u64);
+        // 0 waits as long as it takes, as in Playwright (it used to fail at once).
+        let timeout = queue_wait(Some(timeout.unwrap_or(30_000.0)));
         future_into_py(py, async move { inner.body(timeout).await.map_err(error) })
     }
 }

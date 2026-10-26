@@ -87,7 +87,10 @@ export declare class NetworkResponse {
   get statusText(): string
   get headers(): Record<string, string>
   get request(): NetworkRequest
-  /** The body, once the response finished loading, within `timeoutMs` (default 30 s). */
+  /**
+   * The body, once the response finished loading, within `timeoutMs` (default 30 s; 0 waits
+   * as long as it takes).
+   */
   body(timeoutMs?: number | undefined | null): Promise<Buffer>
 }
 
@@ -264,6 +267,11 @@ export interface LaunchOptions {
    * browser to start when one is needed. 0 or unset waits as long as the queue takes.
    */
   queueTimeout?: number
+  /**
+   * Memory budget in MB for all Chrome processes together: new pages wait while they use
+   * more. Default: 75% of the memory free at launch.
+   */
+  memoryCeilingMb?: number
 }
 
 /** One console message or uncaught error, for `page.on`. */

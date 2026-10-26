@@ -16,6 +16,7 @@ class Engine:
         executable_path: _Path | None = None,
         headless: bool | None = None,
         queue_timeout: float | None = None,
+        memory_ceiling_mb: int | None = None,
     ) -> Awaitable[Engine]: ...
     def new_page(
         self,

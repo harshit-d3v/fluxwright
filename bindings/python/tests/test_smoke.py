@@ -21,6 +21,11 @@ from fluxwright import Error, TimeoutError
 from fluxwright.async_api import async_playwright
 from fluxwright.sync_api import sync_playwright
 
+# A page that asks "leave this page?" once its button was clicked (Chrome wants a user gesture).
+ARM_BEFOREUNLOAD = (
+    "data:text/html,<button onclick=\"onbeforeunload = e => { e.preventDefault(); e.returnValue = '' }\">arm</button>"
+)
+
 FETCH_API = "() => fetch('/api').then((r) => r.text())"
 CLICK_REPORT = "() => { const a = document.createElement('a'); a.href = '/report'; document.body.append(a); a.click() }"
 
@@ -361,6 +366,20 @@ async def event_smoke(base: str) -> None:
         page.on("dialog", on_dialog)
         assert await page.evaluate("() => prompt('name')") == "name!"
         assert await page.evaluate("() => confirm('sure?')") is False
+        # A beforeunload one it leaves is accepted, as with no listener: leaving the page works.
+        await page.goto(ARM_BEFOREUNLOAD)
+        await page.click("button")
+        await page.goto("data:text/html,<title>left</title>")
+        assert await page.title() == "left"
+
+        # A cancelled call drops its Rust future, and with it the downloads lock it held: a
+        # second wait times out on its own clock instead of queueing behind the first.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(page.wait_for_download(timeout=10_000), 0.2)
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await page.wait_for_download(timeout=300)
+        assert time.monotonic() - start < 3
 
     with sync_playwright() as p:
         browser = p.chromium.launch(max_browsers=1)
