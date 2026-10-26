@@ -33,9 +33,12 @@ jobs:
           # Ubuntu 24.04 blocks the user namespaces Chrome's sandbox needs: allow them, so every
           # tool runs sandboxed, as in production.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          # Chrome for Testing's version list sometimes answers with something other than JSON.
+          # The stable build, read from the list that carries download links: the short list that
+          # `@stable` resolves through has come back empty, which fails the install.
+          versions=https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json
           for attempt in 1 2 3; do
-            out=$(npx -y @puppeteer/browsers install chrome-headless-shell@stable --path "$RUNNER_TEMP/browsers") && break
+            version=$(curl -fsSL "$versions" | node -pe "JSON.parse(require('fs').readFileSync(0, 'utf8')).channels.Stable.version") &&
+              out=$(npx -y @puppeteer/browsers install "chrome-headless-shell@$version" --path "$RUNNER_TEMP/browsers") && break
             [ "$attempt" = 3 ] && exit 1
             sleep 20
           done
