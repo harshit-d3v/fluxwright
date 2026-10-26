@@ -613,9 +613,14 @@ class Page(_Finders):
     def _listen(self, method: str, event: str, handler: Callable[[Any], Any]) -> None:
         loop = _event_loop()
 
+        # Dialog listeners run on the loop's own pool: on the one-at-a-time listener thread, a
+        # slow listener on another page held up the answer, and the click that opened the dialog
+        # timed out. Each page's dialogs still come one at a time.
+        executor = None if event == "dialog" else _listeners
+
         def bridge(arg: Any) -> Any:
             # A future, so the dialog loop waits for the handler's answer.
-            return loop.run_in_executor(_listeners, _listen, handler, _to_sync(arg))
+            return loop.run_in_executor(executor, _listen, handler, _to_sync(arg))
 
         _run(_on_loop, getattr(self._impl, method), event, bridge)
         self._listener_bridges.append((event, handler, bridge))
@@ -737,10 +742,16 @@ class BrowserContext:
             try:
                 for url, handler in self._routes:
                     page.route(url, handler)
+                # close() from another thread while the page was coming: it would otherwise stay
+                # open on a closed context. Checked and stored under the lock close() takes.
+                with self._lock:
+                    if not self._closed:
+                        self._page = page
+                if self._page is not page:
+                    raise Error("browser_context.new_page: the context is closed")
             except BaseException:
                 page.close()
                 raise
-            self._page = page
             return page
         finally:
             self._opening = False
@@ -770,9 +781,11 @@ class BrowserContext:
 
     def close(self) -> None:
         """Closes the context's page; the context opens no other."""
-        self._closed = True
-        if self._page is not None:
-            self._page.close()
+        with self._lock:
+            self._closed = True
+            page = self._page
+        if page is not None:
+            page.close()
 
     def __enter__(self) -> BrowserContext:
         return self
@@ -796,11 +809,14 @@ class BrowserType:
         executable_path: str | PathLike[str] | None = None,
         max_browsers: int | None = None,
         queue_timeout: float | None = None,
+        memory_ceiling_mb: int | None = None,
     ) -> Browser:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
-        4), headless unless ``headless=False``. When every slot is busy, ``new_page`` waits its
-        turn however long the queue is; with ``queue_timeout`` (milliseconds) it raises
-        ``TimeoutError`` after that long instead, counting a browser start when one is needed."""
+        one per 4 CPUs, 8 pages each), headless unless ``headless=False``. New pages wait while
+        all Chrome processes together use more than ``memory_ceiling_mb`` (default 75% of the
+        memory free at launch). When every slot is busy, ``new_page`` waits its turn however long
+        the queue is; with ``queue_timeout`` (milliseconds) it raises ``TimeoutError`` after that
+        long instead, counting a browser start when one is needed."""
         return Browser(
             _run(
                 self._impl.launch,
@@ -808,6 +824,7 @@ class BrowserType:
                 executable_path=executable_path,
                 max_browsers=max_browsers,
                 queue_timeout=queue_timeout,
+                memory_ceiling_mb=memory_ceiling_mb,
             )
         )
 
