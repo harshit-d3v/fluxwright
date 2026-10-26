@@ -94,6 +94,9 @@ impl FluxwrightMcp {
                 st.engine = Some(engine);
             }
             let page = st.engine.as_ref().expect("made above").acquire().await.map_err(internal)?;
+            if !any_url() {
+                guard_requests(&page).await.map_err(internal)?;
+            }
             st.page = Some(page);
         }
         Ok(MutexGuard::map(st, |s| s.page.as_mut().expect("made above")))
@@ -104,13 +107,35 @@ fn internal(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
-/// Web pages only, unless FLUXWRIGHT_MCP_ANY_URL is set. A page the agent reads can talk it into
-/// anything: `file://` would hand it local files, and a link-local host the cloud metadata
-/// service (instance credentials).
+/// FLUXWRIGHT_MCP_ANY_URL lifts the URL rules below.
+fn any_url() -> bool {
+    std::env::var_os("FLUXWRIGHT_MCP_ANY_URL").is_some()
+}
+
+/// Every request the page makes (subresources, redirects, navigations a script or click starts)
+/// is checked against the host rules, on the URL as Chrome parsed it: nothing the agent types
+/// can slip past through a parser difference, a redirect or `evaluate`. `check_url` on
+/// `open`/`goto` adds the scheme rule (Chrome itself refuses pages' own navigations to `file:`).
 /// shortcut: a hostname that resolves to a link-local address is not caught; the README says
 /// never to expose this server without authentication.
+async fn guard_requests(page: &PageLease) -> fluxwright::Result<()> {
+    let mut requests = page.intercept().await?;
+    tokio::spawn(async move {
+        while let Some(req) = requests.recv().await {
+            if request_blocked(&req.url) {
+                tracing::warn!(url = %req.url, "blocked a request to a link-local host");
+                let _ = req.abort("blockedbyclient").await;
+            }
+            // Any other request is dropped here, which lets it through.
+        }
+    });
+    Ok(())
+}
+
+/// Web pages only. A page the agent reads can talk it into anything: `file://` would hand it
+/// local files, and a link-local host the cloud metadata service (instance credentials).
 fn check_url(url: &str) -> Result<(), McpError> {
-    if std::env::var_os("FLUXWRIGHT_MCP_ANY_URL").is_some() {
+    if any_url() {
         return Ok(());
     }
     url_allowed(url).map_err(|why| {
@@ -119,7 +144,8 @@ fn check_url(url: &str) -> Result<(), McpError> {
 }
 
 fn url_allowed(url: &str) -> Result<(), &'static str> {
-    let url = url.trim();
+    // Browsers drop tabs and newlines anywhere in a URL.
+    let url: String = url.trim().chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
     if url.eq_ignore_ascii_case("about:blank") {
         return Ok(());
     }
@@ -127,8 +153,25 @@ fn url_allowed(url: &str) -> Result<(), &'static str> {
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Err("only http and https URLs are allowed");
     }
+    if host_blocked(rest) {
+        return Err("link-local hosts (cloud metadata) are blocked");
+    }
+    Ok(())
+}
+
+/// For a request URL as Chrome wrote it: web requests to a blocked host, and `file:`.
+fn request_blocked(url: &str) -> bool {
+    match url.split_once("://") {
+        Some((scheme, rest)) if matches!(scheme, "http" | "https" | "ws" | "wss") => host_blocked(rest),
+        _ => url.starts_with("file:"),
+    }
+}
+
+/// Whether the host of `after_scheme` (the URL after `://`) is link-local or a cloud metadata
+/// name.
+fn host_blocked(after_scheme: &str) -> bool {
     // Browsers read `\` as `/` in web URLs.
-    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    let authority = after_scheme.split(['/', '?', '#', '\\']).next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or("").to_ascii_lowercase();
     let host = match host.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
@@ -136,20 +179,16 @@ fn url_allowed(url: &str) -> Result<(), &'static str> {
     }
     .trim_end_matches('.');
     if host == "metadata.google.internal" || host == "metadata" {
-        return Err("cloud metadata hosts are blocked");
+        return true;
     }
-    let link_local = match host.parse::<Ipv6Addr>() {
+    match host.parse::<Ipv6Addr>() {
         Ok(v6) => {
             v6.segments()[0] & 0xffc0 == 0xfe80
                 || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254) // AWS IMDS over IPv6
                 || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
         }
         Err(_) => ipv4_host(host).is_some_and(|v4| v4.is_link_local()),
-    };
-    if link_local {
-        return Err("link-local hosts (cloud metadata) are blocked");
     }
-    Ok(())
 }
 
 /// A host read as IPv4 the way browsers do: 1 to 4 dot-separated numbers in decimal, hex (0x)
@@ -362,5 +401,49 @@ mod tests {
         let cut = truncate(html, 40_001);
         assert!(cut.starts_with(&"é".repeat(20_000)));
         assert!(cut.ends_with("[truncated: 60000 bytes in all]"));
+    }
+
+    #[test]
+    fn requests_are_checked_as_chrome_wrote_them() {
+        for blocked in [
+            "http://169.254.169.254/latest/meta-data/",
+            "https://[fe80::1]/",
+            "ws://169.254.169.254/",
+            "file:///etc/passwd",
+        ] {
+            assert!(request_blocked(blocked), "{blocked}");
+        }
+        for allowed in ["https://example.com/a.js", "data:image/png;base64,iVBO", "blob:https://example.com/1-2", "http://127.0.0.1:3000/"] {
+            assert!(!request_blocked(allowed), "{allowed}");
+        }
+        // Browsers drop tabs inside a URL: so does the goto check.
+        assert!(url_allowed("http://169.254.169.254\t/").is_err());
+    }
+
+    /// A redirect to the metadata address is stopped too: the guard sees every request with the
+    /// URL Chrome parsed, not only what goto was given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirects_to_link_local_hosts_are_blocked() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let _ = stream.read(&mut [0u8; 2048]);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let engine = BrowserEngine::builder().max_browsers(1).build().await.unwrap();
+        let page = engine.acquire().await.unwrap();
+        guard_requests(&page).await.unwrap();
+        let start = std::time::Instant::now();
+        let err = page.goto(&url).await.expect_err("the redirect was followed");
+        assert!(err.to_string().contains("BLOCKED_BY_CLIENT"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        drop(page);
+        engine.shutdown(Duration::from_secs(5)).await.unwrap();
     }
 }
