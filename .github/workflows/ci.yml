@@ -61,6 +61,11 @@ jobs:
       - run: npm ci
       - run: npm run test:types
       - run: npm run build:debug
+      # The build regenerates both; the loader carries the package version, so a version bump
+      # that skips the rebuild would publish a loader expecting the old one.
+      - name: Generated index.js and index.d.ts are committed
+        if: matrix.os == 'ubuntu-latest'
+        run: git diff --exit-code -- index.js index.d.ts || { echo "::error::Run npm run build:debug and commit index.js and index.d.ts"; exit 1; }
       - run: npm test
 
   python:

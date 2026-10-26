@@ -1,6 +1,7 @@
 version: 2
-# Each group takes patch and minor updates only. A major update gets a PR of its own, so one
-# breaking release (napi-rs 3, Next 16) no longer holds back every safe update in its group.
+# Each group takes patch and minor updates only. A major update (Dependabot counts 0.x minors,
+# like pyo3 0.29 -> 0.30, as major) gets a PR of its own, so one breaking release (napi-rs 3,
+# Next 16) no longer holds back every safe update in its group.
 updates:
   - package-ecosystem: cargo
     directory: /
@@ -19,8 +20,11 @@ updates:
     groups:
       bindings-rust:
         update-types: [minor, patch]
-        # A pyo3 0.x "minor" release changes its API: always a PR of its own.
-        exclude-patterns: ["pyo3*"]
+      # Both bindings reach the workspace's own dependencies: one PR per major update, not one
+      # per binding with the same change (parking_lot 0.13 came as #46 and #48).
+      bindings-rust-major:
+        update-types: [major]
+        group-by: dependency-name
 
   - package-ecosystem: npm
     directories:

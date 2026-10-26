@@ -60,11 +60,17 @@ fn this_machine() -> (usize, u64) {
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    let mut free = sys.available_memory();
-    if let Some(cgroup) = sys.cgroup_limits() {
-        free = free.min(cgroup.free_memory);
-    }
-    (cpus, free / (1024 * 1024))
+    let cgroup = sys.cgroup_limits().map(|c| (c.total_memory, c.rss));
+    (cpus, free_mb(sys.available_memory(), cgroup))
+}
+
+/// Memory free now (MB): the host's available memory, or less inside a container: its limit
+/// minus its anonymous memory (`cgroup` is that pair, in bytes). Page cache counts as free, as it
+/// does on the host; sysinfo's own cgroup "free" subtracts memory.current, which includes cache,
+/// so a container that had read 2.5 GB of files looked nearly full.
+fn free_mb(host_available: u64, cgroup: Option<(u64, u64)>) -> u64 {
+    let free = cgroup.map_or(host_available, |(limit, anon)| host_available.min(limit.saturating_sub(anon)));
+    free / (1024 * 1024)
 }
 
 impl Default for EngineConfig {
@@ -223,5 +229,15 @@ mod tests {
         assert_eq!(auto_tune(64, 1), (16, 1), "never 0 MB, which would mean no ceiling");
         let config = EngineConfig::default();
         assert!(config.max_browsers >= 1 && config.memory_ceiling_mb >= 1);
+    }
+
+    #[test]
+    fn containers_count_page_cache_as_free() {
+        const MB: u64 = 1024 * 1024;
+        // A 4 GB container using 512 MB itself, on a host with 16 GB available.
+        assert_eq!(free_mb(16_384 * MB, Some((4_096 * MB, 512 * MB))), 3_584);
+        // The host has less available than the container's limit.
+        assert_eq!(free_mb(2_048 * MB, Some((4_096 * MB, 512 * MB))), 2_048);
+        assert_eq!(free_mb(8_192 * MB, None), 8_192);
     }
 }
