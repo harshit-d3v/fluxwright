@@ -42,6 +42,6 @@ http-body-util = "0.1"
 hyper = { version = "1.6", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 anyhow = "1.0"
-parking_lot = "0.12"
+parking_lot = "0.13"
 async-trait = "0.1"
 base64 = "0.23"
