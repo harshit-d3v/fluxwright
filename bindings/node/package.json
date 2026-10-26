@@ -45,24 +45,24 @@
     "test:types": "tsc -p test",
     "build:debug": "napi build --platform",
     "artifacts": "napi artifacts",
-    "prepublishOnly": "napi prepublish -t npm --skip-gh-release"
+    "prepublishOnly": "napi pre-publish -t npm --no-gh-release"
   },
   "napi": {
-    "name": "fluxwright",
-    "triples": {
-      "defaults": true,
-      "additional": [
-        "aarch64-apple-darwin"
-      ]
-    }
+    "binaryName": "fluxwright",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-apple-darwin"
+    ]
   },
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4",
-    "@types/node": "^22.20.4",
-    "typescript": "^5.9.3"
+    "@napi-rs/cli": "^3.10.9",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   },
   "optionalDependencies": {
     "fluxwright-darwin-arm64": "0.5.0",

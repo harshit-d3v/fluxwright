@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Env, JsFunction};
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
@@ -24,16 +23,15 @@ type LeaseSlot = Arc<RwLock<Option<fluxwright::PageLease>>>;
 pub struct Page {
     lease: LeaseSlot,
     /// The JavaScript route dispatcher, once `page.route` was called.
-    routes: Arc<std::sync::Mutex<Option<RouteCallback>>>,
+    routes: Arc<std::sync::Mutex<Option<Arc<Callback<InterceptedRoute>>>>>,
 }
 
-type RouteCallback = ThreadsafeFunction<InterceptedRoute, ErrorStrategy::Fatal>;
+/// A thread-safe JavaScript callback (errors are not passed to it) that does not keep Node
+/// running on its own.
+type Callback<T> = ThreadsafeFunction<T, (), T, Status, false, true>;
 
-/// A thread-safe JavaScript callback that does not keep Node running on its own.
-fn callback<T: ToNapiValue + Send + 'static>(env: &Env, f: JsFunction) -> Result<ThreadsafeFunction<T, ErrorStrategy::Fatal>> {
-    let mut tsfn = f.create_threadsafe_function(0, |ctx: ThreadSafeCallContext<T>| Ok(vec![ctx.value]))?;
-    tsfn.unref(env)?;
-    Ok(tsfn)
+fn callback<T: ToNapiValue + 'static>(f: Function<T, ()>) -> Result<Callback<T>> {
+    f.build_threadsafe_function().callee_handled::<false>().weak::<true>().build()
 }
 
 /// A paused request handed to `page.route` handlers; `addon.js` wraps it in Playwright's
@@ -1093,8 +1091,8 @@ impl Page {
     /// Calls `handler` with each console message and uncaught error from now on; `addon.js`
     /// builds `page.on('console' | 'pageerror')` on it.
     #[napi(js_name = "_onLog")]
-    pub fn on_log(&self, env: Env, handler: JsFunction) -> Result<()> {
-        let tsfn = callback::<LogEvent>(&env, handler)?;
+    pub fn on_log(&self, handler: Function<LogEvent, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
         let lease = self.lease.clone();
         RT.spawn(async move {
             let Some(mut entries) = lease.read().await.as_ref().map(|p| p.subscribe_logs()) else {
@@ -1120,14 +1118,12 @@ impl Page {
         Ok(())
     }
 
-    /// Sets the function that receives intercepted requests; `addon.js` passes its route
-    /// dispatcher, then calls `intercept`.
     /// Calls `handler` with each network event from now on; `addon.js` builds
     /// `page.on('request' | 'response' | 'requestfinished' | 'requestfailed')` on it. Subscribed
     /// before this returns, so a navigation right after it is seen whole.
     #[napi(js_name = "_onNetwork")]
-    pub fn on_network(&self, env: Env, handler: JsFunction) -> Result<()> {
-        let tsfn = callback::<NetworkEvent>(&env, handler)?;
+    pub fn on_network(&self, handler: Function<NetworkEvent, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
         let mut events = {
             let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
             page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_network()
@@ -1144,8 +1140,8 @@ impl Page {
     /// Hands this page's dialogs to `handler` instead of dismissing them, from before this
     /// returns; `addon.js` builds `page.on('dialog')` on it.
     #[napi(js_name = "_onDialog")]
-    pub fn on_dialog(&self, env: Env, handler: JsFunction) -> Result<()> {
-        let tsfn = callback::<PendingDialog>(&env, handler)?;
+    pub fn on_dialog(&self, handler: Function<PendingDialog, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
         let mut dialogs = {
             let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
             page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_dialogs()
@@ -1158,9 +1154,11 @@ impl Page {
         Ok(())
     }
 
+    /// Sets the function that receives intercepted requests; `addon.js` passes its route
+    /// dispatcher, then calls `intercept`.
     #[napi(js_name = "_setRouteHandler")]
-    pub fn set_route_handler(&self, env: Env, handler: JsFunction) -> Result<()> {
-        *self.routes.lock().unwrap() = Some(callback::<InterceptedRoute>(&env, handler)?);
+    pub fn set_route_handler(&self, handler: Function<InterceptedRoute, ()>) -> Result<()> {
+        *self.routes.lock().unwrap() = Some(Arc::new(callback(handler)?));
         Ok(())
     }
 
