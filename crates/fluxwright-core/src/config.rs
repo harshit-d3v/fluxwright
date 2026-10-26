@@ -43,18 +43,45 @@ pub struct EngineConfig {
     pub job_timeout: Duration,
 }
 
+/// Browsers and the fleet's memory budget (MB) for a machine with `cpus` CPUs and
+/// `available_mb` of memory free: a browser per 4 CPUs, so 8 pages each makes about 2 pages
+/// per CPU, and 75% of the free memory. The budget is what keeps the fleet from overcommitting:
+/// a lease waits while the measured fleet is over it (one Chrome is about 50 MB and a light page
+/// 25 MB more), so more browsers than a small budget can fill cost nothing.
+fn auto_tune(cpus: usize, available_mb: u64) -> (usize, u64) {
+    let browsers = cpus.div_ceil(4).max(1);
+    // 0 means memory unknown: keep the old fixed budget. Never 0 MB, which means no ceiling.
+    let budget = if available_mb == 0 { 8192 } else { (available_mb * 3 / 4).max(1) };
+    (browsers, budget)
+}
+
+/// CPUs this process may use, and memory (MB) free now within a container's limit.
+fn this_machine() -> (usize, u64) {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let mut free = sys.available_memory();
+    if let Some(cgroup) = sys.cgroup_limits() {
+        free = free.min(cgroup.free_memory);
+    }
+    (cpus, free / (1024 * 1024))
+}
+
 impl Default for EngineConfig {
+    /// Sized to this machine when called (see [`auto_tune`]); the rest are fixed defaults.
     fn default() -> Self {
         let no_sandbox = std::env::var("FLUXWRIGHT_NO_SANDBOX")
             .ok()
             .filter(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .is_some();
+        let (cpus, available_mb) = this_machine();
+        let (max_browsers, memory_ceiling_mb) = auto_tune(cpus, available_mb);
         Self {
             min_browsers: 0,
-            max_browsers: 4,
+            max_browsers,
             max_contexts_per_browser: 8,
             max_pages_per_context: 1,
-            memory_ceiling_mb: 8192,
+            memory_ceiling_mb,
             idle_timeout: Some(Duration::from_secs(300)),
             recycle_after_jobs: Some(100),
             recycle_after: Some(Duration::from_secs(30 * 60)),
@@ -181,5 +208,20 @@ impl JobOptions {
     pub fn storage_state(mut self, state: StorageState) -> Self {
         self.storage_state = Some(state);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_tune_sizes_the_fleet_to_the_machine() {
+        assert_eq!(auto_tune(16, 10_000), (4, 7_500));
+        assert_eq!(auto_tune(4, 2_048), (1, 1_536));
+        assert_eq!(auto_tune(1, 0), (1, 8_192), "memory unknown: the old fixed budget");
+        assert_eq!(auto_tune(64, 1), (16, 1), "never 0 MB, which would mean no ceiling");
+        let config = EngineConfig::default();
+        assert!(config.max_browsers >= 1 && config.memory_ceiling_mb >= 1);
     }
 }
