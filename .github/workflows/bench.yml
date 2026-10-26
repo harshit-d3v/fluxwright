@@ -1,0 +1,54 @@
+name: benchmarks
+
+# Run by hand: Actions → benchmarks → Run workflow. Every tool runs in one job, on one
+# chrome-headless-shell, on the same machine. A GitHub runner is a shared VM, so compare tools
+# within one run, not one run with another.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: benchmarks/package-lock.json
+      - name: Playwright and Puppeteer, without browsers of their own
+        working-directory: benchmarks
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: npm ci
+      - name: One chrome-headless-shell for every tool
+        run: |
+          # Ubuntu 24.04 blocks the user namespaces Chrome's sandbox needs: allow them, so every
+          # tool runs sandboxed, as in production.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          out=$(npx -y @puppeteer/browsers install chrome-headless-shell@stable --path "$RUNNER_TEMP/browsers")
+          echo "$out"
+          echo "FLUXWRIGHT_CHROMIUM=$(echo "$out" | tail -1 | cut -d' ' -f2-)" >> "$GITHUB_ENV"
+      - name: Run
+        run: cargo run --release -p fluxwright-benchmarks -- --out bench-results
+      - name: Summary
+        run: |
+          {
+            echo "### Benchmarks: $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB, $(date -u +%F)"
+            echo
+            echo "| tool | scenario | jobs | jobs/s | p95 ms | failures |"
+            echo "|---|---|---|---|---|---|"
+            node -e "for (const r of require('./bench-results/latest.json')) console.log('| ' + [r.tool, r.scenario, r.jobs, r.jobs_per_second.toFixed(1), r.p95_latency_ms, (r.failure_rate * 100).toFixed(1) + '%'].join(' | ') + ' |')"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-results
+          path: bench-results/latest.json
+          if-no-files-found: error
