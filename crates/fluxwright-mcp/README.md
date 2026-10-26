@@ -49,6 +49,10 @@ command = "C:\\Users\\harsh\\.cargo\\bin\\fluxwright-mcp.exe"
 
 Project file `.cursor/mcp.json` (already added) or Cursor Settings → MCP.
 
+## What the agent may open
+
+`open` and `goto` take `http` and `https` URLs and `about:blank`. They refuse `file://`, `chrome://` and other schemes, and link-local hosts such as `169.254.169.254` (the cloud metadata service, which hands out instance credentials), however the address is written. A page the agent reads can try to talk it into opening those. Set `FLUXWRIGHT_MCP_ANY_URL=1` to allow any URL.
+
 ## Where you can deploy
 
 MCP **stdio** is a local child process. The Chrome fleet has to run **next to the server**.
@@ -57,7 +61,7 @@ MCP **stdio** is a local child process. The Chrome fleet has to run **next to th
 |---|---|---|
 | **Your PC** (Claude / Codex / Cursor) | Yes — this is the intended setup | Chrome is already here |
 | **Vercel / Cloudflare / Lambda** | No | No long-lived Chromium, no MCP stdio child |
-| **Docker on a VPS** (Fly.io, Railway, Render, ECS, a cheap VM) | Yes, with caveats | Install Chromium, `FLUXWRIGHT_HEADLESS=1` `FLUXWRIGHT_NO_SANDBOX=1`, expose MCP over HTTP with a stdio→SSE proxy |
+| **Docker on a VPS** (Fly.io, Railway, Render, ECS, a cheap VM) | Yes, with caveats | Install Chromium, `FLUXWRIGHT_HEADLESS=1` `FLUXWRIGHT_NO_SANDBOX=1`, reach MCP over HTTP through a stdio→SSE proxy that only you can reach (see below) |
 | **Browserless / Browserbase** | Different product | Hosted Chrome; Fluxwright would need a remote `BrowserSource` (not in this server yet) |
 
 Remote sketch (VPS):
@@ -79,3 +83,5 @@ CMD ["fluxwright-mcp"]
 ```
 
 Then point a **remote MCP** client at that HTTP/SSE URL. Claude Desktop still prefers **local stdio**.
+
+**Never publish that port.** The proxy has no login, so anyone who reaches it drives a browser inside your network. Bind it to `127.0.0.1` and connect over SSH (`ssh -L 8787:127.0.0.1:8787 your-vm`) or a VPN, or put a reverse proxy that requires authentication in front of it.
