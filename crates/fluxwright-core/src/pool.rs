@@ -41,6 +41,31 @@ struct State {
     launching: usize,
 }
 
+impl State {
+    /// Browsers that count toward `max_browsers`: those that can still take a lease. A draining
+    /// or dead one is on its way out, so its replacement may start at once; counting it stopped
+    /// the whole pool (with one browser) until its last job ended. The memory ceiling still
+    /// gates every new lease.
+    fn serving(&self) -> usize {
+        self.browsers
+            .iter()
+            .filter(|s| !s.crashed && !s.draining && !s.browser.connection_dead())
+            .count()
+    }
+}
+
+/// An engine dropped without `shutdown()` kills its browsers: their own tasks keep them alive
+/// until Chrome exits.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Ok(st) = self.state.try_lock() {
+            for s in &st.browsers {
+                s.browser.start_kill();
+            }
+        }
+    }
+}
+
 struct Slot {
     browser: Arc<CdpBrowser>,
     active: usize,
@@ -116,21 +141,28 @@ impl Engine {
             rss_refreshing: AtomicBool::new(false),
             grants: Arc::new(tokio::sync::Semaphore::new(24)),
         });
-        let pump = inner.clone();
+        // Weak: an engine dropped without shutdown() must free its browsers (see Inner's Drop),
+        // and this loop holding it would keep it alive forever.
+        let pump = Arc::downgrade(&inner);
         tokio::spawn(async move {
             loop {
-                if *pump.shutdown.lock().await {
+                let Some(inner) = pump.upgrade() else {
+                    break;
+                };
+                if *inner.shutdown.lock().await {
                     break;
                 }
-                let notified = pump.admit.notified();
+                let notified = inner.admit.notified();
                 tokio::pin!(notified);
                 // notify_waiters() stores no permit, and Notified only listens
                 // once polled: without enable() every wakeup raised while
                 // dispatch runs is lost and the queue stalls until timeout.
                 notified.as_mut().enable();
-                let progress = Inner::dispatch(pump.clone()).await.unwrap_or(false);
+                let progress = Inner::dispatch(inner.clone()).await.unwrap_or(false);
                 if !progress {
-                    notified.await;
+                    // Also wakes every second without traffic: idle browsers close on time, and
+                    // a dropped engine is noticed.
+                    let _ = tokio::time::timeout(Duration::from_secs(1), notified).await;
                 }
             }
         });
@@ -175,6 +207,7 @@ impl Engine {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut st = self.inner.state.lock().await;
+            drop_abandoned(&mut st.queue);
             if st.queue.len() >= self.inner.config.queue_capacity {
                 match self.inner.config.queue_full_mode {
                     QueueFullMode::Error => return Err(Error::QueueFull),
@@ -189,7 +222,8 @@ impl Engine {
                             tokio::pin!(notified);
                             notified.as_mut().enable();
                             {
-                                let st = self.inner.state.lock().await;
+                                let mut st = self.inner.state.lock().await;
+                                drop_abandoned(&mut st.queue);
                                 if st.queue.len() < self.inner.config.queue_capacity {
                                     break;
                                 }
@@ -353,7 +387,8 @@ impl Engine {
                 while let Some(w) = st.queue.pop_front() {
                     let _ = w.tx.send(Err(Error::ShuttingDown));
                 }
-                let idle = st.browsers.iter().all(|s| s.active == 0);
+                // A browser still starting counts: it would otherwise come up after this returns.
+                let idle = st.launching == 0 && st.browsers.iter().all(|s| s.active == 0);
                 if idle || start.elapsed() > grace {
                     for s in st.browsers.drain(..) {
                         let _ = s.browser.close().await;
@@ -401,8 +436,7 @@ impl Inner {
                         .saturating_sub(s.active)
                 })
                 .sum();
-            let used = st.browsers.iter().filter(|s| !s.crashed).count() + st.launching;
-            let launch_room = self.config.max_browsers.saturating_sub(used);
+            let launch_room = self.config.max_browsers.saturating_sub(st.serving() + st.launching);
             if free + launch_room == 0 {
                 return Ok(false);
             }
@@ -504,8 +538,7 @@ impl Inner {
                 st.counters.acquires_reused_browser += 1;
                 Some(st.browsers[i].browser.clone())
             } else {
-                let can_launch = st.browsers.iter().filter(|s| !s.crashed).count() + st.launching
-                    < self.config.max_browsers;
+                let can_launch = st.serving() + st.launching < self.config.max_browsers;
                 if can_launch {
                     st.launching += 1;
                     None
@@ -524,6 +557,11 @@ impl Inner {
                 st.launching = st.launching.saturating_sub(1);
             }
             let browser = launched?;
+            // shutdown() may have finished while this browser started: it must not serve.
+            if *self.shutdown.lock().await {
+                let _ = browser.close().await;
+                return Err(Error::ShuttingDown);
+            }
             let mut st = self.state.lock().await;
             st.browsers.push(Slot {
                 browser: browser.clone(),
@@ -609,10 +647,11 @@ impl Inner {
             if dead && st.browsers[i].active == 0 {
                 let slot = st.browsers.remove(i);
                 st.counters.crash_count += 1;
-                drop(st);
                 warn!(pid = slot.browser.pid, "removing dead browser");
-                let _ = slot.browser.close().await;
-                st = self.state.lock().await;
+                // Not awaited: dispatch serves every waiter, and a close can take seconds.
+                tokio::spawn(async move {
+                    let _ = slot.browser.close().await;
+                });
                 continue;
             }
             i += 1;
@@ -641,6 +680,8 @@ impl Inner {
         let mut bump = 0u64;
         {
             let mut st = self.state.lock().await;
+            // The idle rule never takes the pool below min_browsers.
+            let mut idle_closable = st.serving().saturating_sub(self.config.min_browsers);
             for s in st.browsers.iter_mut() {
                 if s.draining || s.crashed {
                     if s.draining && s.active == 0 {
@@ -659,9 +700,13 @@ impl Inner {
                 let by_rss = rss_limit.is_some_and(|mb| {
                     rss_by_pid.get(&s.browser.pid).copied().unwrap_or(0) / (1024 * 1024) >= mb
                 });
-                let idle = self.config.idle_timeout.is_some_and(|d| {
-                    s.active == 0 && now.duration_since(s.last_used) >= d
-                });
+                let idle = idle_closable > 0
+                    && self.config.idle_timeout.is_some_and(|d| {
+                        s.active == 0 && now.duration_since(s.last_used) >= d
+                    });
+                if idle {
+                    idle_closable -= 1;
+                }
                 if by_jobs || by_age || by_rss || idle {
                     info!(
                         pid = s.browser.pid,
@@ -686,13 +731,17 @@ impl Inner {
                     .any(|b| b.id == s.browser.id && s.active == 0 && s.draining)
             });
         }
+        // Not awaited: dispatch serves every waiter, and a close can take seconds.
         for b in to_close {
-            let _ = b.close().await;
+            tokio::spawn(async move {
+                let _ = b.close().await;
+            });
         }
     }
 }
 
 fn pick_waiter(queue: &mut VecDeque<Waiter>) -> Option<Waiter> {
+    drop_abandoned(queue);
     let best_pri = queue.iter().map(|w| w.priority).max()?;
     let idx = queue
         .iter()
@@ -701,6 +750,12 @@ fn pick_waiter(queue: &mut VecDeque<Waiter>) -> Option<Waiter> {
         .min_by_key(|(_, w)| w.queued_at)
         .map(|(i, _)| i)?;
     queue.remove(idx)
+}
+
+/// Waiters whose caller timed out or gave up (the receiver is gone). Left queued, they count
+/// against `queue_capacity` and get a page built that nobody takes.
+fn drop_abandoned(queue: &mut VecDeque<Waiter>) {
+    queue.retain(|w| !w.tx.is_closed());
 }
 
 async fn apply_blocking(page: &PageLease, opts: &JobOptions) -> Result<()> {

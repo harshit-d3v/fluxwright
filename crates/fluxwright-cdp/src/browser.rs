@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::process::Child;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -56,8 +56,6 @@ impl Proxy {
 }
 
 pub(crate) struct TargetState {
-    #[allow(dead_code)]
-    target_id: String,
     session_id: Option<String>,
     r#type: String,
     url: String,
@@ -75,7 +73,6 @@ pub struct CdpBrowser {
     /// Blocking and proxy credentials per browser context, so iframes that attach later
     /// get them too.
     setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
-    pub events: broadcast::Sender<CdpEvent>,
 }
 
 impl CdpBrowser {
@@ -96,7 +93,6 @@ impl CdpBrowser {
         conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(60))
             .await
             .map_err(|e| Error::Launch(format!("chromium did not answer on its DevTools connection: {e}")))?;
-        let (fanout, _) = broadcast::channel(512);
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
             pid: launched.pid,
@@ -105,7 +101,6 @@ impl CdpBrowser {
             _profile: Some(launched.user_data_dir),
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
-            events: fanout.clone(),
         });
 
         let b = browser.clone();
@@ -126,11 +121,6 @@ impl CdpBrowser {
                         drop(child);
                         warn!(pid = waiter.pid, ?status, "chromium process exited");
                         waiter.conn.mark_dead();
-                        let _ = waiter.events.send(CdpEvent {
-                            method: "Fluxwright.disconnected".into(),
-                            params: json!({ "pid": waiter.pid }),
-                            session_id: None,
-                        });
                         break;
                     }
                     Some(Ok(None)) => {}
@@ -139,28 +129,30 @@ impl CdpBrowser {
             }
         });
 
-        browser
-            .conn
-            .call(
-                "Target.setDiscoverTargets",
-                json!({ "discover": true }),
-                None,
-                Duration::from_secs(5),
-            )
-            .await?;
-        browser
-            .conn
-            .call(
-                "Target.setAutoAttach",
-                json!({
-                    "autoAttach": true,
-                    "waitForDebuggerOnStart": true,
-                    "flatten": true
-                }),
-                None,
-                Duration::from_secs(5),
-            )
-            .await?;
+        let handshake = async {
+            browser
+                .conn
+                .call("Target.setDiscoverTargets", json!({ "discover": true }), None, Duration::from_secs(5))
+                .await?;
+            browser
+                .conn
+                .call(
+                    "Target.setAutoAttach",
+                    json!({
+                        "autoAttach": true,
+                        "waitForDebuggerOnStart": true,
+                        "flatten": true
+                    }),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await
+        };
+        if let Err(e) = handshake.await {
+            // The tasks above hold the browser: end Chrome so they end too and it is freed.
+            let _ = browser.kill_process().await;
+            return Err(e);
+        }
 
         info!(browser_id = %browser.id.0, pid = browser.pid, "browser ready");
         Ok(browser)
@@ -171,7 +163,6 @@ impl CdpBrowser {
     }
 
     async fn on_event(self: &Arc<Self>, ev: CdpEvent) {
-        let _ = self.events.send(ev.clone());
         match ev.method.as_str() {
             "Target.attachedToTarget" => {
                 let info = &ev.params["targetInfo"];
@@ -192,7 +183,6 @@ impl CdpBrowser {
                 {
                     let mut targets = self.targets.lock().await;
                     let state = targets.entry(target_id.clone()).or_insert(TargetState {
-                        target_id: target_id.clone(),
                         session_id: None,
                         r#type: ty.clone(),
                         url: url.clone(),
@@ -246,8 +236,7 @@ impl CdpBrowser {
                 let info = &ev.params["targetInfo"];
                 let target_id = info["targetId"].as_str().unwrap_or_default().to_string();
                 let mut targets = self.targets.lock().await;
-                targets.entry(target_id.clone()).or_insert(TargetState {
-                    target_id,
+                targets.entry(target_id).or_insert(TargetState {
                     session_id: None,
                     r#type: info["type"].as_str().unwrap_or("").to_string(),
                     url: info["url"].as_str().unwrap_or("").to_string(),
@@ -445,7 +434,6 @@ impl CdpBrowser {
             context_id: ctx.clone(),
             target_id: TargetId(target_id),
             session_id: SessionId(session_id),
-            events: self.events.clone(),
             targets: self.targets.clone(),
             worlds: Default::default(),
             setups: self.setups.clone(),
@@ -464,7 +452,6 @@ impl CdpBrowser {
             targets
                 .entry(target_id.to_string())
                 .or_insert(TargetState {
-                    target_id: target_id.to_string(),
                     session_id: None,
                     r#type: "page".into(),
                     url: String::new(),
@@ -516,13 +503,6 @@ impl CdpBrowser {
             .collect()
     }
 
-    pub async fn iframe_session_for_url(&self, needle: &str) -> Option<String> {
-        let targets = self.targets.lock().await;
-        targets
-            .values()
-            .find(|t| t.r#type == "iframe" && t.url.contains(needle))
-            .and_then(|t| t.session_id.clone())
-    }
 
     pub async fn close(&self) -> Result<()> {
         let _ = self
@@ -534,6 +514,33 @@ impl CdpBrowser {
         }
         self.conn.mark_dead();
         Ok(())
+    }
+
+    /// Kills Chrome without waiting, for code that cannot await (a dropped engine). The
+    /// connection then closes and the browser is freed.
+    pub fn start_kill(self: &Arc<Self>) {
+        self.conn.mark_dead();
+        match self._child.try_lock() {
+            Ok(mut child) => {
+                if let Some(child) = child.as_mut() {
+                    let _ = child.start_kill();
+                }
+            }
+            // The exit watcher holds it for a moment: kill from a task instead.
+            Err(_) => {
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    let browser = self.clone();
+                    rt.spawn(async move {
+                        let _ = browser.kill_process().await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// The Chrome profile folder; deleted when the browser is freed.
+    pub fn profile_dir(&self) -> Option<&std::path::Path> {
+        self._profile.as_ref().map(|d| d.path())
     }
 
     pub async fn kill_process(&self) -> Result<()> {
@@ -589,4 +596,32 @@ async fn prepare_session(
             .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(5))),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A closed browser is freed: its tasks end and its profile folder goes. Its own event loop
+    /// used to keep it alive until the process exited.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closed_browser_is_freed() {
+        let opts = LaunchOptions {
+            no_sandbox: std::env::var("FLUXWRIGHT_NO_SANDBOX").is_ok(),
+            ..LaunchOptions::default()
+        };
+        let browser = CdpBrowser::launch(opts).await.expect("launch");
+        let dir = browser.profile_dir().expect("profile folder").to_path_buf();
+        let weak = Arc::downgrade(&browser);
+        browser.close().await.unwrap();
+        drop(browser);
+        for _ in 0..100 {
+            if weak.upgrade().is_none() && !dir.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(weak.upgrade().is_none(), "the closed browser is still alive");
+        assert!(!dir.exists(), "profile folder left behind: {}", dir.display());
+    }
 }

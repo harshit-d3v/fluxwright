@@ -22,8 +22,6 @@ pub enum Error {
     TargetCrashed { status: String },
     #[error("session {0} is gone")]
     SessionGone(String),
-    #[error("no main frame")]
-    NoMainFrame,
     #[error("evaluate threw: {0}")]
     JavaScript(String),
     #[error("element {selector} not actionable: {reason}")]
