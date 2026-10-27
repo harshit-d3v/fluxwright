@@ -18,10 +18,10 @@ The goal is to be the best engine for running many browser jobs on your own mach
 - **0.4.1:** `newPage` / `new_page` waits for a free slot however long the queue is, so starting every job at once works; it used to fail past 256 waiting jobs or after 30 s. `queueTimeout` / `queue_timeout` fails after a set time instead.
 - **0.5.0:** Playwright scripts need fewer changes: `browser.newContext()` / `new_context()` with `context.newPage()`; `page.on('request' | 'response' | 'requestfinished' | 'requestfailed')` with `response.body()` / `json()`, and `page.waitForResponse` / `waitForRequest` (`expect_response` / `expect_request` in Python); `page.on('dialog')` to accept or dismiss alerts, confirms and prompts. Clicks, boxes and screenshots land right inside iframes that CSS scales or rotates. Fixes a crash on Windows under heavy load (a stack overflow while measuring Chrome's memory). Both bindings are tested on Windows, macOS and Linux.
 - **0.5.1 (PyPI):** a script that ended right after an awaited call could crash at exit on Linux (SIGSEGV, about 1 run in 16 on Python 3.10–3.13). It now exits cleanly.
+- **0.6.0:** the fleet sizes itself: by default a browser per 4 CPUs, and a memory budget of 75% of the memory free at launch (inside a container, its limit), which `memoryCeilingMb` / `memory_ceiling_mb` overrides. Long runs stay healthy: a closed or recycled browser frees its profile folder, tasks and pipes; recycling a browser no longer pauses the pool; callers that gave up leave the queue; idle browsers close without new traffic; Chrome never outlives its engine. Text cut through an emoji no longer makes calls time out, a route reply Chrome rejects no longer leaves the request stuck, and route requests show lower-case header names. In the bindings, an unanswered `beforeunload` is accepted, routed pages and console listeners no longer keep closed pages alive, and `timeout: 0` waits as long as it takes. The MCP server opens web pages only and checks every request the page makes. Benchmarks run on GitHub's runner and time every tool the same way.
 
-## 0.6: the fleet at scale
+## Next: the fleet at scale
 
-- **Auto-tuning:** pick the number of browsers and pages per browser from free RAM and CPU, instead of hand-tuned numbers.
 - **Server mode:** submit jobs over HTTP, so any language can use one fleet.
 - **Observability:** a Prometheus endpoint, OpenTelemetry traces per job, and a live fleet dashboard with real data.
 - **Failure evidence:** per-job network log (HAR), console output, and a screenshot on failure.
