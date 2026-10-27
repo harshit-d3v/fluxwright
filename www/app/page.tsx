@@ -62,11 +62,13 @@ const STEPS: { title: string; text: string }[] = [
   },
 ];
 
+// Three runs of the benchmarks workflow on GitHub's ubuntu-latest runner, 27 October 2026.
 const BENCH: { setup: string; flux: [number, number]; pw: [number, number] }[] = [
-  { setup: "5 browsers, 2 pages each", flux: [66, 70], pw: [45, 51] },
-  { setup: "1 browser, 10 pages", flux: [54, 58], pw: [42, 46] },
+  { setup: "1 browser, 10 pages", flux: [34, 40], pw: [27, 34] },
+  { setup: "10 browsers, 2 pages each", flux: [39, 47], pw: [28, 33] },
+  { setup: "1,000 jobs on 4 browsers × 8 pages", flux: [36, 44], pw: [30, 38] },
 ];
-const BENCH_MAX = 80;
+const BENCH_MAX = 50;
 
 const TS_EXAMPLE = `import { chromium } from "fluxwright";
 
@@ -177,7 +179,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.5.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
+              Version 0.6.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
             </p>
           </div>
           <FleetBoard />
@@ -254,8 +256,9 @@ export default function Home() {
             <div className="section-head">
               <h2 id="bench-title">Benchmarks</h2>
               <p>
-                Jobs per second, higher is better. Both tools ran on the same chrome-headless-shell
-                binary, alternating runs, with 10 jobs in flight loading a small local page.
+                Jobs per second, higher is better. Every tool ran on the same chrome-headless-shell
+                binary and loaded a small local page, with the same number of jobs in flight (up to
+                24).
               </p>
             </div>
             <table className="bench">
@@ -288,10 +291,11 @@ export default function Home() {
               </tbody>
             </table>
             <p className="note bench-note">
-              One Windows machine, 30 September 2026. The first Fluxwright run of each series ran
-              cold and slower (30 jobs/s) and is left out of the ranges. On Chrome&apos;s regular
-              headless mode the two were level, at about 13 jobs/s. One machine and one page shape
-              say little about yours, so measure your own workload with{" "}
+              Three runs on GitHub&apos;s ubuntu-latest runner, 27 October 2026, chrome-headless-shell
+              156, no failures. Puppeteer landed between the two in most runs, and its best 1,000-job
+              run (46 jobs/s) beat Fluxwright&apos;s best. A shared cloud machine varies by up to a
+              third from run to run. Run it yourself from the repository&apos;s Actions tab
+              (benchmarks), and measure your own workload with{" "}
               <code>cargo run --release -p fluxwright-benchmarks</code>.
             </p>
           </div>
