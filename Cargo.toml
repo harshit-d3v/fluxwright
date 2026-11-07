@@ -34,7 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 tempfile = "3.13"
-sysinfo = "0.39"
+sysinfo = "0.40"
 bytes = "1.9"
 clap = { version = "4.5", features = ["derive"] }
 axum = "0.8"
