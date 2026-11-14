@@ -64,6 +64,7 @@ class Page:
     def wait_for_download(self, *, timeout: float | None = None) -> Awaitable[Download]:
         """The next download this page finished (ones that finished earlier queue up), within
         ``timeout`` milliseconds (default 30 s)."""
+    def _clear_downloads(self) -> Awaitable[None]: ...
     def close(self) -> Awaitable[None]: ...
     def is_closed(self) -> bool:
         """Whether ``close()`` was called (or is under way)."""

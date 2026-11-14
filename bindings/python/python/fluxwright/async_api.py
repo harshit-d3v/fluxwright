@@ -343,7 +343,9 @@ Listener = Callable[[Any], Any]
 class Page(_native.Page):
     """A browser tab in a fresh browser context, leased from the engine.
 
-    Close it when the job is done; a page you forget is cleaned up when Python collects it.
+    Close it when the job is done, in a ``finally``. A page you drop is freed when Python
+    collects it only while no listener or route handler refers to the page: those stay reachable
+    from the page's pending event streams, so the page and its slot in the pool stay taken.
     """
 
     def __init__(self, lease: _native.Lease) -> None:
@@ -352,9 +354,11 @@ class Page(_native.Page):
         self._route_lock = asyncio.Lock()
         self._listeners: dict[str, list[tuple[Listener, Listener]]] = {}
         self._logging = False
-        self._watching_network = False
+        # Ends once no network listener is left; the next one starts another (see _serve_network).
+        self._network_task: asyncio.Future[Any] | None = None
         self._answering_dialogs = False
         self._tasks: set[asyncio.Future[Any]] = set()
+        self._expects: set[asyncio.Future[Any]] = set()
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
         """Hands matching requests of this page, its popups and iframes to ``handler(route)``
@@ -385,7 +389,9 @@ class Page(_native.Page):
         listeners = self._listeners
 
         def call(arg: Any) -> Any:
-            _remove_listener(listeners, event, handler)
+            # This registration only: an ``on`` of the same handler stays.
+            with suppress(ValueError):
+                listeners[event].remove((handler, call))
             return handler(arg)
 
         self._add_listener("once", event, handler, call)
@@ -404,6 +410,8 @@ class Page(_native.Page):
                 await page.get_by_text("Export").click()
             download = await info.value
         """
+        # Only a download the block starts: drop ones that finished before it.
+        await self._clear_downloads()
         future = asyncio.ensure_future(self.wait_for_download(timeout=timeout))
         try:
             yield EventInfo(future)
@@ -435,9 +443,21 @@ class Page(_native.Page):
         async with self._expect("request", url_or_predicate, timeout) as info:
             yield info
 
+    async def close(self) -> None:
+        """Closes the page and rejects any pending ``expect_*`` waiters."""
+        for future in list(self._expects):
+            if not future.done():
+                future.set_exception(Error("page closed"))
+        self._routes.clear()
+        self._listeners.clear()
+        await super().close()
+
     @asynccontextmanager
     async def _expect(self, event: str, url_or_predicate: Any, timeout: float | None) -> AsyncIterator[EventInfo[Any]]:
+        if self.is_closed():
+            raise Error("page closed")
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._expects.add(future)
         if callable(url_or_predicate):
             matches = url_or_predicate
         else:
@@ -464,6 +484,7 @@ class Page(_native.Page):
             except asyncio.TimeoutError:
                 raise TimeoutError(f"page.expect_{event}: timeout {limit:g}ms exceeded") from None
         finally:
+            self._expects.discard(future)
             self.remove_listener(event, listener)
 
     def _add_listener(self, method: str, event: str, added: Listener, call: Listener) -> None:
@@ -476,17 +497,19 @@ class Page(_native.Page):
         elif event == "dialog" and not self._answering_dialogs:
             _keep(self._tasks, asyncio.ensure_future(_serve_dialogs(self._dialogs(), self._listeners)))
             self._answering_dialogs = True
-        elif event in ("request", "response", "requestfinished", "requestfailed") and not self._watching_network:
-            _keep(self._tasks, asyncio.ensure_future(_serve_network(self._network(), self._listeners, self._tasks)))
-            self._watching_network = True
+        elif event in _NETWORK_EVENTS and (self._network_task is None or self._network_task.done()):
+            self._network_task = asyncio.ensure_future(_serve_network(self._network(), self._listeners, self._tasks))
+            _keep(self._tasks, self._network_task)
         self._listeners.setdefault(event, []).append((added, call))
 
 
-_EVENTS = ("console", "pageerror", "request", "response", "requestfinished", "requestfailed", "dialog")
+_NETWORK_EVENTS = ("request", "response", "requestfinished", "requestfailed")
+_EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog")
 
 
-# The loops below run until the page closes. They hold the page's handlers, never the page, so a
-# page nobody holds is still collected and its slot goes back to the pool.
+# The loops below run until the page closes (the network one also once nobody listens). They hold
+# the page's handlers, never the page, so a page nobody holds is still collected and its slot goes
+# back to the pool, unless a handler itself refers to the page.
 
 
 def _keep(tasks: set[asyncio.Future[Any]], future: asyncio.Future[Any]) -> None:
@@ -536,6 +559,9 @@ async def _serve_network(
     tasks: set[asyncio.Future[Any]],
 ) -> None:
     while (e := await stream.next()) is not None:
+        if not any(listeners.get(name) for name in _NETWORK_EVENTS):
+            # Nobody listens any more: dropping the stream stops the engine tracking requests.
+            return
         response = e.response
         arg = Response(response) if response is not None else Request(e.request, e.failure)
         _emit(listeners, e.event, arg, tasks)
@@ -573,6 +599,7 @@ async def _serve_routes(
 
 async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
     request = Request(native)
+    answered = False
     try:
         for entry in reversed(list(routes)):
             try:
@@ -590,14 +617,17 @@ async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
                     continue
                 if route._answer is not None:
                     await route._answer
+                    answered = True
             except Exception:
                 _log.exception("a route handler failed; the request continues")
             break
     finally:
-        # No answer, or one that failed: let the request through rather than hang the page. A
-        # request already answered refuses this, harmlessly.
-        with suppress(Error):
-            await native.continue_()
+        # No answer, or one that failed: let the request through rather than hang the page. One
+        # that failed after taking the request is refused here, harmlessly (the engine continues
+        # it).
+        if not answered:
+            with suppress(Error):
+                await native.continue_()
 
 
 class Browser:

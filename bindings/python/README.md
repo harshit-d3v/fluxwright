@@ -88,15 +88,28 @@ The sync API runs every call on one event loop in a background thread, so its ob
 | `page.on("request" \| "response" \| "requestfinished" \| "requestfailed", handler)` | Network traffic of the page, its popups and iframes: `Request` (`.url`, `.method`, `.headers`, `.post_data`, `.resource_type`, `.failure`) and `Response` (`.status`, `.ok`, `.headers`, `.request`, `body()`, `text()`, `json()`) |
 | `page.expect_response(url_or_predicate, timeout=None)` / `expect_request` | `with` block: the first match from now on, a glob or regex for the URL or a function of the Response / Request; `info.value` is it. Default timeout 30 s |
 | `page.on("dialog", handler)` | Answer `alert`, `confirm`, `prompt` and `beforeunload` with `dialog.accept(prompt_text)` or `dialog.dismiss()`. Without a listener, or when no listener answers, a dialog is dismissed (`beforeunload` accepted), so the page never hangs |
-| `page.expect_download(timeout=None)` / `page.wait_for_download(timeout=None)` | The next download the page finished: `.url`, `.suggested_filename`, `path()`, `save_as(path)`. Files are deleted when the page closes. `timeout=0` waits as long as it takes |
+| `page.expect_download(timeout=None)` / `page.wait_for_download(timeout=None)` | A finished download: `.url`, `.suggested_filename`, `path()`, `save_as(path)`. `expect_download` waits for one the `with` block starts; `wait_for_download` also returns ones that finished before the call, oldest first. Files are deleted when the page closes. `timeout=0` waits as long as it takes |
 | `page.console_messages()` / `page.page_errors()` | What the page, its popups and iframes logged, and the exceptions nothing caught, the last 1000 of each. Fail a job with `assert await page.page_errors() == []` |
 | `page.set_viewport_size({"width", "height"})` | CSS-pixel viewport for this page |
 | `page.wait_for_selector(selector)` | Waits until visible (Playwright's default state) |
 | `page.close()` / `browser.close()` | Dispose the context / shut down |
 
-Timeouts are in milliseconds, as in Playwright. Errors are `fluxwright.Error`, and `fluxwright.TimeoutError` when something ran out of time. Close pages when a job is done; a page you forget is cleaned up when Python collects it.
+Timeouts are in milliseconds, as in Playwright. Errors are `fluxwright.Error`, and `fluxwright.TimeoutError` when something ran out of time.
 
-In the sync API, route handlers run on worker threads and event listeners one at a time on a thread of their own, so both can call the page.
+Close pages when a job is done, in a `finally`, so a job that raises gives its slot back too:
+
+```python
+page = await browser.new_page()
+try:
+    page.on("response", lambda r: print(page, r.status))
+    await page.goto(url)
+finally:
+    await page.close()
+```
+
+Don't count on garbage collection instead. A page you drop is freed when Python collects it only if no `page.on` listener or `page.route` handler refers to the page, like the lambda above or a method of an object that holds the page: the page's pending event streams keep those handlers, and with them the page, alive, so its slot in the pool is never given back.
+
+In the sync API, route handlers run on worker threads and each page's event listeners one at a time on that page's own thread, so both can call the page.
 
 ## Develop
 
