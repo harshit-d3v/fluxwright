@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +39,10 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(server: impl Into<String>) -> Self {
-        Self { server: server.into(), ..Self::default() }
+        Self {
+            server: server.into(),
+            ..Self::default()
+        }
     }
 
     /// Credentials, answered when the proxy asks (HTTP 407).
@@ -74,6 +77,10 @@ pub struct CdpBrowser {
     /// Blocking and proxy credentials per browser context, so iframes that attach later
     /// get them too.
     setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
+    /// Browser contexts this connection created. On a remote browser (`connect`), targets in
+    /// any other context belong to someone else: attaching prepares their pages and our dialog
+    /// and route handlers then answer theirs.
+    contexts: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CdpBrowser {
@@ -90,16 +97,28 @@ impl CdpBrowser {
                 (conn, Some(url))
             }
             #[cfg(unix)]
-            Transport::Pipe { to_chrome, from_chrome } => {
+            Transport::Pipe {
+                to_chrome,
+                from_chrome,
+            } => {
                 let conn = Connection::from_pipes(to_chrome, from_chrome)?;
                 (conn, None)
             }
         };
         // Over a pipe nothing has waited for Chrome to start yet. A first, cold start on a busy CI
         // machine has taken over 20 s.
-        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(60))
-            .await
-            .map_err(|e| Error::Launch(format!("chromium did not answer on its DevTools connection: {e}")))?;
+        conn.call(
+            "Browser.getVersion",
+            json!({}),
+            None,
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| {
+            Error::Launch(format!(
+                "chromium did not answer on its DevTools connection: {e}"
+            ))
+        })?;
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
             pid: launched.pid,
@@ -109,6 +128,7 @@ impl CdpBrowser {
             _profile: Some(launched.user_data_dir),
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            contexts: Default::default(),
         });
 
         let b = browser.clone();
@@ -140,7 +160,12 @@ impl CdpBrowser {
         let handshake = async {
             browser
                 .conn
-                .call("Target.setDiscoverTargets", json!({ "discover": true }), None, Duration::from_secs(5))
+                .call(
+                    "Target.setDiscoverTargets",
+                    json!({ "discover": true }),
+                    None,
+                    Duration::from_secs(5),
+                )
                 .await?;
             browser
                 .conn
@@ -161,6 +186,7 @@ impl CdpBrowser {
             let _ = browser.kill_process().await;
             return Err(e);
         }
+        spawn_keepalive(browser.conn.clone());
 
         info!(browser_id = %browser.id.0, pid = browser.pid, "browser ready");
         Ok(browser)
@@ -173,9 +199,21 @@ impl CdpBrowser {
     pub async fn connect(endpoint_url: &str) -> Result<Arc<Self>> {
         let ws_url = resolve_ws_endpoint(endpoint_url).await?;
         let conn = Connection::connect(&ws_url).await?;
-        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(30))
+        if let Err(e) = conn
+            .call(
+                "Browser.getVersion",
+                json!({}),
+                None,
+                Duration::from_secs(30),
+            )
             .await
-            .map_err(|e| Error::Launch(format!("remote chromium did not answer on its DevTools connection: {e}")))?;
+        {
+            // A failed handshake must not leave the socket and its tasks running.
+            conn.close();
+            return Err(Error::Launch(format!(
+                "remote chromium did not answer on its DevTools connection: {e}"
+            )));
+        }
 
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
@@ -186,6 +224,7 @@ impl CdpBrowser {
             _profile: None,
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            contexts: Default::default(),
         });
 
         let b = browser.clone();
@@ -226,6 +265,7 @@ impl CdpBrowser {
             browser.conn.close();
             return Err(e);
         }
+        spawn_keepalive(browser.conn.clone());
 
         info!(browser_id = %browser.id.0, "remote browser ready over CDP");
         Ok(browser)
@@ -255,6 +295,12 @@ impl CdpBrowser {
                 let ty = info["type"].as_str().unwrap_or("").to_string();
                 let url = info["url"].as_str().unwrap_or("").to_string();
                 let ctx = info["browserContextId"].as_str().map(|s| s.to_string());
+                // Pages and out-of-process iframes count only in a context this connection
+                // created; anything else on a remote browser belongs to its owner.
+                let ours = match &ctx {
+                    Some(c) => self.contexts.lock().await.contains(c),
+                    None => false,
+                };
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
                 let setup = match &ctx {
                     Some(c) => self.setups.lock().await.get(c).cloned(),
@@ -278,7 +324,7 @@ impl CdpBrowser {
                 // Do not await CDP on this task: it is the only consumer of
                 // attachedToTarget and must stay ahead of createTarget.
                 let waiting = ev.params["waitingForDebugger"].as_bool().unwrap_or(false);
-                if ty != "page" && ty != "iframe" {
+                if (ty != "page" && ty != "iframe") || !ours {
                     // Chrome's own targets (browser_ui, extension workers, background pages)
                     // and workers: nothing drives them, and setup hung on ~1 in 3 browser_ui
                     // sessions. Detach, as Playwright does; resume first in case one is paused.
@@ -287,11 +333,21 @@ impl CdpBrowser {
                         let t = Duration::from_secs(5);
                         if waiting {
                             let _ = conn
-                                .call("Runtime.runIfWaitingForDebugger", json!({}), Some(&session_id), t)
+                                .call(
+                                    "Runtime.runIfWaitingForDebugger",
+                                    json!({}),
+                                    Some(&session_id),
+                                    t,
+                                )
                                 .await;
                         }
                         let _ = conn
-                            .call("Target.detachFromTarget", json!({ "sessionId": session_id }), None, t)
+                            .call(
+                                "Target.detachFromTarget",
+                                json!({ "sessionId": session_id }),
+                                None,
+                                t,
+                            )
                             .await;
                     });
                     return;
@@ -367,31 +423,44 @@ impl CdpBrowser {
             // paused requests) and the rest continue. Answered here, on the loop that sees
             // every session and never lags.
             "Fetch.requestPaused" => {
-                let (Some(sid), Some(id)) = (ev.session_id.clone(), ev.params["requestId"].as_str()) else {
+                let (Some(sid), Some(id)) =
+                    (ev.session_id.clone(), ev.params["requestId"].as_str())
+                else {
                     return;
                 };
                 let setup = self.setup_for_session(&sid).await;
                 // Paused because its type is blocked, or because everything is paused (proxy
                 // credentials, interception). No setup means the context is gone.
                 let ty = ev.params["resourceType"].as_str().unwrap_or("");
-                let block = setup.as_ref().is_none_or(|s| s.types.iter().any(|t| t.as_str() == ty));
+                let block = setup
+                    .as_ref()
+                    .is_none_or(|s| s.types.iter().any(|t| t.as_str() == ty));
                 if !block {
                     if let Some(routes) = setup.as_ref().and_then(|s| s.routes.as_ref()) {
                         // The job answers it; if it can't (gone), dropping it continues it.
-                        if let Some(req) = InterceptedRequest::from_paused(&ev.params, self.conn.clone(), sid.clone()) {
+                        if let Some(req) = InterceptedRequest::from_paused(
+                            &ev.params,
+                            self.conn.clone(),
+                            sid.clone(),
+                        ) {
                             let _ = routes.send(req);
                             return;
                         }
                     }
                 }
                 let (method, params) = if block {
-                    ("Fetch.failRequest", json!({ "requestId": id, "errorReason": "BlockedByClient" }))
+                    (
+                        "Fetch.failRequest",
+                        json!({ "requestId": id, "errorReason": "BlockedByClient" }),
+                    )
                 } else {
                     ("Fetch.continueRequest", json!({ "requestId": id }))
                 };
                 let conn = self.conn.clone();
                 tokio::spawn(async move {
-                    let _ = conn.call(method, params, Some(&sid), Duration::from_secs(5)).await;
+                    let _ = conn
+                        .call(method, params, Some(&sid), Duration::from_secs(5))
+                        .await;
                 });
             }
             // Nothing handles dialogs, and an open one blocks every call on its page until it
@@ -402,7 +471,11 @@ impl CdpBrowser {
                     // The job answers it (page.on('dialog')). A dialog it cannot take is
                     // dropped, which answers it as below.
                     if let Some(tx) = self.setup_for_session(&sid).await.and_then(|s| s.dialogs) {
-                        let _ = tx.send(crate::events::Dialog::new(&ev.params, self.conn.clone(), sid));
+                        let _ = tx.send(crate::events::Dialog::new(
+                            &ev.params,
+                            self.conn.clone(),
+                            sid,
+                        ));
                         return;
                     }
                     let accept = ev.params["type"] == "beforeunload";
@@ -423,9 +496,10 @@ impl CdpBrowser {
             // Proxy credentials. A second challenge for the same request means they were
             // rejected: cancel, or Chrome and the proxy loop forever.
             "Fetch.authRequired" => {
-                let (Some(sid), Some(id)) =
-                    (ev.session_id.clone(), ev.params["requestId"].as_str().map(String::from))
-                else {
+                let (Some(sid), Some(id)) = (
+                    ev.session_id.clone(),
+                    ev.params["requestId"].as_str().map(String::from),
+                ) else {
                     return;
                 };
                 let ctx = self.context_of_session(&sid).await;
@@ -485,20 +559,36 @@ impl CdpBrowser {
             }
         }
         let res = self
-            .call("Target.createBrowserContext", params, None, Duration::from_secs(10))
+            .call(
+                "Target.createBrowserContext",
+                params,
+                None,
+                Duration::from_secs(10),
+            )
             .await?;
         let id = res["browserContextId"]
             .as_str()
             .ok_or_else(|| Error::Other("createBrowserContext: no id".into()))?
             .to_string();
-        if let Some(Proxy { username: Some(user), password, .. }) = proxy {
-            self.setups.lock().await.entry(id.clone()).or_default().proxy_auth =
-                Some((user.clone(), password.clone().unwrap_or_default()));
+        self.contexts.lock().await.insert(id.clone());
+        if let Some(Proxy {
+            username: Some(user),
+            password,
+            ..
+        }) = proxy
+        {
+            self.setups
+                .lock()
+                .await
+                .entry(id.clone())
+                .or_default()
+                .proxy_auth = Some((user.clone(), password.clone().unwrap_or_default()));
         }
         Ok(ContextId(id))
     }
 
     pub async fn dispose_context(&self, id: &ContextId) -> Result<()> {
+        self.contexts.lock().await.remove(&id.0);
         self.setups.lock().await.remove(&id.0);
         let _ = self
             .call(
@@ -592,11 +682,18 @@ impl CdpBrowser {
         targets: &Mutex<HashMap<String, TargetState>>,
         target_id: &str,
     ) -> Option<String> {
-        targets.lock().await.get(target_id).and_then(|t| t.session_id.clone())
+        targets
+            .lock()
+            .await
+            .get(target_id)
+            .and_then(|t| t.session_id.clone())
     }
 
     /// Sessions of every target in a browser context.
-    pub(crate) async fn sessions_in_context(targets: &Mutex<HashMap<String, TargetState>>, context: &str) -> Vec<String> {
+    pub(crate) async fn sessions_in_context(
+        targets: &Mutex<HashMap<String, TargetState>>,
+        context: &str,
+    ) -> Vec<String> {
         targets
             .lock()
             .await
@@ -605,7 +702,6 @@ impl CdpBrowser {
             .filter_map(|t| t.session_id.clone())
             .collect()
     }
-
 
     /// A launched browser is closed and its process ended. A remote one is left running for its
     /// owner: only this connection to it ends, which also disposes of the contexts it created.
@@ -660,27 +756,64 @@ impl CdpBrowser {
     }
 }
 
+/// A browser that stops answering without dropping the socket (a hung renderer host, a broken
+/// network link to a remote browser) used to fail every job with a timeout and keep its socket
+/// forever. `Browser.getVersion` is cheap and browser-wide; ten silent seconds means dead.
+fn spawn_keepalive(conn: Arc<Connection>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            if conn.is_dead() {
+                break;
+            }
+            match conn
+                .call(
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "cdp keepalive failed; marking the connection dead");
+                    conn.mark_dead();
+                    conn.close();
+                    break;
+                }
+            }
+        }
+    });
+}
+
 fn parse_host_port(host_port: &str) -> Result<(&str, u16)> {
     if let Some(rest) = host_port.strip_prefix('[') {
-        let (host, after) = rest
-            .split_once(']')
-            .ok_or_else(|| Error::Launch(format!("unclosed IPv6 bracket in CDP endpoint: {host_port}")))?;
+        let (host, after) = rest.split_once(']').ok_or_else(|| {
+            Error::Launch(format!(
+                "unclosed IPv6 bracket in CDP endpoint: {host_port}"
+            ))
+        })?;
         if host.is_empty() {
-            return Err(Error::Launch(format!("empty host in CDP endpoint: {host_port}")));
+            return Err(Error::Launch(format!(
+                "empty host in CDP endpoint: {host_port}"
+            )));
         }
         if after.is_empty() {
             return Ok((host, 80));
         }
-        let port_str = after
-            .strip_prefix(':')
-            .ok_or_else(|| Error::Launch(format!("invalid host:port in CDP endpoint: {host_port}")))?;
+        let port_str = after.strip_prefix(':').ok_or_else(|| {
+            Error::Launch(format!("invalid host:port in CDP endpoint: {host_port}"))
+        })?;
         let port = port_str
             .parse::<u16>()
             .map_err(|_| Error::Launch(format!("invalid port in CDP endpoint: {host_port}")))?;
         Ok((host, port))
     } else if let Some((host, port_str)) = host_port.split_once(':') {
         if host.is_empty() {
-            return Err(Error::Launch(format!("empty host in CDP endpoint: {host_port}")));
+            return Err(Error::Launch(format!(
+                "empty host in CDP endpoint: {host_port}"
+            )));
         }
         let port = port_str
             .parse::<u16>()
@@ -699,24 +832,30 @@ async fn resolve_ws_endpoint(endpoint: &str) -> Result<String> {
         return Ok(endpoint.to_string());
     }
     if let Some(rest) = endpoint.strip_prefix("http://") {
+        // The authority ends at the first `/`, `?` or `#`; a query string or trailing slash
+        // before /json/version is tolerated.
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
         let (host_port, path) = match rest.split_once('/') {
-            Some((hp, p)) => (hp, format!("/{p}")),
-            None => (rest, "/json/version".to_string()),
+            Some((hp, p)) => (hp, format!("/{}", p.trim_matches('/'))),
+            None => (rest, String::new()),
         };
-        let path = if path == "/" || path.is_empty() {
+        let path = if path.is_empty() || path == "/json/version" {
             "/json/version".to_string()
-        } else if !path.ends_with("/json/version") {
-            format!("{}/json/version", path.trim_end_matches('/'))
         } else {
-            path
+            format!("{}/json/version", path.trim_end_matches('/'))
         };
         let (host, port) = parse_host_port(host_port)?;
         return tokio::time::timeout(Duration::from_secs(10), async {
             let mut stream = tokio::net::TcpStream::connect((host, port))
                 .await
-                .map_err(|e| Error::Launch(format!("failed to connect to CDP endpoint at {host}:{port}: {e}")))?;
+                .map_err(|e| {
+                    Error::Launch(format!(
+                        "failed to connect to CDP endpoint at {host}:{port}: {e}"
+                    ))
+                })?;
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
             stream
                 .write_all(req.as_bytes())
                 .await
@@ -768,7 +907,10 @@ async fn prepare_session(
             calls.extend(e.calls(ty == "page"));
         }
         for source in &setup.init_scripts {
-            calls.push(("Page.addScriptToEvaluateOnNewDocument", json!({ "source": source })));
+            calls.push((
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": source }),
+            ));
         }
         if let Some(params) = fetch_params(&setup) {
             calls.push(("Fetch.enable", params));
@@ -802,8 +944,14 @@ fn check_prepare_results(
         if let Err(e) = res {
             warn!(%session_id, method, error = %e, "prepare_session command failed");
             // Emulation command rejections on secondary iframe targets are non-fatal unless
-            // transport/session itself failed.
-            let fatal = !method.starts_with("Emulation.") || !matches!(e, Error::Command { .. });
+            // transport/session itself failed. A slow answer is not a dead session either,
+            // except where the session cannot work without it: interception and the
+            // debugger release.
+            let fatal = if e.is_timeout() {
+                matches!(method, "Fetch.enable" | "Runtime.runIfWaitingForDebugger")
+            } else {
+                !method.starts_with("Emulation.") || !matches!(e, Error::Command { .. })
+            };
             if fatal && failure.is_none() {
                 failure = Some(e);
             }
@@ -838,18 +986,29 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(weak.upgrade().is_none(), "the closed browser is still alive");
-        assert!(!dir.exists(), "profile folder left behind: {}", dir.display());
+        assert!(
+            weak.upgrade().is_none(),
+            "the closed browser is still alive"
+        );
+        assert!(
+            !dir.exists(),
+            "profile folder left behind: {}",
+            dir.display()
+        );
     }
 
     #[tokio::test]
     async fn resolve_ws_endpoint_handles_schemes() {
         assert_eq!(
-            resolve_ws_endpoint("ws://127.0.0.1:9222/devtools/browser/1").await.unwrap(),
+            resolve_ws_endpoint("ws://127.0.0.1:9222/devtools/browser/1")
+                .await
+                .unwrap(),
             "ws://127.0.0.1:9222/devtools/browser/1"
         );
         assert_eq!(
-            resolve_ws_endpoint("wss://secure.cdp.example/devtools/browser/2").await.unwrap(),
+            resolve_ws_endpoint("wss://secure.cdp.example/devtools/browser/2")
+                .await
+                .unwrap(),
             "wss://secure.cdp.example/devtools/browser/2"
         );
         assert!(resolve_ws_endpoint("ftp://invalid").await.is_err());
@@ -871,7 +1030,8 @@ mod tests {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let mut buf = [0u8; 256];
                     let _ = stream.read(&mut buf).await;
-                    let body = r#"{"webSocketDebuggerUrl":"ws://[::1]:9222/devtools/browser/ipv6"}"#;
+                    let body =
+                        r#"{"webSocketDebuggerUrl":"ws://[::1]:9222/devtools/browser/ipv6"}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
                         body.len(),
@@ -880,7 +1040,9 @@ mod tests {
                     let _ = stream.write_all(resp.as_bytes()).await;
                 }
             });
-            let ws = resolve_ws_endpoint(&format!("http://[::1]:{port}")).await.unwrap();
+            let ws = resolve_ws_endpoint(&format!("http://[::1]:{port}"))
+                .await
+                .unwrap();
             assert_eq!(ws, "ws://[::1]:9222/devtools/browser/ipv6");
         }
     }
@@ -914,6 +1076,7 @@ mod tests {
             _profile: None,
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            contexts: Default::default(),
         };
 
         assert!(browser.is_remote());
@@ -962,7 +1125,9 @@ mod tests {
             }
         });
 
-        let browser = CdpBrowser::connect(&format!("ws://{addr}")).await.expect("connect");
+        let browser = CdpBrowser::connect(&format!("ws://{addr}"))
+            .await
+            .expect("connect");
         let weak = Arc::downgrade(&browser);
         browser.close().await.unwrap();
         drop(browser);
@@ -972,7 +1137,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(weak.upgrade().is_none(), "the closed remote browser is still alive");
+        assert!(
+            weak.upgrade().is_none(),
+            "the closed remote browser is still alive"
+        );
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .expect("the socket was never closed")
@@ -1002,6 +1170,7 @@ mod tests {
             _profile: None,
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            contexts: Default::default(),
         });
         let b = browser.clone();
         let mut sub = conn.subscribe_unbounded();
@@ -1022,7 +1191,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(weak.upgrade().is_none(), "remote browser leaked after start_kill");
+        assert!(
+            weak.upgrade().is_none(),
+            "remote browser leaked after start_kill"
+        );
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .expect("start_kill never closed the remote socket")

@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod metrics;
+pub mod netguard;
 mod pool;
 mod process;
 mod source;

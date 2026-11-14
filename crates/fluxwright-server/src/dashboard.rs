@@ -462,7 +462,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
         document.getElementById('val-active-leases').textContent = fleet.active_leases != null ? fleet.active_leases : 0;
         document.getElementById('val-contexts').textContent = (fleet.contexts != null ? fleet.contexts : 0) + ' contexts open';
-        document.getElementById('val-queued').textContent = (srv.queued_jobs || 0) + (fleet.queued_requests || 0);
+        document.getElementById('val-queued').textContent = srv.queued_jobs || 0;
         document.getElementById('val-pool-waiting').textContent = (fleet.queued_requests || 0) + ' in engine pool';
         document.getElementById('val-browsers').textContent = fleet.browsers != null ? fleet.browsers : 0;
         document.getElementById('val-pages').textContent = (fleet.pages != null ? fleet.pages : 0) + ' pages allocated';

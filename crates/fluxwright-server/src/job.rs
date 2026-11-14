@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use fluxwright::{JobOptions, PageLease, Priority, WaitUntil};
+use fluxwright::{netguard, JobOptions, PageLease, Priority, WaitUntil};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -59,6 +59,11 @@ impl JobRequest {
             match step {
                 Step::Goto { url, .. } if !web_url(url) => {
                     return Err("goto accepts only http://, https://, or about:blank URLs".into());
+                }
+                Step::Goto { url, .. } if netguard::url_allowed(url).is_err() => {
+                    return Err(
+                        "goto url is not allowed (link-local and non-web URLs are blocked)".into(),
+                    );
                 }
                 Step::Click { selector }
                 | Step::Fill { selector, .. }

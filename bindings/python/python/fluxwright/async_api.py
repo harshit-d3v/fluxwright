@@ -559,9 +559,6 @@ async def _serve_network(
     tasks: set[asyncio.Future[Any]],
 ) -> None:
     while (e := await stream.next()) is not None:
-        if not any(listeners.get(name) for name in _NETWORK_EVENTS):
-            # Nobody listens any more: dropping the stream stops the engine tracking requests.
-            return
         response = e.response
         arg = Response(response) if response is not None else Request(e.request, e.failure)
         _emit(listeners, e.event, arg, tasks)

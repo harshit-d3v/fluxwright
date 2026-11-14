@@ -99,7 +99,10 @@ impl Connection {
 
     /// `--remote-debugging-pipe`: NUL-separated JSON over two pipes.
     #[cfg(unix)]
-    pub fn from_pipes(to_chrome: std::os::fd::OwnedFd, from_chrome: std::os::fd::OwnedFd) -> Result<Arc<Self>> {
+    pub fn from_pipes(
+        to_chrome: std::os::fd::OwnedFd,
+        from_chrome: std::os::fd::OwnedFd,
+    ) -> Result<Arc<Self>> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::unix::pipe;
 
@@ -225,10 +228,30 @@ impl Connection {
 
     /// Marks the connection dead and ends its transport, so its reader stops and everything
     /// subscribed is told and let go. For a remote browser this is the only thing that ends
-    /// the connection: nothing kills a process on the other end.
+    /// the connection: nothing kills a process on the other end. If the peer never answers the
+    /// close (a hung browser behind a live socket), pending calls are failed and subscribers
+    /// told after 5 s anyway, so nothing waits forever on a dead link.
     pub fn close(&self) {
         self.mark_dead();
         let _ = self.tx.send(Outgoing::Close);
+        let pending = self.pending.clone();
+        let watchers = self.watchers.clone();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            fail_all(&pending, Error::WebSocket("connection closed".into())).await;
+            let ev = Arc::new(CdpEvent {
+                method: "Fluxwright.disconnected".into(),
+                params: json!({}),
+                session_id: None,
+            });
+            let mut watchers = watchers.lock().unwrap();
+            for tx in watchers.drain(..) {
+                let _ = tx.send(ev.clone());
+            }
+        });
     }
 }
 
@@ -288,7 +311,11 @@ fn fanout(watchers: &Watchers, ev: CdpEvent) {
         .retain(|tx| tx.send(ev.clone()).is_ok());
 }
 
-async fn dispatch(text: &str, pending: &Mutex<HashMap<u64, Pending>>, watchers: &Watchers) -> Result<()> {
+async fn dispatch(
+    text: &str,
+    pending: &Mutex<HashMap<u64, Pending>>,
+    watchers: &Watchers,
+) -> Result<()> {
     let msg: Incoming = match serde_json::from_str(text) {
         Ok(msg) => msg,
         Err(e) => match replace_lone_surrogates(text) {
@@ -389,9 +416,15 @@ mod tests {
     #[test]
     fn lone_surrogates_become_replacement_characters() {
         let case = |input: &str| fix(&json(input));
-        assert_eq!(case(r#"{"a":"%ude00 hi"}"#), Some(json(r#"{"a":"%ufffd hi"}"#)));
+        assert_eq!(
+            case(r#"{"a":"%ude00 hi"}"#),
+            Some(json(r#"{"a":"%ufffd hi"}"#))
+        );
         assert_eq!(case(r#"{"a":"x%ud83d"}"#), Some(json(r#"{"a":"x%ufffd"}"#)));
-        assert_eq!(case(r#"{"a":"%ud83d%u0041"}"#), Some(json(r#"{"a":"%ufffd%u0041"}"#)));
+        assert_eq!(
+            case(r#"{"a":"%ud83d%u0041"}"#),
+            Some(json(r#"{"a":"%ufffd%u0041"}"#))
+        );
         // A valid pair, an escaped backslash and plain text are left alone.
         assert_eq!(case(r#"{"a":"%ud83d%ude00"}"#), None);
         assert_eq!(case(r#"{"a":"%%ud83d é"}"#), None);
@@ -402,6 +435,9 @@ mod tests {
 
     #[test]
     fn tls_connector_builds_without_a_process_default_provider() {
-        assert!(matches!(super::tls_connector(), tokio_tungstenite::Connector::Rustls(_)));
+        assert!(matches!(
+            super::tls_connector(),
+            tokio_tungstenite::Connector::Rustls(_)
+        ));
     }
 }

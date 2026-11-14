@@ -3,13 +3,16 @@
 //! This crate does not claim to be faster or lighter than Playwright, Puppeteer,
 //! or any other tool. See `docs/COMPETITIVE_ANALYSIS.md`.
 
+pub use fluxwright_core::netguard;
 pub use fluxwright_core::{
-    BrowserInfo, BrowserSource, Downloads, Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, FrameLocator, JobOptions,
-    LocalChromium, Locator, MetricsSnapshot, PageLease, Priority, QueueFullMode, RemoteCdp, Result,
+    BrowserInfo, BrowserSource, Downloads, Engine as BrowserEngine, EngineBuilder, EngineConfig,
+    Error, FrameLocator, JobOptions, LocalChromium, Locator, MetricsSnapshot, PageLease, Priority,
+    QueueFullMode, RemoteCdp, Result,
 };
 
 pub use fluxwright_cdp::{
-    find_browser, find_chrome, sweep_stale_profiles, BoundingBox, ColorScheme, ConsoleMessage, Cookie, Dialog, Download, Emulation,
-    Fulfill, Geolocation, InterceptedRequest, LaunchOptions, LogEntry, NetEvent, NetRequest, NetResponse, OriginStorage, Overrides,
-    PageError, Proxy, ResourceType, Selector, StorageItem, StorageState, WaitUntil,
+    find_browser, find_chrome, sweep_stale_profiles, BoundingBox, ColorScheme, ConsoleMessage,
+    Cookie, Dialog, Download, Emulation, Fulfill, Geolocation, InterceptedRequest, LaunchOptions,
+    LogEntry, NetEvent, NetRequest, NetResponse, OriginStorage, Overrides, PageError, Proxy,
+    ResourceType, Selector, StorageItem, StorageState, WaitUntil,
 };

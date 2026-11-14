@@ -439,10 +439,9 @@ async fn submit(
         HeaderValue::from_str(&format!("/v1/jobs/{id}")).expect("UUID is a valid header"),
     );
     if let Ok(tp_val) = HeaderValue::from_str(&outbound_tp) {
-        response.headers_mut().insert(
-            header::HeaderName::from_static("traceparent"),
-            tp_val,
-        );
+        response
+            .headers_mut()
+            .insert(header::HeaderName::from_static("traceparent"), tp_val);
     }
     Ok(response)
 }
@@ -495,6 +494,13 @@ async fn execute(
                     let mut net_rx = page.subscribe_network();
                     let mut log_rx = page.subscribe_logs();
                     let mut accumulator = EvidenceAccumulator::new();
+
+                    // SSRF guard: a job must not reach link-local hosts (cloud metadata)
+                    // through a goto, redirect or subresource. FLUXWRIGHT_SERVER_ANY_URL=1
+                    // turns it off for trusted workloads.
+                    if std::env::var_os("FLUXWRIGHT_SERVER_ANY_URL").is_none() {
+                        fluxwright::netguard::guard_requests(&page).await?;
+                    }
 
                     let mut results = Vec::with_capacity(steps.len());
                     let mut bytes = 2;
@@ -552,7 +558,7 @@ async fn execute(
 
                         match outcome {
                             Ok(result) => {
-                                bytes += serde_json::to_vec(&result).expect("Value is JSON").len()
+                                bytes += json_len(&result)
                                     + usize::from(index > 0);
                                 if bytes > MAX_RESULT_BYTES {
                                     run_error = Some(fluxwright::Error::Other(
@@ -618,6 +624,23 @@ async fn execute(
     };
 
     execution.instrument(job_span).await
+}
+
+/// Serialized length of a JSON value without materializing it.
+fn json_len(value: &Value) -> usize {
+    struct Tally(usize);
+    impl std::io::Write for Tally {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut tally = Tally(0);
+    serde_json::to_writer(&mut tally, value).expect("Value is JSON");
+    tally.0
 }
 
 fn drain_evidence(
@@ -732,13 +755,21 @@ impl EvidenceAccumulator {
             .console_messages()
             .into_iter()
             .map(|msg| (msg.kind, msg.text))
-            .chain(page.page_errors().into_iter().map(|err| ("error".to_string(), format_page_error(&err))));
+            .chain(
+                page.page_errors()
+                    .into_iter()
+                    .map(|err| ("error".to_string(), format_page_error(&err))),
+            );
         for (kind, text) in logged {
             if self.console_full() {
                 break;
             }
             let text = job::truncate_bytes(&text, MAX_CONSOLE_TEXT_BYTES);
-            if !self.console.iter().any(|c| c.kind == kind && c.text == text) {
+            if !self
+                .console
+                .iter()
+                .any(|c| c.kind == kind && c.text == text)
+            {
                 self.console.push(ConsoleEntry { kind, text });
             }
         }

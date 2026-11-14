@@ -212,6 +212,23 @@ oversized bodies **413**, full capacity **429**, and shutdown admission **503**.
 failure is a retained job with `status: "failed"`, not an HTTP error on submission or polling.
 Responses include `Cache-Control: no-store`; there is no cross-origin browser access (CORS).
 
+### Reaching internal networks (SSRF)
+
+Jobs cannot navigate to link-local, loopback or private addresses: `goto` URLs are checked at
+submission, and every request the page makes — redirects and subresources included — is resolved
+and aborted when its host answers with a blocked address. `FLUXWRIGHT_SERVER_ANY_URL=1` disables
+this for trusted workloads.
+
+A DNS check alone can be beaten by **DNS rebinding**: a name can resolve to a safe address when
+Fluxwright checks it and to the metadata address when Chrome connects. Block these ranges at the
+network level too:
+
+- **AWS:** require IMDSv2 with a hop limit of 1 on the instance metadata service, and/or add a
+  security-group/NACL or host firewall rule dropping `169.254.169.254` and `fd00:ec2::254`.
+- **GCP/Azure:** firewall or route rules dropping `169.254.169.254` and `169.254.169.253`.
+- **Any host:** an egress firewall rule for link-local (`169.254.0.0/16`, `fe80::/10`) and private
+  ranges when jobs should only reach the public internet.
+
 ## Observability
 
 ### Prometheus metrics (`GET /metrics`)
@@ -274,7 +291,7 @@ The server supports the W3C TraceContext `traceparent` header to propagate distr
 - **Incoming headers**: Clients can pass a standard W3C `traceparent` header (format `00-<trace_id>-<parent_id>-<flags>`) when submitting a job (`POST /v1/jobs`).
 - **Trace propagation**: If a valid `traceparent` is provided, the server preserves the 32-hex `trace_id` and records the parent span ID. If missing or invalid, a fresh high-entropy 16-byte hex trace ID and 8-byte hex root span ID are generated automatically.
 - **Response headers & payload**: The `POST /v1/jobs` response returns an outbound `traceparent` header (e.g. `00-<trace_id>-<root_span_id>-01`), and the `trace_id` is included in the `Job` JSON object (`trace_id`).
-- **Spans**: Jobs and steps are instrumented with OpenTelemetry-compliant tracing spans:
+- **Spans**: Jobs and steps are instrumented with OpenTelemetry-*named* spans emitted through the `tracing` crate (so any tracing subscriber, including `RUST_LOG` output, sees them; there is no OTLP/OpenTelemetry SDK exporter yet):
   - `fluxwright.job`: Wraps the entire job lifecycle with fields `otel.name`, `trace_id`, `span_id`, `parent_span_id`, `job.id`, `job.priority`, `job.timeout_ms`, and `job.retries`.
   - `fluxwright.step`: Wraps each step execution on the page with fields `otel.name`, `trace_id`, `job.id`, `step.index`, and `step.action`.
 
