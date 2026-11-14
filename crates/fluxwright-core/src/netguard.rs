@@ -2,7 +2,9 @@
 //! (the cloud metadata service hands out instance credentials) and `file:` pages. Shared by
 //! the MCP server and the HTTP server; each caller picks its own opt-out env var.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex};
 
 use fluxwright_cdp::InterceptedRequest;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -45,20 +47,27 @@ pub fn request_blocked(url: &str) -> bool {
 /// Every request the page makes (subresources, redirects, navigations a script or click
 /// starts) is checked against the host rules, on the URL as Chrome parsed it: nothing the
 /// job's steps can slip past through a parser difference, a redirect or `evaluate`.
-/// shortcut: a hostname that resolves to a link-local address is not caught.
 pub async fn guard_requests(page: &PageLease) -> Result<()> {
-    let mut requests = page.intercept().await?;
+    let requests = page.intercept().await?;
     tokio::spawn(serve_guarded(requests));
     Ok(())
 }
 
+/// Per-host DNS verdicts, kept for the life of the page.
+type Verdicts = Arc<Mutex<HashMap<String, bool>>>;
+
 async fn serve_guarded(mut requests: UnboundedReceiver<InterceptedRequest>) {
+    let verdicts = Verdicts::default();
     while let Some(req) = requests.recv().await {
-        if request_blocked(&req.url) || resolves_to_blocked(&req.url).await {
-            tracing::warn!(url = %req.url, "blocked a request to a link-local or internal host");
-            let _ = req.abort("blockedbyclient").await;
-        }
-        // Any other request is dropped here, which lets it through.
+        // One task per request: a slow DNS answer for one host holds up no other request.
+        let verdicts = verdicts.clone();
+        tokio::spawn(async move {
+            if request_blocked(&req.url) || resolves_to_blocked(&req.url, &verdicts).await {
+                tracing::warn!(url = %req.url, "blocked a request to a link-local host");
+                let _ = req.abort("blockedbyclient").await;
+            }
+            // Any other request is dropped here, which lets it through.
+        });
     }
 }
 
@@ -74,41 +83,41 @@ fn url_host(url: &str) -> Option<String> {
     Some(host.trim_end_matches('.').to_ascii_lowercase())
 }
 
-/// Whether the URL's host resolves to an address a job must not reach: link-local, loopback
-/// or private. Catches names that `request_blocked`'s literal check misses; a DNS answer can
-/// still change between this check and Chrome's own connect (rebinding), so deployments
-/// should also block these ranges at the network level — see docs/SERVER.md.
-async fn resolves_to_blocked(url: &str) -> bool {
+/// Whether the URL's host resolves to a link-local address. Catches names that
+/// `request_blocked`'s literal check misses; a DNS answer can still change between this check
+/// and Chrome's own connect (rebinding), so deployments should also block these ranges at the
+/// network level — see docs/SERVER.md.
+async fn resolves_to_blocked(url: &str, verdicts: &Verdicts) -> bool {
     let Some(scheme) = url.split("://").next() else {
         return false;
     };
     if !matches!(scheme, "http" | "https" | "ws" | "wss") {
         return false;
     }
-    let Some(host) = url_host(url) else {
+    let Some(host) = url_host(url).filter(|h| !h.is_empty()) else {
         return false;
     };
-    if host.is_empty() {
-        return false;
+    if let Some(&blocked) = verdicts.lock().unwrap().get(&host) {
+        return blocked;
     }
-    let Ok(addrs) = tokio::net::lookup_host((host.as_str(), 80)).await else {
-        // Unresolvable here does not mean unreachable for Chrome; only a proven bad
-        // answer blocks.
-        return false;
+    // Unresolvable here does not mean unreachable for Chrome; only a proven bad answer blocks.
+    let blocked = match tokio::net::lookup_host((host.as_str(), 80)).await {
+        Ok(mut addrs) => addrs.any(|addr| addr_is_blocked(addr.ip())),
+        Err(_) => false,
     };
-    addrs.any(|addr| addr_is_blocked(addr.ip()))
+    verdicts.lock().unwrap().insert(host, blocked);
+    blocked
 }
 
-fn addr_is_blocked(ip: std::net::IpAddr) -> bool {
+/// Link-local (which holds the cloud metadata service) and AWS's IPv6 metadata address.
+/// Loopback and private ranges stay reachable: local fixtures and intranet pages are real jobs.
+fn addr_is_blocked(ip: IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_loopback() || v4.is_private(),
-        std::net::IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_link_local() || v4.is_loopback() || v4.is_private();
-            }
-            v6.is_loopback()
-                || (v6.segments()[0] & 0xffc0 == 0xfe80) // link-local fe80::/10
-                || (v6.segments()[0] & 0xfe00 == 0xfc00) // unique local fc00::/7
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.segments()[0] & 0xffc0 == 0xfe80 // fe80::/10
+                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254) // AWS IMDS over IPv6
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
         }
     }
 }
@@ -135,12 +144,8 @@ fn host_blocked(after_scheme: &str) -> bool {
         return true;
     }
     match host.parse::<Ipv6Addr>() {
-        Ok(v6) => {
-            v6.segments()[0] & 0xffc0 == 0xfe80
-                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254) // AWS IMDS over IPv6
-                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
-        }
-        Err(_) => ipv4_host(host).is_some_and(|v4| v4.is_link_local()),
+        Ok(v6) => addr_is_blocked(v6.into()),
+        Err(_) => ipv4_host(host).is_some_and(|v4| addr_is_blocked(v4.into())),
     }
 }
 
@@ -205,6 +210,29 @@ mod tests {
         ] {
             assert!(!request_blocked(url), "{url}");
             assert!(url_allowed(url).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn resolved_addresses_block_link_local_only() {
+        for ip in [
+            "169.254.169.254",
+            "fe80::1",
+            "fd00:ec2::254",
+            "::ffff:169.254.1.1",
+        ] {
+            assert!(addr_is_blocked(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "::1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "fc00::1",
+            "fd00::1",
+            "8.8.8.8",
+        ] {
+            assert!(!addr_is_blocked(ip.parse().unwrap()), "{ip}");
         }
     }
 }

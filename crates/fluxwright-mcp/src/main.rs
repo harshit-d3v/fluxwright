@@ -396,6 +396,39 @@ mod tests {
         engine.shutdown(Duration::from_secs(5)).await.unwrap();
     }
 
+    /// Only link-local hosts are blocked: a local fixture on 127.0.0.1 loads with the guard on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guarded_pages_load_loopback_hosts() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let _ = stream.read(&mut [0u8; 2048]);
+                let body = "<title>local</title>";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let engine = BrowserEngine::builder()
+            .max_browsers(1)
+            .build()
+            .await
+            .unwrap();
+        let page = engine.acquire().await.unwrap();
+        guard_requests(&page).await.unwrap();
+        page.goto(&url).await.unwrap();
+        assert_eq!(page.title().await.unwrap(), "local");
+        drop(page);
+        engine.shutdown(Duration::from_secs(5)).await.unwrap();
+    }
+
     #[test]
     fn truncate_respects_utf8_char_boundary() {
         assert_eq!(truncate("ok".into(), 5), "ok");

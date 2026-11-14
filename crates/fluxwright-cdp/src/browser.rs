@@ -186,7 +186,6 @@ impl CdpBrowser {
             let _ = browser.kill_process().await;
             return Err(e);
         }
-        spawn_keepalive(browser.conn.clone());
 
         info!(browser_id = %browser.id.0, pid = browser.pid, "browser ready");
         Ok(browser)
@@ -832,9 +831,10 @@ async fn resolve_ws_endpoint(endpoint: &str) -> Result<String> {
         return Ok(endpoint.to_string());
     }
     if let Some(rest) = endpoint.strip_prefix("http://") {
-        // The authority ends at the first `/`, `?` or `#`; a query string or trailing slash
-        // before /json/version is tolerated.
-        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        // The authority ends at the first `/`, `?` or `#`. A query string (an auth token)
+        // goes along to /json/version; a trailing slash before it is tolerated.
+        let rest = rest.split('#').next().unwrap_or(rest);
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
         let (host_port, path) = match rest.split_once('/') {
             Some((hp, p)) => (hp, format!("/{}", p.trim_matches('/'))),
             None => (rest, String::new()),
@@ -843,6 +843,11 @@ async fn resolve_ws_endpoint(endpoint: &str) -> Result<String> {
             "/json/version".to_string()
         } else {
             format!("{}/json/version", path.trim_end_matches('/'))
+        };
+        let path = if query.is_empty() {
+            path
+        } else {
+            format!("{path}?{query}")
         };
         let (host, port) = parse_host_port(host_port)?;
         return tokio::time::timeout(Duration::from_secs(10), async {
@@ -1045,6 +1050,97 @@ mod tests {
                 .unwrap();
             assert_eq!(ws, "ws://[::1]:9222/devtools/browser/ipv6");
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_ws_endpoint_keeps_the_query_string() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).await.unwrap();
+            let body = r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/q"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK
+Content-Length: {}
+
+{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let ws = resolve_ws_endpoint(&format!("http://127.0.0.1:{port}/?token=x"))
+            .await
+            .unwrap();
+        assert_eq!(ws, "ws://127.0.0.1:9222/devtools/browser/q");
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("GET /json/version?token=x HTTP/1.1"),
+            "{request}"
+        );
+    }
+
+    /// A page in a context this connection did not create (someone else's tab on a shared
+    /// remote browser) is detached and left alone: no domains enabled, no debugger resume.
+    #[tokio::test]
+    async fn foreign_targets_are_only_detached() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                let reply = json!({ "id": msg["id"], "result": {} }).to_string();
+                ws.send(Message::Text(reply.into())).await.unwrap();
+                if msg["method"] == "Target.setAutoAttach" && msg.get("sessionId").is_none() {
+                    let event = json!({
+                        "method": "Target.attachedToTarget",
+                        "params": {
+                            "sessionId": "FOREIGN",
+                            "waitingForDebugger": false,
+                            "targetInfo": {
+                                "targetId": "T1",
+                                "type": "page",
+                                "url": "https://example.com/",
+                                "browserContextId": "someone-else",
+                            },
+                        },
+                    });
+                    ws.send(Message::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                let _ = msg_tx.send(msg);
+            }
+        });
+
+        let browser = CdpBrowser::connect(&format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let mut about_foreign = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, msg_rx.recv()).await {
+            if msg["sessionId"] == "FOREIGN" || msg["params"]["sessionId"] == "FOREIGN" {
+                about_foreign.push(msg["method"].clone());
+            }
+        }
+        assert_eq!(about_foreign, vec![json!("Target.detachFromTarget")]);
+        browser.close().await.unwrap();
+    }
+
+    #[test]
+    fn prepare_results_timeouts_are_fatal_only_where_the_session_needs_them() {
+        let slow = |m: &'static str| (m, Err(Error::timeout(m, 5_000)));
+        assert!(check_prepare_results("s1", vec![slow("Page.enable")]).is_ok());
+        assert!(check_prepare_results("s1", vec![slow("Fetch.enable")]).is_err());
     }
 
     #[tokio::test]
