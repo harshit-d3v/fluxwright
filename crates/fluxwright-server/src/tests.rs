@@ -176,6 +176,21 @@ async fn requires_auth_before_parsing_jobs_and_protects_results_and_stats() {
             .status(),
         StatusCode::OK
     );
+    // The scheme is case-insensitive.
+    for scheme in ["bearer", "BEARER"] {
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stats")
+                    .header(header::AUTHORIZATION, format!("{scheme} {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{scheme}");
+    }
     server.shutdown(Duration::ZERO).await.unwrap();
 }
 
@@ -655,4 +670,136 @@ async fn query_tokens_are_refused_everywhere() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
     }
     srv.shutdown(Duration::ZERO).await.unwrap();
+}
+
+fn counts(server: &HttpServer) -> (u64, u64, u64) {
+    let reg = server.inner.registry.lock().unwrap();
+    (reg.succeeded_jobs, reg.failed_jobs, reg.cancelled_jobs)
+}
+
+#[tokio::test]
+async fn a_worker_panic_is_recorded_as_a_failure() {
+    let server = server(2).await;
+    let job = submit_job(&server).await;
+    let panicked = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
+    finish_job(&server.inner, job.id, Err(panicked));
+    let job: Job = serde_json::from_value(
+        body(
+            call(
+                &server,
+                "GET",
+                &format!("/v1/jobs/{}", job.id),
+                Body::empty(),
+            )
+            .await,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert_eq!(job.error.as_deref(), Some("job worker panicked"));
+    assert!(job.finished_at.is_some());
+    assert_eq!(counts(&server), (0, 1, 0));
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+/// A job cancelled as its result arrives is counted once, as cancelled.
+#[tokio::test]
+async fn cancel_and_completion_count_each_job_once() {
+    let server = server(2).await;
+    let job = submit_job(&server).await;
+    let path = format!("/v1/jobs/{}", job.id);
+    for _ in 0..2 {
+        assert_eq!(
+            call(&server, "DELETE", &path, Body::empty()).await.status(),
+            StatusCode::OK
+        );
+    }
+    finish_job(&server.inner, job.id, Ok(Ok(vec![json!("late")])));
+    assert_eq!(
+        body(call(&server, "GET", &path, Body::empty()).await).await["status"],
+        "cancelled"
+    );
+    assert_eq!(counts(&server), (0, 0, 1));
+
+    // And a finished job is counted once, however often its outcome is reported.
+    let done = submit_job(&server).await;
+    finish_job(&server.inner, done.id, Ok(Ok(vec![])));
+    finish_job(&server.inner, done.id, Ok(Ok(vec![])));
+    assert_eq!(
+        call(
+            &server,
+            "DELETE",
+            &format!("/v1/jobs/{}", done.id),
+            Body::empty()
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(counts(&server), (1, 0, 1));
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+/// Room is made from the oldest finished jobs only; running and queued ones stay, wherever
+/// they sit in the list.
+#[test]
+fn eviction_keeps_active_jobs() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let record = |status| {
+        let active = !matches!(
+            status,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+        );
+        Record {
+            job: Job {
+                id: Uuid::new_v4(),
+                status,
+                submitted_at: 0,
+                started_at: None,
+                finished_at: None,
+                attempts: 0,
+                step_index: None,
+                results: None,
+                error: None,
+                trace_id: None,
+                failure_evidence: None,
+            },
+            abort: active.then(|| tokio::spawn(std::future::pending::<()>()).abort_handle()),
+        }
+    };
+    let mut registry = Registry {
+        accepting: true,
+        jobs: VecDeque::from([
+            record(JobStatus::Running),
+            record(JobStatus::Succeeded),
+            record(JobStatus::Queued),
+            record(JobStatus::Failed),
+            record(JobStatus::Running),
+        ]),
+        succeeded_jobs: 0,
+        failed_jobs: 0,
+        cancelled_jobs: 0,
+    };
+    assert!(registry.make_room(4));
+    let left: Vec<JobStatus> = registry.jobs.iter().map(|r| r.job.status).collect();
+    assert_eq!(
+        left,
+        [
+            JobStatus::Running,
+            JobStatus::Queued,
+            JobStatus::Failed,
+            JobStatus::Running
+        ]
+    );
+    assert!(registry.make_room(3));
+    let left: Vec<JobStatus> = registry.jobs.iter().map(|r| r.job.status).collect();
+    assert_eq!(
+        left,
+        [JobStatus::Running, JobStatus::Queued, JobStatus::Running]
+    );
+    // Only active jobs left: no room, and none of them evicted.
+    assert!(!registry.make_room(3));
+    assert_eq!(registry.jobs.len(), 3);
 }

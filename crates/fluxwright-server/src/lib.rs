@@ -280,8 +280,10 @@ async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next
     let valid = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "))
-        .is_some_and(|supplied| same_token(supplied, &inner.token));
+        // RFC 9110: the auth scheme is case-insensitive.
+        .and_then(|value| value.as_bytes().split_at_checked(7))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(b"Bearer "))
+        .is_some_and(|(_, supplied)| same_token(supplied, &inner.token));
 
     if !valid {
         let mut response = ApiError::new(
@@ -390,47 +392,9 @@ async fn submit(
     // cancelled task to actually drop its lease. Its Weak reference does not keep a discarded server alive.
     tokio::spawn(async move {
         let outcome = task.await;
-        let Some(inner) = weak.upgrade() else { return };
-        let mut registry = inner.registry.lock().unwrap();
-        let Some(record) = registry.find_mut(id) else {
-            return;
-        };
-        record.abort = None;
-        if record.job.status.terminal() {
-            return; // Cancellation wins over a result arriving at the same instant.
+        if let Some(inner) = weak.upgrade() {
+            finish_job(&inner, id, outcome);
         }
-        record.job.finished_at = Some(now_ms());
-        let final_status = match outcome {
-            Ok(Ok(results)) => {
-                record.job.status = JobStatus::Succeeded;
-                record.job.results = Some(results);
-                JobStatus::Succeeded
-            }
-            Ok(Err(error)) => {
-                record.job.status = JobStatus::Failed;
-                record.job.error = Some(bounded_error(&error.to_string()));
-                JobStatus::Failed
-            }
-            Err(error) => {
-                record.job.status = JobStatus::Failed;
-                record.job.error = Some(
-                    if error.is_panic() {
-                        "job worker panicked"
-                    } else {
-                        "job worker stopped"
-                    }
-                    .into(),
-                );
-                JobStatus::Failed
-            }
-        };
-        // Record is no longer borrowed, so counters can be updated safely
-        match final_status {
-            JobStatus::Succeeded => registry.succeeded_jobs += 1,
-            JobStatus::Failed => registry.failed_jobs += 1,
-            _ => {}
-        }
-        tracing::info!(job_id = %id, status = ?final_status, "HTTP job finished");
     });
 
     let mut response = (StatusCode::ACCEPTED, Json(job)).into_response();
@@ -444,6 +408,50 @@ async fn submit(
             .insert(header::HeaderName::from_static("traceparent"), tp_val);
     }
     Ok(response)
+}
+
+/// Records how a job's worker ended, and counts it, unless the job already ended (a cancel).
+fn finish_job(
+    inner: &Inner,
+    id: Uuid,
+    outcome: Result<fluxwright::Result<Vec<Value>>, tokio::task::JoinError>,
+) {
+    let mut registry = inner.registry.lock().unwrap();
+    let Some(record) = registry.find_mut(id) else {
+        return;
+    };
+    record.abort = None;
+    if record.job.status.terminal() {
+        return; // Cancellation wins over a result arriving at the same instant.
+    }
+    record.job.finished_at = Some(now_ms());
+    match outcome {
+        Ok(Ok(results)) => {
+            record.job.status = JobStatus::Succeeded;
+            record.job.results = Some(results);
+        }
+        Ok(Err(error)) => {
+            record.job.status = JobStatus::Failed;
+            record.job.error = Some(bounded_error(&error.to_string()));
+        }
+        Err(error) => {
+            record.job.status = JobStatus::Failed;
+            record.job.error = Some(
+                if error.is_panic() {
+                    "job worker panicked"
+                } else {
+                    "job worker stopped"
+                }
+                .into(),
+            );
+        }
+    }
+    let status = record.job.status;
+    match status {
+        JobStatus::Succeeded => registry.succeeded_jobs += 1,
+        _ => registry.failed_jobs += 1,
+    }
+    tracing::info!(job_id = %id, ?status, "HTTP job finished");
 }
 
 async fn execute(
@@ -656,7 +664,7 @@ fn drain_evidence(
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct EvidenceAccumulator {
     console: Vec<ConsoleEntry>,
     network: Vec<NetworkEntry>,

@@ -190,7 +190,7 @@ impl Step {
                 } else {
                     page.screenshot().await?
                 };
-                if bytes.len() > MAX_RESULT_BYTES / 4 * 3 {
+                if bytes.len() > MAX_SCREENSHOT_BYTES {
                     return Err(fluxwright::Error::Other(
                         "screenshot exceeds the result limit".into(),
                     ));
@@ -261,18 +261,6 @@ pub struct NetworkEntry {
     pub resource_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
-}
-
-impl NetworkEntry {
-    pub fn new(url: impl Into<String>, method: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            method: method.into(),
-            status: None,
-            resource_type: None,
-            failure: None,
-        }
-    }
 }
 
 /// Diagnostic failure evidence collected for a job.

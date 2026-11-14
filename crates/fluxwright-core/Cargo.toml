@@ -16,5 +16,9 @@ tracing.workspace = true
 uuid.workspace = true
 sysinfo.workspace = true
 
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

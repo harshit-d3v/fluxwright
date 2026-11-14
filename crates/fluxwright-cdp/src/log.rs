@@ -134,6 +134,11 @@ fn insert_bounded<K: Eq + std::hash::Hash + Clone, V>(
         if order.len() >= KEEP * 2 {
             order.retain(|k| map.contains_key(k));
         }
+        // A key removed from the map and inserted again (a redirect reuses its request id)
+        // still has its old place: drop it, or evicting that copy would evict the new entry.
+        if let Some(stale) = order.iter().position(|k| k == &key) {
+            order.remove(stale);
+        }
         order.push_back(key.clone());
     }
     map.insert(key, val);
@@ -221,6 +226,15 @@ pub(crate) async fn collect(
             }
             "Page.frameAttached" if ours => {
                 frames.insert(str_of("frameId"));
+            }
+            // A "swap" moves the frame to its own process: it comes back as a target.
+            "Page.frameDetached" if ours && e.params["reason"] != "swap" => {
+                frames.remove(&str_of("frameId"));
+            }
+            "Target.detachedFromTarget" => {
+                if sessions.remove(&str_of("sessionId")) {
+                    frames.remove(&str_of("targetId"));
+                }
             }
             "Browser.downloadWillBegin" if browser_wide && frames.contains(&str_of("frameId")) => {
                 insert_bounded(
@@ -353,6 +367,17 @@ mod tests {
         let e = page_error(&json!({ "exception": { "subtype": "error",
             "description": format!("Error: {}", "x".repeat(10 * MAX_TEXT)) } }));
         assert!(e.stack.len() <= MAX_TEXT + 3 && e.message.len() <= MAX_TEXT + 3);
+    }
+
+    #[test]
+    fn reinserted_keys_keep_one_place_in_order() {
+        let (mut map, mut order) = (HashMap::new(), VecDeque::new());
+        insert_bounded(&mut map, &mut order, "a", 1);
+        map.remove("a");
+        insert_bounded(&mut map, &mut order, "a", 2);
+        insert_bounded(&mut map, &mut order, "a", 3);
+        assert_eq!(order, ["a"]);
+        assert_eq!(map["a"], 3);
     }
 
     #[tokio::test]

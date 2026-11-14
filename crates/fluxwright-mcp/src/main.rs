@@ -1,7 +1,6 @@
 //! Fluxwright MCP server (stdio). Claude Desktop, Codex, and Cursor spawn this
 //! process and call tools to drive a Chromium fleet.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -119,6 +118,18 @@ fn internal(e: impl std::fmt::Display) -> McpError {
 /// FLUXWRIGHT_MCP_ANY_URL lifts the URL rules below.
 fn any_url() -> bool {
     std::env::var_os("FLUXWRIGHT_MCP_ANY_URL").is_some()
+}
+
+fn check_url(url: &str) -> Result<(), McpError> {
+    if any_url() {
+        return Ok(());
+    }
+    netguard::url_allowed(url).map_err(|why| {
+        McpError::invalid_params(
+            format!("{why}: {url} (FLUXWRIGHT_MCP_ANY_URL=1 allows any URL)"),
+            None,
+        )
+    })
 }
 
 /// `text` cut to at most `max` bytes on a character boundary (a byte cut panicked inside a
@@ -277,7 +288,10 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
+    use netguard::guard_requests;
 
     #[test]
     fn the_agent_opens_web_pages_only() {

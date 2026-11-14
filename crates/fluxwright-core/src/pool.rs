@@ -46,7 +46,7 @@ impl State {
     /// Browsers that count toward `max_browsers`: those that can still take a lease. A draining
     /// or dead one is on its way out, so its replacement may start at once; counting it stopped
     /// the whole pool (with one browser) until its last job ended. The memory ceiling still
-    /// gates every new lease.
+    /// gates every new launch.
     fn serving(&self) -> usize {
         self.browsers
             .iter()
@@ -489,14 +489,15 @@ impl Inner {
                 return Ok(false);
             }
         }
+        // Over the memory ceiling no new browser starts; one already running still takes work.
         let ceiling = self.config.memory_ceiling_mb * 1024 * 1024;
-        if ceiling > 0 {
+        let over_ceiling = ceiling > 0 && {
             let tree = self.browser_tree_rss().await;
             if tree > ceiling {
-                debug!(tree, ceiling, "rss ceiling hit");
-                return Ok(false);
+                debug!(tree, ceiling, "rss ceiling hit: no new launches");
             }
-        }
+            tree > ceiling
+        };
         let permit = match self.grants.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => return Ok(false),
@@ -508,7 +509,7 @@ impl Inner {
             }
             drop_abandoned(&mut st.queue);
             let idx = st.next_reusable_browser(self.config.max_contexts_per_browser);
-            if idx.is_none() && !st.can_launch_for_queue(&self.config) {
+            if idx.is_none() && (over_ceiling || !st.can_launch_for_queue(&self.config)) {
                 return Ok(false);
             }
             let Some(waiter) = pick_waiter(&mut st.queue) else {
@@ -1566,6 +1567,77 @@ mod tests {
         for h in waiters {
             assert!(matches!(h.await.unwrap(), Err(Error::ShuttingDown)));
         }
+    }
+
+    /// Over the ceiling a running browser with room is still used; only launches stop.
+    #[tokio::test]
+    async fn memory_ceiling_still_reuses_running_browsers() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        // A stand-in remote browser: answers every command with an empty result.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, mut seen) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let msg: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let _ = seen_tx.send(msg["method"].as_str().unwrap_or("").to_string());
+                let reply = serde_json::json!({ "id": msg["id"], "result": {} }).to_string();
+                if ws.send(Message::Text(reply.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let browser = CdpBrowser::connect(&format!("ws://{addr}")).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(4)
+            .max_contexts_per_browser(8)
+            .memory_ceiling_mb(1)
+            .source(Arc::new(HoldSource {
+                calls: calls.clone(),
+                started: tx,
+                release: Arc::new(Notify::new()),
+            }))
+            .build()
+            .await
+            .unwrap();
+        *eng.inner.rss_cache.lock().await = (
+            Some(Instant::now()),
+            HashMap::from([(1, 100 * 1024 * 1024)]),
+        );
+        eng.inner.state.lock().await.browsers.push(Slot {
+            browser,
+            active: 0,
+            jobs_served: 0,
+            started: Instant::now(),
+            last_used: Instant::now(),
+            draining: false,
+            crashed: false,
+        });
+
+        // The stand-in cannot make a context, so the lease fails: what counts is that it was
+        // tried on the running browser instead of waiting in the queue.
+        let res = tokio::time::timeout(Duration::from_secs(5), eng.acquire())
+            .await
+            .expect("the request waited instead of reusing the running browser");
+        assert!(res.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let mut methods = Vec::new();
+        while let Ok(m) = seen.try_recv() {
+            methods.push(m);
+        }
+        assert!(
+            methods.iter().any(|m| m == "Target.createBrowserContext"),
+            "{methods:?}"
+        );
+        eng.shutdown(Duration::from_millis(10)).await.unwrap();
     }
 
     #[tokio::test]
