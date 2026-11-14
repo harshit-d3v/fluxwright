@@ -99,6 +99,38 @@ jobs:
           VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop
           "$bin/python" -m pytest -q tests
 
+  # The image builds, and `fluxwright serve` in it runs a job end to end (against a loopback
+  # page, which the SSRF guard must let through).
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t fluxwright .
+      - name: Run one job through fluxwright serve
+        run: |
+          token=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+          mkdir site && echo '<title>docker-ok</title>' > site/index.html
+          python3 -m http.server 8000 --bind 127.0.0.1 --directory site &
+          docker run -d --name fw --network host --shm-size=1g \
+            -e FLUXWRIGHT_SERVER_TOKEN="$token" -e FLUXWRIGHT_NO_SANDBOX=1 \
+            fluxwright serve --listen 127.0.0.1:7331
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:7331/healthz && break; sleep 1; done
+          auth="Authorization: Bearer $token"
+          id=$(curl -fsS -H "$auth" -H 'Content-Type: application/json' \
+            -d '{"steps":[{"action":"goto","url":"http://127.0.0.1:8000/"},{"action":"title"}]}' \
+            http://127.0.0.1:7331/v1/jobs | jq -r .id)
+          for _ in $(seq 90); do
+            job=$(curl -fsS -H "$auth" "http://127.0.0.1:7331/v1/jobs/$id")
+            case $(jq -r .status <<<"$job") in succeeded|failed|cancelled) break ;; esac
+            sleep 1
+          done
+          jq . <<<"$job"
+          test "$(jq -r '.results[1]' <<<"$job")" = docker-ok
+      - if: always()
+        run: docker logs fw || true
+
   site:
     name: website
     runs-on: ubuntu-latest
