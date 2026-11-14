@@ -462,11 +462,13 @@ name = "fluxwright-core"
 version = "0.1.0"
 dependencies = [
  "fluxwright-cdp",
+ "futures-util",
  "serde",
  "serde_json",
  "sysinfo",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
