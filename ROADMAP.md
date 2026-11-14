@@ -22,11 +22,13 @@ The goal is to be the best engine for running many browser jobs on your own mach
 
 ## Next: the fleet at scale
 
-- **Server mode:** submit jobs over HTTP, so any language can use one fleet.
-- **Observability:** a Prometheus endpoint, OpenTelemetry traces per job, and a live fleet dashboard with real data.
-- **Failure evidence:** per-job network log (HAR), console output, and a screenshot on failure.
-- **Bring your own browsers:** `connectOverCDP` to use browsers you already run or rent.
-- **Docker image** with Chrome and Fluxwright.
+Implement these milestones in order, verifying each before starting the next:
+
+1. [x] **Server mode:** `fluxwright serve` exposes authenticated HTTP job submission, status/results, cancellation, bounded admission/output, priorities and total deadlines. Protocol and browser-backed tests verified. See [docs/SERVER.md](docs/SERVER.md).
+2. [x] **Observability:** a Prometheus endpoint, OpenTelemetry traces per job, and a live fleet dashboard with real data.
+3. [x] **Failure evidence:** per-job network log (HAR), console output, and a screenshot on failure.
+4. [x] **Bring your own browsers:** `connectOverCDP` to use browsers you already run or rent.
+5. [x] **Docker image** with Chrome and Fluxwright.
 
 ## Later: many machines
 
