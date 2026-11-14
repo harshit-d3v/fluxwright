@@ -102,10 +102,10 @@ async fn resolves_to_blocked(url: &str, verdicts: &Verdicts) -> bool {
     }
     // Unresolvable here does not mean unreachable for Chrome; only a proven bad answer blocks.
     // A failed lookup is not cached: the next request for the host asks again.
-    let Ok(mut addrs) = tokio::net::lookup_host((host.as_str(), 80)).await else {
-        return false;
+    let blocked = match tokio::net::lookup_host((host.as_str(), 80)).await {
+        Ok(mut addrs) => addrs.any(|addr| addr_is_blocked(addr.ip())),
+        Err(_) => return false,
     };
-    let blocked = addrs.any(|addr| addr_is_blocked(addr.ip()));
     verdicts.lock().unwrap().insert(host, blocked);
     blocked
 }
