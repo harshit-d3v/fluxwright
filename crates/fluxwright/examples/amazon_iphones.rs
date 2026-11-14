@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("Chrome will open. Searching {host} for iPhone 13–18…\n");
-    println!("{:<10}  {:<12}  {}", "model", "price", "title");
+    println!("{:<10}  {:<12}  title", "model", "price");
     println!("{}", "-".repeat(88));
 
     for model in 13u32..=18 {
@@ -123,7 +123,7 @@ fn urlencoding_lite(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
-            b' ' => out.push_str("+"),
+            b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

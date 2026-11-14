@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
@@ -36,16 +36,21 @@ struct Pending {
     tx: oneshot::Sender<Result<Value>>,
 }
 
+/// Every subscriber of a connection, each handed a pointer to the same parsed event.
+type Watchers = std::sync::Mutex<Vec<mpsc::UnboundedSender<Arc<CdpEvent>>>>;
+
 pub struct Connection {
     next_id: AtomicU64,
     tx: mpsc::UnboundedSender<Outgoing>,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
-    watchers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>>,
+    watchers: Arc<Watchers>,
     dead: Arc<AtomicBool>,
 }
 
 enum Outgoing {
     Json(String),
+    /// Ends the transport: a WebSocket close handshake, or the pipe's write end.
+    Close,
 }
 
 impl Connection {
@@ -57,14 +62,20 @@ impl Connection {
         let config = WebSocketConfig::default()
             .max_message_size(limit)
             .max_frame_size(limit);
-        let (ws, _) = connect_async_with_config(ws_url, Some(config), true)
+        let connector = ws_url.starts_with("wss://").then(tls_connector);
+        let (ws, _) = connect_async_tls_with_config(ws_url, Some(config), true, connector)
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();
         let (conn, mut out_rx, inbound) = Self::open();
 
         tokio::spawn(async move {
-            while let Some(Outgoing::Json(s)) = out_rx.recv().await {
+            while let Some(out) = out_rx.recv().await {
+                let Outgoing::Json(s) = out else {
+                    // The peer answers the close, which ends the reader below.
+                    let _ = sink.close().await;
+                    break;
+                };
                 if sink.send(Message::Text(s.into())).await.is_err() {
                     break;
                 }
@@ -97,6 +108,7 @@ impl Connection {
         let (conn, mut out_rx, inbound) = Self::open();
 
         tokio::spawn(async move {
+            // Close ends the loop and drops the write end.
             while let Some(Outgoing::Json(s)) = out_rx.recv().await {
                 let mut msg = s.into_bytes();
                 msg.push(0);
@@ -154,8 +166,9 @@ impl Connection {
     }
 
     /// Never-lagging event stream for the browser session state machine. Ends when the
-    /// connection does (at once if it already has).
-    pub fn subscribe_unbounded(&self) -> mpsc::UnboundedReceiver<CdpEvent> {
+    /// connection does (at once if it already has). Every subscriber shares one copy of each
+    /// event: a browser's pages each subscribe, and a deep copy per page cost pages² work.
+    pub fn subscribe_unbounded(&self) -> mpsc::UnboundedReceiver<Arc<CdpEvent>> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut watchers = self.watchers.lock().unwrap();
         // Checked under the lock `closed` clears the list with, so no sender outlives it.
@@ -209,12 +222,36 @@ impl Connection {
     pub fn mark_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
     }
+
+    /// Marks the connection dead and ends its transport, so its reader stops and everything
+    /// subscribed is told and let go. For a remote browser this is the only thing that ends
+    /// the connection: nothing kills a process on the other end.
+    pub fn close(&self) {
+        self.mark_dead();
+        let _ = self.tx.send(Outgoing::Close);
+    }
+}
+
+/// TLS for `wss://` remote browsers. The provider is explicit: `ClientConfig::builder()` needs a
+/// process-wide default that the app embedding this library may never install.
+fn tls_connector() -> Connector {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default TLS versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Connector::Rustls(Arc::new(config))
 }
 
 /// The reader's half of a connection, whatever the transport.
 struct Inbound {
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
-    watchers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>>,
+    watchers: Arc<Watchers>,
     dead: Arc<AtomicBool>,
 }
 
@@ -231,11 +268,11 @@ impl Inbound {
     async fn closed(&self) {
         self.dead.store(true, Ordering::SeqCst);
         fail_all(&self.pending, Error::WebSocket("connection closed".into())).await;
-        let ev = CdpEvent {
+        let ev = Arc::new(CdpEvent {
             method: "Fluxwright.disconnected".into(),
             params: json!({}),
             session_id: None,
-        };
+        });
         let mut watchers = self.watchers.lock().unwrap();
         for tx in watchers.drain(..) {
             let _ = tx.send(ev.clone());
@@ -243,21 +280,15 @@ impl Inbound {
     }
 }
 
-fn fanout(
-    watchers: &std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>,
-    ev: CdpEvent,
-) {
+fn fanout(watchers: &Watchers, ev: CdpEvent) {
+    let ev = Arc::new(ev);
     watchers
         .lock()
         .unwrap()
         .retain(|tx| tx.send(ev.clone()).is_ok());
 }
 
-async fn dispatch(
-    text: &str,
-    pending: &Mutex<HashMap<u64, Pending>>,
-    watchers: &std::sync::Mutex<Vec<mpsc::UnboundedSender<CdpEvent>>>,
-) -> Result<()> {
+async fn dispatch(text: &str, pending: &Mutex<HashMap<u64, Pending>>, watchers: &Watchers) -> Result<()> {
     let msg: Incoming = match serde_json::from_str(text) {
         Ok(msg) => msg,
         Err(e) => match replace_lone_surrogates(text) {
@@ -367,5 +398,10 @@ mod tests {
         let fixed = case(r#"{"result":{"value":"%ude00 tail"}}"#).unwrap();
         let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
         assert_eq!(v["result"]["value"], "\u{FFFD} tail");
+    }
+
+    #[test]
+    fn tls_connector_builds_without_a_process_default_provider() {
+        assert!(matches!(super::tls_connector(), tokio_tungstenite::Connector::Rustls(_)));
     }
 }

@@ -2,17 +2,12 @@ use std::time::Duration;
 
 use fluxwright_cdp::{ColorScheme, Emulation, Geolocation, LaunchOptions, Proxy, StorageState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Priority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +23,6 @@ pub struct EngineConfig {
     pub min_browsers: usize,
     pub max_browsers: usize,
     pub max_contexts_per_browser: usize,
-    pub max_pages_per_context: usize,
     pub memory_ceiling_mb: u64,
     pub idle_timeout: Option<Duration>,
     pub recycle_after_jobs: Option<u64>,
@@ -86,7 +80,6 @@ impl Default for EngineConfig {
             min_browsers: 0,
             max_browsers,
             max_contexts_per_browser: 8,
-            max_pages_per_context: 1,
             memory_ceiling_mb,
             idle_timeout: Some(Duration::from_secs(300)),
             recycle_after_jobs: Some(100),
@@ -110,6 +103,8 @@ impl Default for EngineConfig {
 pub struct JobOptions {
     pub priority: Priority,
     pub timeout: Option<Duration>,
+    /// Runs after a browser died mid-job (see `Error::is_retryable`). A job that timed out is
+    /// not run again: it may already have clicked or submitted something.
     pub retries: u32,
     pub block_images: bool,
     pub block_fonts: bool,

@@ -16,6 +16,23 @@ use crate::events::{BodySource, Loaded, NetEvent, NetRequest, NetResponse};
 /// Per kind; older entries are dropped first.
 const KEEP: usize = 1000;
 
+/// Longest console text or error kept, in bytes. A page logging megabyte strings in a loop
+/// otherwise made each page hold a gigabyte (KEEP of them) and every listener's queue grow.
+const MAX_TEXT: usize = 16 * 1024;
+
+/// `s` cut to [`MAX_TEXT`] bytes on a character boundary, marked with `…` when cut.
+fn capped(mut s: String) -> String {
+    if s.len() > MAX_TEXT {
+        let mut cut = MAX_TEXT;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+        s.push('…');
+    }
+    s
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConsoleMessage {
     /// `log`, `error`, `warning`, `info`, `debug`, ..., as Playwright's `type()` reports them.
@@ -103,6 +120,25 @@ fn keep<T>(q: &mut VecDeque<T>, v: T) {
     q.push_back(v);
 }
 
+fn insert_bounded<K: Eq + std::hash::Hash + Clone, V>(
+    map: &mut HashMap<K, V>,
+    order: &mut VecDeque<K>,
+    key: K,
+    val: V,
+) {
+    if !map.contains_key(&key) {
+        while map.len() >= KEEP {
+            let Some(old) = order.pop_front() else { break };
+            map.remove(&old);
+        }
+        if order.len() >= KEEP * 2 {
+            order.retain(|k| map.contains_key(k));
+        }
+        order.push_back(key.clone());
+    }
+    map.insert(key, val);
+}
+
 /// How a console argument reads: strings as they are, other values as Chrome describes them.
 fn arg_text(o: &Value) -> String {
     match o.get("value") {
@@ -119,11 +155,13 @@ fn arg_text(o: &Value) -> String {
 
 fn page_error(details: &Value) -> PageError {
     let ex = &details["exception"];
-    let stack = ex["description"]
-        .as_str()
-        .map(str::to_owned)
-        .or_else(|| ex.get("value").map(|_| arg_text(ex)))
-        .unwrap_or_else(|| details["text"].as_str().unwrap_or("Uncaught").to_string());
+    let stack = capped(
+        ex["description"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| ex.get("value").map(|_| arg_text(ex)))
+            .unwrap_or_else(|| details["text"].as_str().unwrap_or("Uncaught").to_string()),
+    );
     if ex["subtype"] != "error" {
         return PageError { name: String::new(), message: stack.clone(), stack };
     }
@@ -152,7 +190,7 @@ pub(crate) struct Watch {
 /// the page and every session that later attaches in its context (popups, iframes in other
 /// processes).
 pub(crate) async fn collect(
-    mut events: UnboundedReceiver<CdpEvent>,
+    mut events: UnboundedReceiver<Arc<CdpEvent>>,
     watch: Watch,
     log: Arc<Mutex<PageLog>>,
     downloads: UnboundedSender<DownloadResult>,
@@ -163,9 +201,11 @@ pub(crate) async fn collect(
     // Download events are browser-wide; the frame that started one tells whose it is.
     let mut frames = HashSet::from([watch.main_frame]);
     let mut started: HashMap<String, (String, String)> = HashMap::new();
+    let mut started_order: VecDeque<String> = VecDeque::new();
     // Requests in flight, by session and request id, with the sender that marks their body
     // loaded once a response arrived.
     let mut requests: InFlight = HashMap::new();
+    let mut request_order: VecDeque<(String, String)> = VecDeque::new();
     while let Some(e) = events.recv().await {
         let ours = e.session_id.as_ref().is_some_and(|s| sessions.contains(s));
         let browser_wide = e.session_id.is_none();
@@ -183,7 +223,12 @@ pub(crate) async fn collect(
                 frames.insert(str_of("frameId"));
             }
             "Browser.downloadWillBegin" if browser_wide && frames.contains(&str_of("frameId")) => {
-                started.insert(str_of("guid"), (str_of("url"), str_of("suggestedFilename")));
+                insert_bounded(
+                    &mut started,
+                    &mut started_order,
+                    str_of("guid"),
+                    (str_of("url"), str_of("suggestedFilename")),
+                );
             }
             "Browser.downloadProgress" if browser_wide => match e.params["state"].as_str() {
                 Some("completed") => {
@@ -203,7 +248,7 @@ pub(crate) async fn collect(
                 let text = e.params["args"].as_array().map(|a| a.iter().map(arg_text).collect::<Vec<_>>().join(" "));
                 let msg = ConsoleMessage {
                     kind: e.params["type"].as_str().unwrap_or("log").to_string(),
-                    text: text.unwrap_or_default(),
+                    text: capped(text.unwrap_or_default()),
                 };
                 let mut log = log.lock().unwrap();
                 log.tell(LogEntry::Console(msg.clone()));
@@ -231,7 +276,7 @@ pub(crate) async fn collect(
                             }
                         }
                         let req = NetRequest::from_sent(&e.params);
-                        requests.insert(key, (req.clone(), None));
+                        insert_bounded(&mut requests, &mut request_order, key, (req.clone(), None));
                         log.tell_net(NetEvent::Request(req));
                     }
                     "Network.responseReceived" => {
@@ -297,5 +342,104 @@ mod tests {
         assert_eq!((e.name.as_str(), e.message.as_str()), ("TypeError", "x is not a function"));
         let thrown = page_error(&json!({ "exception": { "type": "string", "value": "boom" } }));
         assert_eq!((thrown.name.as_str(), thrown.message.as_str()), ("", "boom"));
+    }
+
+    #[test]
+    fn huge_console_text_and_errors_are_capped() {
+        // 3-byte characters: the cut lands mid-character and must step back.
+        let cut = capped("€".repeat(MAX_TEXT));
+        assert!(cut.len() <= MAX_TEXT + '…'.len_utf8() && cut.ends_with('…'), "{}", cut.len());
+        assert_eq!(capped("short".into()), "short");
+        let e = page_error(&json!({ "exception": { "subtype": "error",
+            "description": format!("Error: {}", "x".repeat(10 * MAX_TEXT)) } }));
+        assert!(e.stack.len() <= MAX_TEXT + 3 && e.message.len() <= MAX_TEXT + 3);
+    }
+
+    #[tokio::test]
+    async fn collect_caps_in_flight_requests_and_started_at_keep() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = tokio_tungstenite::accept_async(stream).await;
+            }
+        });
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = Arc::new(Mutex::new(PageLog::default()));
+        let mut net_rx = log.lock().unwrap().subscribe_network();
+        let (dl_tx, mut dl_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let watch = Watch {
+            session: "s1".into(),
+            main_frame: "f1".into(),
+            context: "c1".into(),
+            download_dir: PathBuf::from("downloads"),
+        };
+        let handle = tokio::spawn(collect(events_rx, watch, log, dl_tx, conn));
+
+        for i in 0..(KEEP + 5) {
+            events_tx
+                .send(Arc::new(CdpEvent {
+                    method: "Network.requestWillBeSent".into(),
+                    params: json!({
+                        "requestId": format!("req-{i}"),
+                        "request": { "url": format!("https://example.test/{i}"), "method": "GET", "headers": {} },
+                        "type": "Fetch"
+                    }),
+                    session_id: Some("s1".into()),
+                }))
+                .unwrap();
+            events_tx
+                .send(Arc::new(CdpEvent {
+                    method: "Browser.downloadWillBegin".into(),
+                    params: json!({
+                        "frameId": "f1",
+                        "guid": format!("dl-{i}"),
+                        "url": format!("https://example.test/dl/{i}"),
+                        "suggestedFilename": format!("file-{i}.bin")
+                    }),
+                    session_id: None,
+                }))
+                .unwrap();
+        }
+
+        // req-0 and dl-0 were evicted once 1005 entries arrived; req-5 and dl-5 are the oldest kept.
+        for id in ["req-0", "req-5"] {
+            events_tx
+                .send(Arc::new(CdpEvent {
+                    method: "Network.loadingFinished".into(),
+                    params: json!({ "requestId": id }),
+                    session_id: Some("s1".into()),
+                }))
+                .unwrap();
+        }
+        for guid in ["dl-0", "dl-5"] {
+            events_tx
+                .send(Arc::new(CdpEvent {
+                    method: "Browser.downloadProgress".into(),
+                    params: json!({ "guid": guid, "state": "completed" }),
+                    session_id: None,
+                }))
+                .unwrap();
+        }
+
+        drop(events_tx);
+        handle.await.unwrap();
+
+        let mut finished_urls = Vec::new();
+        while let Ok(ev) = net_rx.try_recv() {
+            if let NetEvent::Finished(req) = ev {
+                finished_urls.push(req.url);
+            }
+        }
+        assert_eq!(finished_urls, vec!["https://example.test/5"]);
+
+        let mut finished_downloads = Vec::new();
+        while let Ok(Ok(dl)) = dl_rx.try_recv() {
+            finished_downloads.push(dl.suggested_filename);
+        }
+        assert_eq!(finished_downloads, vec!["file-5.bin"]);
     }
 }

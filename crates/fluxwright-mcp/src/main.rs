@@ -162,7 +162,7 @@ fn url_allowed(url: &str) -> Result<(), &'static str> {
 /// For a request URL as Chrome wrote it: web requests to a blocked host, and `file:`.
 fn request_blocked(url: &str) -> bool {
     match url.split_once("://") {
-        Some((scheme, rest)) if matches!(scheme, "http" | "https" | "ws" | "wss") => host_blocked(rest),
+        Some(("http" | "https" | "ws" | "wss", rest)) => host_blocked(rest),
         _ => url.starts_with("file:"),
     }
 }
@@ -224,10 +224,7 @@ fn truncate(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }
-    let mut cut = max;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = text.floor_char_boundary(max);
     format!("{}…\n[truncated: {} bytes in all]", &text[..cut], text.len())
 }
 
@@ -445,5 +442,12 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(10));
         drop(page);
         engine.shutdown(Duration::from_secs(5)).await.unwrap();
+    }
+
+    #[test]
+    fn truncate_respects_utf8_char_boundary() {
+        assert_eq!(truncate("ok".into(), 5), "ok");
+        let out = truncate("a🦀b".into(), 2);
+        assert!(out.starts_with("a…"), "{out:?}");
     }
 }

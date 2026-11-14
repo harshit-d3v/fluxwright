@@ -650,21 +650,33 @@ impl CdpPage {
         // The engine ran in an isolated world; hand the same node to the page's main world,
         // where page scripts' globals live.
         let call = |method: &'static str, params: Value| self.session_call(&scope.session, method, params, timeout);
-        let node = call("DOM.describeNode", json!({ "objectId": isolated })).await?;
-        let main = call("DOM.resolveNode", json!({ "backendNodeId": node["node"]["backendNodeId"] })).await?;
-        let element = main["object"]["objectId"].clone();
-        let mut args = vec![json!({ "objectId": element })];
-        if let Some(arg) = arg {
-            args.push(json!({ "value": arg }));
+        let mut element: Option<String> = None;
+        let res = async {
+            let node = call("DOM.describeNode", json!({ "objectId": isolated })).await?;
+            let main = call("DOM.resolveNode", json!({ "backendNodeId": node["node"]["backendNodeId"] })).await?;
+            let el = main["object"]["objectId"]
+                .as_str()
+                .ok_or_else(|| Error::NotActionable {
+                    selector: sel.to_string(),
+                    reason: "element went away".into(),
+                })?
+                .to_string();
+            let mut args = vec![json!({ "objectId": el })];
+            if let Some(arg) = arg {
+                args.push(json!({ "value": arg }));
+            }
+            element = Some(el.clone());
+            call(
+                "Runtime.callFunctionOn",
+                json!({ "functionDeclaration": function, "objectId": el, "arguments": args,
+                        "returnByValue": true, "awaitPromise": true }),
+            )
+            .await
         }
-        let res = call(
-            "Runtime.callFunctionOn",
-            json!({ "functionDeclaration": function, "objectId": element, "arguments": args,
-                    "returnByValue": true, "awaitPromise": true }),
-        )
         .await;
-        for id in [json!(isolated), element] {
-            let _ = call("Runtime.releaseObject", json!({ "objectId": id })).await;
+        let _ = call("Runtime.releaseObject", json!({ "objectId": isolated })).await;
+        if let Some(el) = element {
+            let _ = call("Runtime.releaseObject", json!({ "objectId": el })).await;
         }
         let res = res?;
         match js_error(&res) {
@@ -794,10 +806,8 @@ impl CdpPage {
         let expr = engine_call(&sel.query, mode);
         loop {
             if start.elapsed() > timeout {
-                return Err(Error::NotActionable {
-                    selector: sel.to_string(),
-                    reason: format!("timeout after {}ms (last: {last_reason})", timeout.as_millis()),
-                });
+                // A timeout like any other, so callers (Python's `except TimeoutError`) see one.
+                return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
             }
             if self.browser.is_dead() {
                 return Err(Error::BrowserDead { pid: self.browser_pid });

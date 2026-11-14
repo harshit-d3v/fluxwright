@@ -4,8 +4,8 @@
 //! or any other tool. See `docs/COMPETITIVE_ANALYSIS.md`.
 
 pub use fluxwright_core::{
-    BrowserInfo, Downloads, Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, FrameLocator, JobOptions, Locator,
-    MetricsSnapshot, PageLease, Priority, QueueFullMode, Result,
+    BrowserInfo, BrowserSource, Downloads, Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, FrameLocator, JobOptions,
+    LocalChromium, Locator, MetricsSnapshot, PageLease, Priority, QueueFullMode, RemoteCdp, Result,
 };
 
 pub use fluxwright_cdp::{

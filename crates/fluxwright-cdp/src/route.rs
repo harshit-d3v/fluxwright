@@ -85,26 +85,37 @@ fn base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+fn parse_paused_fields(params: &Value) -> Option<(String, String, Vec<(String, String)>, Option<String>, String, String)> {
+    let request = &params["request"];
+    let url = request["url"].as_str()?.to_string();
+    let request_id = params["requestId"].as_str()?.to_string();
+    let method = request["method"].as_str().unwrap_or("GET").to_string();
+    let headers = request["headers"]
+        .as_object()
+        // Lower-cased, as Playwright and our network events give them: Chrome sends
+        // `User-Agent`, and `{...headers, 'user-agent': x}` then carried both.
+        .map(|h| h.iter().map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("").to_string())).collect())
+        .unwrap_or_default();
+    let post_data = request["postData"].as_str().map(str::to_owned);
+    let resource_type = params["resourceType"].as_str().unwrap_or("Other").to_lowercase();
+    Some((url, method, headers, post_data, resource_type, request_id))
+}
+
 impl InterceptedRequest {
     /// From a `Fetch.requestPaused` event on `session`.
     pub(crate) fn from_paused(params: &Value, conn: Arc<Connection>, session: String) -> Option<Self> {
-        let request = &params["request"];
-        let headers = request["headers"]
-            .as_object()
-            // Lower-cased, as Playwright and our network events give them: Chrome sends
-            // `User-Agent`, and `{...headers, 'user-agent': x}` then carried both.
-            .map(|h| h.iter().map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("").to_string())).collect())
-            .unwrap_or_default();
+        let (url, method, headers, post_data, resource_type, request_id) =
+            parse_paused_fields(params)?;
         Some(InterceptedRequest {
-            url: request["url"].as_str()?.to_string(),
-            method: request["method"].as_str().unwrap_or("GET").to_string(),
+            url,
+            method,
             headers,
-            post_data: request["postData"].as_str().map(str::to_owned),
-            resource_type: params["resourceType"].as_str().unwrap_or("Other").to_lowercase(),
+            post_data,
+            resource_type,
             reply: Reply {
                 conn,
                 session,
-                request_id: params["requestId"].as_str()?.to_string(),
+                request_id,
                 runtime: tokio::runtime::Handle::try_current().ok()?,
                 done: false,
             },
@@ -163,4 +174,79 @@ fn error_reason(code: &str) -> Result<&'static str> {
         "failed" => "Failed",
         _ => return Err(Error::Other(format!("unknown abort error code `{code}`"))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_paused_fields_lowercases_headers_and_defaults_method() {
+        let params = json!({
+            "requestId": "req-1",
+            "resourceType": "Script",
+            "request": {
+                "url": "https://example.com/app.js",
+                "headers": {
+                    "User-Agent": "Fluxwright/1.0",
+                    "X-Custom": "value"
+                },
+                "postData": "{\"ok\":true}"
+            }
+        });
+        let (url, method, mut headers, post_data, resource_type, request_id) =
+            parse_paused_fields(&params).expect("parsed");
+        headers.sort();
+        assert_eq!(url, "https://example.com/app.js");
+        assert_eq!(method, "GET");
+        assert_eq!(
+            headers,
+            vec![
+                ("user-agent".into(), "Fluxwright/1.0".into()),
+                ("x-custom".into(), "value".into()),
+            ]
+        );
+        assert_eq!(post_data.as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(resource_type, "script");
+        assert_eq!(request_id, "req-1");
+    }
+
+    #[test]
+    fn parse_paused_fields_requires_url_and_request_id() {
+        assert!(parse_paused_fields(&json!({ "request": {} })).is_none());
+        assert!(parse_paused_fields(&json!({ "requestId": "r1", "request": {} })).is_none());
+        assert!(
+            parse_paused_fields(&json!({ "request": { "url": "https://a.test" } })).is_none()
+        );
+    }
+
+    #[test]
+    fn header_list_and_base64_encode_cdp_shapes() {
+        let encoded = header_list(&[("x-test".into(), "42".into())]);
+        assert_eq!(encoded, json!([{ "name": "x-test", "value": "42" }]));
+        assert_eq!(base64(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn error_reason_maps_known_codes_and_rejects_unknown() {
+        for (code, expected) in [
+            ("aborted", "Aborted"),
+            ("accessdenied", "AccessDenied"),
+            ("addressunreachable", "AddressUnreachable"),
+            ("blockedbyclient", "BlockedByClient"),
+            ("blockedbyresponse", "BlockedByResponse"),
+            ("connectionaborted", "ConnectionAborted"),
+            ("connectionclosed", "ConnectionClosed"),
+            ("connectionfailed", "ConnectionFailed"),
+            ("connectionrefused", "ConnectionRefused"),
+            ("connectionreset", "ConnectionReset"),
+            ("internetdisconnected", "InternetDisconnected"),
+            ("namenotresolved", "NameNotResolved"),
+            ("timedout", "TimedOut"),
+            ("failed", "Failed"),
+        ] {
+            assert_eq!(error_reason(code).unwrap(), expected);
+        }
+        assert!(error_reason("bogus").is_err());
+    }
 }

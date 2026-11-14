@@ -13,6 +13,8 @@ use crate::error::{Error, Result};
 /// A request the page, one of its frames or popups sent.
 #[derive(Debug, Clone)]
 pub struct NetRequest {
+    /// Chrome's request id: the same for every event of one request (redirect hops included).
+    pub id: String,
     pub url: String,
     pub method: String,
     /// Names lower-cased, as Playwright reports them.
@@ -26,6 +28,7 @@ impl NetRequest {
     pub(crate) fn from_sent(params: &Value) -> Self {
         let r = &params["request"];
         NetRequest {
+            id: params["requestId"].as_str().unwrap_or("").to_string(),
             url: r["url"].as_str().unwrap_or("").to_string(),
             method: r["method"].as_str().unwrap_or("GET").to_string(),
             headers: headers(&r["headers"]),

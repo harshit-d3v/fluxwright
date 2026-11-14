@@ -329,6 +329,14 @@ fn tie_to_this_process(child: &Child) {
     }
 }
 
+fn stale_profile_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("fluxwright-")?
+        .split('-')
+        .next()?
+        .parse::<u32>()
+        .ok()
+}
+
 /// Deletes profile dirs of engines that died without cleaning up (a crash or hard kill skips
 /// TempDir's Drop). Only `fluxwright-<pid>-*` dirs whose pid is no longer running.
 /// Runs once, in the background, on the first launch in a process.
@@ -340,12 +348,7 @@ pub fn sweep_stale_profiles() {
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
     for e in entries.flatten() {
         let name = e.file_name();
-        let pid = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("fluxwright-"))
-            .and_then(|rest| rest.split('-').next())
-            .and_then(|p| p.parse::<u32>().ok());
-        if let Some(pid) = pid {
+        if let Some(pid) = name.to_str().and_then(stale_profile_pid) {
             if sys.process(sysinfo::Pid::from_u32(pid)).is_none() {
                 let _ = std::fs::remove_dir_all(e.path());
             }
@@ -397,25 +400,55 @@ async fn try_read_port_file(port_file: &Path) -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
+fn push_tail(tail: &mut std::collections::VecDeque<String>, line: String) {
+    if tail.len() == 16 {
+        tail.pop_front();
+    }
+    tail.push_back(line);
+}
+
+#[cfg(windows)]
 async fn wait_devtools_url(
     child: &mut Child,
     user_data_dir: &Path,
     timeout: Duration,
 ) -> Result<String> {
     let port_file = user_data_dir.join("DevToolsActivePort");
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    enum StderrMsg {
+        Url(String),
+        Line(String),
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StderrMsg>();
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(url) = ws_url_from_line(&line) {
-                    let _ = tx.send(url);
+                    let _ = tx.send(StderrMsg::Url(url));
+                } else if !line.trim().is_empty() {
+                    let _ = tx.send(StderrMsg::Line(line));
                 }
             }
         });
     }
+    let mut stderr_tail = std::collections::VecDeque::with_capacity(16);
+    let mut stderr_open = true;
     let start = tokio::time::Instant::now();
     loop {
+        if let Some(status) = child.try_wait()? {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    StderrMsg::Url(url) => push_tail(&mut stderr_tail, url),
+                    StderrMsg::Line(line) => push_tail(&mut stderr_tail, line),
+                }
+            }
+            let tail = Vec::from(stderr_tail).join("\n");
+            return Err(Error::Launch(if tail.is_empty() {
+                format!("chrome exited immediately with {status}")
+            } else {
+                format!("chrome exited with {status}: {tail}")
+            }));
+        }
         if start.elapsed() > timeout {
             return Err(Error::Launch(
                 "timed out waiting for DevToolsActivePort".into(),
@@ -423,7 +456,11 @@ async fn wait_devtools_url(
         }
         tokio::select! {
             biased;
-            Some(url) = rx.recv() => return Ok(url),
+            msg = rx.recv(), if stderr_open => match msg {
+                Some(StderrMsg::Url(url)) => return Ok(url),
+                Some(StderrMsg::Line(line)) => push_tail(&mut stderr_tail, line),
+                None => stderr_open = false,
+            },
             _ = sleep(Duration::from_millis(30)) => {
                 if let Some(url) = try_read_port_file(&port_file).await? {
                     return Ok(url);
@@ -435,7 +472,7 @@ async fn wait_devtools_url(
 
 #[cfg(test)]
 mod tests {
-    use super::newest_shell;
+    use super::*;
 
     #[test]
     fn newest_headless_shell_wins() {
@@ -456,5 +493,68 @@ mod tests {
         }
         let found = newest_shell(puppeteer.path(), "", "shell").unwrap();
         assert!(found.starts_with(puppeteer.path().join("win64-140.0.7339.80")), "{found:?}");
+    }
+
+    #[test]
+    fn stale_profile_pid_parses_fluxwright_prefix() {
+        assert_eq!(stale_profile_pid("fluxwright-1234-ab"), Some(1234));
+        assert_eq!(stale_profile_pid("fluxwright-42-dl-ctx"), Some(42));
+        assert_eq!(stale_profile_pid("other-1234-ab"), None);
+        assert_eq!(stale_profile_pid("fluxwright-bad-ab"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ws_url_from_line_parses_banner_and_inline_urls() {
+        assert_eq!(
+            ws_url_from_line("  DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc  "),
+            Some("ws://127.0.0.1:9222/devtools/browser/abc".into())
+        );
+        assert_eq!(
+            ws_url_from_line("[123] ready ws://127.0.0.1:5000/devtools/browser/xyz extra"),
+            Some("ws://127.0.0.1:5000/devtools/browser/xyz".into())
+        );
+        assert_eq!(ws_url_from_line("nothing to see here"), None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn try_read_port_file_parses_formats_and_incomplete_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let port_file = dir.path().join("DevToolsActivePort");
+        assert_eq!(try_read_port_file(&port_file).await.unwrap(), None);
+
+        tokio::fs::write(&port_file, "9222\n").await.unwrap();
+        assert_eq!(try_read_port_file(&port_file).await.unwrap(), None);
+
+        tokio::fs::write(&port_file, "9222\n/devtools/browser/id1\n").await.unwrap();
+        assert_eq!(
+            try_read_port_file(&port_file).await.unwrap(),
+            Some("ws://127.0.0.1:9222/devtools/browser/id1".into())
+        );
+
+        tokio::fs::write(&port_file, "9222\nws://127.0.0.1:9222/custom\n").await.unwrap();
+        assert_eq!(
+            try_read_port_file(&port_file).await.unwrap(),
+            Some("ws://127.0.0.1:9222/custom".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn wait_devtools_url_fails_fast_when_child_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("cmd")
+            .args(["/C", "echo mock crash 1>&2 & exit /B 7"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = wait_devtools_url(&mut child, dir.path(), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2), "stalled: {:?}", started.elapsed());
+        let msg = err.to_string();
+        assert!(msg.contains("exited") && msg.contains("mock crash"), "{msg}");
     }
 }
