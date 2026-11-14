@@ -865,18 +865,29 @@ async fn resolve_ws_endpoint(endpoint: &str) -> Result<String> {
                 .write_all(req.as_bytes())
                 .await
                 .map_err(|e| Error::Launch(e.to_string()))?;
-            let mut resp = String::new();
-            (&mut stream)
-                .take(64 * 1024)
-                .read_to_string(&mut resp)
-                .await
-                .map_err(|e| Error::Launch(e.to_string()))?;
-            if let Some((_hdr, body)) = resp.split_once("\r\n\r\n") {
-                let json: Value = serde_json::from_str(body)
-                    .map_err(|e| Error::Launch(format!("invalid JSON from {path}: {e}")))?;
-                if let Some(ws) = json["webSocketDebuggerUrl"].as_str() {
-                    return Ok(ws.to_string());
+            // Chrome keeps the connection open whatever the request asks: stop once the body is
+            // whole JSON instead of waiting for a close that never comes.
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 4096];
+            let json: Value = loop {
+                let n = stream
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| Error::Launch(e.to_string()))?;
+                resp.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&resp);
+                if let Some(Ok(json)) = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| serde_json::from_str::<Value>(body))
+                {
+                    break json;
                 }
+                if n == 0 || resp.len() > 64 * 1024 {
+                    return Err(Error::Launch(format!("no JSON answer from {path}")));
+                }
+            };
+            if let Some(ws) = json["webSocketDebuggerUrl"].as_str() {
+                return Ok(ws.to_string());
             }
             Err(Error::Launch(format!(
                 "could not obtain webSocketDebuggerUrl from {endpoint}"
@@ -1057,10 +1068,12 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
+        let (seen_tx, seen) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 512];
             let n = stream.read(&mut buf).await.unwrap();
+            let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
             let body = r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/q"}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK
@@ -1070,13 +1083,14 @@ Content-Length: {}
                 body.len()
             );
             stream.write_all(resp.as_bytes()).await.unwrap();
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+            // As Chrome does: the connection stays open after the answer.
+            std::future::pending::<()>().await;
         });
         let ws = resolve_ws_endpoint(&format!("http://127.0.0.1:{port}/?token=x"))
             .await
             .unwrap();
         assert_eq!(ws, "ws://127.0.0.1:9222/devtools/browser/q");
-        let request = server.await.unwrap();
+        let request = seen.await.unwrap();
         assert!(
             request.starts_with("GET /json/version?token=x HTTP/1.1"),
             "{request}"
