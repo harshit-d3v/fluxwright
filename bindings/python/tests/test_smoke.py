@@ -280,6 +280,19 @@ async def async_smoke(base: str, tmp: Path) -> None:
         del forgotten
         gc.collect()
         assert gone() is None
+        # Also when its handlers refer to the page: the loops reach it only weakly.
+        def uses(page):
+            return lambda *_: page.url
+
+        forgotten = await browser.new_page()
+        forgotten.on("console", uses(forgotten))
+        forgotten.on("request", uses(forgotten))
+        forgotten.on("dialog", uses(forgotten))
+        await forgotten.route("**/api", uses(forgotten))
+        gone = weakref.ref(forgotten)
+        del forgotten
+        gc.collect()
+        assert gone() is None
 
         # Left open on purpose: the context manager's exit closes the browser under it.
         await browser.new_page()
@@ -331,8 +344,9 @@ async def queue_smoke() -> None:
             await page.close()
 
 
-def test_events(base):
+def test_events(base, caplog):
     asyncio.run(event_smoke(base))
+    assert "answered after its handler returned" in caplog.text
 
 
 async def event_smoke(base: str) -> None:
@@ -347,6 +361,8 @@ async def event_smoke(base: str) -> None:
         page.on("response", lambda r: seen.append(f"response {r.status} {path(r)}"))
         page.on("requestfinished", lambda r: seen.append(f"finished {path(r)}"))
         page.on("requestfailed", lambda r: seen.append(f"failed {path(r)} {r.failure}"))
+        requests = []
+        page.on("request", requests.append)
         await page.goto(base)
         async with page.expect_response("**/api") as info:
             await page.evaluate(FETCH_API)
@@ -354,6 +370,9 @@ async def event_smoke(base: str) -> None:
         assert api.status == 200 and api.ok
         assert await api.json() == {"real": True}
         assert api.request.method == "GET"
+        # One Request per request: the response hands over the one the request event did.
+        await asyncio.sleep(0.1)
+        assert any(r is api.request for r in requests), requests
         assert api.headers["content-type"] == "application/json"
         await page.route("**/gone", lambda route: route.abort())
         await page.evaluate("() => fetch('/gone').catch(() => 'failed')")
@@ -365,6 +384,22 @@ async def event_smoke(base: str) -> None:
         assert "response 200 /api" in seen, seen
         assert "finished /api" in seen, seen
         assert "failed /gone net::ERR_FAILED" in seen, seen
+        # An answer after the handler returned is too late: it warns and resolves, the request
+        # having gone on without it.
+        late = []
+
+        def answer_late(route):
+            late.append(asyncio.get_running_loop().create_task(asyncio.sleep(0.05)))
+            late[-1].add_done_callback(lambda _: late.append(route.fulfill(body="late")))
+
+        await page.route("**/late", answer_late)
+        assert await page.evaluate("() => fetch('/late').then((r) => r.text())") != "late"
+        for _ in range(50):
+            if len(late) == 2:
+                break
+            await asyncio.sleep(0.02)
+        await late[1]
+        await page.unroute("**/late")
         async with page.expect_request(lambda r: r.url.endswith("/hdr")) as request:
             await page.evaluate("() => fetch('/hdr')")
         assert (await request.value).method == "GET"
@@ -451,6 +486,35 @@ async def event_smoke(base: str) -> None:
         page.evaluate("() => console.log('two')")
         time.sleep(0.3)
         assert [m.text for m in heard] == ["one"]
+
+
+def test_close_does_not_wait(base):
+    asyncio.run(close_smoke(base))
+
+
+async def close_smoke(base: str) -> None:
+    # close() does not wait for calls still running on the page (this one would run until the
+    # action timeout): they fail at once, and so do pending waits.
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(max_browsers=1)
+        closing = await browser.new_page()
+        await closing.goto(base)
+
+        async def wait_response():
+            async with closing.expect_response("**/never", timeout=0):
+                pass
+
+        open_call = asyncio.ensure_future(closing.wait_for_selector("#never"))
+        open_wait = asyncio.ensure_future(wait_response())
+        await asyncio.sleep(0.2)
+        assert not open_call.done() and not open_wait.done()
+        started = time.monotonic()
+        await closing.close()
+        assert time.monotonic() - started < 5, "close() waited for a running call"
+        with pytest.raises(Error, match="page closed"):
+            await open_call
+        with pytest.raises(Error, match="page closed"):
+            await open_wait
 
 
 def test_contexts(base):

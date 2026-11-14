@@ -23,6 +23,7 @@ import inspect
 import json as _json
 import logging
 import re
+import weakref
 from contextlib import asynccontextmanager, suppress
 from os import PathLike
 from pathlib import Path
@@ -155,9 +156,9 @@ class Request:
 class Response:
     """A response, as ``page.on("response")`` and ``expect_response`` hand it over."""
 
-    def __init__(self, native: _native.NetworkResponse) -> None:
+    def __init__(self, native: _native.NetworkResponse, request: Request | None = None) -> None:
         self._native = native
-        self._request = Request(native.request)
+        self._request = request or Request(native.request)
 
     @property
     def url(self) -> str:
@@ -243,6 +244,8 @@ class Route:
         self._request = request
         self._answer: asyncio.Future[None] | None = None
         self._fell_back = False
+        # Set once the handler returned: the request went on, and a later answer is too late.
+        self._returned = False
 
     @property
     def request(self) -> Request:
@@ -295,6 +298,8 @@ class Route:
 
     def fallback(self) -> Awaitable[None]:
         """Leaves the request to the next matching handler: the one added before this one."""
+        if self._returned:
+            return _late("route")
         if self._answer is not None:
             return _settled(error=Error("route is already handled"))
         self._fell_back = True
@@ -303,6 +308,8 @@ class Route:
     def _answer_with(self, start: Callable[[], Awaitable[None]]) -> Awaitable[None]:
         # The first answer wins. It starts now rather than when awaited, so an answer still under
         # way when the handler returns is waited for, not taken as no answer.
+        if self._returned:
+            return _late("route")
         if self._answer is not None or self._fell_back:
             return _settled(error=Error("route is already handled"))
 
@@ -311,6 +318,17 @@ class Route:
 
         self._answer = asyncio.ensure_future(run())
         return self._answer
+
+
+def _late(what: str) -> asyncio.Future[None]:
+    """An answer after its handler returned: the request already went on. It resolves, with a
+    warning, rather than raising where nothing awaits it."""
+    _log.warning(
+        "a %s was answered after its handler returned, and the answer is ignored: "
+        "await it inside the handler",
+        what,
+    )
+    return _settled()
 
 
 class _RouteEntry:
@@ -344,8 +362,7 @@ class Page(_native.Page):
     """A browser tab in a fresh browser context, leased from the engine.
 
     Close it when the job is done, in a ``finally``. A page you drop is freed when Python
-    collects it only while no listener or route handler refers to the page: those stay reachable
-    from the page's pending event streams, so the page and its slot in the pool stay taken.
+    collects it, even if its listeners or route handlers refer to it.
     """
 
     def __init__(self, lease: _native.Lease) -> None:
@@ -369,7 +386,7 @@ class Page(_native.Page):
         async with self._route_lock:
             if not self._routing:
                 stream = await self._intercept()
-                _keep(self._tasks, asyncio.ensure_future(_serve_routes(stream, self._routes, self._tasks)))
+                _keep(self._tasks, asyncio.ensure_future(_serve_routes(stream, weakref.ref(self), self._tasks)))
                 self._routing = True
             self._routes.append(_RouteEntry(url, handler))
 
@@ -492,13 +509,13 @@ class Page(_native.Page):
             raise ValueError(f"page.{method}: {event!r} is not supported ({', '.join(_EVENTS)})")
         # Each source is subscribed here, so nothing after this call is missed.
         if event in ("console", "pageerror") and not self._logging:
-            _keep(self._tasks, asyncio.ensure_future(_serve_logs(self._logs(), self._listeners, self._tasks)))
+            _keep(self._tasks, asyncio.ensure_future(_serve_logs(self._logs(), weakref.ref(self), self._tasks)))
             self._logging = True
         elif event == "dialog" and not self._answering_dialogs:
-            _keep(self._tasks, asyncio.ensure_future(_serve_dialogs(self._dialogs(), self._listeners)))
+            _keep(self._tasks, asyncio.ensure_future(_serve_dialogs(self._dialogs(), weakref.ref(self))))
             self._answering_dialogs = True
         elif event in _NETWORK_EVENTS and (self._network_task is None or self._network_task.done()):
-            self._network_task = asyncio.ensure_future(_serve_network(self._network(), self._listeners, self._tasks))
+            self._network_task = asyncio.ensure_future(_serve_network(self._network(), weakref.ref(self), self._tasks))
             _keep(self._tasks, self._network_task)
         self._listeners.setdefault(event, []).append((added, call))
 
@@ -507,9 +524,16 @@ _NETWORK_EVENTS = ("request", "response", "requestfinished", "requestfailed")
 _EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog")
 
 
-# The loops below run until the page closes (the network one also once nobody listens). They hold
-# the page's handlers, never the page, so a page nobody holds is still collected and its slot goes
-# back to the pool, unless a handler itself refers to the page.
+# The loops below run until the page closes (the network one also once nobody listens). They reach
+# the page only through a weak reference, between events, so a page nobody holds is collected and
+# its slot goes back to the pool even when its handlers refer to it (as Node's WeakRef does).
+
+PageRef = Callable[[], "Page | None"]
+
+
+def _listeners_of(page: PageRef) -> dict[str, list[tuple[Listener, Listener]]]:
+    p = page()
+    return p._listeners if p is not None else {}
 
 
 def _keep(tasks: set[asyncio.Future[Any]], future: asyncio.Future[Any]) -> None:
@@ -544,54 +568,80 @@ def _emit(
             _log.exception("a page.on(%r) listener failed", event)
 
 
-async def _serve_logs(
-    stream: _native.LogStream,
-    listeners: dict[str, list[tuple[Listener, Listener]]],
-    tasks: set[asyncio.Future[Any]],
-) -> None:
+# No loop keeps a listener, route entry or page in a local across ``await stream.next()``: that
+# would hold the page for as long as the stream is quiet.
+
+
+async def _serve_logs(stream: _native.LogStream, page: PageRef, tasks: set[asyncio.Future[Any]]) -> None:
     while (entry := await stream.next()) is not None:
-        _emit(listeners, "pageerror" if isinstance(entry, Error) else "console", entry, tasks)
+        _emit(_listeners_of(page), "pageerror" if isinstance(entry, Error) else "console", entry, tasks)
 
 
-async def _serve_network(
-    stream: _native.NetworkStream,
-    listeners: dict[str, list[tuple[Listener, Listener]]],
-    tasks: set[asyncio.Future[Any]],
-) -> None:
+# Requests kept for their later events; ones that never finish (a long poll) go first, as in Node.
+_MAX_REQUESTS = 1000
+
+
+async def _serve_network(stream: _native.NetworkStream, page: PageRef, tasks: set[asyncio.Future[Any]]) -> None:
+    # One Request per request, as in Playwright: its request, response, requestfinished and
+    # requestfailed events, and response.request, hand over the same object.
+    requests: dict[str, Request] = {}
     while (e := await stream.next()) is not None:
-        response = e.response
-        arg = Response(response) if response is not None else Request(e.request, e.failure)
-        _emit(listeners, e.event, arg, tasks)
+        request = requests.get(e.request.id)
+        if request is None:
+            request = requests[e.request.id] = Request(e.request)
+            if len(requests) > _MAX_REQUESTS:
+                del requests[next(iter(requests))]
+        if e.event in ("requestfinished", "requestfailed"):
+            requests.pop(e.request.id, None)
+        if e.event == "requestfailed":
+            request._failure = e.failure
+        arg = Response(e.response, request) if e.response is not None else request
+        if not _emit_network(_listeners_of(page), e.event, arg, tasks):
+            return  # nobody listens: the next listener starts another stream
 
 
-async def _serve_dialogs(stream: _native.DialogStream, listeners: dict[str, list[tuple[Listener, Listener]]]) -> None:
+def _emit_network(
+    listeners: dict[str, list[tuple[Listener, Listener]]], event: str, arg: Any, tasks: set[asyncio.Future[Any]]
+) -> bool:
+    """Emits ``event``; whether any network listener is left."""
+    _emit(listeners, event, arg, tasks)
+    return any(listeners.get(e) for e in _NETWORK_EVENTS)
+
+
+async def _serve_dialogs(stream: _native.DialogStream, page: PageRef) -> None:
+    while (native := await stream.next()) is not None:
+        await _answer_dialog(_listeners_of(page).get("dialog", []), Dialog(native))
+
+
+async def _answer_dialog(listeners: list[tuple[Listener, Listener]], dialog: Dialog) -> None:
     # Every listener runs and is awaited; a dialog none of them answered is dismissed, so the
     # page never hangs on it.
-    while (native := await stream.next()) is not None:
-        dialog = Dialog(native)
-        pending = []
-        for _, call in list(listeners.get("dialog", ())):
-            try:
-                result = call(dialog)
-                if inspect.isawaitable(result):
-                    pending.append(result)
-            except Exception:
-                _log.exception("a page.on('dialog') listener failed")
-        for outcome in await asyncio.gather(*pending, return_exceptions=True):
-            if isinstance(outcome, BaseException):
-                _log.error("a page.on('dialog') listener failed", exc_info=outcome)
-        if not dialog._answered:
-            # As with no listener at all: beforeunload is accepted (dismissing it would cancel
-            # the navigation), the rest dismissed.
-            with suppress(Error):
-                await (dialog.accept() if dialog.type == "beforeunload" else dialog.dismiss())
+    pending = []
+    for _, call in list(listeners):
+        try:
+            result = call(dialog)
+            if inspect.isawaitable(result):
+                pending.append(result)
+        except Exception:
+            _log.exception("a page.on('dialog') listener failed")
+    for outcome in await asyncio.gather(*pending, return_exceptions=True):
+        if isinstance(outcome, BaseException):
+            _log.error("a page.on('dialog') listener failed", exc_info=outcome)
+    if not dialog._answered:
+        # As with no listener at all: beforeunload is accepted (dismissing it would cancel
+        # the navigation), the rest dismissed.
+        with suppress(Error):
+            await (dialog.accept() if dialog.type == "beforeunload" else dialog.dismiss())
 
 
-async def _serve_routes(
-    stream: _native.RouteStream, routes: list[_RouteEntry], tasks: set[asyncio.Future[Any]]
-) -> None:
+def _routes_of(page: PageRef) -> list[_RouteEntry]:
+    p = page()
+    return list(p._routes) if p is not None else []
+
+
+async def _serve_routes(stream: _native.RouteStream, page: PageRef, tasks: set[asyncio.Future[Any]]) -> None:
     while (native := await stream.next()) is not None:
-        _keep(tasks, asyncio.ensure_future(_dispatch(native, routes)))
+        _keep(tasks, asyncio.ensure_future(_dispatch(native, _routes_of(page))))
 
 
 async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
@@ -607,9 +657,12 @@ async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
                 continue
             route = Route(native, request)
             try:
-                result = entry.handler(route, request) if entry.with_request else entry.handler(route)
-                if inspect.isawaitable(result):
-                    await result
+                try:
+                    result = entry.handler(route, request) if entry.with_request else entry.handler(route)
+                    if inspect.isawaitable(result):
+                        await result
+                finally:
+                    route._returned = True
                 if route._fell_back and route._answer is None:
                     continue
                 if route._answer is not None:

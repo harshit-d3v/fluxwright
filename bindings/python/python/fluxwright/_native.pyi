@@ -170,6 +170,7 @@ class Download:
     def failure(self) -> Awaitable[str | None]: ...
 
 class NetworkRequest:
+    id: str
     url: str
     method: str
     headers: dict[str, str]

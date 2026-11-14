@@ -1127,6 +1127,9 @@ impl Route {
 /// A request, as network events hand it over; `fluxwright.async_api` wraps it in `Request`.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct NetworkRequest {
+    /// Chrome's request id: the same for every event of one request.
+    #[pyo3(get)]
+    id: String,
     #[pyo3(get)]
     url: String,
     #[pyo3(get)]
@@ -1143,6 +1146,7 @@ struct NetworkRequest {
 impl From<fluxwright::NetRequest> for NetworkRequest {
     fn from(r: fluxwright::NetRequest) -> Self {
         NetworkRequest {
+            id: r.id,
             url: r.url,
             method: r.method,
             headers: r.headers.into_iter().collect(),
