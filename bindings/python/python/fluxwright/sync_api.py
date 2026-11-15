@@ -167,22 +167,23 @@ class Locator(_Finders):
     def __repr__(self) -> str:
         return repr(self._impl)
 
-    def click(self) -> None:
-        _run(self._impl.click)
+    def click(self, *, timeout: float | None = None) -> None:
+        """``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
+        _run(self._impl.click, timeout=timeout)
 
-    def fill(self, value: str) -> None:
-        _run(self._impl.fill, value)
+    def fill(self, value: str, *, timeout: float | None = None) -> None:
+        _run(self._impl.fill, value, timeout=timeout)
 
-    def wait_for(self) -> None:
+    def wait_for(self, *, timeout: float | None = None) -> None:
         """Waits until visible."""
-        _run(self._impl.wait_for)
+        _run(self._impl.wait_for, timeout=timeout)
 
-    def text_content(self) -> str | None:
-        return _run(self._impl.text_content)
+    def text_content(self, *, timeout: float | None = None) -> str | None:
+        return _run(self._impl.text_content, timeout=timeout)
 
-    def bounding_box(self) -> FloatRect | None:
+    def bounding_box(self, *, timeout: float | None = None) -> FloatRect | None:
         """Relative to the viewport, without scrolling; ``None`` when the element is not visible."""
-        return _run(self._impl.bounding_box)
+        return _run(self._impl.bounding_box, timeout=timeout)
 
     def screenshot(
         self,
@@ -191,13 +192,21 @@ class Locator(_Finders):
         type: Literal["png", "jpeg"] | None = None,
         quality: int | None = None,
         omit_background: bool | None = None,
+        timeout: float | None = None,
     ) -> bytes:
         """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""
-        return _run(self._impl.screenshot, path=path, type=type, quality=quality, omit_background=omit_background)
+        return _run(
+            self._impl.screenshot,
+            path=path,
+            type=type,
+            quality=quality,
+            omit_background=omit_background,
+            timeout=timeout,
+        )
 
-    def evaluate(self, expression: str, arg: Any = None) -> Any:
+    def evaluate(self, expression: str, arg: Any = None, *, timeout: float | None = None) -> Any:
         """Calls the JavaScript function ``expression`` with the element and ``arg``."""
-        return _run(self._impl.evaluate, expression, arg)
+        return _run(self._impl.evaluate, expression, arg, timeout=timeout)
 
     def nth(self, index: int) -> Locator:
         """The ``index``-th match (0-based; negative counts from the end)."""
@@ -452,10 +461,19 @@ class Page(_Finders):
         # page never holds them up. The thread starts with the first event.
         self._listener_thread = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="fluxwright-listeners")
 
-    def goto(self, url: str, *, wait_until: str | None = None) -> None:
+    def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None) -> None:
         """Navigates; ``wait_until`` is ``load`` (the default), ``domcontentloaded``,
-        ``networkidle`` or ``commit``."""
-        _run(self._impl.goto, url, wait_until=wait_until)
+        ``networkidle`` or ``commit``. ``timeout`` is in milliseconds; 0 for none."""
+        _run(self._impl.goto, url, wait_until=wait_until, timeout=timeout)
+
+    def set_default_timeout(self, timeout: float) -> None:
+        """The timeout in milliseconds for this page's calls from now on, navigation included;
+        0 for none. A call's own ``timeout`` wins."""
+        self._impl.set_default_timeout(timeout)
+
+    def set_default_navigation_timeout(self, timeout: float) -> None:
+        """The timeout in milliseconds for this page's ``goto`` from now on; 0 for none."""
+        self._impl.set_default_navigation_timeout(timeout)
 
     def title(self) -> str:
         return _run(self._impl.title)
@@ -463,16 +481,16 @@ class Page(_Finders):
     def content(self) -> str:
         return _run(self._impl.content)
 
-    def click(self, selector: str) -> None:
+    def click(self, selector: str, *, timeout: float | None = None) -> None:
         """Scrolls into view and waits until the element is enabled, stable and not covered."""
-        _run(self._impl.click, selector)
+        _run(self._impl.click, selector, timeout=timeout)
 
-    def fill(self, selector: str, value: str) -> None:
-        _run(self._impl.fill, selector, value)
+    def fill(self, selector: str, value: str, *, timeout: float | None = None) -> None:
+        _run(self._impl.fill, selector, value, timeout=timeout)
 
-    def wait_for_selector(self, selector: str) -> None:
+    def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> None:
         """Waits until visible."""
-        _run(self._impl.wait_for_selector, selector)
+        _run(self._impl.wait_for_selector, selector, timeout=timeout)
 
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         """Runs JavaScript in the page and returns its JSON result, awaiting promises. A function
@@ -488,6 +506,7 @@ class Page(_Finders):
         quality: int | None = None,
         clip: FloatRect | None = None,
         omit_background: bool | None = None,
+        timeout: float | None = None,
     ) -> bytes:
         """PNG or JPEG; with ``path``, also written there (extension picks type if omitted)."""
         return _run(
@@ -498,6 +517,7 @@ class Page(_Finders):
             quality=quality,
             clip=clip,
             omit_background=omit_background,
+            timeout=timeout,
         )
 
     def pdf(

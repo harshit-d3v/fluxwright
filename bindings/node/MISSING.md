@@ -8,16 +8,16 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 - `page.on('popup')`, which needs pages beyond the one a context holds
 - `getByAltText`, `getByTitle`, `filter({ has })`, strict mode
 - `connectOverCDP` in Node bindings (supported in Rust engine and HTTP server via `--cdp-endpoint`)
-- `context.addCookies`, `setDefaultTimeout` and `setDefaultNavigationTimeout`
+- `context.addCookies`
 
 ## Options that throw
 
 napi would silently ignore an option the binding does not implement, so it throws a TypeError instead. The main ones:
 
-- A per-call `timeout`, except on `waitForResponse`, `waitForRequest` and `waitForDownload`: the engine's own timeouts apply
+- A per-call `timeout` on `title`, `content`, `evaluate`, `pdf` and `setViewportSize` (Playwright has none there either); `goto`, `click`, `fill`, `waitForSelector`, `screenshot` and the locator actions take one
 - `waitForSelector` and `locator.waitFor` with a `state` other than `visible`, or `strict`
 - Click and fill options (`button`, `clickCount`, `modifiers`, `position`, `force`, ...)
-- Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, `timeout`, and WebP (see `docs/DECISIONS.md`)
+- Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and WebP (see `docs/DECISIONS.md`)
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)
 - `newPage` / `newContext` options the README does not list (`extraHTTPHeaders`, `javaScriptEnabled`, `ignoreHTTPSErrors`, `baseURL`, `httpCredentials`, `offline`, ...), and `launch` options other than its five (`args`; for `proxy`, give `newPage` one)
 - `page.locator(selector, options)` (use `.filter({ hasText })`), `filter` options other than `hasText`, `getByRole` options other than `name` and `exact`

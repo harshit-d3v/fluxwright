@@ -28,6 +28,12 @@ export async function typed(): Promise<void> {
   const box: { x: number; width: number } | null = await item.boundingBox()
   const length: number = await item.evaluate((el: { textContent: string }, n: number) => el.textContent.length + n, 1)
   const shot: Buffer = await page.getByLabel('Email').screenshot({ path: 'el.png' })
+  await page.goto('https://example.com', { waitUntil: 'commit', timeout: 5_000 })
+  await page.click('button', { timeout: 500 })
+  await page.getByLabel('Email').fill('a@b.c', { timeout: 0 })
+  await item.waitFor({ state: 'visible', timeout: 100 })
+  page.setDefaultTimeout(2_000)
+  page.setDefaultNavigationTimeout(20_000)
   const errors: Error[] = await page.pageErrors()
   const logs: { type: string; text: string }[] = await page.consoleMessages()
   void [box, length, shot, errors, logs, page.getByPlaceholder('city').first().last(), await page.screenshot({ path: 'p.png' })]

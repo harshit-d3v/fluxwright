@@ -101,6 +101,22 @@ pub struct PageLease {
     download_dir: std::path::PathBuf,
     /// Who answers this page's dialogs; with nobody, a dialog is dismissed as before.
     dialog_listeners: DialogListeners,
+    /// `set_default_timeout` and `set_default_navigation_timeout`, when called.
+    default_timeouts: std::sync::Mutex<(Option<Duration>, Option<Duration>)>,
+}
+
+tokio::task_local! {
+    /// The timeout of the call in progress: Playwright's per-call `timeout` option.
+    static CALL_TIMEOUT: Duration;
+}
+
+/// Runs `call` (one or more page calls) with `timeout` in place of the page's and the engine's
+/// timeouts, as Playwright's per-call `timeout` option does. `None` changes nothing.
+pub async fn with_timeout<F: std::future::Future>(timeout: Option<Duration>, call: F) -> F::Output {
+    match timeout {
+        Some(t) => CALL_TIMEOUT.scope(t, call).await,
+        None => call.await,
+    }
 }
 
 type DialogListeners = Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<fluxwright_cdp::Dialog>>>>;
@@ -686,6 +702,7 @@ impl Inner {
             downloads: Downloads(Arc::new(Mutex::new(downloads))),
             download_dir,
             dialog_listeners,
+            default_timeouts: Default::default(),
         })
     }
 
@@ -872,6 +889,39 @@ async fn apply_blocking(page: &PageLease, opts: &JobOptions) -> Result<()> {
 }
 
 impl PageLease {
+    /// For click, fill, waits, screenshots and the like: the call's own timeout, else this
+    /// page's default, else the engine's.
+    fn action_timeout(&self) -> Duration {
+        CALL_TIMEOUT
+            .try_with(|t| *t)
+            .ok()
+            .or(self.default_timeouts.lock().unwrap().0)
+            .unwrap_or(self.engine.config.action_timeout)
+    }
+
+    /// For `goto`. As in Playwright, the page's default timeout covers navigation too unless
+    /// a navigation default was set.
+    fn navigation_timeout(&self) -> Duration {
+        let (action, navigation) = *self.default_timeouts.lock().unwrap();
+        CALL_TIMEOUT
+            .try_with(|t| *t)
+            .ok()
+            .or(navigation)
+            .or(action)
+            .unwrap_or(self.engine.config.navigation_timeout)
+    }
+
+    /// The timeout for this page's calls from now on, navigation included (Playwright's
+    /// `page.setDefaultTimeout`).
+    pub fn set_default_timeout(&self, timeout: Duration) {
+        self.default_timeouts.lock().unwrap().0 = Some(timeout);
+    }
+
+    /// The timeout for this page's `goto` from now on (`page.setDefaultNavigationTimeout`).
+    pub fn set_default_navigation_timeout(&self, timeout: Duration) {
+        self.default_timeouts.lock().unwrap().1 = Some(timeout);
+    }
+
     pub fn browser_pid(&self) -> u32 {
         self.browser.pid
     }
@@ -894,7 +944,7 @@ impl PageLease {
     /// Playwright's `storageState` format. Start a later job from it with
     /// `JobOptions::storage_state` to skip logging in again.
     pub async fn storage_state(&self) -> Result<fluxwright_cdp::StorageState> {
-        Ok(self.page.storage_state(self.engine.config.action_timeout).await?)
+        Ok(self.page.storage_state(self.action_timeout()).await?)
     }
 
     /// Navigates and waits for the `load` event.
@@ -904,23 +954,23 @@ impl PageLease {
 
     pub async fn goto_with(&self, url: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
         self.page
-            .goto(url, wait_until, self.engine.config.navigation_timeout)
+            .goto(url, wait_until, self.navigation_timeout())
             .await?;
         Ok(())
     }
 
     pub async fn title(&self) -> Result<String> {
-        Ok(self.page.title(self.engine.config.action_timeout).await?)
+        Ok(self.page.title(self.action_timeout()).await?)
     }
 
     pub async fn content(&self) -> Result<String> {
-        Ok(self.page.content(self.engine.config.action_timeout).await?)
+        Ok(self.page.content(self.action_timeout()).await?)
     }
 
     pub async fn evaluate(&self, expression: &str) -> Result<serde_json::Value> {
         Ok(self
             .page
-            .evaluate(expression, self.engine.config.action_timeout)
+            .evaluate(expression, self.action_timeout())
             .await?)
     }
 
@@ -938,7 +988,7 @@ impl PageLease {
     pub async fn screenshot_with(&self, options: &ScreenshotOptions) -> Result<Vec<u8>> {
         Ok(self
             .page
-            .screenshot(options, self.engine.config.action_timeout)
+            .screenshot(options, self.action_timeout())
             .await?)
     }
 
@@ -952,7 +1002,7 @@ impl PageLease {
     pub async fn pdf_within(&self, options: &PdfOptions, max_bytes: usize) -> Result<Vec<u8>> {
         Ok(self
             .page
-            .pdf(options, max_bytes, self.engine.config.action_timeout)
+            .pdf(options, max_bytes, self.action_timeout())
             .await?)
     }
 
@@ -960,28 +1010,28 @@ impl PageLease {
     pub async fn set_viewport_size(&self, width: u32, height: u32) -> Result<()> {
         Ok(self
             .page
-            .set_viewport(width, height, self.engine.config.action_timeout)
+            .set_viewport(width, height, self.action_timeout())
             .await?)
     }
 
     /// Selectors: CSS, `text=`, `role=` (see [`Selector`]), or a [`Selector`] with frames.
     pub async fn click(&self, selector: impl Into<Selector>) -> Result<()> {
         self.page
-            .click(&selector.into(), self.engine.config.action_timeout)
+            .click(&selector.into(), self.action_timeout())
             .await?;
         Ok(())
     }
 
     pub async fn fill(&self, selector: impl Into<Selector>, value: &str) -> Result<()> {
         self.page
-            .fill(&selector.into(), value, self.engine.config.action_timeout)
+            .fill(&selector.into(), value, self.action_timeout())
             .await?;
         Ok(())
     }
 
     pub async fn wait_for_selector(&self, selector: impl Into<Selector>) -> Result<()> {
         self.page
-            .wait_for_selector(&selector.into(), self.engine.config.action_timeout)
+            .wait_for_selector(&selector.into(), self.action_timeout())
             .await?;
         Ok(())
     }
@@ -990,7 +1040,7 @@ impl PageLease {
     pub async fn text_content(&self, selector: impl Into<Selector>) -> Result<Option<String>> {
         Ok(self
             .page
-            .text_content(&selector.into(), self.engine.config.action_timeout)
+            .text_content(&selector.into(), self.action_timeout())
             .await?)
     }
 
@@ -1030,7 +1080,7 @@ impl PageLease {
     /// fulfill, change or abort (Playwright's `page.route`). Call it before navigating. A request
     /// dropped unanswered continues; blocked resource types stay blocked.
     pub async fn intercept(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>> {
-        Ok(self.page.intercept(self.engine.config.action_timeout).await?)
+        Ok(self.page.intercept(self.action_timeout()).await?)
     }
 
     /// The next download this page, its popups or iframes finished, oldest first, waiting up to
@@ -1078,14 +1128,14 @@ impl PageLease {
 
     /// The first match's box relative to the viewport, without scrolling; `None` when hidden.
     pub async fn bounding_box(&self, selector: impl Into<Selector>) -> Result<Option<BoundingBox>> {
-        Ok(self.page.bounding_box(&selector.into(), self.engine.config.action_timeout).await?)
+        Ok(self.page.bounding_box(&selector.into(), self.action_timeout()).await?)
     }
 
     /// Calls `function` (JavaScript source taking the element and `arg`) on the first match.
     pub async fn evaluate_on(&self, selector: impl Into<Selector>, function: &str, arg: Option<serde_json::Value>) -> Result<serde_json::Value> {
         Ok(self
             .page
-            .evaluate_on(&selector.into(), function, arg, self.engine.config.action_timeout)
+            .evaluate_on(&selector.into(), function, arg, self.action_timeout())
             .await?)
     }
 
@@ -1103,7 +1153,7 @@ impl PageLease {
     ) -> Result<Vec<u8>> {
         Ok(self
             .page
-            .element_screenshot(&selector.into(), options, self.engine.config.action_timeout)
+            .element_screenshot(&selector.into(), options, self.action_timeout())
             .await?)
     }
 

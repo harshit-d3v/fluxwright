@@ -33,7 +33,7 @@ const NONE = {}
 const EXACT = { exact: true }
 const VISIBLE = { state: ['visible'] }
 const TIMEOUT = { timeout: true }
-const SHOT = { path: true, type: ['png', 'jpeg'], quality: true, omitBackground: true }
+const SHOT = { path: true, type: ['png', 'jpeg'], quality: true, omitBackground: true, timeout: true }
 const PDF = {
   path: true,
   format: true,
@@ -86,7 +86,7 @@ function checkOptions(method, options, allowed) {
 // Checks the options argument (at index `at`) of native methods first. Async ones reject rather
 // than throw, as the native call would.
 function guard(Class, label, sync, methods) {
-  for (const [name, at, allowed] of methods) {
+  for (const [name, at, allowed, via] of methods) {
     const call = Class.prototype[name]
     Class.prototype[name] = sync
       ? function (...args) {
@@ -95,6 +95,11 @@ function guard(Class, label, sync, methods) {
         }
       : async function (...args) {
           checkOptions(`${label}.${name}`, args[at], allowed)
+          // Playwright's per-call timeout: a locator carries it, and a page method that takes
+          // a selector is the same action on that selector's locator.
+          const timeout = args[at]?.timeout
+          if (timeout != null && via) return this.locator(args[0])[via](...args.slice(1))
+          if (timeout != null && this._withTimeout) return call.apply(this._withTimeout(timeout), args)
           return call.apply(this, args)
         }
   }
@@ -619,9 +624,10 @@ try {
   }
   // Playwright's locator.evaluate(fn, arg) calls fn(element, arg).
   const evaluateOn = native.Locator.prototype.evaluate
-  native.Locator.prototype.evaluate = async function (pageFunction, arg) {
+  native.Locator.prototype.evaluate = async function (pageFunction, arg, options) {
+    checkOptions('locator.evaluate', options, TIMEOUT)
     const source = typeof pageFunction === 'function' ? functionSource(pageFunction) : String(pageFunction)
-    return evaluateOn.call(this, source, arg)
+    return evaluateOn.call(options?.timeout != null ? this._withTimeout(options.timeout) : this, source, arg)
   }
   // As Playwright's page.pageErrors(): Error objects.
   const pageErrors = native.Page.prototype.pageErrors
@@ -674,17 +680,17 @@ try {
   guard(native.FrameLocator, 'frameLocator', true, builders)
   guard(native.Locator, 'locator', true, [...builders, ['filter', 0, { hasText: true }]])
   guard(native.Page, 'page', false, [
-    ['goto', 1, { waitUntil: true }],
-    ['click', 1, NONE],
-    ['fill', 2, NONE],
-    ['waitForSelector', 1, VISIBLE],
+    ['goto', 1, { waitUntil: true, timeout: true }],
+    ['click', 1, TIMEOUT, 'click'],
+    ['fill', 2, TIMEOUT, 'fill'],
+    ['waitForSelector', 1, { ...VISIBLE, ...TIMEOUT }, 'waitFor'],
   ])
   guard(native.Locator, 'locator', false, [
-    ['click', 0, NONE],
-    ['fill', 1, NONE],
-    ['waitFor', 0, VISIBLE],
-    ['textContent', 0, NONE],
-    ['boundingBox', 0, NONE],
+    ['click', 0, TIMEOUT],
+    ['fill', 1, TIMEOUT],
+    ['waitFor', 0, { ...VISIBLE, ...TIMEOUT }],
+    ['textContent', 0, TIMEOUT],
+    ['boundingBox', 0, TIMEOUT],
   ])
   native.Browser.prototype.newContext = async function (options) {
     checkOptions('browser.newContext', options, PAGE)
