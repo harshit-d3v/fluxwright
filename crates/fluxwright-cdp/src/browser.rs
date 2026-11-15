@@ -665,7 +665,8 @@ impl CdpBrowser {
             // and a second attach opens a second session that duplicates every event.
             match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(Ok(sid))) => Ok(sid),
-                Ok(Ok(Err(e))) => Err(e),
+                // SessionGone keeps it retryable: the job moves to another browser instead of failing.
+                Ok(Ok(Err(e))) => Err(Error::SessionGone(format!("{target_id}: {e}"))),
                 Ok(Err(_)) => Err(Error::SessionGone(target_id.into())),
                 Err(_) => Err(Error::timeout("attachToTarget", timeout.as_millis() as u64)),
             }

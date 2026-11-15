@@ -1624,7 +1624,8 @@ mod tests {
 
         // The stand-in cannot make a context, so the lease fails: what counts is that it was
         // tried on the running browser instead of waiting in the queue.
-        let res = tokio::time::timeout(Duration::from_secs(5), eng.acquire())
+        // Under the 500 ms RSS cache expiry: the old code also got through once the cache refreshed.
+        let res = tokio::time::timeout(Duration::from_millis(400), eng.acquire())
             .await
             .expect("the request waited instead of reusing the running browser");
         assert!(res.is_err());
