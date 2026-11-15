@@ -216,7 +216,7 @@ async fn touch_scripts_off_and_offline() {
     opts.emulation.has_touch = true;
     opts.emulation.offline = true;
     let page = eng.acquire_job(&opts).await.unwrap();
-    page.goto("data:text/html,<title>t</title>").await.unwrap();
+    page.goto("data:text/html,<meta name=viewport content='width=device-width'><title>t</title>").await.unwrap();
     let seen = page
         .evaluate("[navigator.maxTouchPoints > 0, 'ontouchstart' in window, navigator.onLine, innerWidth].join('|')")
         .await
