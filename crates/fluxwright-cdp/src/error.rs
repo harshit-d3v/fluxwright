@@ -45,6 +45,10 @@ impl Error {
         )
     }
 
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Timeout { .. })
+    }
+
     pub fn timeout(what: impl Into<String>, timeout_ms: u64) -> Self {
         Error::Timeout {
             what: what.into(),

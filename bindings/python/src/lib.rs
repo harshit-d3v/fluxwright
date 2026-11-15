@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -20,8 +20,14 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex, RwLock};
 
 /// Read-locked by every page call, so calls run side by side (a download wait and the click
-/// that starts it); write-locked by `close`.
-type LeaseSlot = Arc<RwLock<Option<fluxwright::PageLease>>>;
+/// that starts it); write-locked by `close`, which raises `closing` first so in-flight calls
+/// unblock immediately instead of holding the lock until timeout.
+struct PageSlot {
+    page: RwLock<Option<fluxwright::PageLease>>,
+    closing: tokio::sync::watch::Sender<bool>,
+}
+
+type LeaseSlot = Arc<PageSlot>;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -33,14 +39,12 @@ fn none<T>(_: T) -> Nothing {
     None
 }
 
-/// `fluxwright.Error` with `message`, or `fluxwright.TimeoutError` (`class`).
-fn raise(class: &str, message: String) -> PyErr {
-    Python::attach(|py| {
-        py.import("fluxwright._errors")
-            .and_then(|m| m.getattr(class))
-            .and_then(|cls| cls.call1((message,)))
-            .map_or_else(|e| e, PyErr::from_value)
-    })
+/// `fluxwright.Error` and `fluxwright.TimeoutError` as lazy `PyErr`s: making one needs no
+/// Python, so futures make them on Tokio's workers (where waiting for the GIL would hold up
+/// other tasks), and Python builds the exception when it raises it.
+mod py_errors {
+    pyo3::import_exception!(fluxwright._errors, Error);
+    pyo3::import_exception!(fluxwright._errors, TimeoutError);
 }
 
 /// An engine error as Playwright raises it: `TimeoutError` when something ran out of time.
@@ -53,24 +57,31 @@ fn error(e: impl Into<fluxwright::Error>) -> PyErr {
         E::Other(m) => m.starts_with("no download finished within"),
         _ => false,
     };
-    raise(
-        if timeout { "TimeoutError" } else { "Error" },
-        e.to_string(),
-    )
+    if timeout {
+        py_errors::TimeoutError::new_err(e.to_string())
+    } else {
+        py_errors::Error::new_err(e.to_string())
+    }
 }
 
 fn closed() -> PyErr {
-    raise("Error", "page closed".into())
+    py_errors::Error::new_err("page closed")
 }
 
-/// Runs `f` against the page; fails with "page closed" after `close()`.
+/// Runs `f` against the page; fails with "page closed" after `close()`, and cancels immediately
+/// when `close()` is called while running.
 async fn with_page<T, F>(lease: &LeaseSlot, f: F) -> PyResult<T>
 where
     F: for<'a> FnOnce(&'a fluxwright::PageLease) -> BoxFuture<'a, fluxwright::Result<T>>,
 {
-    match lease.read().await.as_ref() {
-        Some(p) => f(p).await.map_err(error),
-        None => Err(closed()),
+    let mut closing = lease.closing.subscribe();
+    let guard = lease.page.read().await;
+    let Some(p) = guard.as_ref() else {
+        return Err(closed());
+    };
+    tokio::select! {
+        r = f(p) => r.map_err(error),
+        _ = async { let _ = closing.wait_for(|c| *c).await; } => Err(closed()),
     }
 }
 
@@ -91,17 +102,28 @@ static RT: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio"));
 /// Results being handed to Python right now, on Tokio's blocking threads.
 static HANDING_OVER: AtomicUsize = AtomicUsize::new(0);
 
+/// Set first thing by `wait_for_hand_overs`: a hand-over that starts later never attaches.
+static EXITING: AtomicBool = AtomicBool::new(false);
+
 /// `fut` as an asyncio future on the running loop; cancelling that future drops `fut`.
 ///
 /// Counts its hand-overs for `wait_for_hand_overs`: a hand-over releases the GIL midway
 /// (`call_soon_threadsafe` writes to the loop's wake-up socket), so the script can finish in
 /// that gap, and if the interpreter is shutting down when the thread takes the GIL back, Python
-/// 3.10-3.13 end the thread and the process crashes (SIGSEGV) while Rust unwinds it.
+/// 3.10-3.13 end the thread and the process crashes (SIGSEGV) while Rust unwinds it. One that
+/// starts after that wait drops its result instead: the sync API's loop keeps futures pending
+/// past exit, and a page freed during shutdown ends its event streams then. The abi3 build
+/// can't ask whether Python is finalizing (PyO3 checks only in 3.13+ builds).
 fn future_into_py<'py, T, F>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,
 {
+    // Its result could never be handed over: fail now rather than leave the caller waiting for
+    // good (an atexit handler registered before fluxwright was imported runs after its own).
+    if EXITING.load(Ordering::SeqCst) {
+        return Err(py_errors::Error::new_err("fluxwright stopped at interpreter exit"));
+    }
     let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
     let future = event_loop.call_method0("create_future")?;
     let task = RT.spawn(fut);
@@ -123,16 +145,20 @@ where
         // Not on a Tokio worker: waiting there for the GIL would hold up its other tasks.
         RT.spawn_blocking(move || {
             HANDING_OVER.fetch_add(1, Ordering::SeqCst);
-            Python::attach(move |py| {
-                let (method, value) = match result.and_then(|v| v.into_bound_py_any(py)) {
-                    Ok(v) => ("set_result", v),
-                    Err(e) => ("set_exception", e.into_value(py).into_bound(py).into_any()),
-                };
-                // Fails when the loop is closed: then nothing waits for the result.
-                let _ = wrap_pyfunction!(hand_over, py).and_then(|f| {
-                    event_loop.call_method1(py, "call_soon_threadsafe", (f, target.bind(py), method, value))
+            // Counted before the check, so the exit wait either waits for this one or this one
+            // sees EXITING. Skipped, the Python objects are released later, without the GIL.
+            if !EXITING.load(Ordering::SeqCst) {
+                Python::attach(move |py| {
+                    let (method, value) = match result.and_then(|v| v.into_bound_py_any(py)) {
+                        Ok(v) => ("set_result", v),
+                        Err(e) => ("set_exception", e.into_value(py).into_bound(py).into_any()),
+                    };
+                    // Fails when the loop is closed: then nothing waits for the result.
+                    let _ = wrap_pyfunction!(hand_over, py).and_then(|f| {
+                        event_loop.call_method1(py, "call_soon_threadsafe", (f, target.bind(py), method, value))
+                    });
                 });
-            });
+            }
             HANDING_OVER.fetch_sub(1, Ordering::SeqCst);
         });
     });
@@ -148,10 +174,11 @@ fn hand_over(future: &Bound<'_, PyAny>, method: &str, value: &Bound<'_, PyAny>) 
     Ok(())
 }
 
-/// Runs at exit (`atexit`, while the interpreter is still whole): lets hand-overs in progress
-/// finish, for at most 2 s.
+/// Runs at exit (`atexit`, while the interpreter is still whole): stops hand-overs that have
+/// not started, then lets the ones in progress finish, for at most 2 s.
 #[pyfunction]
 fn wait_for_hand_overs(py: Python<'_>) {
+    EXITING.store(true, Ordering::SeqCst);
     py.detach(|| {
         let give_up = Instant::now() + Duration::from_secs(2);
         while HANDING_OVER.load(Ordering::SeqCst) > 0 && Instant::now() < give_up {
@@ -202,6 +229,14 @@ fn bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 fn save(path: &Path, data: &[u8]) -> PyResult<()> {
     create_parent(path, &mut std::fs::DirBuilder::new())?;
     Ok(std::fs::write(path, data)?)
+}
+
+/// `save` on a blocking thread, handing `data` back: a Tokio worker held by a large write delays
+/// every page's browser traffic.
+async fn save_blocking(path: PathBuf, data: Vec<u8>) -> PyResult<Vec<u8>> {
+    RT.spawn_blocking(move || save(&path, &data).map(|()| data))
+        .await
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
 }
 
 /// `save` for saved cookies: new folders and the file are the owner's alone.
@@ -285,7 +320,9 @@ struct Size {
 /// Saved storage: what `storage_state()` returned, or the path of the JSON file it saved.
 fn storage(value: &Bound<'_, PyAny>) -> PyResult<fluxwright::StorageState> {
     match value.extract::<PathBuf>() {
-        Ok(path) => serde_json::from_str(&std::fs::read_to_string(&path)?)
+        Ok(path) => value
+            .py()
+            .detach(|| std::fs::read_to_string(&path).map(|s| serde_json::from_str::<fluxwright::StorageState>(&s)))?
             .map_err(|e| PyValueError::new_err(format!("storage_state {}: {e}", path.display()))),
         Err(_) => options(value, "storage_state"),
     }
@@ -433,8 +470,12 @@ impl Page {
     fn new(lease: &Bound<'_, Lease>) -> PyResult<Self> {
         let lease = lease.get().0.lock().unwrap().take();
         let lease = lease.ok_or_else(|| PyValueError::new_err("this lease already has a page"))?;
+        let (closing, _) = tokio::sync::watch::channel(false);
         Ok(Page {
-            lease: Arc::new(RwLock::new(Some(lease))),
+            lease: Arc::new(PageSlot {
+                page: RwLock::new(Some(lease)),
+                closing,
+            }),
         })
     }
 
@@ -530,10 +571,10 @@ impl Page {
                 })
             })
             .await?;
-            if let Some(path) = path {
-                save(&path, &png)?;
+            match path {
+                Some(path) => save_blocking(path, png).await,
+                None => Ok(png),
             }
-            Ok(png)
         })
     }
 
@@ -562,10 +603,11 @@ impl Page {
             let json =
                 serde_json::to_value(&state).map_err(|e| PyValueError::new_err(e.to_string()))?;
             if let Some(path) = path {
-                save_private(
-                    &path,
-                    serde_json::to_string_pretty(&json).unwrap().as_bytes(),
-                )?;
+                let bytes = serde_json::to_vec_pretty(&json)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                RT.spawn_blocking(move || save_private(&path, &bytes))
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
             }
             Ok(Json(json))
         })
@@ -608,17 +650,37 @@ impl Page {
         let lease = self.lease.clone();
         future_into_py(py, async move {
             // Hold no page lock while waiting, or close() would wait for the download too.
+            let mut closing = lease.closing.subscribe();
             let downloads =
                 with_page(&lease, |p| Box::pin(async move { Ok(p.downloads()) })).await?;
-            let inner = downloads.next(timeout).await.map_err(error)?;
+            let inner = tokio::select! {
+                r = downloads.next(timeout) => r.map_err(error)?,
+                _ = async { let _ = closing.wait_for(|c| *c).await; } => return Err(closed()),
+            };
             Ok(Download { inner })
         })
     }
 
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Drops downloads that already finished, so the next `wait_for_download` waits for a new
+    /// one: `expect_download` starts with it.
+    #[pyo3(name = "_clear_downloads")]
+    fn clear_downloads<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease.clone();
         future_into_py(py, async move {
-            let page = lease.write().await.take();
+            // As in wait_for_download: no page lock while waiting for the downloads.
+            let downloads =
+                with_page(&lease, |p| Box::pin(async move { Ok(p.downloads()) })).await?;
+            downloads.clear().await;
+            Ok(None::<()>)
+        })
+    }
+
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        // Calls still running unblock at once (see `with_page`), so the write lock comes right away.
+        self.lease.closing.send_replace(true);
+        let lease = self.lease.clone();
+        future_into_py(py, async move {
+            let page = lease.page.write().await.take();
             if let Some(p) = page {
                 let _ = p.close().await;
             }
@@ -628,7 +690,7 @@ impl Page {
 
     /// Whether `close()` was called (or is under way).
     fn is_closed(&self) -> bool {
-        self.lease.try_read().map_or(true, |page| page.is_none())
+        *self.lease.closing.borrow()
     }
 
     /// CSS, `text=`, or `role=` selector.
@@ -668,26 +730,20 @@ impl Page {
     /// nothing logged after the call is missed.
     #[pyo3(name = "_logs")]
     fn logs(&self) -> PyResult<LogStream> {
-        let page = self.lease.try_read().map_err(|_| closed())?;
-        let p = page.as_ref().ok_or_else(closed)?;
-        Ok(LogStream(Arc::new(Mutex::new(p.subscribe_logs()))))
+        self.now(|p| LogStream(Arc::new(Mutex::new(p.subscribe_logs()))))
     }
 
     /// Network events from now on: subscribed before this returns, so a navigation right after
     /// it is seen whole.
     #[pyo3(name = "_network")]
     fn network(&self) -> PyResult<NetworkStream> {
-        let page = self.lease.try_read().map_err(|_| closed())?;
-        let p = page.as_ref().ok_or_else(closed)?;
-        Ok(NetworkStream(Arc::new(Mutex::new(p.subscribe_network()))))
+        self.now(|p| NetworkStream(Arc::new(Mutex::new(p.subscribe_network()))))
     }
 
     /// Dialogs from now on, for the caller to answer instead of the engine dismissing them.
     #[pyo3(name = "_dialogs")]
     fn dialogs(&self) -> PyResult<DialogStream> {
-        let page = self.lease.try_read().map_err(|_| closed())?;
-        let p = page.as_ref().ok_or_else(closed)?;
-        Ok(DialogStream(Arc::new(Mutex::new(p.subscribe_dialogs()))))
+        self.now(|p| DialogStream(Arc::new(Mutex::new(p.subscribe_dialogs()))))
     }
 
     /// Starts handing this page's requests over; resolves once interception is on, so a `goto`
@@ -701,6 +757,15 @@ impl Page {
 }
 
 impl Page {
+    fn now<T>(&self, f: impl FnOnce(&fluxwright::PageLease) -> T) -> PyResult<T> {
+        if *self.lease.closing.borrow() {
+            return Err(closed());
+        }
+        let page = self.lease.page.try_read().map_err(|_| closed())?;
+        let p = page.as_ref().ok_or_else(closed)?;
+        Ok(f(p))
+    }
+
     fn top(&self) -> FrameLocator {
         FrameLocator {
             lease: self.lease.clone(),
@@ -761,10 +826,10 @@ impl Locator {
                 Box::pin(async move { p.element_screenshot(&sel).await })
             })
             .await?;
-            if let Some(path) = path {
-                save(&path, &png)?;
+            match path {
+                Some(path) => save_blocking(path, png).await,
+                None => Ok(png),
             }
-            Ok(png)
         })
     }
 
@@ -977,7 +1042,7 @@ impl Route {
         slot.lock()
             .await
             .take()
-            .ok_or_else(|| raise("Error", "route is already handled".into()))
+            .ok_or_else(|| py_errors::Error::new_err("route is already handled"))
     }
 }
 
@@ -1062,6 +1127,9 @@ impl Route {
 /// A request, as network events hand it over; `fluxwright.async_api` wraps it in `Request`.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct NetworkRequest {
+    /// Chrome's request id: the same for every event of one request.
+    #[pyo3(get)]
+    id: String,
     #[pyo3(get)]
     url: String,
     #[pyo3(get)]
@@ -1078,6 +1146,7 @@ struct NetworkRequest {
 impl From<fluxwright::NetRequest> for NetworkRequest {
     fn from(r: fluxwright::NetRequest) -> Self {
         NetworkRequest {
+            id: r.id,
             url: r.url,
             method: r.method,
             headers: r.headers.into_iter().collect(),
@@ -1217,7 +1286,7 @@ impl Dialog {
         slot.lock()
             .await
             .take()
-            .ok_or_else(|| raise("Error", "dialog is already handled".into()))
+            .ok_or_else(|| py_errors::Error::new_err("dialog is already handled"))
     }
 }
 
@@ -1325,8 +1394,7 @@ impl<'py> IntoPyObject<'py> for PageError {
 
     fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
         let e = self.0;
-        py.import("fluxwright._errors")?
-            .getattr("Error")?
+        py.get_type::<py_errors::Error>()
             .call1((e.message, e.name, e.stack))
     }
 }
@@ -1384,7 +1452,13 @@ impl Download {
     /// Copies the file to `path`, creating missing folders.
     fn save_as<'py>(&self, py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyAny>> {
         let download = self.inner.clone();
-        future_into_py(py, async move { Ok(download.save_as(path).map(none)?) })
+        future_into_py(py, async move {
+            // On a blocking thread: copying a large file held a Tokio worker for seconds.
+            RT.spawn_blocking(move || download.save_as(path))
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
+            Ok(None::<()>)
+        })
     }
 
     /// Always `None`: only finished downloads are handed over.

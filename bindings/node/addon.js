@@ -25,6 +25,75 @@ async function savePrivate(path, data) {
   }
 }
 
+// The options each method implements: a key maps to true (any value the native side accepts) or
+// to the values it supports. Any other throws a TypeError. napi would ignore it, and Playwright
+// code relying on it (`state: 'hidden'`, `type: 'jpeg'`, `button: 'right'`) would quietly do
+// something else. MISSING.md lists what is not implemented.
+const NONE = {}
+const EXACT = { exact: true }
+const VISIBLE = { state: ['visible'] }
+const TIMEOUT = { timeout: true }
+const SHOT = { path: true, type: ['png'] }
+const LAUNCH = { maxBrowsers: true, executablePath: true, headless: true, queueTimeout: true, memoryCeilingMb: true }
+const PAGE = {
+  proxy: true,
+  userAgent: true,
+  locale: true,
+  timezoneId: true,
+  geolocation: true,
+  permissions: true,
+  viewport: true,
+  deviceScaleFactor: true,
+  colorScheme: true,
+  storageState: true,
+}
+const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true }
+const CONTINUE = { url: true, method: true, headers: true, postData: true }
+
+function checkOptions(method, options, allowed) {
+  if (options == null) return
+  if (typeof options !== 'object') throw new TypeError(`${method}: options must be an object`)
+  for (const [key, value] of Object.entries(options)) {
+    if (value == null) continue
+    const ok = Object.hasOwn(allowed, key) && allowed[key]
+    if (!ok) throw new TypeError(`${method}: option '${key}' is not supported (see MISSING.md)`)
+    // NaN reaches napi as 0: an unset env var would make `maxBrowsers: 0` or no memory budget.
+    if (Number.isNaN(value)) throw new TypeError(`${method}: option '${key}' is NaN`)
+    if (Array.isArray(ok) && !ok.includes(value)) {
+      const supported = ok.map((v) => JSON.stringify(v)).join(', ')
+      throw new TypeError(`${method}: ${key} ${JSON.stringify(value)} is not supported, only ${supported} (see MISSING.md)`)
+    }
+  }
+}
+
+// Checks the options argument (at index `at`) of native methods first. Async ones reject rather
+// than throw, as the native call would.
+function guard(Class, label, sync, methods) {
+  for (const [name, at, allowed] of methods) {
+    const call = Class.prototype[name]
+    Class.prototype[name] = sync
+      ? function (...args) {
+          checkOptions(`${label}.${name}`, args[at], allowed)
+          return call.apply(this, args)
+        }
+      : async function (...args) {
+          checkOptions(`${label}.${name}`, args[at], allowed)
+          return call.apply(this, args)
+        }
+  }
+}
+
+// An answer that comes after its handler returned, once the request went on or the dialog was
+// answered for it: it resolves, with a warning, instead of rejecting where nothing catches it,
+// which would crash Node.
+function late(what) {
+  console.warn(
+    `[fluxwright] a ${what} was answered after its handler returned, and the answer is ignored: ` +
+      'await it, or return its promise, inside the handler',
+  )
+  return Promise.resolve()
+}
+
 // Playwright-style `page.evaluate(fn, arg)`. As in Playwright, the function is sent to the page as
 // source text, so it can use `arg` but not variables from Node. Strings run as expressions.
 function toExpression(pageFunction, arg) {
@@ -52,20 +121,38 @@ function toError(e) {
   return err
 }
 
-// Playwright's Request, Response and Dialog over the native objects.
-function toRequest(native, failure = null) {
-  return {
+// Every listener of `event`, as emit runs them, except that one which throws or rejects is
+// logged instead of reaching the native callback, where napi ends the process and every job in
+// it (Playwright's `msg.text()` on the plain `{ type, text }` console messages did that).
+function emitSafely(em, event, arg) {
+  const failed = (err) => console.error(`[fluxwright] a page.on('${event}') listener failed:`, err)
+  for (const listener of em?.rawListeners(event) ?? []) {
+    try {
+      const out = listener.call(em, arg)
+      if (typeof out?.then === 'function') out.then(undefined, failed)
+    } catch (err) {
+      failed(err)
+    }
+  }
+}
+
+// Why a request failed, for request.failure(); set on requestfailed.
+const failures = new WeakMap()
+
+// Playwright's Request and Response over the native objects.
+function toRequest(native) {
+  const request = {
     url: () => native.url,
     method: () => native.method,
     headers: () => ({ ...native.headers }),
     postData: () => native.postData ?? null,
     resourceType: () => native.resourceType,
-    failure: () => (failure === null ? null : { errorText: failure }),
+    failure: () => (failures.has(request) ? { errorText: failures.get(request) } : null),
   }
+  return request
 }
 
-function toResponse(native) {
-  const request = toRequest(native.request)
+function toResponse(native, request) {
   const text = async () => (await native.body()).toString('utf8')
   return {
     url: () => native.url,
@@ -80,35 +167,30 @@ function toResponse(native) {
   }
 }
 
-function toDialog(native) {
+// Playwright's Dialog over the native one. Every dialog listener runs, and their promises are
+// awaited. A dialog none of them answered is dismissed, so the page never hangs on it; a
+// beforeunload one is accepted, as with no listener at all (dismissing it would cancel the
+// navigation). An answer after that is too late.
+async function answerDialog(listeners, native) {
+  let answered = false
+  let settled = false
+  const answer = (work) => {
+    if (settled) return late('dialog')
+    answered = true
+    return work()
+  }
   const dialog = {
-    answered: false,
     type: () => native.type,
     message: () => native.message,
     defaultValue: () => native.defaultValue,
-    accept: (promptText) => {
-      dialog.answered = true
-      return native.accept(promptText)
-    },
-    dismiss: () => {
-      dialog.answered = true
-      return native.dismiss()
-    },
+    accept: (promptText) => answer(() => native.accept(promptText)),
+    dismiss: () => answer(() => native.dismiss()),
   }
-  return dialog
-}
-
-// Every dialog listener runs, and their promises are awaited. A dialog none of them answered is
-// dismissed, so the page never hangs on it; a beforeunload one is accepted, as with no listener at
-// all (dismissing it would cancel the navigation).
-async function answerDialog(em, dialog) {
-  const pending = em.rawListeners('dialog').map(async (handler) => handler(dialog))
-  for (const r of await Promise.allSettled(pending)) {
+  for (const r of await Promise.allSettled(listeners.map(async (handler) => handler(dialog)))) {
     if (r.status === 'rejected') console.error('[fluxwright] a dialog listener failed:', r.reason)
   }
-  if (!dialog.answered) {
-    await (dialog.type() === 'beforeunload' ? dialog.accept() : dialog.dismiss()).catch(() => {})
-  }
+  settled = true
+  if (!answered) await (native.type === 'beforeunload' ? native.accept() : native.dismiss()).catch(() => {})
 }
 
 // page.on / once / off as in Playwright, for console messages, page errors, network events and
@@ -125,34 +207,58 @@ function installEvents(Page) {
     dialog: 'dialog',
   }
   const events = Object.keys(sources)
-  const emitter = (page, event) => {
+  // Pages whose close() was called: the native flag goes up only once napi runs the call.
+  const closing = new WeakSet()
+  // The native side keeps these callbacks as long as the page's lease. They reach the emitter only
+  // through a WeakRef and the WeakMap, so listeners that use the page don't keep a forgotten page,
+  // and its browser slot, alive. Made apart from `stateOf`, whose scope holds the page.
+  function subscribe(page, source) {
+    const ref = new WeakRef(page)
+    const em = () => emitters.get(ref.deref())?.em
+    if (source === 'log') {
+      page._onLog((e) =>
+        e.event === 'console' ? emitSafely(em(), 'console', e.message) : emitSafely(em(), 'pageerror', toError(e.error)),
+      )
+    } else if (source === 'network') {
+      // One Request per request, as in Playwright: its request, response, requestfinished and
+      // requestfailed events, and response.request(), hand over the same object.
+      const requests = new Map()
+      page._onNetwork((e) => {
+        let request = requests.get(e.request.id)
+        if (!request) {
+          request = toRequest(e.request)
+          requests.set(e.request.id, request)
+          // Ones that never finish (a long poll, say) go in the end, as in the engine.
+          if (requests.size > 1000) requests.delete(requests.keys().next().value)
+        }
+        if (e.event === 'requestfinished' || e.event === 'requestfailed') requests.delete(e.request.id)
+        if (e.event === 'requestfailed') failures.set(request, e.failure)
+        emitSafely(em(), e.event, e.event === 'response' ? toResponse(e.response, request) : request)
+      })
+    } else {
+      page._onDialog((native) => answerDialog(em()?.rawListeners('dialog') ?? [], native))
+    }
+  }
+  // The page's emitter and its pending waits, which close() rejects; starts `event`'s source.
+  const stateOf = (page, event) => {
     let state = emitters.get(page)
     if (!state) {
       const em = new EventEmitter()
       em.setMaxListeners(0) // waitForResponse adds one per call
-      state = { em, started: new Set() }
+      state = { em, started: new Set(), waits: new Set() }
       emitters.set(page, state)
     }
-    const { em, started } = state
     const source = sources[event]
-    if (!started.has(source)) {
-      started.add(source)
-      if (source === 'log') {
-        page._onLog((e) => (e.event === 'console' ? em.emit('console', e.message) : em.emit('pageerror', toError(e.error))))
-      } else if (source === 'network') {
-        page._onNetwork((e) =>
-          em.emit(e.event, e.event === 'response' ? toResponse(e.response) : toRequest(e.request, e.failure ?? null)),
-        )
-      } else {
-        page._onDialog((native) => answerDialog(em, toDialog(native)))
-      }
+    if (!state.started.has(source)) {
+      subscribe(page, source)
+      state.started.add(source)
     }
-    return em
+    return state
   }
   for (const method of ['on', 'once', 'addListener']) {
     Page.prototype[method] = function (event, handler) {
       if (!events.includes(event)) throw new Error(`page.${method}: '${event}' is not supported (${events.join(', ')})`)
-      emitter(this, event)[method === 'addListener' ? 'on' : method](event, handler)
+      stateOf(this, event).em[method === 'addListener' ? 'on' : method](event, handler)
       return this
     }
   }
@@ -164,43 +270,58 @@ function installEvents(Page) {
   }
   // page.waitForResponse / waitForRequest: the first match from now on, within `timeout` ms
   // (default 30 s, 0 for none). A string or RegExp matches the URL as page.route does; a function
-  // gets the Response or Request and may return a promise.
+  // gets the Response or Request and may return a promise. Closing the page rejects it.
   for (const [method, event] of [
     ['waitForResponse', 'response'],
     ['waitForRequest', 'request'],
   ]) {
     Page.prototype[method] = function (urlOrPredicate, options) {
-      const timeout = options?.timeout ?? 30000
-      let matches = urlOrPredicate
-      if (typeof urlOrPredicate !== 'function') {
-        const url = urlMatcher(urlOrPredicate)
-        matches = (r) => url(r.url())
-      }
       return new Promise((resolve, reject) => {
+        checkOptions(`page.${method}`, options, TIMEOUT)
+        if (closing.has(this) || this.isClosed()) throw new Error(`page.${method}: the page is closed`)
+        const timeout = options?.timeout ?? 30000
+        let matches = urlOrPredicate
+        if (typeof urlOrPredicate !== 'function') {
+          const url = urlMatcher(urlOrPredicate)
+          matches = (r) => url(r.url())
+        }
+        const { em, waits } = stateOf(this, event)
         let timer = null
+        const fail = (err) => {
+          done()
+          reject(err)
+        }
+        const closed = () => fail(new Error(`page.${method}: the page closed`))
         const done = () => {
-          this.off(event, listener)
+          em.off(event, listener)
           clearTimeout(timer)
+          waits.delete(closed)
         }
         const listener = async (r) => {
           try {
             if (!(await matches(r))) return
           } catch (err) {
-            done()
-            return reject(err)
+            return fail(err)
           }
           done()
           resolve(r)
         }
-        this.on(event, listener)
+        em.on(event, listener)
+        waits.add(closed)
         if (timeout > 0) {
-          timer = setTimeout(() => {
-            done()
-            reject(new Error(`page.${method}: timeout ${timeout}ms exceeded`))
-          }, timeout)
+          timer = setTimeout(() => fail(new Error(`page.${method}: timeout ${timeout}ms exceeded`)), timeout)
         }
       })
     }
+  }
+  // As in Playwright, closing the page rejects its pending waits at once; calls still running on
+  // the page reject on the native side.
+  const close = Page.prototype.close
+  Page.prototype.close = async function (options) {
+    checkOptions('page.close', options, NONE)
+    closing.add(this)
+    for (const closed of emitters.get(this)?.waits ?? []) closed()
+    return close.call(this)
   }
 }
 
@@ -242,8 +363,9 @@ function urlMatcher(pattern) {
 // route.fallback() passes the request to the next matching one, and unmatched requests continue.
 function installRoutes(Page) {
   const routes = new WeakMap()
-  const request = (native) => toRequest(native)
   const dispatch = async (list, native) => {
+    const request = toRequest(native)
+    let answered = false
     try {
       for (let i = list.length - 1; i >= 0; i--) {
         // A URL function is user code: one that throws counts as no match.
@@ -255,18 +377,22 @@ function installRoutes(Page) {
         }
         if (!matched) continue
         // The first answer wins; it is set when the call starts, so an answer still under way
-        // when the handler returns is waited for, not taken as no answer.
+        // when the handler returns is waited for, not taken as no answer. One that comes after
+        // the handler returned is too late: the request went on without it.
         let answer = null
         let fellBack = false
+        let returned = false
         const answerWith = (work) => {
+          if (returned) return late('route')
           if (answer || fellBack) return Promise.reject(new Error('route is already handled'))
           answer = work()
           return answer
         }
         const route = {
-          request: () => request(native),
+          request: () => request,
           fulfill: (o = {}) =>
             answerWith(async () => {
+              checkOptions('route.fulfill', o, FULFILL)
               const headers = { ...o.headers }
               let body = o.body
               if (o.json !== undefined) {
@@ -278,33 +404,51 @@ function installRoutes(Page) {
               return native.fulfill({ status: o.status, headers, body })
             }),
           continue: (o = {}) =>
-            answerWith(() => native.continue({ url: o.url, method: o.method, headers: o.headers, postData: o.postData })),
+            answerWith(async () => {
+              checkOptions('route.continue', o, CONTINUE)
+              return native.continue({ url: o.url, method: o.method, headers: o.headers, postData: o.postData })
+            }),
           abort: (errorCode) => answerWith(() => native.abort(errorCode)),
-          fallback: async () => {
+          fallback: async (o) => {
+            if (returned) return late('route')
+            checkOptions('route.fallback', o, NONE)
             if (answer) throw new Error('route is already handled')
             fellBack = true
           },
         }
         try {
-          await list[i].handler(route, route.request())
+          await list[i].handler(route, request)
+          returned = true
           if (fellBack && !answer) continue
-          if (answer) await answer
+          if (answer) {
+            await answer
+            answered = true
+          }
         } catch (err) {
           console.error('[fluxwright] a route handler failed; the request continues:', err)
+        } finally {
+          returned = true
         }
         return
       }
     } finally {
       // No answer, or one that failed: let the request through rather than hang the page.
-      // A request already answered refuses this, harmlessly.
-      await native.continue().catch(() => {})
+      if (!answered) await native.continue().catch(() => {})
     }
+  }
+  // The native side keeps the dispatcher as long as the page's lease. It reaches the route list
+  // through a WeakRef, so handlers that use the page don't keep a forgotten page alive. Made apart
+  // from route(), whose scope holds the page.
+  const dispatcher = (page) => {
+    const ref = new WeakRef(page)
+    return (native) => dispatch(routes.get(ref.deref()) ?? [], native)
   }
   // One interception start per page. Every route() call waits for it, so none returns before
   // requests are handed over, and a call adds its handler only once the start succeeded (a
   // failed start is tried again by the next call).
   const starts = new WeakMap()
-  Page.prototype.route = async function (url, handler) {
+  Page.prototype.route = async function (url, handler, options) {
+    checkOptions('page.route', options, NONE)
     let list = routes.get(this)
     if (!list) {
       list = []
@@ -312,7 +456,7 @@ function installRoutes(Page) {
     }
     let start = starts.get(this)
     if (!start) {
-      this._setRouteHandler((native) => dispatch(list, native))
+      this._setRouteHandler(dispatcher(this))
       start = this._intercept()
       starts.set(this, start)
       start.catch(() => starts.get(this) === start && starts.delete(this))
@@ -377,7 +521,8 @@ class BrowserContext {
   }
 
   // page.route for this context's page; added before newPage(), it applies from the first request.
-  async route(url, handler) {
+  async route(url, handler, options) {
+    checkOptions('browserContext.route', options, NONE)
     this.#routes.push([url, handler])
     if (this.#page) await this.#page.route(url, handler)
   }
@@ -392,11 +537,13 @@ class BrowserContext {
     return this.#page.storageState(options)
   }
 
-  async cookies() {
+  async cookies(urls) {
+    if (urls !== undefined) throw new TypeError('browserContext.cookies: filtering by URL is not supported (see MISSING.md)')
     return (await this.storageState()).cookies
   }
 
-  async close() {
+  async close(options) {
+    checkOptions('browserContext.close', options, NONE)
     this.#closed = true
     if (this.#page) await this.#page.close()
   }
@@ -405,6 +552,7 @@ class BrowserContext {
 // page.waitForDownload() with Playwright's Download.
 function installDownloads(Page) {
   Page.prototype.waitForDownload = async function (options) {
+    checkOptions('page.waitForDownload', options, TIMEOUT)
     const d = await this._waitForDownload(options?.timeout)
     return {
       url: () => d.url,
@@ -439,6 +587,7 @@ try {
   // As in Playwright, saved storage can live in a JSON file.
   const newPage = native.Browser.prototype.newPage
   native.Browser.prototype.newPage = async function (options) {
+    checkOptions('browser.newPage', options, PAGE)
     if (typeof options?.storageState === 'string') {
       options = { ...options, storageState: JSON.parse(await fs.readFile(options.storageState, 'utf8')) }
     }
@@ -446,6 +595,7 @@ try {
   }
   const storageState = native.Page.prototype.storageState
   native.Page.prototype.storageState = async function (options) {
+    checkOptions('page.storageState', options, { path: true })
     const state = await storageState.call(this)
     if (options?.path) await savePrivate(options.path, JSON.stringify(state, null, 2))
     return state
@@ -461,29 +611,74 @@ try {
   native.Page.prototype.pageErrors = async function () {
     return (await pageErrors.call(this)).map(toError)
   }
-  for (const Class of [native.Page, native.Locator]) {
+  for (const [Class, label, allowed] of [
+    [native.Page, 'page', { fullPage: true, ...SHOT }],
+    [native.Locator, 'locator', SHOT],
+  ]) {
     const screenshot = Class.prototype.screenshot
     Class.prototype.screenshot = async function (options) {
+      checkOptions(`${label}.screenshot`, options, allowed)
+      // Playwright picks JPEG from the extension: PNG bytes there would make a broken file.
+      if (!options?.type && /\.jpe?g$/i.test(options?.path ?? '')) {
+        throw new TypeError(`${label}.screenshot: only PNG is supported, not ${options.path} (see MISSING.md)`)
+      }
       const png = await screenshot.call(this, options)
       if (options?.path) await save(options.path, png)
       return png
     }
   }
+  const builders = [
+    ['locator', 1, NONE],
+    ['getByText', 1, EXACT],
+    ['getByRole', 1, { name: true, exact: true }],
+    ['getByLabel', 1, EXACT],
+    ['getByPlaceholder', 1, EXACT],
+  ]
+  guard(native.Page, 'page', true, builders)
+  guard(native.FrameLocator, 'frameLocator', true, builders)
+  guard(native.Locator, 'locator', true, [...builders, ['filter', 0, { hasText: true }]])
+  guard(native.Page, 'page', false, [
+    ['goto', 1, { waitUntil: true }],
+    ['click', 1, NONE],
+    ['fill', 2, NONE],
+    ['waitForSelector', 1, VISIBLE],
+  ])
+  guard(native.Locator, 'locator', false, [
+    ['click', 0, NONE],
+    ['fill', 1, NONE],
+    ['waitFor', 0, VISIBLE],
+    ['textContent', 0, NONE],
+    ['boundingBox', 0, NONE],
+  ])
   native.Browser.prototype.newContext = async function (options) {
+    checkOptions('browser.newContext', options, PAGE)
     return new BrowserContext(this, options)
   }
   installEvents(native.Page)
   installRoutes(native.Page)
   installDownloads(native.Page)
   module.exports = native
-  module.exports.chromium = native.Chromium
-  module.exports.BrowserContext = BrowserContext
+  // Chromium.launch is read-only on the native class, so `chromium` is a checked stand-in.
+  module.exports.chromium = {
+    launch: async (options) => {
+      checkOptions('chromium.launch', options, LAUNCH)
+      return native.Chromium.launch(options)
+    },
+  }
   module.exports.default = module.exports
 } catch (err) {
+  // Keep why: no prebuild for this platform, a missing optional dependency, or a checkout that
+  // was never built.
+  const error = new Error(
+    `fluxwright: the native addon failed to load: ${err.message}. Prebuilds cover Windows x64, ` +
+      'macOS x64 and arm64, and Linux x64 (glibc); elsewhere, build it from a source checkout ' +
+      '(bindings/node: npm run build).',
+    { cause: err },
+  )
   module.exports = {
     chromium: {
       launch: async () => {
-        throw new Error('build the native addon: npm run build')
+        throw error
       },
     },
   }

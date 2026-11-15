@@ -843,4 +843,3 @@ module.exports.Locator = nativeBinding.Locator
 module.exports.NetworkResponse = nativeBinding.NetworkResponse
 module.exports.Page = nativeBinding.Page
 module.exports.PendingDialog = nativeBinding.PendingDialog
-module.exports.chromium = nativeBinding.chromium

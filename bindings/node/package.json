@@ -41,7 +41,7 @@
   ],
   "scripts": {
     "build": "napi build --platform --release",
-    "test": "node test/smoke.mjs",
+    "test": "node --expose-gc test/smoke.mjs",
     "test:types": "tsc -p test",
     "build:debug": "napi build --platform",
     "artifacts": "napi artifacts",

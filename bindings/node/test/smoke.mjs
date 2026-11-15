@@ -33,6 +33,11 @@ await once(server, 'listening')
 server.unref()
 const base = `http://127.0.0.1:${server.address().port}`
 
+// A pool that could never start a browser fails at once, and so does NaN (an unset env var, say),
+// which napi would read as 0.
+await assert.rejects(fluxwright.chromium.launch({ maxBrowsers: 0 }), /at least 1/)
+await assert.rejects(fluxwright.chromium.launch({ maxBrowsers: NaN }), /NaN/)
+
 const browser = await fluxwright.chromium.launch({ maxBrowsers: 1 })
 try {
   const page = await browser.newPage()
@@ -68,6 +73,13 @@ try {
   assert.equal(await page.evaluate(methods.twice, 4), 8)
   assert.equal(await page.evaluate(new Calc().triple, 2), 6)
   await assert.rejects(page.evaluate(Math.max), /can't be sent to the page/)
+  // Options Fluxwright does not implement throw instead of being ignored.
+  await assert.rejects(page.waitForSelector('p', { state: 'hidden' }), TypeError)
+  await page.waitForSelector('p', { state: 'visible' })
+  assert.throws(() => page.locator('p', { hasText: 'x' }), TypeError)
+  await assert.rejects(page.click('p', { button: 'right' }), TypeError)
+  await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.jpg') }), TypeError)
+  await assert.rejects(browser.newPage({ extraHTTPHeaders: { a: '1' } }), TypeError)
   await page.close()
 
   // Per-page emulation, with Playwright's option names.
@@ -166,6 +178,28 @@ try {
   })
   for (let i = 0; i < 50 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20))
   assert.deepEqual(seen, ['warning:careful', 'SyntaxError:oops'])
+
+  // A listener that throws (Playwright's `msg.text()` on a `{ type, text }` message) or rejects
+  // is logged: the process lives on and the other listeners still run.
+  const quietErrors = console.error
+  const logged = []
+  console.error = (...args) => logged.push(args.join(' '))
+  try {
+    const strict = await browser.newPage()
+    const got = []
+    strict.on('console', (m) => m.text()).on('console', async () => {
+      throw new Error('async boom')
+    })
+    strict.on('console', (m) => got.push(m.text))
+    await strict.evaluate(() => console.log('hello'))
+    for (let i = 0; i < 50 && (got.length < 1 || logged.length < 2); i++) await new Promise((r) => setTimeout(r, 20))
+    assert.deepEqual(got, ['hello'])
+    assert.equal(logged.length, 2, logged.join('\n'))
+    await strict.close()
+  } finally {
+    console.error = quietErrors
+  }
+
   await live.goto(base)
   await live.evaluate(() => {
     const a = document.createElement('a')
@@ -194,7 +228,10 @@ try {
   })
   assert.equal((await pending).suggestedFilename(), 'report.csv')
   const quiet = console.error
+  const warn = console.warn
+  let warning = ''
   console.error = () => {}
+  console.warn = (message) => (warning = message)
   try {
     await rv.route('**/api', (route) => route.fulfill({ path: join(tmpdir(), 'no-such-file-fluxwright') }))
     assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
@@ -214,8 +251,19 @@ try {
     await rv.route(broken, (route) => route.fulfill({ body: 'never' }))
     assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
     await rv.unroute(broken)
+    // An answer after the handler returned is ignored with a warning, not a rejection that would
+    // crash Node; the request went on without it.
+    let late = null
+    await rv.route('**/api', (route) => {
+      late = new Promise((resolve) => setTimeout(resolve, 50)).then(() => route.fulfill({ body: 'late' }))
+    })
+    assert.equal(await rv.evaluate(() => fetch('/api').then((r) => r.text())), '{"real":true}')
+    await late
+    assert.match(warning, /after its handler returned/)
+    await rv.unroute('**/api')
   } finally {
     console.error = quiet
+    console.warn = warn
   }
   await rv.route(/\/hdr$/g, (route, request) => route.continue({ headers: { ...request.headers(), 'x-test': 'again' } }))
   for (let i = 0; i < 2; i++) {
@@ -270,6 +318,15 @@ try {
   net.on('response', (r) => seenNet.push(`response ${r.status()} ${path(r)}`))
   net.on('requestfinished', (r) => seenNet.push(`finished ${path(r)}`))
   net.on('requestfailed', (r) => seenNet.push(`failed ${path(r)} ${r.failure()?.errorText}`))
+  // One Request object per request, as in Playwright, so in-flight trackers drain.
+  const requested = []
+  const inFlight = new Set()
+  net.on('request', (r) => {
+    requested.push(r)
+    inFlight.add(r)
+  })
+  net.on('requestfinished', (r) => inFlight.delete(r))
+  net.on('requestfailed', (r) => inFlight.delete(r))
   await net.goto(base)
   const [api] = await Promise.all([net.waitForResponse('**/api'), net.evaluate(() => fetch('/api').then((r) => r.text()))])
   assert.equal(api.status(), 200)
@@ -284,6 +341,8 @@ try {
   assert.ok(seenNet.includes('response 200 /api'), seenNet.join('\n'))
   assert.ok(seenNet.includes('finished /api'), seenNet.join('\n'))
   assert.ok(seenNet.includes('failed /gone net::ERR_FAILED'), seenNet.join('\n'))
+  assert.ok(requested.includes(api.request()), 'response.request() is the request event object')
+  assert.ok(![...inFlight].some((r) => ['/api', '/gone'].includes(path(r))), [...inFlight].map(path).join(' '))
   const byPredicate = net.waitForRequest((r) => r.url().endsWith('/hdr'))
   await net.evaluate(() => fetch('/hdr'))
   assert.equal((await byPredicate).method(), 'GET')
@@ -318,6 +377,17 @@ try {
   assert.deepEqual(context.pages(), [])
   await assert.rejects(context.newPage(), /context is closed/)
 
+  // close() does not wait for calls still running on the page (this one would run until the
+  // action timeout): they reject at once, and so do pending waits.
+  const closing = await browser.newPage()
+  const openCall = assert.rejects(closing.waitForSelector('#never'), /page closed/)
+  const openWait = assert.rejects(closing.waitForResponse('**/never', { timeout: 0 }), /page closed/)
+  const closeStarted = Date.now()
+  await closing.close()
+  assert.ok(Date.now() - closeStarted < 5000, 'close() waited for a running call')
+  await openCall
+  await openWait
+
   // One browser holds 8 pages; the 300 started after them wait their turn instead of failing
   // (the engine used to refuse jobs past 256 waiting, and give up after 30 s).
   const held = await Promise.all(Array.from({ length: 8 }, () => browser.newPage()))
@@ -347,6 +417,28 @@ try {
     await Promise.all(busy.map((page) => page.close()))
   } finally {
     await hurried.close()
+  }
+
+  // A page you forget is cleaned up once Node collects it, even when its listeners and routes use
+  // it: the native side reaches them only through a WeakRef. Needs --expose-gc, as npm test runs.
+  if (globalThis.gc) {
+    const small = await fluxwright.chromium.launch({ maxBrowsers: 1, queueTimeout: 10000 })
+    try {
+      for (let i = 0; i < 8; i++) {
+        const page = await small.newPage()
+        page.on('console', () => page.isClosed()).on('request', () => page.isClosed())
+        page.on('dialog', (dialog) => (page.isClosed() ? undefined : dialog.dismiss()))
+        await page.route('**/never', (route) => (page.isClosed() ? route.abort() : route.fallback()))
+      }
+      for (let i = 0; i < 5; i++) {
+        globalThis.gc()
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      // All 8 slots of its one browser were taken: only a collected page can give one back.
+      await (await small.newPage()).close()
+    } finally {
+      await small.close()
+    }
   }
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).

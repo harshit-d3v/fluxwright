@@ -12,9 +12,11 @@ Requires a local Chrome/Chromium binary (`FLUXWRIGHT_CHROMIUM`, `CHROME`, `CHROM
 npm install fluxwright
 ```
 
-If no prebuild exists for your platform, you need Rust + Chrome, then from this package directory:
+Prebuilds cover Windows x64, macOS x64 and arm64, and Linux x64 (glibc). Elsewhere, `chromium.launch` rejects with the reason the addon did not load; build it from a source checkout instead (needs Rust):
 
 ```bash
+cd bindings/node
+npm install
 npm run build
 ```
 
@@ -51,20 +53,20 @@ await browser.close();
 | `page.frameLocator(iframeSelector)` | Same locators inside an iframe, same- or cross-origin; nest with `.frameLocator()` |
 | `page.evaluate(fn, arg?)` / `page.evaluate(expression)` | Runs a function with a JSON-serializable `arg`, or a string expression, in the page. Awaits promises and returns JSON. As in Playwright, the function is sent as source text, so it can't use variables from Node. A thrown JS error rejects with its message and stack |
 | `page.screenshot({ fullPage?, path? })` | PNG `Buffer`, also written to `path` |
-| `page.route(url, handler)` / `page.unroute(url, handler?)` | Playwright's request interception: `url` is a glob (`**/api/*`), a RegExp or a function of the URL; the handler gets `(route, request)` and answers with `route.fulfill({ status, headers, body, json, path })`, `route.continue({ url, method, headers, postData })`, `route.abort(code?)` or `route.fallback()`. The handler added last runs first. Requests of popups and iframes too; blocked resource types never reach it |
-| `page.on('console' \| 'pageerror', handler)` / `once` / `off` | Console messages (`{ type, text }`) and uncaught errors (`Error`) as they happen |
-| `page.on('request' \| 'response' \| 'requestfinished' \| 'requestfailed', handler)` | Network traffic of the page, its popups and iframes: `Request` (`url()`, `method()`, `headers()`, `postData()`, `resourceType()`, `failure()`) and `Response` (`status()`, `ok()`, `headers()`, `request()`, `body()`, `text()`, `json()`) |
-| `page.waitForResponse(urlOrPredicate, { timeout? })` / `waitForRequest` | The first match from now on: a glob or RegExp for the URL, or a function of the Response / Request. Default timeout 30 s |
+| `page.route(url, handler)` / `page.unroute(url, handler?)` | Playwright's request interception: `url` is a glob (`**/api/*`), a RegExp or a function of the URL; the handler gets `(route, request)` and answers with `route.fulfill({ status, headers, body, json, path })`, `route.continue({ url, method, headers, postData })`, `route.abort(code?)` or `route.fallback()`. The handler added last runs first. Requests of popups and iframes too; blocked resource types never reach it. Answer before the handler returns (await or return the answer): a request it leaves unanswered continues, and a later answer is ignored with a warning |
+| `page.on('console' \| 'pageerror', handler)` / `once` / `off` | Console messages (`{ type, text }`, properties rather than Playwright's methods) and uncaught errors (`Error`) as they happen. A listener that throws or rejects is logged, and the others still run |
+| `page.on('request' \| 'response' \| 'requestfinished' \| 'requestfailed', handler)` | Network traffic of the page, its popups and iframes: `Request` (`url()`, `method()`, `headers()`, `postData()`, `resourceType()`, `failure()`) and `Response` (`status()`, `ok()`, `headers()`, `request()`, `body()`, `text()`, `json()`). As in Playwright, one request is one `Request` object in all its events and in `response.request()` |
+| `page.waitForResponse(urlOrPredicate, { timeout? })` / `waitForRequest` | The first match from now on: a glob or RegExp for the URL, or a function of the Response / Request. Default timeout 30 s; closing the page rejects it |
 | `page.on('dialog', handler)` | Answer `alert`, `confirm`, `prompt` and `beforeunload` with `dialog.accept(promptText?)` or `dialog.dismiss()`. Without a listener, or when no listener answers, a dialog is dismissed (`beforeunload` accepted), so the page never hangs |
 | `page.waitForDownload({ timeout? })` | The next download the page finished (ones that finished earlier queue up, so call it before or after the click): `url()`, `suggestedFilename()`, `path()`, `saveAs(path)`. Files are deleted when the page closes. `timeout: 0` waits as long as it takes |
 | `page.consoleMessages()` / `page.pageErrors()` | What the page, its popups and iframes logged (`{ type, text }`), and the exceptions nothing caught (`Error` objects), the last 1000 of each. Fail a job with `assert.deepEqual(await page.pageErrors(), [])` |
 | `page.setViewportSize({ width, height })` | CSS-pixel viewport for this page |
 | `page.waitForSelector(selector)` | Waits until visible (Playwright's default state) |
-| `page.close()` / `browser.close()` | Dispose context / shut down |
+| `page.close()` / `browser.close()` | Dispose context / shut down. `page.close()` does not wait for calls still running on the page: they reject with `page closed` |
 
-Close pages when a job is done. A page you forget is cleaned up when Node garbage-collects it, which may be much later.
+Close pages when a job is done. A page you forget is cleaned up when Node garbage-collects it, which may be much later, also when its listeners and routes use it.
 
-See `MISSING.md` for Playwright features that are planned or out of scope.
+An option Fluxwright does not implement (a per-call `timeout`, `waitForSelector` states other than `visible`, JPEG screenshots, click options such as `button`, ...) throws a TypeError rather than being ignored. See `MISSING.md` for these and the Playwright features that are planned or out of scope.
 
 ## Develop
 

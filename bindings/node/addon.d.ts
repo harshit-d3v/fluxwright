@@ -1,11 +1,17 @@
 export * from './index'
 import { Chromium, ConsoleMessage, NewPageOptions, Page, ScreenshotOptions, StorageState, Browser } from './index'
-/** Playwright-style export: `chromium.launch(...)`. Same as `Chromium.launch`. */
-export const chromium: typeof Chromium
-declare const fluxwright: { chromium: typeof Chromium }
+/**
+ * Playwright-style export: `chromium.launch(...)`, which is `Chromium.launch` after a check that
+ * every option is one Fluxwright implements (others throw a TypeError).
+ */
+export const chromium: Pick<typeof Chromium, 'launch'>
+declare const fluxwright: { chromium: typeof chromium }
 export default fluxwright
 
-/** A request as a `page.route` handler sees it, as in Playwright. */
+/**
+ * A request, as in Playwright: the same object for all of one request's events and for
+ * `response.request()`.
+ */
 export interface Request {
   url(): string
   method(): string
@@ -122,7 +128,9 @@ declare module './index' {
     screenshot(options?: ScreenshotOptions & { path?: string }): Promise<Buffer>
     /**
      * Hands matching requests of this page, its popups and iframes to `handler`, as Playwright's
-     * `page.route`. The handler added last runs first. Call it before navigating.
+     * `page.route`. The handler added last runs first. Call it before navigating. Answer before
+     * the handler returns (await or return the answer): an unanswered request continues, and a
+     * later answer is ignored with a warning.
      */
     route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
     /** Removes the handlers added for `url` (only `handler`, when given). */
@@ -143,7 +151,7 @@ declare module './index' {
     ): this
     /**
      * The first response from now on whose URL matches (a glob or RegExp, as in `page.route`) or
-     * that the predicate accepts. Default timeout 30 s; 0 waits forever.
+     * that the predicate accepts. Default timeout 30 s; 0 waits until the page closes.
      */
     waitForResponse(
       urlOrPredicate: string | RegExp | ((response: Response) => boolean | Promise<boolean>),

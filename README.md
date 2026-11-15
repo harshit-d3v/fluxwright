@@ -51,7 +51,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. The names are Playwright's, so a Playwright script for these features runs after changing its import.
+Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. The names are Playwright's, so a Playwright script for these features runs after changing its import. In Node, an option Fluxwright does not implement, such as a per-call `timeout`, throws a TypeError instead of being ignored (new in the next release: 0.6.0 ignored them), so such a script fails loudly at the call rather than quietly doing something else.
 
 ## What a page can do
 
@@ -136,8 +136,9 @@ Requires Rust 1.95+ and Chrome or Chromium (found on the standard install paths,
 | `fluxwright-cdp` | One connection per browser (DevTools pipe on Linux/macOS, WebSocket on Windows), flat sessions |
 | `fluxwright-core` | Pool, scheduler, memory ceiling, recycling, metrics |
 | `fluxwright` | Public API |
-| `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `benchmark` |
+| `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `benchmark` / `serve` (HTTP, unreleased) |
 | `fluxwright-mcp` | MCP server: open, goto, click, fill, evaluate, screenshot, close |
+| `fluxwright-server` | Authenticated HTTP job API over one local or remote CDP fleet (unreleased) |
 
 ## MCP server
 
@@ -156,7 +157,38 @@ cargo run -p fluxwright-cli -- browsers
 cargo run -p fluxwright-cli -- doctor
 ```
 
-The control channel is a Unix socket, or `\\.\pipe\fluxwright` on Windows. Nothing listens on TCP.
+The `start` / `stats` / `browsers` control channel is a Unix socket, or `\\.\pipe\fluxwright` on Windows. Those commands do not listen on TCP.
+
+### HTTP server (unreleased)
+
+`fluxwright serve` owns a fleet and accepts JSON browser jobs from any HTTP client. It defaults
+to `127.0.0.1:7331` and requires `FLUXWRIGHT_SERVER_TOKEN` (a random token of 32–256 printable
+ASCII characters). Submit with `POST /v1/jobs`, poll with `GET /v1/jobs/{id}`, and cancel with
+`DELETE /v1/jobs/{id}`. Jobs use isolated pages, bounded admission/results, priorities, and a
+total deadline. Pass `--cdp-endpoint <url>` to connect to an existing browser over CDP instead
+of launching local Chrome (one connection; set concurrency with `--max-contexts`). This is a
+trusted-operator API, not a public multi-tenant service.
+
+See [the HTTP server guide](docs/SERVER.md) for startup commands, authentication, job steps,
+limits, and deployment precautions.
+
+#### Docker quickstart
+
+Build and run the self-contained image (Debian Bookworm slim + Chromium + `tini` + `fluxwright`):
+
+```bash
+docker build -t fluxwright .
+export FLUXWRIGHT_SERVER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+docker run --rm \
+  -e FLUXWRIGHT_SERVER_TOKEN="$FLUXWRIGHT_SERVER_TOKEN" \
+  -p 127.0.0.1:7331:7331 \
+  --shm-size=1g \
+  --memory=4g --cpus=4 \
+  --cap-add=SYS_ADMIN \
+  fluxwright
+```
+
+Fluxwright automatically detects container `--memory` and `--cpus` limits via cgroups. See [Docker in `docs/SERVER.md`](docs/SERVER.md#docker) for sandbox configuration, custom flags, and security guidance.
 
 ## Benchmarks
 

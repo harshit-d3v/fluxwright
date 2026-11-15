@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +39,10 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(server: impl Into<String>) -> Self {
-        Self { server: server.into(), ..Self::default() }
+        Self {
+            server: server.into(),
+            ..Self::default()
+        }
     }
 
     /// Credentials, answered when the proxy asks (HTTP 407).
@@ -60,12 +63,13 @@ pub(crate) struct TargetState {
     r#type: String,
     url: String,
     browser_context_id: Option<String>,
-    waiting: Vec<tokio::sync::oneshot::Sender<String>>,
+    waiting: Vec<tokio::sync::oneshot::Sender<Result<String>>>,
 }
 
 pub struct CdpBrowser {
     pub id: BrowserId,
     pub pid: u32,
+    pub ws_endpoint: Option<String>,
     conn: Arc<Connection>,
     _child: Mutex<Option<Child>>,
     _profile: Option<tempfile::TempDir>,
@@ -73,6 +77,10 @@ pub struct CdpBrowser {
     /// Blocking and proxy credentials per browser context, so iframes that attach later
     /// get them too.
     setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
+    /// Browser contexts this connection created. On a remote browser (`connect`), targets in
+    /// any other context belong to someone else: attaching prepares their pages and our dialog
+    /// and route handlers then answer theirs.
+    contexts: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CdpBrowser {
@@ -82,32 +90,52 @@ impl CdpBrowser {
     }
 
     async fn from_launched(launched: Launched) -> Result<Arc<Self>> {
-        let conn = match launched.transport {
+        let (conn, ws_endpoint) = match launched.transport {
             #[cfg(windows)]
-            Transport::WebSocket(url) => Connection::connect(&url).await?,
+            Transport::WebSocket(url) => {
+                let conn = Connection::connect(&url).await?;
+                (conn, Some(url))
+            }
             #[cfg(unix)]
-            Transport::Pipe { to_chrome, from_chrome } => Connection::from_pipes(to_chrome, from_chrome)?,
+            Transport::Pipe {
+                to_chrome,
+                from_chrome,
+            } => {
+                let conn = Connection::from_pipes(to_chrome, from_chrome)?;
+                (conn, None)
+            }
         };
         // Over a pipe nothing has waited for Chrome to start yet. A first, cold start on a busy CI
         // machine has taken over 20 s.
-        conn.call("Browser.getVersion", json!({}), None, Duration::from_secs(60))
-            .await
-            .map_err(|e| Error::Launch(format!("chromium did not answer on its DevTools connection: {e}")))?;
+        conn.call(
+            "Browser.getVersion",
+            json!({}),
+            None,
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| {
+            Error::Launch(format!(
+                "chromium did not answer on its DevTools connection: {e}"
+            ))
+        })?;
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
             pid: launched.pid,
+            ws_endpoint,
             conn: conn.clone(),
             _child: Mutex::new(Some(launched.child)),
             _profile: Some(launched.user_data_dir),
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            contexts: Default::default(),
         });
 
         let b = browser.clone();
         let mut sub = conn.subscribe_unbounded();
         tokio::spawn(async move {
             while let Some(ev) = sub.recv().await {
-                b.on_event(ev).await;
+                b.on_event(&ev).await;
             }
         });
 
@@ -132,7 +160,12 @@ impl CdpBrowser {
         let handshake = async {
             browser
                 .conn
-                .call("Target.setDiscoverTargets", json!({ "discover": true }), None, Duration::from_secs(5))
+                .call(
+                    "Target.setDiscoverTargets",
+                    json!({ "discover": true }),
+                    None,
+                    Duration::from_secs(5),
+                )
                 .await?;
             browser
                 .conn
@@ -158,11 +191,98 @@ impl CdpBrowser {
         Ok(browser)
     }
 
+    /// Connects directly to an existing Chrome DevTools Protocol endpoint (e.g. `ws://...` or `http://...`).
+    ///
+    /// Does not spawn a local child process or manage user profile directories. Runs target discovery
+    /// and auto-attach handshake.
+    pub async fn connect(endpoint_url: &str) -> Result<Arc<Self>> {
+        let ws_url = resolve_ws_endpoint(endpoint_url).await?;
+        let conn = Connection::connect(&ws_url).await?;
+        if let Err(e) = conn
+            .call(
+                "Browser.getVersion",
+                json!({}),
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+        {
+            // A failed handshake must not leave the socket and its tasks running.
+            conn.close();
+            return Err(Error::Launch(format!(
+                "remote chromium did not answer on its DevTools connection: {e}"
+            )));
+        }
+
+        let browser = Arc::new(Self {
+            id: BrowserId(Uuid::new_v4()),
+            pid: 0,
+            ws_endpoint: Some(ws_url),
+            conn: conn.clone(),
+            _child: Mutex::new(None),
+            _profile: None,
+            targets: Arc::new(Mutex::new(HashMap::new())),
+            setups: Default::default(),
+            contexts: Default::default(),
+        });
+
+        let b = browser.clone();
+        let mut sub = conn.subscribe_unbounded();
+        tokio::spawn(async move {
+            while let Some(ev) = sub.recv().await {
+                b.on_event(&ev).await;
+            }
+        });
+
+        let handshake = async {
+            browser
+                .conn
+                .call(
+                    "Target.setDiscoverTargets",
+                    json!({ "discover": true }),
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await?;
+            browser
+                .conn
+                .call(
+                    "Target.setAutoAttach",
+                    json!({
+                        "autoAttach": true,
+                        "waitForDebuggerOnStart": true,
+                        "flatten": true
+                    }),
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await
+        };
+
+        if let Err(e) = handshake.await {
+            // The event loop above holds the browser until the connection ends.
+            browser.conn.close();
+            return Err(e);
+        }
+        spawn_keepalive(browser.conn.clone());
+
+        info!(browser_id = %browser.id.0, "remote browser ready over CDP");
+        Ok(browser)
+    }
+
+    pub fn ws_endpoint(&self) -> Option<&str> {
+        self.ws_endpoint.as_deref()
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.pid == 0
+    }
+
     pub fn connection_dead(&self) -> bool {
         self.conn.is_dead()
     }
 
-    async fn on_event(self: &Arc<Self>, ev: CdpEvent) {
+    async fn on_event(self: &Arc<Self>, ev: &CdpEvent) {
         match ev.method.as_str() {
             "Target.attachedToTarget" => {
                 let info = &ev.params["targetInfo"];
@@ -174,6 +294,12 @@ impl CdpBrowser {
                 let ty = info["type"].as_str().unwrap_or("").to_string();
                 let url = info["url"].as_str().unwrap_or("").to_string();
                 let ctx = info["browserContextId"].as_str().map(|s| s.to_string());
+                // Pages and out-of-process iframes count only in a context this connection
+                // created; anything else on a remote browser belongs to its owner.
+                let ours = match &ctx {
+                    Some(c) => self.contexts.lock().await.contains(c),
+                    None => false,
+                };
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
                 let setup = match &ctx {
                     Some(c) => self.setups.lock().await.get(c).cloned(),
@@ -197,7 +323,7 @@ impl CdpBrowser {
                 // Do not await CDP on this task: it is the only consumer of
                 // attachedToTarget and must stay ahead of createTarget.
                 let waiting = ev.params["waitingForDebugger"].as_bool().unwrap_or(false);
-                if ty != "page" && ty != "iframe" {
+                if (ty != "page" && ty != "iframe") || !ours {
                     // Chrome's own targets (browser_ui, extension workers, background pages)
                     // and workers: nothing drives them, and setup hung on ~1 in 3 browser_ui
                     // sessions. Detach, as Playwright does; resume first in case one is paused.
@@ -206,11 +332,21 @@ impl CdpBrowser {
                         let t = Duration::from_secs(5);
                         if waiting {
                             let _ = conn
-                                .call("Runtime.runIfWaitingForDebugger", json!({}), Some(&session_id), t)
+                                .call(
+                                    "Runtime.runIfWaitingForDebugger",
+                                    json!({}),
+                                    Some(&session_id),
+                                    t,
+                                )
                                 .await;
                         }
                         let _ = conn
-                            .call("Target.detachFromTarget", json!({ "sessionId": session_id }), None, t)
+                            .call(
+                                "Target.detachFromTarget",
+                                json!({ "sessionId": session_id }),
+                                None,
+                                t,
+                            )
                             .await;
                     });
                     return;
@@ -219,16 +355,46 @@ impl CdpBrowser {
                 // page never reaches a caller with its domains still being enabled.
                 let me = self.clone();
                 tokio::spawn(async move {
-                    prepare_session(&me.conn, &session_id, &ty, waiting, setup).await;
-                    let waiters = match me.targets.lock().await.get_mut(&target_id) {
-                        Some(t) => {
-                            t.session_id = Some(session_id.clone());
-                            std::mem::take(&mut t.waiting)
+                    match prepare_session(&me.conn, &session_id, &ty, waiting, setup).await {
+                        Ok(()) => {
+                            let waiters = match me.targets.lock().await.get_mut(&target_id) {
+                                Some(t) => {
+                                    t.session_id = Some(session_id.clone());
+                                    std::mem::take(&mut t.waiting)
+                                }
+                                None => Vec::new(), // destroyed while preparing
+                            };
+                            for w in waiters {
+                                let _ = w.send(Ok(session_id.clone()));
+                            }
                         }
-                        None => Vec::new(), // destroyed while preparing
-                    };
-                    for w in waiters {
-                        let _ = w.send(session_id.clone());
+                        Err(e) => {
+                            let _ = me
+                                .conn
+                                .call(
+                                    "Target.detachFromTarget",
+                                    json!({ "sessionId": session_id }),
+                                    None,
+                                    Duration::from_secs(5),
+                                )
+                                .await;
+                            // Wakes wait_for_session immediately with the prepare failure instead
+                            // of exposing an unprepared session or stalling until timeout.
+                            let waiters = me
+                                .targets
+                                .lock()
+                                .await
+                                .get_mut(&target_id)
+                                .map(|t| std::mem::take(&mut t.waiting))
+                                .unwrap_or_default();
+                            let msg = e.to_string();
+                            let mut err = Some(e);
+                            for w in waiters {
+                                let _ = w.send(Err(err
+                                    .take()
+                                    .unwrap_or_else(|| Error::Other(msg.clone()))));
+                            }
+                        }
                     }
                 });
             }
@@ -264,31 +430,44 @@ impl CdpBrowser {
             // paused requests) and the rest continue. Answered here, on the loop that sees
             // every session and never lags.
             "Fetch.requestPaused" => {
-                let (Some(sid), Some(id)) = (ev.session_id.clone(), ev.params["requestId"].as_str()) else {
+                let (Some(sid), Some(id)) =
+                    (ev.session_id.clone(), ev.params["requestId"].as_str())
+                else {
                     return;
                 };
                 let setup = self.setup_for_session(&sid).await;
                 // Paused because its type is blocked, or because everything is paused (proxy
                 // credentials, interception). No setup means the context is gone.
                 let ty = ev.params["resourceType"].as_str().unwrap_or("");
-                let block = setup.as_ref().is_none_or(|s| s.types.iter().any(|t| t.as_str() == ty));
+                let block = setup
+                    .as_ref()
+                    .is_none_or(|s| s.types.iter().any(|t| t.as_str() == ty));
                 if !block {
                     if let Some(routes) = setup.as_ref().and_then(|s| s.routes.as_ref()) {
                         // The job answers it; if it can't (gone), dropping it continues it.
-                        if let Some(req) = InterceptedRequest::from_paused(&ev.params, self.conn.clone(), sid.clone()) {
+                        if let Some(req) = InterceptedRequest::from_paused(
+                            &ev.params,
+                            self.conn.clone(),
+                            sid.clone(),
+                        ) {
                             let _ = routes.send(req);
                             return;
                         }
                     }
                 }
                 let (method, params) = if block {
-                    ("Fetch.failRequest", json!({ "requestId": id, "errorReason": "BlockedByClient" }))
+                    (
+                        "Fetch.failRequest",
+                        json!({ "requestId": id, "errorReason": "BlockedByClient" }),
+                    )
                 } else {
                     ("Fetch.continueRequest", json!({ "requestId": id }))
                 };
                 let conn = self.conn.clone();
                 tokio::spawn(async move {
-                    let _ = conn.call(method, params, Some(&sid), Duration::from_secs(5)).await;
+                    let _ = conn
+                        .call(method, params, Some(&sid), Duration::from_secs(5))
+                        .await;
                 });
             }
             // Nothing handles dialogs, and an open one blocks every call on its page until it
@@ -299,7 +478,11 @@ impl CdpBrowser {
                     // The job answers it (page.on('dialog')). A dialog it cannot take is
                     // dropped, which answers it as below.
                     if let Some(tx) = self.setup_for_session(&sid).await.and_then(|s| s.dialogs) {
-                        let _ = tx.send(crate::events::Dialog::new(&ev.params, self.conn.clone(), sid));
+                        let _ = tx.send(crate::events::Dialog::new(
+                            &ev.params,
+                            self.conn.clone(),
+                            sid,
+                        ));
                         return;
                     }
                     let accept = ev.params["type"] == "beforeunload";
@@ -320,9 +503,10 @@ impl CdpBrowser {
             // Proxy credentials. A second challenge for the same request means they were
             // rejected: cancel, or Chrome and the proxy loop forever.
             "Fetch.authRequired" => {
-                let (Some(sid), Some(id)) =
-                    (ev.session_id.clone(), ev.params["requestId"].as_str().map(String::from))
-                else {
+                let (Some(sid), Some(id)) = (
+                    ev.session_id.clone(),
+                    ev.params["requestId"].as_str().map(String::from),
+                ) else {
                     return;
                 };
                 let ctx = self.context_of_session(&sid).await;
@@ -382,20 +566,36 @@ impl CdpBrowser {
             }
         }
         let res = self
-            .call("Target.createBrowserContext", params, None, Duration::from_secs(10))
+            .call(
+                "Target.createBrowserContext",
+                params,
+                None,
+                Duration::from_secs(10),
+            )
             .await?;
         let id = res["browserContextId"]
             .as_str()
             .ok_or_else(|| Error::Other("createBrowserContext: no id".into()))?
             .to_string();
-        if let Some(Proxy { username: Some(user), password, .. }) = proxy {
-            self.setups.lock().await.entry(id.clone()).or_default().proxy_auth =
-                Some((user.clone(), password.clone().unwrap_or_default()));
+        self.contexts.lock().await.insert(id.clone());
+        if let Some(Proxy {
+            username: Some(user),
+            password,
+            ..
+        }) = proxy
+        {
+            self.setups
+                .lock()
+                .await
+                .entry(id.clone())
+                .or_default()
+                .proxy_auth = Some((user.clone(), password.clone().unwrap_or_default()));
         }
         Ok(ContextId(id))
     }
 
     pub async fn dispose_context(&self, id: &ContextId) -> Result<()> {
+        self.contexts.lock().await.remove(&id.0);
         self.setups.lock().await.remove(&id.0);
         let _ = self
             .call(
@@ -464,7 +664,9 @@ impl CdpBrowser {
             // No explicit Target.attachToTarget: browser-level auto-attach covers new pages,
             // and a second attach opens a second session that duplicates every event.
             match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(sid)) => Ok(sid),
+                Ok(Ok(Ok(sid))) => Ok(sid),
+                // SessionGone keeps it retryable: the job moves to another browser instead of failing.
+                Ok(Ok(Err(e))) => Err(Error::SessionGone(format!("{target_id}: {e}"))),
                 Ok(Err(_)) => Err(Error::SessionGone(target_id.into())),
                 Err(_) => Err(Error::timeout("attachToTarget", timeout.as_millis() as u64)),
             }
@@ -489,11 +691,18 @@ impl CdpBrowser {
         targets: &Mutex<HashMap<String, TargetState>>,
         target_id: &str,
     ) -> Option<String> {
-        targets.lock().await.get(target_id).and_then(|t| t.session_id.clone())
+        targets
+            .lock()
+            .await
+            .get(target_id)
+            .and_then(|t| t.session_id.clone())
     }
 
     /// Sessions of every target in a browser context.
-    pub(crate) async fn sessions_in_context(targets: &Mutex<HashMap<String, TargetState>>, context: &str) -> Vec<String> {
+    pub(crate) async fn sessions_in_context(
+        targets: &Mutex<HashMap<String, TargetState>>,
+        context: &str,
+    ) -> Vec<String> {
         targets
             .lock()
             .await
@@ -503,23 +712,26 @@ impl CdpBrowser {
             .collect()
     }
 
-
+    /// A launched browser is closed and its process ended. A remote one is left running for its
+    /// owner: only this connection to it ends, which also disposes of the contexts it created.
     pub async fn close(&self) -> Result<()> {
-        let _ = self
-            .call("Browser.close", json!({}), None, Duration::from_secs(5))
-            .await;
-        if let Some(mut child) = self._child.lock().await.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        if !self.is_remote() {
+            let _ = self
+                .call("Browser.close", json!({}), None, Duration::from_secs(5))
+                .await;
+            if let Some(mut child) = self._child.lock().await.take() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
         }
-        self.conn.mark_dead();
+        self.conn.close();
         Ok(())
     }
 
     /// Kills Chrome without waiting, for code that cannot await (a dropped engine). The
     /// connection then closes and the browser is freed.
     pub fn start_kill(self: &Arc<Self>) {
-        self.conn.mark_dead();
+        self.conn.close();
         match self._child.try_lock() {
             Ok(mut child) => {
                 if let Some(child) = child.as_mut() {
@@ -548,9 +760,155 @@ impl CdpBrowser {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
-        self.conn.mark_dead();
+        self.conn.close();
         Ok(())
     }
+}
+
+/// A browser that stops answering without dropping the socket (a hung renderer host, a broken
+/// network link to a remote browser) used to fail every job with a timeout and keep its socket
+/// forever. `Browser.getVersion` is cheap and browser-wide; ten silent seconds means dead.
+fn spawn_keepalive(conn: Arc<Connection>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            if conn.is_dead() {
+                break;
+            }
+            match conn
+                .call(
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "cdp keepalive failed; marking the connection dead");
+                    conn.mark_dead();
+                    conn.close();
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn parse_host_port(host_port: &str) -> Result<(&str, u16)> {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or_else(|| {
+            Error::Launch(format!(
+                "unclosed IPv6 bracket in CDP endpoint: {host_port}"
+            ))
+        })?;
+        if host.is_empty() {
+            return Err(Error::Launch(format!(
+                "empty host in CDP endpoint: {host_port}"
+            )));
+        }
+        if after.is_empty() {
+            return Ok((host, 80));
+        }
+        let port_str = after.strip_prefix(':').ok_or_else(|| {
+            Error::Launch(format!("invalid host:port in CDP endpoint: {host_port}"))
+        })?;
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| Error::Launch(format!("invalid port in CDP endpoint: {host_port}")))?;
+        Ok((host, port))
+    } else if let Some((host, port_str)) = host_port.split_once(':') {
+        if host.is_empty() {
+            return Err(Error::Launch(format!(
+                "empty host in CDP endpoint: {host_port}"
+            )));
+        }
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| Error::Launch(format!("invalid port in CDP endpoint: {host_port}")))?;
+        Ok((host, port))
+    } else {
+        if host_port.is_empty() {
+            return Err(Error::Launch("empty host in CDP endpoint".into()));
+        }
+        Ok((host_port, 80))
+    }
+}
+
+async fn resolve_ws_endpoint(endpoint: &str) -> Result<String> {
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        return Ok(endpoint.to_string());
+    }
+    if let Some(rest) = endpoint.strip_prefix("http://") {
+        // The authority ends at the first `/`, `?` or `#`. A query string (an auth token)
+        // goes along to /json/version; a trailing slash before it is tolerated.
+        let rest = rest.split('#').next().unwrap_or(rest);
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (host_port, path) = match rest.split_once('/') {
+            Some((hp, p)) => (hp, format!("/{}", p.trim_matches('/'))),
+            None => (rest, String::new()),
+        };
+        let path = if path.is_empty() || path == "/json/version" {
+            "/json/version".to_string()
+        } else {
+            format!("{}/json/version", path.trim_end_matches('/'))
+        };
+        let path = if query.is_empty() {
+            path
+        } else {
+            format!("{path}?{query}")
+        };
+        let (host, port) = parse_host_port(host_port)?;
+        return tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = tokio::net::TcpStream::connect((host, port))
+                .await
+                .map_err(|e| {
+                    Error::Launch(format!(
+                        "failed to connect to CDP endpoint at {host}:{port}: {e}"
+                    ))
+                })?;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+            stream
+                .write_all(req.as_bytes())
+                .await
+                .map_err(|e| Error::Launch(e.to_string()))?;
+            // Chrome keeps the connection open whatever the request asks: stop once the body is
+            // whole JSON instead of waiting for a close that never comes.
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 4096];
+            let json: Value = loop {
+                let n = stream
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| Error::Launch(e.to_string()))?;
+                resp.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&resp);
+                if let Some(Ok(json)) = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| serde_json::from_str::<Value>(body))
+                {
+                    break json;
+                }
+                if n == 0 || resp.len() > 64 * 1024 {
+                    return Err(Error::Launch(format!("no JSON answer from {path}")));
+                }
+            };
+            if let Some(ws) = json["webSocketDebuggerUrl"].as_str() {
+                return Ok(ws.to_string());
+            }
+            Err(Error::Launch(format!(
+                "could not obtain webSocketDebuggerUrl from {endpoint}"
+            )))
+        })
+        .await
+        .map_err(|_| Error::timeout("resolve_ws_endpoint", 10_000))?;
+    }
+    Err(Error::Launch(format!(
+        "unsupported CDP endpoint URL scheme: {endpoint}"
+    )))
 }
 
 async fn prepare_session(
@@ -559,7 +917,7 @@ async fn prepare_session(
     ty: &str,
     waiting_for_debugger: bool,
     setup: Option<ContextSetup>,
-) {
+) -> Result<()> {
     let mut calls = vec![(
         "Target.setAutoAttach",
         json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
@@ -575,7 +933,10 @@ async fn prepare_session(
             calls.extend(e.calls(ty == "page"));
         }
         for source in &setup.init_scripts {
-            calls.push(("Page.addScriptToEvaluateOnNewDocument", json!({ "source": source })));
+            calls.push((
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": source }),
+            ));
         }
         if let Some(params) = fetch_params(&setup) {
             calls.push(("Fetch.enable", params));
@@ -590,12 +951,44 @@ async fn prepare_session(
     }
     // Pipelined: Chrome runs a session's commands in order, so one round trip instead of
     // one per command. Sequential calls cost ~1 s per page on a busy browser.
-    futures_util::future::join_all(
+    let methods: Vec<&'static str> = calls.iter().map(|(m, _)| *m).collect();
+    // Busy runners (macOS full Chrome under 300-page churn) can take >5 s to boot a renderer
+    // and process pipelined domain enables + runIfWaitingForDebugger; match navigation_timeout.
+    let results = futures_util::future::join_all(
         calls
             .into_iter()
-            .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(5))),
+            .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(30))),
     )
     .await;
+    check_prepare_results(session_id, methods.into_iter().zip(results).collect())
+}
+
+fn check_prepare_results(
+    session_id: &str,
+    results: Vec<(&'static str, Result<Value>)>,
+) -> Result<()> {
+    let mut failure = None;
+    for (method, res) in results {
+        if let Err(e) = res {
+            warn!(%session_id, method, error = %e, "prepare_session command failed");
+            // Emulation command rejections on secondary iframe targets are non-fatal unless
+            // transport/session itself failed. A slow answer is not a dead session either,
+            // except where the session cannot work without it: interception and the
+            // debugger release.
+            let fatal = if e.is_timeout() {
+                matches!(method, "Fetch.enable" | "Runtime.runIfWaitingForDebugger")
+            } else {
+                !method.starts_with("Emulation.") || !matches!(e, Error::Command { .. })
+            };
+            if fatal && failure.is_none() {
+                failure = Some(e);
+            }
+        }
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -621,7 +1014,362 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(weak.upgrade().is_none(), "the closed browser is still alive");
-        assert!(!dir.exists(), "profile folder left behind: {}", dir.display());
+        assert!(
+            weak.upgrade().is_none(),
+            "the closed browser is still alive"
+        );
+        assert!(
+            !dir.exists(),
+            "profile folder left behind: {}",
+            dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_ws_endpoint_handles_schemes() {
+        assert_eq!(
+            resolve_ws_endpoint("ws://127.0.0.1:9222/devtools/browser/1")
+                .await
+                .unwrap(),
+            "ws://127.0.0.1:9222/devtools/browser/1"
+        );
+        assert_eq!(
+            resolve_ws_endpoint("wss://secure.cdp.example/devtools/browser/2")
+                .await
+                .unwrap(),
+            "wss://secure.cdp.example/devtools/browser/2"
+        );
+        assert!(resolve_ws_endpoint("ftp://invalid").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_ws_endpoint_parses_ipv6_and_rejects_invalid_ports() {
+        assert_eq!(parse_host_port("[::1]:9222").unwrap(), ("::1", 9222));
+        assert_eq!(parse_host_port("[::1]").unwrap(), ("::1", 80));
+        assert!(parse_host_port("[::1]:abc").is_err());
+        assert!(parse_host_port("localhost:abc").is_err());
+        assert!(resolve_ws_endpoint("http://localhost:abc").await.is_err());
+        assert!(resolve_ws_endpoint("http://[::1]:abc").await.is_err());
+
+        if let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await {
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 256];
+                    let _ = stream.read(&mut buf).await;
+                    let body =
+                        r#"{"webSocketDebuggerUrl":"ws://[::1]:9222/devtools/browser/ipv6"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+            let ws = resolve_ws_endpoint(&format!("http://[::1]:{port}"))
+                .await
+                .unwrap();
+            assert_eq!(ws, "ws://[::1]:9222/devtools/browser/ipv6");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_ws_endpoint_keeps_the_query_string() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen_tx, seen) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).await.unwrap();
+            let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let body = r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/q"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            // As Chrome does: the connection stays open after the answer.
+            std::future::pending::<()>().await;
+        });
+        let ws = resolve_ws_endpoint(&format!("http://127.0.0.1:{port}/?token=x"))
+            .await
+            .unwrap();
+        assert_eq!(ws, "ws://127.0.0.1:9222/devtools/browser/q");
+        let request = seen.await.unwrap();
+        assert!(
+            request.starts_with("GET /json/version?token=x HTTP/1.1"),
+            "{request}"
+        );
+    }
+
+    /// A page in a context this connection did not create (someone else's tab on a shared
+    /// remote browser) is detached and left alone: no domains enabled, no debugger resume.
+    #[tokio::test]
+    async fn foreign_targets_are_only_detached() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                let reply = json!({ "id": msg["id"], "result": {} }).to_string();
+                ws.send(Message::Text(reply.into())).await.unwrap();
+                if msg["method"] == "Target.setAutoAttach" && msg.get("sessionId").is_none() {
+                    let event = json!({
+                        "method": "Target.attachedToTarget",
+                        "params": {
+                            "sessionId": "FOREIGN",
+                            "waitingForDebugger": false,
+                            "targetInfo": {
+                                "targetId": "T1",
+                                "type": "page",
+                                "url": "https://example.com/",
+                                "browserContextId": "someone-else",
+                            },
+                        },
+                    });
+                    ws.send(Message::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                let _ = msg_tx.send(msg);
+            }
+        });
+
+        let browser = CdpBrowser::connect(&format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let mut about_foreign = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, msg_rx.recv()).await {
+            if msg["sessionId"] == "FOREIGN" || msg["params"]["sessionId"] == "FOREIGN" {
+                about_foreign.push(msg["method"].clone());
+            }
+        }
+        assert_eq!(about_foreign, vec![json!("Target.detachFromTarget")]);
+        browser.close().await.unwrap();
+    }
+
+    #[test]
+    fn prepare_results_timeouts_are_fatal_only_where_the_session_needs_them() {
+        let slow = |m: &'static str| (m, Err(Error::timeout(m, 5_000)));
+        assert!(check_prepare_results("s1", vec![slow("Page.enable")]).is_ok());
+        assert!(check_prepare_results("s1", vec![slow("Fetch.enable")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_browser_close_does_not_send_browser_close() {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(msg)) = ws.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                    let _ = msg_tx.send(text.to_string());
+                }
+            }
+        });
+
+        let ws_url = format!("ws://{addr}");
+        let conn = Connection::connect(&ws_url).await.unwrap();
+        let browser = CdpBrowser {
+            id: BrowserId(Uuid::new_v4()),
+            pid: 0,
+            ws_endpoint: Some(ws_url),
+            conn: conn.clone(),
+            _child: Mutex::new(None),
+            _profile: None,
+            targets: Arc::new(Mutex::new(HashMap::new())),
+            setups: Default::default(),
+            contexts: Default::default(),
+        };
+
+        assert!(browser.is_remote());
+        assert!(!browser.connection_dead());
+
+        browser.close().await.unwrap();
+        assert!(browser.connection_dead());
+
+        drop(browser);
+        drop(conn);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+
+        let mut received = Vec::new();
+        while let Ok(m) = msg_rx.try_recv() {
+            received.push(m);
+        }
+        assert!(
+            !received.iter().any(|m| m.contains("Browser.close")),
+            "remote close() must not send Browser.close, got: {received:?}"
+        );
+    }
+
+    /// A closed remote browser is freed and its socket closed. Closing used to only flag the
+    /// connection: the socket stayed open and the event loop held the browser for good, one
+    /// leak per recycle.
+    #[tokio::test]
+    async fn closed_remote_browser_is_freed() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A stand-in browser: answers every command, and ends when the client closes.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(text) = msg {
+                    let text = text.to_string();
+                    let id = serde_json::from_str::<Value>(&text).unwrap()["id"].clone();
+                    let reply = json!({ "id": id, "result": {} }).to_string();
+                    if ws.send(Message::Text(reply.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let browser = CdpBrowser::connect(&format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let weak = Arc::downgrade(&browser);
+        browser.close().await.unwrap();
+        drop(browser);
+        for _ in 0..100 {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "the closed remote browser is still alive"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the socket was never closed")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_kill_on_remote_browser_closes_socket() {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while ws.next().await.is_some() {}
+        });
+
+        let ws_url = format!("ws://{addr}");
+        let conn = Connection::connect(&ws_url).await.unwrap();
+        let browser = Arc::new(CdpBrowser {
+            id: BrowserId(Uuid::new_v4()),
+            pid: 0,
+            ws_endpoint: Some(ws_url),
+            conn: conn.clone(),
+            _child: Mutex::new(None),
+            _profile: None,
+            targets: Arc::new(Mutex::new(HashMap::new())),
+            setups: Default::default(),
+            contexts: Default::default(),
+        });
+        let b = browser.clone();
+        let mut sub = conn.subscribe_unbounded();
+        tokio::spawn(async move {
+            while let Some(ev) = sub.recv().await {
+                b.on_event(&ev).await;
+            }
+        });
+        drop(conn);
+
+        let weak = Arc::downgrade(&browser);
+        browser.start_kill();
+        drop(browser);
+
+        for _ in 0..100 {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "remote browser leaked after start_kill"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("start_kill never closed the remote socket")
+            .unwrap();
+    }
+
+    #[test]
+    fn prepare_results_rejects_fetch_or_resume_errors() {
+        assert!(check_prepare_results("s1", vec![("Page.enable", Ok(json!({})))]).is_ok());
+
+        let err = check_prepare_results(
+            "s1",
+            vec![
+                ("Page.enable", Ok(json!({}))),
+                (
+                    "Fetch.enable",
+                    Err(Error::Command {
+                        method: "Fetch.enable".into(),
+                        message: "bad pattern".into(),
+                    }),
+                ),
+            ],
+        );
+        assert!(err.is_err());
+
+        let resume_err = check_prepare_results(
+            "s1",
+            vec![(
+                "Runtime.runIfWaitingForDebugger",
+                Err(Error::SessionGone("s1".into())),
+            )],
+        );
+        assert!(resume_err.is_err());
+    }
+
+    #[test]
+    fn prepare_results_tolerates_nonfatal_emulation_command_error() {
+        let res = check_prepare_results(
+            "s1",
+            vec![(
+                "Emulation.setLocaleOverride",
+                Err(Error::Command {
+                    method: "Emulation.setLocaleOverride".into(),
+                    message: "already set".into(),
+                }),
+            )],
+        );
+        assert!(res.is_ok());
+
+        let dead = check_prepare_results(
+            "s1",
+            vec![(
+                "Emulation.setLocaleOverride",
+                Err(Error::SessionGone("s1".into())),
+            )],
+        );
+        assert!(dead.is_err());
     }
 }

@@ -155,6 +155,9 @@
           out.push(el);
           return true;
         }
+        // textContent includes <script> text: fine to rule a subtree out, never to match. Matched
+        // on it, a Next.js page's __NEXT_DATA__ made <body> the element, so a wait for text not
+        // shown yet returned at once and the click landed mid-page.
         const t = norm(el.textContent);
         if (!m.has(t) && !el.querySelector(buttons)) return false; // nothing below can match
         let below = false;
@@ -163,7 +166,7 @@
           if (walk(c)) below = true;
           if (below && first) return true;
         }
-        if (below || !m.is(t)) return below;
+        if (below || !m.is(norm(shownText(el)))) return below;
         out.push(el);
         return true;
       };

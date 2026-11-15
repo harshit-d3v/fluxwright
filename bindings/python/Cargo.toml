@@ -13,6 +13,6 @@ crate-type = ["cdylib"]
 fluxwright = { path = "../../crates/fluxwright" }
 fluxwright-cdp = { path = "../../crates/fluxwright-cdp" }
 pyo3 = { version = "0.30", features = ["abi3-py310"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

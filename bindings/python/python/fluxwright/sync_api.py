@@ -10,8 +10,8 @@
         browser.close()
 
 Every call runs on one event loop in a background thread, so the objects work from any thread:
-a thread pool of jobs sharing one browser is fine. Route handlers run on worker threads; event
-listeners run one at a time, in order, on a thread of their own.
+a thread pool of jobs sharing one browser is fine. Route handlers run on worker threads; each
+page's event listeners run one at a time, in order, on a thread of that page's own.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from os import PathLike
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -65,9 +65,6 @@ T = TypeVar("T")
 _lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
-# Event listeners run here, one at a time and in order. Route handlers use the loop's default
-# pool, so one waiting on the page cannot hold up another request.
-_listeners = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="fluxwright-listeners")
 
 
 def _event_loop() -> asyncio.AbstractEventLoop:
@@ -443,6 +440,9 @@ class Page(_Finders):
         self._impl = impl
         self._route_bridges: list[tuple[URLMatch, Callable[..., Any], Callable[..., Any]]] = []
         self._listener_bridges: list[tuple[str, Callable[[Any], Any], Callable[[Any], Any]]] = []
+        # This page's listeners run here, one at a time and in order, so a slow one on another
+        # page never holds them up. The thread starts with the first event.
+        self._listener_thread = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="fluxwright-listeners")
 
     def goto(self, url: str, *, wait_until: str | None = None) -> None:
         """Navigates; ``wait_until`` is ``load`` (the default), ``domcontentloaded``,
@@ -503,6 +503,7 @@ class Page(_Finders):
 
         def bridge(route: _a.Route, request: _a.Request) -> Any:
             args = (Route(route), Request(request)) if with_request else (Route(route),)
+            # The loop's default pool: a handler waiting on the page holds up no other request.
             return loop.run_in_executor(None, lambda: handler(*args))
 
         self._route_bridges.append((url, handler, bridge))
@@ -529,7 +530,8 @@ class Page(_Finders):
     def remove_listener(self, event: str, handler: Callable[[Any], Any]) -> None:
         for entry in list(self._listener_bridges):
             if entry[0] == event and entry[1] == handler:
-                self._listener_bridges.remove(entry)
+                with suppress(ValueError):  # a once that fired meanwhile removed itself
+                    self._listener_bridges.remove(entry)
                 _run(_on_loop, self._impl.remove_listener, event, entry[2])
                 return
 
@@ -544,6 +546,7 @@ class Page(_Finders):
                 page.get_by_text("Export").click()
             download = info.value
         """
+        _run(self._impl._clear_downloads)  # only a download the block starts
         future = _submit(self._impl.wait_for_download, timeout=timeout)
         info = EventInfo(future, Download)
         try:
@@ -606,24 +609,39 @@ class Page(_Finders):
 
     def close(self) -> None:
         _run(self._impl.close)
+        # Listener calls already queued still run; events after this are dropped (see _listen).
+        self._listener_thread.shutdown(wait=False)
 
     def is_closed(self) -> bool:
         return self._impl.is_closed()
 
     def _listen(self, method: str, event: str, handler: Callable[[Any], Any]) -> None:
         loop = _event_loop()
+        bridges = self._listener_bridges
 
-        # Dialog listeners run on the loop's own pool: on the one-at-a-time listener thread, a
-        # slow listener on another page held up the answer, and the click that opened the dialog
-        # timed out. Each page's dialogs still come one at a time.
-        executor = None if event == "dialog" else _listeners
+        # Dialog listeners run on the loop's own pool: behind a slow listener on the one-at-a-time
+        # thread, the answer came late and the click that opened the dialog timed out. Each page's
+        # dialogs still come one at a time.
+        executor = None if event == "dialog" else self._listener_thread
 
         def bridge(arg: Any) -> Any:
-            # A future, so the dialog loop waits for the handler's answer.
-            return loop.run_in_executor(executor, _listen, handler, _to_sync(arg))
+            if method == "once":
+                with suppress(ValueError):  # spent: remove_listener must not find it
+                    bridges.remove(entry)
+            try:
+                # A future, so the dialog loop waits for the handler's answer.
+                return loop.run_in_executor(executor, _listen, handler, _to_sync(arg))
+            except RuntimeError:  # the page closed, and its listener thread with it
+                return None
 
-        _run(_on_loop, getattr(self._impl, method), event, bridge)
-        self._listener_bridges.append((event, handler, bridge))
+        entry = (event, handler, bridge)
+        bridges.append(entry)  # before the first event can fire it
+        try:
+            _run(_on_loop, getattr(self._impl, method), event, bridge)
+        except BaseException:
+            with suppress(ValueError):
+                bridges.remove(entry)
+            raise
 
 
 class Browser:
