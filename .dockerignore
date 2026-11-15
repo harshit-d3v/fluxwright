@@ -1,0 +1,38 @@
+# Rust build artifacts
+/target
+**/target
+**/*.rs.bk
+*.pdb
+
+# Version control & editor/agent state
+.git
+.github
+.claude
+.cursor
+.idea
+.vscode
+.playwright-mcp
+.ruff_cache
+.vercel
+
+# Node, Python, and web assets not needed for the Rust workspace build
+**/node_modules
+bindings/
+plugins/
+www/
+video/
+docs/
+users-data/
+benchmarks/node_modules/
+benchmarks/results/
+benchmarks/*.mjs
+benchmarks/package*.json
+
+# Local environment, scripts, and logs
+.env
+.env.*
+*.log
+*.tgz
+*.tsbuildinfo
+*.bat
+DOGFOOD-*.md

@@ -179,8 +179,6 @@ export interface BoundingBox {
   height: number
 }
 
-export declare function chromium(): Chromium
-
 export interface ConsoleMessage {
   /** `log`, `error`, `warning`, `info`, `debug`, ... */
   type: string
@@ -294,6 +292,8 @@ export interface NetworkEvent {
 
 /** A request, as network events hand it over; `addon.js` wraps it in Playwright's `Request`. */
 export interface NetworkRequest {
+  /** Chrome's request id: the same for every event of one request. */
+  id: string
   url: string
   method: string
   /** Names lower-cased, as Playwright reports them. */

@@ -1,18 +1,18 @@
 //! Fluxwright MCP server (stdio). Claude Desktop, Codex, and Cursor spawn this
 //! process and call tools to drive a Chromium fleet.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use base64::Engine as _;
-use fluxwright::{BrowserEngine, PageLease};
+use fluxwright::{netguard, BrowserEngine, PageLease};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
-    schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
+    schemars, tool, tool_handler, tool_router,
     transport::stdio,
+    ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use tracing_subscriber::EnvFilter;
@@ -93,13 +93,21 @@ impl FluxwrightMcp {
                     .map_err(internal)?;
                 st.engine = Some(engine);
             }
-            let page = st.engine.as_ref().expect("made above").acquire().await.map_err(internal)?;
+            let page = st
+                .engine
+                .as_ref()
+                .expect("made above")
+                .acquire()
+                .await
+                .map_err(internal)?;
             if !any_url() {
-                guard_requests(&page).await.map_err(internal)?;
+                netguard::guard_requests(&page).await.map_err(internal)?;
             }
             st.page = Some(page);
         }
-        Ok(MutexGuard::map(st, |s| s.page.as_mut().expect("made above")))
+        Ok(MutexGuard::map(st, |s| {
+            s.page.as_mut().expect("made above")
+        }))
     }
 }
 
@@ -112,110 +120,16 @@ fn any_url() -> bool {
     std::env::var_os("FLUXWRIGHT_MCP_ANY_URL").is_some()
 }
 
-/// Every request the page makes (subresources, redirects, navigations a script or click starts)
-/// is checked against the host rules, on the URL as Chrome parsed it: nothing the agent types
-/// can slip past through a parser difference, a redirect or `evaluate`. `check_url` on
-/// `open`/`goto` adds the scheme rule (Chrome itself refuses pages' own navigations to `file:`).
-/// shortcut: a hostname that resolves to a link-local address is not caught; the README says
-/// never to expose this server without authentication.
-async fn guard_requests(page: &PageLease) -> fluxwright::Result<()> {
-    let mut requests = page.intercept().await?;
-    tokio::spawn(async move {
-        while let Some(req) = requests.recv().await {
-            if request_blocked(&req.url) {
-                tracing::warn!(url = %req.url, "blocked a request to a link-local host");
-                let _ = req.abort("blockedbyclient").await;
-            }
-            // Any other request is dropped here, which lets it through.
-        }
-    });
-    Ok(())
-}
-
-/// Web pages only. A page the agent reads can talk it into anything: `file://` would hand it
-/// local files, and a link-local host the cloud metadata service (instance credentials).
 fn check_url(url: &str) -> Result<(), McpError> {
     if any_url() {
         return Ok(());
     }
-    url_allowed(url).map_err(|why| {
-        McpError::invalid_params(format!("{why}: {url} (FLUXWRIGHT_MCP_ANY_URL=1 allows any URL)"), None)
+    netguard::url_allowed(url).map_err(|why| {
+        McpError::invalid_params(
+            format!("{why}: {url} (FLUXWRIGHT_MCP_ANY_URL=1 allows any URL)"),
+            None,
+        )
     })
-}
-
-fn url_allowed(url: &str) -> Result<(), &'static str> {
-    // Browsers drop tabs and newlines anywhere in a URL.
-    let url: String = url.trim().chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
-    if url.eq_ignore_ascii_case("about:blank") {
-        return Ok(());
-    }
-    let (scheme, rest) = url.split_once("://").ok_or("only http and https URLs are allowed")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return Err("only http and https URLs are allowed");
-    }
-    if host_blocked(rest) {
-        return Err("link-local hosts (cloud metadata) are blocked");
-    }
-    Ok(())
-}
-
-/// For a request URL as Chrome wrote it: web requests to a blocked host, and `file:`.
-fn request_blocked(url: &str) -> bool {
-    match url.split_once("://") {
-        Some((scheme, rest)) if matches!(scheme, "http" | "https" | "ws" | "wss") => host_blocked(rest),
-        _ => url.starts_with("file:"),
-    }
-}
-
-/// Whether the host of `after_scheme` (the URL after `://`) is link-local or a cloud metadata
-/// name.
-fn host_blocked(after_scheme: &str) -> bool {
-    // Browsers read `\` as `/` in web URLs.
-    let authority = after_scheme.split(['/', '?', '#', '\\']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or("").to_ascii_lowercase();
-    let host = match host.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => host.split(':').next().unwrap_or(""),
-    }
-    .trim_end_matches('.');
-    if host == "metadata.google.internal" || host == "metadata" {
-        return true;
-    }
-    match host.parse::<Ipv6Addr>() {
-        Ok(v6) => {
-            v6.segments()[0] & 0xffc0 == 0xfe80
-                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254) // AWS IMDS over IPv6
-                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
-        }
-        Err(_) => ipv4_host(host).is_some_and(|v4| v4.is_link_local()),
-    }
-}
-
-/// A host read as IPv4 the way browsers do: 1 to 4 dot-separated numbers in decimal, hex (0x)
-/// or octal (leading 0), the last one filling the remaining bytes. So `2852039166` and
-/// `0xa9.0xfe.0xa9.0xfe` are both 169.254.169.254. None for a name.
-fn ipv4_host(host: &str) -> Option<Ipv4Addr> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() > 4 {
-        return None;
-    }
-    let mut nums = Vec::with_capacity(parts.len());
-    for p in parts {
-        let n = if let Some(hex) = p.strip_prefix("0x") {
-            if hex.is_empty() { 0 } else { u64::from_str_radix(hex, 16).ok()? }
-        } else if p.len() > 1 && p.starts_with('0') {
-            u64::from_str_radix(&p[1..], 8).ok()?
-        } else {
-            p.parse::<u64>().ok()?
-        };
-        nums.push(n);
-    }
-    let (&last, head) = nums.split_last()?;
-    if head.iter().any(|&n| n > 255) || last >= 256u64.pow(5 - nums.len() as u32) {
-        return None;
-    }
-    let value = head.iter().enumerate().fold(last, |v, (i, &n)| v + (n << (8 * (3 - i))));
-    Some(Ipv4Addr::from(value as u32))
 }
 
 /// `text` cut to at most `max` bytes on a character boundary (a byte cut panicked inside a
@@ -224,11 +138,12 @@ fn truncate(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }
-    let mut cut = max;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…\n[truncated: {} bytes in all]", &text[..cut], text.len())
+    let cut = text.floor_char_boundary(max);
+    format!(
+        "{}…\n[truncated: {} bytes in all]",
+        &text[..cut],
+        text.len()
+    )
 }
 
 #[tool_router]
@@ -251,7 +166,10 @@ impl FluxwrightMcp {
     }
 
     #[tool(description = "Navigate the current page to a URL.")]
-    async fn goto(&self, Parameters(UrlArgs { url }): Parameters<UrlArgs>) -> Result<String, McpError> {
+    async fn goto(
+        &self,
+        Parameters(UrlArgs { url }): Parameters<UrlArgs>,
+    ) -> Result<String, McpError> {
         check_url(&url)?;
         let page = self.page(false).await?;
         page.goto(&url).await.map_err(internal)?;
@@ -275,7 +193,11 @@ impl FluxwrightMcp {
         &self,
         Parameters(SelectorArgs { selector }): Parameters<SelectorArgs>,
     ) -> Result<String, McpError> {
-        self.page(false).await?.click(&selector).await.map_err(internal)?;
+        self.page(false)
+            .await?
+            .click(&selector)
+            .await
+            .map_err(internal)?;
         Ok(format!("clicked {selector}"))
     }
 
@@ -284,7 +206,11 @@ impl FluxwrightMcp {
         &self,
         Parameters(FillArgs { selector, value }): Parameters<FillArgs>,
     ) -> Result<String, McpError> {
-        self.page(false).await?.fill(&selector, &value).await.map_err(internal)?;
+        self.page(false)
+            .await?
+            .fill(&selector, &value)
+            .await
+            .map_err(internal)?;
         Ok(format!("filled {selector}"))
     }
 
@@ -293,15 +219,28 @@ impl FluxwrightMcp {
         &self,
         Parameters(EvalArgs { expression }): Parameters<EvalArgs>,
     ) -> Result<String, McpError> {
-        let v = self.page(false).await?.evaluate(&expression).await.map_err(internal)?;
+        let v = self
+            .page(false)
+            .await?
+            .evaluate(&expression)
+            .await
+            .map_err(internal)?;
         Ok(v.to_string())
     }
 
     #[tool(description = "Take a PNG screenshot of the current page.")]
     async fn screenshot(&self) -> Result<CallToolResult, McpError> {
-        let png = self.page(false).await?.screenshot().await.map_err(internal)?;
+        let png = self
+            .page(false)
+            .await?
+            .screenshot()
+            .await
+            .map_err(internal)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-        Ok(CallToolResult::success(vec![ContentBlock::image(b64, "image/png")]))
+        Ok(CallToolResult::success(vec![ContentBlock::image(
+            b64,
+            "image/png",
+        )]))
     }
 
     #[tool(description = "Close the current page (destroys the browser context).")]
@@ -349,7 +288,10 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
+    use netguard::guard_requests;
 
     #[test]
     fn the_agent_opens_web_pages_only() {
@@ -362,7 +304,7 @@ mod tests {
             "http://192.168.1.10/",
             "about:blank",
         ] {
-            assert!(url_allowed(ok).is_ok(), "{ok}");
+            assert!(netguard::url_allowed(ok).is_ok(), "{ok}");
         }
         for bad in [
             "file:///etc/passwd",
@@ -381,18 +323,27 @@ mod tests {
             "http://[fd00:ec2::254]/",
             "http://metadata.google.internal/computeMetadata/v1/",
         ] {
-            assert!(url_allowed(bad).is_err(), "{bad}");
+            assert!(netguard::url_allowed(bad).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn ipv4_hosts_read_as_browsers_do() {
-        assert_eq!(ipv4_host("2852039166"), Some(Ipv4Addr::new(169, 254, 169, 254)));
-        assert_eq!(ipv4_host("0x7f.1"), Some(Ipv4Addr::new(127, 0, 0, 1)));
-        assert_eq!(ipv4_host("010.0.0.1"), Some(Ipv4Addr::new(8, 0, 0, 1)));
-        assert_eq!(ipv4_host("example.com"), None);
-        assert_eq!(ipv4_host("1.2.3.256"), None);
-        assert_eq!(ipv4_host("1.2.3.4.5"), None);
+        assert_eq!(
+            netguard::ipv4_host("2852039166"),
+            Some(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        assert_eq!(
+            netguard::ipv4_host("0x7f.1"),
+            Some(Ipv4Addr::new(127, 0, 0, 1))
+        );
+        assert_eq!(
+            netguard::ipv4_host("010.0.0.1"),
+            Some(Ipv4Addr::new(8, 0, 0, 1))
+        );
+        assert_eq!(netguard::ipv4_host("example.com"), None);
+        assert_eq!(netguard::ipv4_host("1.2.3.256"), None);
+        assert_eq!(netguard::ipv4_host("1.2.3.4.5"), None);
     }
 
     #[test]
@@ -411,13 +362,18 @@ mod tests {
             "ws://169.254.169.254/",
             "file:///etc/passwd",
         ] {
-            assert!(request_blocked(blocked), "{blocked}");
+            assert!(netguard::request_blocked(blocked), "{blocked}");
         }
-        for allowed in ["https://example.com/a.js", "data:image/png;base64,iVBO", "blob:https://example.com/1-2", "http://127.0.0.1:3000/"] {
-            assert!(!request_blocked(allowed), "{allowed}");
+        for allowed in [
+            "https://example.com/a.js",
+            "data:image/png;base64,iVBO",
+            "blob:https://example.com/1-2",
+            "http://127.0.0.1:3000/",
+        ] {
+            assert!(!netguard::request_blocked(allowed), "{allowed}");
         }
         // Browsers drop tabs inside a URL: so does the goto check.
-        assert!(url_allowed("http://169.254.169.254\t/").is_err());
+        assert!(netguard::url_allowed("http://169.254.169.254\t/").is_err());
     }
 
     /// A redirect to the metadata address is stopped too: the guard sees every request with the
@@ -436,14 +392,61 @@ mod tests {
                 );
             }
         });
-        let engine = BrowserEngine::builder().max_browsers(1).build().await.unwrap();
+        let engine = BrowserEngine::builder()
+            .max_browsers(1)
+            .build()
+            .await
+            .unwrap();
         let page = engine.acquire().await.unwrap();
         guard_requests(&page).await.unwrap();
         let start = std::time::Instant::now();
-        let err = page.goto(&url).await.expect_err("the redirect was followed");
+        let err = page
+            .goto(&url)
+            .await
+            .expect_err("the redirect was followed");
         assert!(err.to_string().contains("BLOCKED_BY_CLIENT"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(10));
         drop(page);
         engine.shutdown(Duration::from_secs(5)).await.unwrap();
+    }
+
+    /// Only link-local hosts are blocked: a local fixture on 127.0.0.1 loads with the guard on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guarded_pages_load_loopback_hosts() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let _ = stream.read(&mut [0u8; 2048]);
+                let body = "<title>local</title>";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let engine = BrowserEngine::builder()
+            .max_browsers(1)
+            .build()
+            .await
+            .unwrap();
+        let page = engine.acquire().await.unwrap();
+        guard_requests(&page).await.unwrap();
+        page.goto(&url).await.unwrap();
+        assert_eq!(page.title().await.unwrap(), "local");
+        drop(page);
+        engine.shutdown(Duration::from_secs(5)).await.unwrap();
+    }
+
+    #[test]
+    fn truncate_respects_utf8_char_boundary() {
+        assert_eq!(truncate("ok".into(), 5), "ok");
+        let out = truncate("a🦀b".into(), 2);
+        assert!(out.starts_with("a…"), "{out:?}");
     }
 }

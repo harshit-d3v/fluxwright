@@ -14,8 +14,6 @@ pub enum Error {
     JobTimeout,
     #[error("engine is shut down")]
     ShuttingDown,
-    #[error("no healthy browser available")]
-    NoBrowser,
     #[error("{0}")]
     Other(String),
 }
@@ -24,7 +22,6 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Cdp(e) => e.is_retryable(),
-            Error::NoBrowser => true,
             _ => false,
         }
     }

@@ -3,21 +3,26 @@ use std::collections::HashMap;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use once_cell::sync::Lazy;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex, RwLock};
 
-static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("tokio"));
+static RT: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio"));
 
 #[napi]
 pub struct Browser {
     inner: fluxwright::BrowserEngine,
 }
 
-/// Read-locked by every page call, so calls run side by side (a download wait and the click
-/// that starts it); write-locked by `close`.
-type LeaseSlot = Arc<RwLock<Option<fluxwright::PageLease>>>;
+/// The page's lease, read-locked by every page call, so calls run side by side (a download wait
+/// and the click that starts it), and write-locked by `close`, which raises `closing` first: calls
+/// still running give up at once instead of holding the lease until their own timeouts.
+struct PageSlot {
+    page: RwLock<Option<fluxwright::PageLease>>,
+    closing: tokio::sync::watch::Sender<bool>,
+}
+
+type LeaseSlot = Arc<PageSlot>;
 
 #[napi]
 pub struct Page {
@@ -163,6 +168,8 @@ impl InterceptedRoute {
 /// A request, as network events hand it over; `addon.js` wraps it in Playwright's `Request`.
 #[napi(object)]
 pub struct NetworkRequest {
+    /// Chrome's request id: the same for every event of one request.
+    pub id: String,
     pub url: String,
     pub method: String,
     /// Names lower-cased, as Playwright reports them.
@@ -174,6 +181,7 @@ pub struct NetworkRequest {
 impl From<fluxwright::NetRequest> for NetworkRequest {
     fn from(r: fluxwright::NetRequest) -> Self {
         NetworkRequest {
+            id: r.id,
             url: r.url,
             method: r.method,
             headers: r.headers.into_iter().collect(),
@@ -335,8 +343,9 @@ pub struct DownloadInfo {
     pub path: String,
 }
 
-/// Runs `f` against the page on the engine's runtime; fails with "page closed" after close().
-async fn with_page<T, F>(lease: LeaseSlot, f: F) -> Result<T>
+/// Runs `f` against the page on the engine's runtime; fails with "page closed" after close(), and
+/// at once when close() is called while it runs.
+async fn with_page<T, F>(slot: LeaseSlot, f: F) -> Result<T>
 where
     T: Send + 'static,
     F: for<'a> FnOnce(
@@ -347,10 +356,14 @@ where
         + 'static,
 {
     RT.spawn(async move {
-        let g = lease.read().await;
-        match g.as_ref() {
-            Some(p) => f(p).await.map_err(|e| e.to_string()),
-            None => Err("page closed".to_string()),
+        let mut closing = slot.closing.subscribe();
+        let g = slot.page.read().await;
+        let Some(p) = g.as_ref() else {
+            return Err("page closed".to_string());
+        };
+        tokio::select! {
+            r = f(p) => r.map_err(|e| e.to_string()),
+            _ = async { let _ = closing.wait_for(|closed| *closed).await; } => Err("page closed".to_string()),
         }
     })
     .await
@@ -874,7 +887,7 @@ impl Browser {
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(Page {
-            lease: Arc::new(RwLock::new(Some(lease))),
+            lease: Arc::new(PageSlot { page: RwLock::new(Some(lease)), closing: tokio::sync::watch::Sender::new(false) }),
             routes: Default::default(),
         })
     }
@@ -915,152 +928,53 @@ impl Page {
                 )))
             }
         };
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.goto_with(&url, wait_until).await.map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.goto_with(&url, wait_until).await })).await
     }
 
     #[napi]
     pub async fn title(&self) -> Result<String> {
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.title().await.map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), |p| Box::pin(async move { p.title().await })).await
     }
 
     #[napi]
     pub async fn content(&self) -> Result<String> {
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.content().await.map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), |p| Box::pin(async move { p.content().await })).await
     }
 
     #[napi]
     pub async fn click(&self, selector: String) -> Result<()> {
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.click(&selector).await.map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.click(&selector).await })).await
     }
 
     #[napi]
     pub async fn fill(&self, selector: String, value: String) -> Result<()> {
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.fill(&selector, &value).await.map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.fill(&selector, &value).await })).await
     }
 
     #[napi]
     pub async fn evaluate(&self, expression: String) -> Result<serde_json::Value> {
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.evaluate(&expression).await.map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.evaluate(&expression).await })).await
     }
 
     #[napi]
     pub async fn screenshot(&self, options: Option<ScreenshotOptions>) -> Result<Buffer> {
         let full_page = options.and_then(|o| o.full_page).unwrap_or(false);
-        let lease = self.lease.clone();
-        let bytes = RT
-            .spawn(async move {
-                let g = lease.read().await;
-                if let Some(p) = g.as_ref() {
-                    if full_page { p.screenshot_full_page().await } else { p.screenshot().await }
-                        .map_err(|e| e.to_string())
-                } else {
-                    Err("page closed".into())
-                }
-            })
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?
-            .map_err(Error::from_reason)?;
-        Ok(bytes.into())
+        let png = with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { if full_page { p.screenshot_full_page().await } else { p.screenshot().await } })
+        })
+        .await?;
+        Ok(png.into())
     }
 
     #[napi]
     pub async fn set_viewport_size(&self, size: ViewportSize) -> Result<()> {
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.set_viewport_size(size.width, size.height)
-                    .await
-                    .map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.set_viewport_size(size.width, size.height).await }))
+            .await
     }
 
     #[napi]
     pub async fn wait_for_selector(&self, selector: String) -> Result<()> {
-        let lease = self.lease.clone();
-        RT.spawn(async move {
-            let g = lease.read().await;
-            if let Some(p) = g.as_ref() {
-                p.wait_for_selector(&selector).await.map_err(|e| e.to_string())
-            } else {
-                Err("page closed".into())
-            }
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.wait_for_selector(&selector).await })).await
     }
 
     /// CSS, `text=`, or `role=` selector.
@@ -1106,10 +1020,7 @@ impl Page {
         let tsfn = callback(handler)?;
         // Subscribed before this returns (a message logged right after it is seen), and the task
         // holds only the subscription: holding the lease kept a page never closed alive.
-        let mut entries = {
-            let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
-            page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_logs()
-        };
+        let mut entries = self.now(|p| p.subscribe_logs())?;
         RT.spawn(async move {
             // Ends when the page closes.
             while let Some(entry) = entries.recv().await {
@@ -1137,10 +1048,7 @@ impl Page {
     #[napi(js_name = "_onNetwork")]
     pub fn on_network(&self, handler: Function<NetworkEvent, ()>) -> Result<()> {
         let tsfn = callback(handler)?;
-        let mut events = {
-            let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
-            page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_network()
-        };
+        let mut events = self.now(|p| p.subscribe_network())?;
         RT.spawn(async move {
             // Ends when the page closes.
             while let Some(e) = events.recv().await {
@@ -1155,10 +1063,7 @@ impl Page {
     #[napi(js_name = "_onDialog")]
     pub fn on_dialog(&self, handler: Function<PendingDialog, ()>) -> Result<()> {
         let tsfn = callback(handler)?;
-        let mut dialogs = {
-            let page = self.lease.try_read().map_err(|_| Error::from_reason("page closed"))?;
-            page.as_ref().ok_or_else(|| Error::from_reason("page closed"))?.subscribe_dialogs()
-        };
+        let mut dialogs = self.now(|p| p.subscribe_dialogs())?;
         RT.spawn(async move {
             while let Some(d) = dialogs.recv().await {
                 tsfn.call(PendingDialog::new(d), ThreadsafeFunctionCallMode::NonBlocking);
@@ -1223,13 +1128,13 @@ impl Page {
 
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        // The route callback holds the JS dispatcher, which holds this page: kept, the page could
-        // never be garbage-collected.
+        // The route callback keeps the JS dispatcher and its handlers: free them now.
         self.routes.lock().unwrap().take();
-        let lease = self.lease.clone();
+        // Calls still running give up now (see `with_page`), so the write lock comes at once.
+        self.lease.closing.send_replace(true);
+        let slot = self.lease.clone();
         RT.spawn(async move {
-            let mut g = lease.write().await;
-            *g = None;
+            *slot.page.write().await = None;
         })
         .await
         .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -1239,7 +1144,7 @@ impl Page {
     /// Whether `close()` was called (or is under way).
     #[napi]
     pub fn is_closed(&self) -> bool {
-        self.lease.try_read().map_or(true, |page| page.is_none())
+        *self.lease.closing.borrow()
     }
 }
 
@@ -1247,9 +1152,14 @@ impl Page {
     fn top(&self) -> FrameLocator {
         FrameLocator { lease: self.lease.clone(), frames: Vec::new() }
     }
-}
 
-#[napi]
-pub fn chromium() -> Chromium {
-    Chromium {}
+    /// Runs `f` on the page at once, for subscriptions, which must be in place when they return;
+    /// fails once `close()` began.
+    fn now<T>(&self, f: impl FnOnce(&fluxwright::PageLease) -> T) -> Result<T> {
+        let page = self.lease.page.try_read().map_err(|_| Error::from_reason("page closed"))?;
+        match page.as_ref() {
+            Some(p) if !*self.lease.closing.borrow() => Ok(f(p)),
+            _ => Err(Error::from_reason("page closed")),
+        }
+    }
 }

@@ -41,24 +41,43 @@ pub fn find_browser(headless: bool) -> Result<PathBuf> {
 
 /// chrome-headless-shell on PATH, else the newest in Puppeteer's or Playwright's cache.
 fn find_headless_shell() -> Option<PathBuf> {
-    let exe = if cfg!(windows) { "chrome-headless-shell.exe" } else { "chrome-headless-shell" };
-    let on_path = std::env::var_os("PATH")
-        .and_then(|paths| std::env::split_paths(&paths).map(|d| d.join(exe)).find(|p| p.is_file()));
+    let exe = if cfg!(windows) {
+        "chrome-headless-shell.exe"
+    } else {
+        "chrome-headless-shell"
+    };
+    let on_path = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(exe))
+            .find(|p| p.is_file())
+    });
     if on_path.is_some() {
         return on_path;
     }
-    let home = PathBuf::from(std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?);
-    let playwright = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH").map(PathBuf::from).unwrap_or_else(|| {
-        if cfg!(windows) {
-            std::env::var_os("LOCALAPPDATA").map_or_else(|| home.join("AppData/Local"), PathBuf::from).join("ms-playwright")
-        } else if cfg!(target_os = "macos") {
-            home.join("Library/Caches/ms-playwright")
-        } else {
-            home.join(".cache/ms-playwright")
-        }
-    });
-    newest_shell(&home.join(".cache/puppeteer/chrome-headless-shell"), "", exe)
-        .or_else(|| newest_shell(&playwright, "chromium_headless_shell-", exe))
+    let home = PathBuf::from(std::env::var_os(if cfg!(windows) {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    })?);
+    let playwright = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("LOCALAPPDATA")
+                    .map_or_else(|| home.join("AppData/Local"), PathBuf::from)
+                    .join("ms-playwright")
+            } else if cfg!(target_os = "macos") {
+                home.join("Library/Caches/ms-playwright")
+            } else {
+                home.join(".cache/ms-playwright")
+            }
+        });
+    newest_shell(
+        &home.join(".cache/puppeteer/chrome-headless-shell"),
+        "",
+        exe,
+    )
+    .or_else(|| newest_shell(&playwright, "chromium_headless_shell-", exe))
 }
 
 /// Layout `<root>/<prefix><version>/chrome-headless-shell-<platform>/<exe>`; highest version
@@ -70,8 +89,15 @@ fn newest_shell(root: &Path, prefix: &str, exe: &str) -> Option<PathBuf> {
         .filter_map(|dir| {
             let name = dir.file_name().to_string_lossy().into_owned();
             let version = name.strip_prefix(prefix)?;
-            let key = version.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
-            let bin = std::fs::read_dir(dir.path()).ok()?.flatten().map(|d| d.path().join(exe)).find(|p| p.is_file())?;
+            let key = version
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            let bin = std::fs::read_dir(dir.path())
+                .ok()?
+                .flatten()
+                .map(|d| d.path().join(exe))
+                .find(|p| p.is_file())?;
             Some((key, bin))
         })
         .collect();
@@ -124,7 +150,10 @@ pub enum Transport {
     /// exits when the pipe closes, so it cannot outlive a crashed engine. That is the only
     /// tether on macOS, which has no parent-death signal.
     #[cfg(unix)]
-    Pipe { to_chrome: OwnedFd, from_chrome: OwnedFd },
+    Pipe {
+        to_chrome: OwnedFd,
+        from_chrome: OwnedFd,
+    },
 }
 
 pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
@@ -189,7 +218,8 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         args.push("--remote-debugging-pipe".to_string());
     } else {
         args.push("--remote-debugging-port=0".to_string());
-        args.push("--remote-allow-origins=*".to_string());
+        // No --remote-allow-origins: it lets any web page in any job open a DevTools socket to
+        // another job's page. tungstenite sends no Origin header, which Chrome accepts.
     }
     args.extend(opts.extra_args.iter().cloned());
 
@@ -199,7 +229,11 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // Windows reads the DevTools URL from stderr; the pipe needs nothing from it.
-        .stderr(if cfg!(unix) { Stdio::null() } else { Stdio::piped() })
+        .stderr(if cfg!(unix) {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .kill_on_drop(true);
 
     #[cfg(unix)]
@@ -248,7 +282,10 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         Ok(Launched {
             child,
             pid,
-            transport: Transport::Pipe { to_chrome, from_chrome },
+            transport: Transport::Pipe {
+                to_chrome,
+                from_chrome,
+            },
             user_data_dir,
         })
     }
@@ -258,7 +295,13 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         let mut child = cmd.spawn().map_err(|e| Error::Launch(e.to_string()))?;
         tie_to_this_process(&child);
         let pid = child.id().ok_or_else(|| Error::Launch("no pid".into()))?;
-        let ws_url = match wait_devtools_url(&mut child, user_data_dir.path(), Duration::from_secs(20)).await {
+        let ws_url = match wait_devtools_url(
+            &mut child,
+            user_data_dir.path(),
+            Duration::from_secs(20),
+        )
+        .await
+        {
             Ok(u) => u,
             Err(e) => {
                 let _ = child.kill().await;
@@ -329,6 +372,14 @@ fn tie_to_this_process(child: &Child) {
     }
 }
 
+fn stale_profile_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("fluxwright-")?
+        .split('-')
+        .next()?
+        .parse::<u32>()
+        .ok()
+}
+
 /// Deletes profile dirs of engines that died without cleaning up (a crash or hard kill skips
 /// TempDir's Drop). Only `fluxwright-<pid>-*` dirs whose pid is no longer running.
 /// Runs once, in the background, on the first launch in a process.
@@ -340,12 +391,7 @@ pub fn sweep_stale_profiles() {
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
     for e in entries.flatten() {
         let name = e.file_name();
-        let pid = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("fluxwright-"))
-            .and_then(|rest| rest.split('-').next())
-            .and_then(|p| p.parse::<u32>().ok());
-        if let Some(pid) = pid {
+        if let Some(pid) = name.to_str().and_then(stale_profile_pid) {
             if sys.process(sysinfo::Pid::from_u32(pid)).is_none() {
                 let _ = std::fs::remove_dir_all(e.path());
             }
@@ -360,7 +406,13 @@ fn ws_url_from_line(line: &str) -> Option<String> {
         return Some(rest.trim().to_string());
     }
     line.find("ws://")
-        .map(|i| line[i..].split_whitespace().next().unwrap_or("").to_string())
+        .map(|i| {
+            line[i..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
         .filter(|s| s.starts_with("ws://"))
 }
 
@@ -397,25 +449,55 @@ async fn try_read_port_file(port_file: &Path) -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
+fn push_tail(tail: &mut std::collections::VecDeque<String>, line: String) {
+    if tail.len() == 16 {
+        tail.pop_front();
+    }
+    tail.push_back(line);
+}
+
+#[cfg(windows)]
 async fn wait_devtools_url(
     child: &mut Child,
     user_data_dir: &Path,
     timeout: Duration,
 ) -> Result<String> {
     let port_file = user_data_dir.join("DevToolsActivePort");
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    enum StderrMsg {
+        Url(String),
+        Line(String),
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StderrMsg>();
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(url) = ws_url_from_line(&line) {
-                    let _ = tx.send(url);
+                    let _ = tx.send(StderrMsg::Url(url));
+                } else if !line.trim().is_empty() {
+                    let _ = tx.send(StderrMsg::Line(line));
                 }
             }
         });
     }
+    let mut stderr_tail = std::collections::VecDeque::with_capacity(16);
+    let mut stderr_open = true;
     let start = tokio::time::Instant::now();
     loop {
+        if let Some(status) = child.try_wait()? {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    StderrMsg::Url(url) => push_tail(&mut stderr_tail, url),
+                    StderrMsg::Line(line) => push_tail(&mut stderr_tail, line),
+                }
+            }
+            let tail = Vec::from(stderr_tail).join("\n");
+            return Err(Error::Launch(if tail.is_empty() {
+                format!("chrome exited immediately with {status}")
+            } else {
+                format!("chrome exited with {status}: {tail}")
+            }));
+        }
         if start.elapsed() > timeout {
             return Err(Error::Launch(
                 "timed out waiting for DevToolsActivePort".into(),
@@ -423,7 +505,11 @@ async fn wait_devtools_url(
         }
         tokio::select! {
             biased;
-            Some(url) = rx.recv() => return Ok(url),
+            msg = rx.recv(), if stderr_open => match msg {
+                Some(StderrMsg::Url(url)) => return Ok(url),
+                Some(StderrMsg::Line(line)) => push_tail(&mut stderr_tail, line),
+                None => stderr_open = false,
+            },
             _ = sleep(Duration::from_millis(30)) => {
                 if let Some(url) = try_read_port_file(&port_file).await? {
                     return Ok(url);
@@ -435,26 +521,120 @@ async fn wait_devtools_url(
 
 #[cfg(test)]
 mod tests {
-    use super::newest_shell;
+    use super::*;
 
     #[test]
     fn newest_headless_shell_wins() {
         let root = tempfile::tempdir().unwrap();
-        for version in ["chromium_headless_shell-1200", "chromium_headless_shell-1243", "chromium-1243"] {
-            let dir = root.path().join(version).join("chrome-headless-shell-linux64");
+        for version in [
+            "chromium_headless_shell-1200",
+            "chromium_headless_shell-1243",
+            "chromium-1243",
+        ] {
+            let dir = root
+                .path()
+                .join(version)
+                .join("chrome-headless-shell-linux64");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("shell"), "").unwrap();
         }
         let found = newest_shell(root.path(), "chromium_headless_shell-", "shell").unwrap();
-        assert!(found.starts_with(root.path().join("chromium_headless_shell-1243")), "{found:?}");
+        assert!(
+            found.starts_with(root.path().join("chromium_headless_shell-1243")),
+            "{found:?}"
+        );
 
         let puppeteer = tempfile::tempdir().unwrap();
-        for version in ["win64-131.0.6778.85", "win64-140.0.7339.80", "win64-99.0.1.1"] {
-            let dir = puppeteer.path().join(version).join("chrome-headless-shell-win64");
+        for version in [
+            "win64-131.0.6778.85",
+            "win64-140.0.7339.80",
+            "win64-99.0.1.1",
+        ] {
+            let dir = puppeteer
+                .path()
+                .join(version)
+                .join("chrome-headless-shell-win64");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("shell"), "").unwrap();
         }
         let found = newest_shell(puppeteer.path(), "", "shell").unwrap();
-        assert!(found.starts_with(puppeteer.path().join("win64-140.0.7339.80")), "{found:?}");
+        assert!(
+            found.starts_with(puppeteer.path().join("win64-140.0.7339.80")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn stale_profile_pid_parses_fluxwright_prefix() {
+        assert_eq!(stale_profile_pid("fluxwright-1234-ab"), Some(1234));
+        assert_eq!(stale_profile_pid("fluxwright-42-dl-ctx"), Some(42));
+        assert_eq!(stale_profile_pid("other-1234-ab"), None);
+        assert_eq!(stale_profile_pid("fluxwright-bad-ab"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ws_url_from_line_parses_banner_and_inline_urls() {
+        assert_eq!(
+            ws_url_from_line("  DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc  "),
+            Some("ws://127.0.0.1:9222/devtools/browser/abc".into())
+        );
+        assert_eq!(
+            ws_url_from_line("[123] ready ws://127.0.0.1:5000/devtools/browser/xyz extra"),
+            Some("ws://127.0.0.1:5000/devtools/browser/xyz".into())
+        );
+        assert_eq!(ws_url_from_line("nothing to see here"), None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn try_read_port_file_parses_formats_and_incomplete_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let port_file = dir.path().join("DevToolsActivePort");
+        assert_eq!(try_read_port_file(&port_file).await.unwrap(), None);
+
+        tokio::fs::write(&port_file, "9222\n").await.unwrap();
+        assert_eq!(try_read_port_file(&port_file).await.unwrap(), None);
+
+        tokio::fs::write(&port_file, "9222\n/devtools/browser/id1\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            try_read_port_file(&port_file).await.unwrap(),
+            Some("ws://127.0.0.1:9222/devtools/browser/id1".into())
+        );
+
+        tokio::fs::write(&port_file, "9222\nws://127.0.0.1:9222/custom\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            try_read_port_file(&port_file).await.unwrap(),
+            Some("ws://127.0.0.1:9222/custom".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn wait_devtools_url_fails_fast_when_child_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("cmd")
+            .args(["/C", "echo mock crash 1>&2 & exit /B 7"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = wait_devtools_url(&mut child, dir.path(), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stalled: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exited") && msg.contains("mock crash"),
+            "{msg}"
+        );
     }
 }

@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
@@ -8,6 +6,55 @@ use tokio::net::TcpListener;
 pub struct Server {
     pub base_url: String,
     handle: tokio::task::JoinHandle<()>,
+}
+
+/// A Chrome anyone can connect to over CDP, as a remote browser is: started with a debugging
+/// port, whose address it writes to `DevToolsActivePort`. Fluxwright's own browsers talk over a
+/// private pipe on Linux and macOS, so they have no address to borrow. Killed when dropped.
+pub struct DebuggableChrome {
+    child: std::process::Child,
+    profile: std::path::PathBuf,
+    pub ws_url: String,
+}
+
+impl DebuggableChrome {
+    pub async fn start(chrome: &std::path::Path) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Named like Fluxwright's profiles, so a crashed run's folder is swept later.
+        let profile = std::env::temp_dir().join(format!("fluxwright-{}-cdp-test-{nanos}", std::process::id()));
+        let mut cmd = std::process::Command::new(chrome);
+        cmd.args(["--headless=new", "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check"])
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .arg("about:blank")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if std::env::var_os("FLUXWRIGHT_NO_SANDBOX").is_some() {
+            cmd.arg("--no-sandbox");
+        }
+        let child = cmd.spawn().expect("start chrome");
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(profile.join("DevToolsActivePort")) {
+                let mut lines = text.lines();
+                if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
+                    let ws_url = format!("ws://127.0.0.1:{}{}", port.trim(), path.trim());
+                    return Self { child, profile, ws_url };
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("chrome wrote no DevToolsActivePort within 20 s");
+    }
+}
+
+impl Drop for DebuggableChrome {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.profile);
+    }
 }
 
 impl Server {
@@ -122,9 +169,4 @@ async fn slow_subresource() -> Html<&'static str> {
 async fn slow() -> Html<&'static str> {
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     Html("<!doctype html><title>slow</title>done")
-}
-
-#[allow(dead_code)]
-pub fn addr_url(addr: SocketAddr) -> String {
-    format!("http://{addr}")
 }

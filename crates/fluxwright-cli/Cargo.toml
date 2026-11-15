@@ -12,7 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 fluxwright.workspace = true
-benchmark-server.workspace = true
+fluxwright-server = { path = "../fluxwright-server" }
+axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,4 +21,3 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-sysinfo.workspace = true

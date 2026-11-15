@@ -1412,3 +1412,73 @@ async fn lone_surrogates_do_not_drop_messages() {
     page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+/// Text inside <script> is not page text. Matched on it, <body> was the element: a wait for text
+/// not shown yet returned at once, and a click landed in the middle of the page.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_selectors_ignore_script_contents() {
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .action_timeout(Duration::from_secs(1))
+        .build()
+        .await
+        .unwrap();
+    let page = eng.acquire().await.unwrap();
+    page.goto("data:text/html,<body><p>Cart</p><script>window.__DATA__ = { label: 'Checkout' }</script></body>")
+        .await
+        .unwrap();
+    assert!(page.get_by_text("checkout", false).wait().await.is_err(), "matched the script's text");
+    assert_eq!(page.get_by_text("cart", false).text_content().await.unwrap().as_deref(), Some("Cart"));
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_over_cdp_to_running_browser() {
+    let chrome = benchmark_server::DebuggableChrome::start(&fluxwright::find_browser(true).unwrap()).await;
+    let ws_url = chrome.ws_url.clone();
+
+    // Connect over CDP using the remote endpoint constructor
+    let remote_eng = BrowserEngine::connect_over_cdp(&ws_url)
+        .await
+        .expect("connected over CDP");
+    let page = remote_eng.acquire().await.expect("acquired remote page lease");
+    assert!(page.is_remote());
+    assert_eq!(page.browser_pid(), 0);
+
+    // Perform page actions
+    page.goto("about:blank").await.unwrap();
+    let title = page.title().await.unwrap();
+    assert_eq!(title, "");
+
+    let res = page.evaluate("10 * 4 + 2").await.unwrap();
+    assert_eq!(res, json!(42));
+
+    // Verify metrics show 0 local memory footprint
+    let metrics = remote_eng.metrics().await;
+    assert_eq!(metrics.browsers, 1);
+    assert_eq!(metrics.browser_tree_rss_bytes, 0);
+
+    // Also via the builder, and through the HTTP address that lists the WebSocket one
+    let http_url = format!("http://{}", ws_url.trim_start_matches("ws://").split('/').next().unwrap());
+    let remote_eng2 = BrowserEngine::builder()
+        .connect_over_cdp(http_url)
+        .max_contexts_per_browser(4)
+        .build()
+        .await
+        .expect("builder connect_over_cdp");
+    let page2 = remote_eng2.acquire().await.unwrap();
+    assert!(page2.is_remote());
+    drop(page2);
+
+    drop(page);
+    remote_eng2.shutdown(Duration::from_secs(5)).await.unwrap();
+    remote_eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    drop(chrome);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_over_cdp_invalid_endpoint_fails_cleanly() {
+    let err = BrowserEngine::connect_over_cdp("ws://127.0.0.1:1/invalid").await;
+    assert!(err.is_err());
+}

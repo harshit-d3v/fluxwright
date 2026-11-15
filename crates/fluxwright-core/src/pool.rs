@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::config::{EngineConfig, JobOptions, Priority, QueueFullMode};
 use crate::error::{Error, Result};
 use crate::metrics::{Counters, MetricsSnapshot};
-use crate::process::{current_process_rss_bytes, process_tree_memory_map, process_trees_memory_bytes};
+use crate::process::{current_process_rss_bytes, process_tree_memory_map};
 use crate::source::BrowserSource;
 
 #[derive(Clone)]
@@ -28,8 +28,8 @@ struct Inner {
     source: Arc<dyn BrowserSource>,
     state: Mutex<State>,
     admit: Notify,
-    shutdown: Mutex<bool>,
-    rss_cache: Mutex<(Instant, u64)>,
+    /// When the fleet's memory was last walked (never: `None`), and each browser root's footprint.
+    rss_cache: Mutex<(Option<Instant>, HashMap<u32, u64>)>,
     rss_refreshing: AtomicBool,
     grants: Arc<tokio::sync::Semaphore>,
 }
@@ -39,13 +39,14 @@ struct State {
     queue: VecDeque<Waiter>,
     counters: Counters,
     launching: usize,
+    shutting_down: bool,
 }
 
 impl State {
     /// Browsers that count toward `max_browsers`: those that can still take a lease. A draining
     /// or dead one is on its way out, so its replacement may start at once; counting it stopped
     /// the whole pool (with one browser) until its last job ended. The memory ceiling still
-    /// gates every new lease.
+    /// gates every new launch.
     fn serving(&self) -> usize {
         self.browsers
             .iter()
@@ -134,10 +135,10 @@ impl Engine {
                 queue: VecDeque::new(),
                 counters: Counters::default(),
                 launching: 0,
+                shutting_down: false,
             }),
             admit: Notify::new(),
-            shutdown: Mutex::new(false),
-            rss_cache: Mutex::new((Instant::now(), 0)),
+            rss_cache: Mutex::new((None, HashMap::new())),
             rss_refreshing: AtomicBool::new(false),
             grants: Arc::new(tokio::sync::Semaphore::new(24)),
         });
@@ -149,7 +150,7 @@ impl Engine {
                 let Some(inner) = pump.upgrade() else {
                     break;
                 };
-                if *inner.shutdown.lock().await {
+                if inner.state.lock().await.shutting_down {
                     break;
                 }
                 let notified = inner.admit.notified();
@@ -160,9 +161,9 @@ impl Engine {
                 notified.as_mut().enable();
                 let progress = Inner::dispatch(inner.clone()).await.unwrap_or(false);
                 if !progress {
-                    // Also wakes every second without traffic: idle browsers close on time, and
-                    // a dropped engine is noticed.
-                    let _ = tokio::time::timeout(Duration::from_secs(1), notified).await;
+                    // Also wakes regularly without traffic: idle browsers close on time,
+                    // RSS ceiling re-checks after cache expiry, and a dropped engine is noticed.
+                    let _ = tokio::time::timeout(Duration::from_millis(500), notified).await;
                 }
             }
         });
@@ -172,7 +173,16 @@ impl Engine {
     pub fn builder() -> EngineBuilder {
         EngineBuilder {
             config: EngineConfig::default(),
+            source: Arc::new(crate::source::LocalChromium),
         }
+    }
+
+    /// Connects to a remote browser over CDP rather than launching local Chrome.
+    pub async fn connect_over_cdp(endpoint_url: impl Into<String>) -> Result<Self> {
+        Self::builder()
+            .connect_over_cdp(endpoint_url)
+            .build()
+            .await
     }
 
     pub async fn acquire(&self) -> Result<PageLease> {
@@ -201,12 +211,12 @@ impl Engine {
     }
 
     async fn acquire_inner(&self, priority: Priority, proxy: Option<Proxy>, timeout: Duration) -> Result<PageLease> {
-        if *self.inner.shutdown.lock().await {
-            return Err(Error::ShuttingDown);
-        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut st = self.inner.state.lock().await;
+            if st.shutting_down {
+                return Err(Error::ShuttingDown);
+            }
             drop_abandoned(&mut st.queue);
             if st.queue.len() >= self.inner.config.queue_capacity {
                 match self.inner.config.queue_full_mode {
@@ -222,9 +232,20 @@ impl Engine {
                             tokio::pin!(notified);
                             notified.as_mut().enable();
                             {
+                                // Checked and joined under one lock: every waiter woken at once
+                                // used to see the same free place and join, past the capacity.
                                 let mut st = self.inner.state.lock().await;
+                                if st.shutting_down {
+                                    return Err(Error::ShuttingDown);
+                                }
                                 drop_abandoned(&mut st.queue);
                                 if st.queue.len() < self.inner.config.queue_capacity {
+                                    st.queue.push_back(Waiter {
+                                        priority,
+                                        proxy,
+                                        queued_at: Instant::now(),
+                                        tx,
+                                    });
                                     break;
                                 }
                             }
@@ -235,13 +256,6 @@ impl Engine {
                             .await
                             .map_err(|_| Error::AcquireTimeout)?;
                         }
-                        let mut st = self.inner.state.lock().await;
-                        st.queue.push_back(Waiter {
-                            priority,
-                            proxy,
-                            queued_at: Instant::now(),
-                            tx,
-                        });
                     }
                 }
             } else {
@@ -280,19 +294,14 @@ impl Engine {
                 f.clone()(page).await
             })
             .await
-            .map_err(|_| Error::JobTimeout);
+            .unwrap_or(Err(Error::JobTimeout));
             match result {
-                Ok(Ok(v)) => return Ok(v),
-                Ok(Err(e)) if e.is_retryable() && attempt < retries => {
+                Ok(v) => return Ok(v),
+                // Only what is_retryable allows (a browser that died). A job that timed out is
+                // not run again: it may already have clicked or submitted something.
+                Err(e) if e.is_retryable() && attempt < retries => {
                     warn!(error = %e, attempt, "retryable job failure");
                     attempt += 1;
-                    continue;
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(_e) if attempt < retries => {
-                    attempt += 1;
-                    warn!(attempt, "job timeout, retrying");
-                    continue;
                 }
                 Err(e) => return Err(e),
             }
@@ -305,11 +314,11 @@ impl Engine {
             let pids: Vec<u32> = st
                 .browsers
                 .iter()
-                .filter(|s| !s.crashed)
+                .filter(|s| !s.crashed && s.browser.pid > 0)
                 .map(|s| s.browser.pid)
                 .collect();
             (
-                pids.len(),
+                st.browsers.iter().filter(|s| !s.crashed).count(),
                 st.browsers.iter().map(|s| s.active).sum::<usize>(),
                 st.queue.len(),
                 st.counters.reuse_rate(),
@@ -318,9 +327,7 @@ impl Engine {
                 pids,
             )
         };
-        let tree = tokio::task::spawn_blocking(move || process_trees_memory_bytes(&pids))
-            .await
-            .unwrap_or(0);
+        let tree = self.inner.recent_tree_rss(pids).await;
         let engine_rss = tokio::task::spawn_blocking(current_process_rss_bytes)
             .await
             .unwrap_or(0);
@@ -358,12 +365,16 @@ impl Engine {
                     )
                 })
                 .collect();
-            let pids: Vec<u32> = rows.iter().map(|r| r.1).collect();
+            let pids: Vec<u32> = rows.iter().filter(|r| r.1 > 0).map(|r| r.1).collect();
             (rows, pids)
         };
-        let rss = tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
-            .await
-            .unwrap_or_default();
+        let rss = if pids.is_empty() {
+            HashMap::new()
+        } else {
+            tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
+                .await
+                .unwrap_or_default()
+        };
         rows.into_iter()
             .map(|r| BrowserInfo {
                 id: r.0,
@@ -379,26 +390,35 @@ impl Engine {
     }
 
     pub async fn shutdown(&self, grace: Duration) -> Result<()> {
-        *self.inner.shutdown.lock().await = true;
         let start = Instant::now();
-        loop {
-            {
+        let browsers = loop {
+            let browsers = {
                 let mut st = self.inner.state.lock().await;
+                st.shutting_down = true;
                 while let Some(w) = st.queue.pop_front() {
                     let _ = w.tx.send(Err(Error::ShuttingDown));
                 }
                 // A browser still starting counts: it would otherwise come up after this returns.
                 let idle = st.launching == 0 && st.browsers.iter().all(|s| s.active == 0);
                 if idle || start.elapsed() > grace {
-                    for s in st.browsers.drain(..) {
-                        let _ = s.browser.close().await;
-                    }
-                    break;
+                    Some(std::mem::take(&mut st.browsers))
+                } else {
+                    None
                 }
+            };
+            self.inner.admit.notify_waiters();
+            if let Some(browsers) = browsers {
+                break browsers;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let mut closing = tokio::task::JoinSet::new();
+        for s in browsers {
+            closing.spawn(async move {
+                let _ = s.browser.close().await;
+            });
         }
-        self.inner.admit.notify_waiters();
+        while closing.join_next().await.is_some() {}
         Ok(())
     }
 
@@ -419,61 +439,98 @@ pub struct BrowserInfo {
     pub healthy: bool,
 }
 
+enum Reservation {
+    Reuse(Arc<CdpBrowser>),
+    Launch,
+}
+
+impl State {
+    fn next_reusable_browser(&self, max_contexts: usize) -> Option<usize> {
+        self.browsers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.crashed
+                    && !s.draining
+                    && !s.browser.connection_dead()
+                    && s.active < max_contexts
+            })
+            .min_by_key(|(_, s)| s.active)
+            .map(|(i, _)| i)
+    }
+
+    fn can_launch_for_queue(&self, config: &EngineConfig) -> bool {
+        // Each in-flight launch will take 1 queued waiter immediately and open
+        // max_contexts_per_browser - 1 remaining slots for additional waiters.
+        let pending_slots =
+            self.launching * config.max_contexts_per_browser.saturating_sub(1);
+        self.serving() + self.launching < config.max_browsers
+            && self.queue.len() > pending_slots
+    }
+
+    fn can_dispatch(&self, config: &EngineConfig) -> bool {
+        !self.queue.is_empty()
+            && (self.next_reusable_browser(config.max_contexts_per_browser).is_some()
+                || self.can_launch_for_queue(config))
+    }
+}
+
 impl Inner {
     async fn dispatch(self: Arc<Self>) -> Result<bool> {
         self.reap().await;
         self.recycle().await;
         {
-            let st = self.state.lock().await;
-            let healthy = st
-                .browsers
-                .iter()
-                .filter(|s| !s.crashed && !s.draining && !s.browser.connection_dead());
-            let free: usize = healthy
-                .map(|s| {
-                    self.config
-                        .max_contexts_per_browser
-                        .saturating_sub(s.active)
-                })
-                .sum();
-            let launch_room = self.config.max_browsers.saturating_sub(st.serving() + st.launching);
-            if free + launch_room == 0 {
+            let mut st = self.state.lock().await;
+            if st.shutting_down {
+                return Ok(false);
+            }
+            drop_abandoned(&mut st.queue);
+            if !st.can_dispatch(&self.config) {
                 return Ok(false);
             }
         }
+        // Over the memory ceiling no new browser starts; one already running still takes work.
+        let ceiling = self.config.memory_ceiling_mb * 1024 * 1024;
+        let over_ceiling = ceiling > 0 && {
+            let tree = self.browser_tree_rss().await;
+            if tree > ceiling {
+                debug!(tree, ceiling, "rss ceiling hit: no new launches");
+            }
+            tree > ceiling
+        };
         let permit = match self.grants.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => return Ok(false),
         };
-        let next = {
+        let (waiter, reservation) = {
             let mut st = self.state.lock().await;
-            pick_waiter(&mut st.queue)
-        };
-        let Some(waiter) = next else {
-            drop(permit);
-            return Ok(false);
+            if st.shutting_down {
+                return Ok(false);
+            }
+            drop_abandoned(&mut st.queue);
+            let idx = st.next_reusable_browser(self.config.max_contexts_per_browser);
+            if idx.is_none() && (over_ceiling || !st.can_launch_for_queue(&self.config)) {
+                return Ok(false);
+            }
+            let Some(waiter) = pick_waiter(&mut st.queue) else {
+                return Ok(false);
+            };
+            let reservation = if let Some(i) = idx {
+                st.browsers[i].active += 1;
+                st.counters.acquires += 1;
+                st.counters.acquires_reused_browser += 1;
+                Reservation::Reuse(st.browsers[i].browser.clone())
+            } else {
+                st.launching += 1;
+                Reservation::Launch
+            };
+            (waiter, reservation)
         };
         let inner = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match inner.grant_lease(waiter.proxy.as_ref()).await {
-                Ok(lease) => {
-                    let _ = waiter.tx.send(Ok(lease));
-                }
-                Err(Error::NoBrowser) => {
-                    {
-                        let mut st = inner.state.lock().await;
-                        st.queue.push_front(waiter);
-                    }
-                    // ponytail: flat 50ms backoff. The rss ceiling clears on a
-                    // release, which notifies anyway; this only stops dispatch
-                    // from spinning on a waiter it cannot serve yet.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => {
-                    let _ = waiter.tx.send(Err(e));
-                }
-            }
+            let res = inner.prepare_lease(waiter.proxy.as_ref(), reservation).await;
+            let _ = waiter.tx.send(res);
             inner.admit.notify_waiters();
         });
         Ok(true)
@@ -483,8 +540,11 @@ impl Inner {
     /// value starts one background refresh. The walk takes ~30 ms idle and ~200 ms under
     /// load, and every acquire used to queue behind it.
     async fn browser_tree_rss(self: &Arc<Self>) -> u64 {
-        let (at, tree) = *self.rss_cache.lock().await;
-        if at.elapsed() >= Duration::from_millis(500)
+        let (at, tree) = {
+            let cache = self.rss_cache.lock().await;
+            (cache.0, cache.1.values().copied().sum())
+        };
+        if at.is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
             && !self.rss_refreshing.swap(true, Ordering::SeqCst)
         {
             let me = self.clone();
@@ -493,87 +553,92 @@ impl Inner {
                     let st = me.state.lock().await;
                     st.browsers
                         .iter()
-                        .filter(|s| !s.crashed)
+                        .filter(|s| !s.crashed && s.browser.pid > 0)
                         .map(|s| s.browser.pid)
                         .collect()
                 };
-                let tree = tokio::task::spawn_blocking(move || process_trees_memory_bytes(&pids))
-                    .await
-                    .unwrap_or(0);
-                *me.rss_cache.lock().await = (Instant::now(), tree);
+                let by_pid = if pids.is_empty() {
+                    HashMap::new()
+                } else {
+                    tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
+                        .await
+                        .unwrap_or_default()
+                };
+                *me.rss_cache.lock().await = (Some(Instant::now()), by_pid);
                 me.rss_refreshing.store(false, Ordering::SeqCst);
+                me.admit.notify_waiters();
             });
         }
         tree
     }
 
-    async fn grant_lease(self: &Arc<Self>, proxy: Option<&Proxy>) -> Result<PageLease> {
-        if *self.shutdown.lock().await {
-            return Err(Error::ShuttingDown);
+    /// The fleet's memory for metrics: the last walk while it is under a second old, else a new
+    /// one. Every dashboard tab, scrape and stats call used to walk the whole process table.
+    async fn recent_tree_rss(&self, pids: Vec<u32>) -> u64 {
+        if pids.is_empty() {
+            return 0;
         }
-        let ceiling = self.config.memory_ceiling_mb * 1024 * 1024;
-        let tree = self.browser_tree_rss().await;
-        if tree > ceiling && ceiling > 0 {
-            debug!(tree, ceiling, "rss ceiling hit");
-            return Err(Error::NoBrowser);
+        {
+            let cache = self.rss_cache.lock().await;
+            if cache.0.is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+                && pids.iter().all(|p| cache.1.contains_key(p))
+            {
+                return pids.iter().map(|p| cache.1.get(p).copied().unwrap_or(0)).sum();
+            }
         }
+        let by_pid = tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
+            .await
+            .unwrap_or_default();
+        let total = by_pid.values().copied().sum();
+        *self.rss_cache.lock().await = (Some(Instant::now()), by_pid);
+        total
+    }
 
-        let chosen = {
-            let mut st = self.state.lock().await;
-            let idx = st
-                .browsers
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| {
-                    !s.crashed
-                        && !s.draining
-                        && !s.browser.connection_dead()
-                        && s.active < self.config.max_contexts_per_browser
-                })
-                .min_by_key(|(_, s)| s.active)
-                .map(|(i, _)| i);
-            if let Some(i) = idx {
-                st.browsers[i].active += 1;
-                st.counters.acquires += 1;
-                st.counters.acquires_reused_browser += 1;
-                Some(st.browsers[i].browser.clone())
-            } else {
-                let can_launch = st.serving() + st.launching < self.config.max_browsers;
-                if can_launch {
-                    st.launching += 1;
-                    None
-                } else {
-                    return Err(Error::NoBrowser);
+    async fn prepare_lease(
+        self: &Arc<Self>,
+        proxy: Option<&Proxy>,
+        reservation: Reservation,
+    ) -> Result<PageLease> {
+        let browser = match reservation {
+            Reservation::Reuse(b) => {
+                if self.state.lock().await.shutting_down {
+                    self.release_slot(&b, false).await;
+                    return Err(Error::ShuttingDown);
+                }
+                b
+            }
+            Reservation::Launch => {
+                let launched = self.source.launch(&self.config.launch).await;
+                let outcome = {
+                    let mut st = self.state.lock().await;
+                    st.launching = st.launching.saturating_sub(1);
+                    match launched {
+                        Ok(browser) if st.shutting_down => Ok(Err(browser)),
+                        Ok(browser) => {
+                            st.browsers.push(Slot {
+                                browser: browser.clone(),
+                                active: 1,
+                                jobs_served: 0,
+                                started: Instant::now(),
+                                last_used: Instant::now(),
+                                draining: false,
+                                crashed: false,
+                            });
+                            st.counters.acquires += 1;
+                            Ok(Ok(browser))
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                match outcome {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(b)) => {
+                        let _ = b.close().await;
+                        return Err(Error::ShuttingDown);
+                    }
+                    Err(e) => return Err(e.into()),
                 }
             }
-        };
-
-        let browser = if let Some(b) = chosen {
-            b
-        } else {
-            let launched = self.source.launch(&self.config.launch).await;
-            {
-                let mut st = self.state.lock().await;
-                st.launching = st.launching.saturating_sub(1);
-            }
-            let browser = launched?;
-            // shutdown() may have finished while this browser started: it must not serve.
-            if *self.shutdown.lock().await {
-                let _ = browser.close().await;
-                return Err(Error::ShuttingDown);
-            }
-            let mut st = self.state.lock().await;
-            st.browsers.push(Slot {
-                browser: browser.clone(),
-                active: 1,
-                jobs_served: 0,
-                started: Instant::now(),
-                last_used: Instant::now(),
-                draining: false,
-                crashed: false,
-            });
-            st.counters.acquires += 1;
-            browser
         };
 
         let ctx = match browser.create_context(proxy).await {
@@ -601,7 +666,8 @@ impl Inner {
             "lease granted"
         );
 
-        let download_dir = std::env::temp_dir().join(format!("fluxwright-downloads-{}", ctx.0));
+        // Named like profile folders, so the sweep after a crash finds it: `fluxwright-<pid>-…`.
+        let download_dir = std::env::temp_dir().join(format!("fluxwright-{}-dl-{}", std::process::id(), ctx.0));
         let (log, downloads, log_task) = page.collect_logs(&download_dir);
         // Best effort: a Chrome that refuses only loses downloads.
         let _ = page.allow_downloads(&download_dir, Duration::from_secs(5)).await;
@@ -666,15 +732,37 @@ impl Inner {
                 let st = self.state.lock().await;
                 st.browsers
                     .iter()
-                    .filter(|s| !s.crashed)
+                    .filter(|s| !s.crashed && s.browser.pid > 0)
                     .map(|s| s.browser.pid)
                     .collect()
             };
-            tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
-                .await
-                .unwrap_or_default()
+            if pids.is_empty() {
+                HashMap::new()
+            } else {
+                let cached = {
+                    let cache = self.rss_cache.lock().await;
+                    if cache.0.is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+                        && pids.iter().all(|p| cache.1.contains_key(p))
+                    {
+                        Some(cache.1.clone())
+                    } else {
+                        None
+                    }
+                };
+                match cached {
+                    Some(map) => map,
+                    None => {
+                        let map =
+                            tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
+                                .await
+                                .unwrap_or_default();
+                        *self.rss_cache.lock().await = (Some(Instant::now()), map.clone());
+                        map
+                    }
+                }
+            }
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
         let mut to_close = Vec::new();
         let mut bump = 0u64;
@@ -697,9 +785,10 @@ impl Inner {
                     .config
                     .recycle_after
                     .is_some_and(|d| now.duration_since(s.started) >= d);
-                let by_rss = rss_limit.is_some_and(|mb| {
-                    rss_by_pid.get(&s.browser.pid).copied().unwrap_or(0) / (1024 * 1024) >= mb
-                });
+                let by_rss = s.browser.pid > 0
+                    && rss_limit.is_some_and(|mb| {
+                        rss_by_pid.get(&s.browser.pid).copied().unwrap_or(0) / (1024 * 1024) >= mb
+                    });
                 let idle = idle_closable > 0
                     && self.config.idle_timeout.is_some_and(|d| {
                         s.active == 0 && now.duration_since(s.last_used) >= d
@@ -785,6 +874,16 @@ async fn apply_blocking(page: &PageLease, opts: &JobOptions) -> Result<()> {
 impl PageLease {
     pub fn browser_pid(&self) -> u32 {
         self.browser.pid
+    }
+
+    /// WebSocket endpoint URL if connected over CDP or local WebSocket transport.
+    pub fn ws_endpoint(&self) -> Option<&str> {
+        self.browser.ws_endpoint()
+    }
+
+    /// Returns `true` if connected to a remote browser rather than a locally spawned OS child process.
+    pub fn is_remote(&self) -> bool {
+        self.browser.is_remote()
     }
 
     pub fn lease_id(&self) -> Uuid {
@@ -1039,6 +1138,16 @@ impl Downloads {
             Err(_) => Err(Error::Other(format!("no download finished within {} ms", timeout.as_millis()))),
         }
     }
+
+    /// Drops downloads that already finished, so the next [`next`](Self::next) waits for a new
+    /// one (Python's `expect_download` block). Their files stay until the page closes. A wait
+    /// already running holds the queue for its whole timeout and takes the old ones itself, so
+    /// then nothing is dropped rather than waiting for it.
+    pub async fn clear(&self) {
+        if let Ok(mut queue) = self.0.try_lock() {
+            while queue.try_recv().is_ok() {}
+        }
+    }
 }
 
 pub struct Locator<'a> {
@@ -1180,6 +1289,13 @@ impl<'a> FrameLocator<'a> {
 
 pub struct EngineBuilder {
     config: EngineConfig,
+    source: Arc<dyn BrowserSource>,
+}
+
+impl Default for EngineBuilder {
+    fn default() -> Self {
+        Engine::builder()
+    }
 }
 
 impl EngineBuilder {
@@ -1193,10 +1309,6 @@ impl EngineBuilder {
     }
     pub fn max_contexts_per_browser(mut self, n: usize) -> Self {
         self.config.max_contexts_per_browser = n;
-        self
-    }
-    pub fn max_pages_per_context(mut self, n: usize) -> Self {
-        self.config.max_pages_per_context = n;
         self
     }
     pub fn memory_ceiling_mb(mut self, n: u64) -> Self {
@@ -1254,29 +1366,27 @@ impl EngineBuilder {
         self.config.launch.executable = Some(path.into());
         self
     }
-    pub fn source(self, _source: Arc<dyn BrowserSource>) -> EngineBuilderWithSource {
-        EngineBuilderWithSource {
-            config: self.config,
-            source: _source,
-        }
+    pub fn source(mut self, source: Arc<dyn BrowserSource>) -> Self {
+        self.source = source;
+        self
+    }
+    /// Connects to a remote browser over CDP (e.g. `ws://...` or `http://...`) with one
+    /// connection: concurrency comes from `max_contexts_per_browser`. Several connections to
+    /// one browser each attach to every page, and each answers dialogs on pages it does not
+    /// own, before the job's own handler can. Set `max_browsers` after this to override.
+    pub fn connect_over_cdp(mut self, endpoint_url: impl Into<String>) -> Self {
+        self.config.min_browsers = 1;
+        self.config.max_browsers = 1;
+        self.source = Arc::new(crate::source::RemoteCdp::new(endpoint_url));
+        self
     }
     pub async fn build(self) -> Result<Engine> {
-        EngineBuilderWithSource {
-            config: self.config,
-            source: Arc::new(crate::source::LocalChromium),
+        // 0 of either means no lease can ever be granted, and every acquire waits it out.
+        if self.config.max_browsers == 0 || self.config.max_contexts_per_browser == 0 {
+            return Err(Error::Other(
+                "max_browsers and max_contexts_per_browser must be at least 1".into(),
+            ));
         }
-        .build()
-        .await
-    }
-}
-
-pub struct EngineBuilderWithSource {
-    config: EngineConfig,
-    source: Arc<dyn BrowserSource>,
-}
-
-impl EngineBuilderWithSource {
-    pub async fn build(self) -> Result<Engine> {
         let engine = Engine::new(self.config, self.source);
         let n = engine.config().min_browsers;
         for _ in 0..n {
@@ -1293,5 +1403,275 @@ impl EngineBuilderWithSource {
             });
         }
         Ok(engine)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use fluxwright_cdp::{CdpBrowser, Error as CdpError, LaunchOptions, Result as CdpResult};
+    use tokio::sync::{mpsc, Notify};
+
+    use super::*;
+
+    struct HoldSource {
+        calls: Arc<AtomicUsize>,
+        started: mpsc::UnboundedSender<()>,
+        release: Arc<Notify>,
+    }
+
+    impl BrowserSource for HoldSource {
+        fn launch(
+            &self,
+            _opts: &LaunchOptions,
+        ) -> Pin<Box<dyn Future<Output = CdpResult<Arc<CdpBrowser>>> + Send + '_>> {
+            let calls = self.calls.clone();
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = started.send(());
+                release.notified().await;
+                Err(CdpError::Launch("mock stop".into()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_start_throttles_launches_by_context_capacity() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(4)
+            .max_contexts_per_browser(8)
+            .memory_ceiling_mb(0)
+            .source(Arc::new(HoldSource {
+                calls: calls.clone(),
+                started: tx,
+                release: release.clone(),
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let eng = eng.clone();
+                tokio::spawn(async move { eng.acquire().await })
+            })
+            .collect();
+
+        rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let st = eng.inner.state.lock().await;
+            assert_eq!(st.launching, 1);
+            assert_eq!(st.queue.len(), 3);
+        }
+
+        eng.shutdown(Duration::from_millis(10)).await.unwrap();
+        release.notify_waiters();
+        let mut results = Vec::new();
+        for h in waiters {
+            results.push(h.await.unwrap());
+        }
+        assert!(results.iter().any(|r| matches!(r, Err(Error::ShuttingDown))));
+    }
+
+    #[tokio::test]
+    async fn cold_start_scales_when_queue_exceeds_in_flight_slots() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(4)
+            .max_contexts_per_browser(8)
+            .memory_ceiling_mb(0)
+            .source(Arc::new(HoldSource {
+                calls: calls.clone(),
+                started: tx,
+                release: release.clone(),
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        let waiters: Vec<_> = (0..10)
+            .map(|_| {
+                let eng = eng.clone();
+                tokio::spawn(async move { eng.acquire().await })
+            })
+            .collect();
+
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        {
+            let st = eng.inner.state.lock().await;
+            assert_eq!(st.launching, 2);
+            assert_eq!(st.queue.len(), 8);
+        }
+
+        eng.shutdown(Duration::from_millis(10)).await.unwrap();
+        release.notify_waiters();
+        for h in waiters {
+            let _ = h.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_ceiling_blocks_dispatch_without_popping_or_launching() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(4)
+            .max_contexts_per_browser(8)
+            .memory_ceiling_mb(1)
+            .source(Arc::new(HoldSource {
+                calls: calls.clone(),
+                started: tx,
+                release: release.clone(),
+            }))
+            .build()
+            .await
+            .unwrap();
+        *eng.inner.rss_cache.lock().await = (
+            Some(Instant::now()),
+            HashMap::from([(1, 100 * 1024 * 1024)]),
+        );
+
+        let waiters: Vec<_> = (0..8)
+            .map(|_| {
+                let eng = eng.clone();
+                tokio::spawn(async move { eng.acquire().await })
+            })
+            .collect();
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(eng.inner.state.lock().await.queue.len(), 8);
+
+        eng.shutdown(Duration::from_millis(10)).await.unwrap();
+        for h in waiters {
+            assert!(matches!(h.await.unwrap(), Err(Error::ShuttingDown)));
+        }
+    }
+
+    /// Over the ceiling a running browser with room is still used; only launches stop.
+    #[tokio::test]
+    async fn memory_ceiling_still_reuses_running_browsers() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        // A stand-in remote browser: answers every command with an empty result.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, mut seen) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let msg: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let _ = seen_tx.send(msg["method"].as_str().unwrap_or("").to_string());
+                let reply = serde_json::json!({ "id": msg["id"], "result": {} }).to_string();
+                if ws.send(Message::Text(reply.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let browser = CdpBrowser::connect(&format!("ws://{addr}")).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(4)
+            .max_contexts_per_browser(8)
+            .memory_ceiling_mb(1)
+            .source(Arc::new(HoldSource {
+                calls: calls.clone(),
+                started: tx,
+                release: Arc::new(Notify::new()),
+            }))
+            .build()
+            .await
+            .unwrap();
+        *eng.inner.rss_cache.lock().await = (
+            Some(Instant::now()),
+            HashMap::from([(1, 100 * 1024 * 1024)]),
+        );
+        eng.inner.state.lock().await.browsers.push(Slot {
+            browser,
+            active: 0,
+            jobs_served: 0,
+            started: Instant::now(),
+            last_used: Instant::now(),
+            draining: false,
+            crashed: false,
+        });
+
+        // The stand-in cannot make a context, so the lease fails: what counts is that it was
+        // tried on the running browser instead of waiting in the queue.
+        // Under the 500 ms RSS cache expiry: the old code also got through once the cache refreshed.
+        let res = tokio::time::timeout(Duration::from_millis(400), eng.acquire())
+            .await
+            .expect("the request waited instead of reusing the running browser");
+        assert!(res.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let mut methods = Vec::new();
+        while let Ok(m) = seen.try_recv() {
+            methods.push(m);
+        }
+        assert!(
+            methods.iter().any(|m| m == "Target.createBrowserContext"),
+            "{methods:?}"
+        );
+        eng.shutdown(Duration::from_millis(10)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_late_acquire_and_discards_late_launch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(2)
+            .max_contexts_per_browser(4)
+            .memory_ceiling_mb(0)
+            .source(Arc::new(HoldSource {
+                calls: calls.clone(),
+                started: tx,
+                release: release.clone(),
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        let inflight = tokio::spawn({
+            let eng = eng.clone();
+            async move { eng.acquire().await }
+        });
+        rx.recv().await.unwrap();
+
+        eng.shutdown(Duration::from_millis(20)).await.unwrap();
+        assert!(matches!(eng.acquire().await, Err(Error::ShuttingDown)));
+
+        release.notify_waiters();
+        let _ = inflight.await;
+        assert!(eng.inner.state.lock().await.browsers.is_empty());
+        assert_eq!(eng.inner.state.lock().await.launching, 0);
     }
 }
