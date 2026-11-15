@@ -38,15 +38,21 @@ class Lease: ...
 
 class Page:
     def __new__(cls, lease: Lease) -> Page: ...
-    def goto(self, url: str, *, wait_until: str | None = None) -> Awaitable[None]:
+    def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None) -> Awaitable[None]:
         """Navigates; ``wait_until`` is ``load`` (the default), ``domcontentloaded``,
-        ``networkidle`` or ``commit``."""
+        ``networkidle`` or ``commit``. ``timeout`` is in milliseconds; 0 for none."""
+    def set_default_timeout(self, timeout: float) -> None:
+        """The timeout in milliseconds for this page's calls from now on, navigation included;
+        0 for none. A call's own ``timeout`` wins."""
+    def set_default_navigation_timeout(self, timeout: float) -> None:
+        """The timeout in milliseconds for this page's ``goto`` from now on; 0 for none."""
     def title(self) -> Awaitable[str]: ...
     def content(self) -> Awaitable[str]: ...
-    def click(self, selector: str) -> Awaitable[None]:
-        """Scrolls into view and waits until the element is enabled, stable and not covered."""
-    def fill(self, selector: str, value: str) -> Awaitable[None]: ...
-    def wait_for_selector(self, selector: str) -> Awaitable[None]:
+    def click(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]:
+        """Scrolls into view and waits until the element is enabled, stable and not covered.
+        ``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
+    def fill(self, selector: str, value: str, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]:
         """Waits until visible."""
     def evaluate(self, expression: str, arg: Any = None) -> Awaitable[Any]:
         """Runs JavaScript in the page and returns its JSON result, awaiting promises. A function
@@ -60,6 +66,7 @@ class Page:
         quality: int | None = None,
         clip: FloatRect | None = None,
         omit_background: bool | None = None,
+        timeout: float | None = None,
     ) -> Awaitable[bytes]:
         """PNG or JPEG; with ``path``, also written there (extension picks type if omitted)."""
     def pdf(
@@ -113,11 +120,12 @@ class Page:
 class Locator:
     """Lazy, like Playwright's: every action runs the query again."""
 
-    def click(self) -> Awaitable[None]: ...
-    def fill(self, value: str) -> Awaitable[None]: ...
-    def wait_for(self) -> Awaitable[None]:
+    def click(self, *, timeout: float | None = None) -> Awaitable[None]:
+        """``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
+    def fill(self, value: str, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def wait_for(self, *, timeout: float | None = None) -> Awaitable[None]:
         """Waits until visible."""
-    def text_content(self) -> Awaitable[str | None]: ...
+    def text_content(self, *, timeout: float | None = None) -> Awaitable[str | None]: ...
     def screenshot(
         self,
         *,
@@ -125,12 +133,13 @@ class Locator:
         type: Literal["png", "jpeg"] | None = None,
         quality: int | None = None,
         omit_background: bool | None = None,
+        timeout: float | None = None,
     ) -> Awaitable[bytes]:
         """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""
-    def bounding_box(self) -> Awaitable[FloatRect | None]:
+    def bounding_box(self, *, timeout: float | None = None) -> Awaitable[FloatRect | None]:
         """``{x, y, width, height}`` relative to the viewport, without scrolling; ``None`` when
         the element is not visible."""
-    def evaluate(self, expression: str, arg: Any = None) -> Awaitable[Any]:
+    def evaluate(self, expression: str, arg: Any = None, *, timeout: float | None = None) -> Awaitable[Any]:
         """Calls the JavaScript function ``expression`` with the element and ``arg``."""
     def nth(self, index: int) -> Locator:
         """The ``index``-th match (0-based; negative counts from the end)."""

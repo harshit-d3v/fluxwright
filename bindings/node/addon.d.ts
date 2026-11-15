@@ -177,13 +177,27 @@ declare module './index' {
     ): Promise<Request>
     /** The next download this page finished; ones that finished earlier queue up. Default timeout 30 s. */
     waitForDownload(options?: { timeout?: number }): Promise<Download>
+    /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
+    click(selector: string, options?: { timeout?: number }): Promise<void>
+    fill(selector: string, value: string, options?: { timeout?: number }): Promise<void>
+    waitForSelector(selector: string, options?: { state?: 'visible'; timeout?: number }): Promise<void>
   }
   interface Locator {
+    /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
+    click(options?: { timeout?: number }): Promise<void>
+    fill(value: string, options?: { timeout?: number }): Promise<void>
+    waitFor(options?: { state?: 'visible'; timeout?: number }): Promise<void>
+    textContent(options?: { timeout?: number }): Promise<string | null>
+    boundingBox(options?: { timeout?: number }): Promise<{ x: number; y: number; width: number; height: number } | null>
     /**
      * Calls `pageFunction` with the element and `arg` in the page, as Playwright does, and returns
      * its result. The function is sent as source text: it can't use variables from Node.
      */
-    evaluate<R, Arg = undefined>(pageFunction: (element: any, arg: Arg) => R, arg?: Arg): Promise<Awaited<R>>
+    evaluate<R, Arg = undefined>(
+      pageFunction: (element: any, arg: Arg) => R,
+      arg?: Arg,
+      options?: { timeout?: number },
+    ): Promise<Awaited<R>>
     /** Also writes the image to `path`; without `type`, its extension picks PNG or JPEG. */
     screenshot(options?: Omit<ScreenshotOptions, 'fullPage' | 'clip'> & { path?: string }): Promise<Buffer>
   }

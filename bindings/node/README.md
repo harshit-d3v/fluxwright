@@ -67,7 +67,9 @@ await browser.close();
 
 Close pages when a job is done. A page you forget is cleaned up when Node garbage-collects it, which may be much later, also when its listeners and routes use it.
 
-An option Fluxwright does not implement (a per-call `timeout`, `waitForSelector` states other than `visible`, screenshot `mask`/`animations`/`caret`, click options such as `button`, ...) throws a TypeError rather than being ignored. See `MISSING.md` for these and the Playwright features that are planned or out of scope.
+`goto`, `click`, `fill`, `waitForSelector`, `screenshot` and the locator actions take Playwright's per-call `timeout` (ms; 0 for none), and `page.setDefaultTimeout(ms)` / `page.setDefaultNavigationTimeout(ms)` change the page's defaults (the engine's are 10 s for actions and 30 s for navigation).
+
+An option Fluxwright does not implement (`waitForSelector` states other than `visible`, screenshot `mask`/`animations`/`caret`, click options such as `button`, ...) throws a TypeError rather than being ignored. See `MISSING.md` for these and the Playwright features that are planned or out of scope.
 
 ## Develop
 

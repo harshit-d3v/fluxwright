@@ -158,6 +158,20 @@ async def async_smoke(base: str, tmp: Path) -> None:
         assert png[:4] == b"\x89PNG"
         assert (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")) == (40, 20)
         assert (tmp / "el.png").read_bytes() == png
+        # A call's timeout, then the page's default, replace the engine's 10 s.
+        began = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await ui.wait_for_selector("#never", timeout=300)
+        with pytest.raises(Error):
+            await ui.locator("#never").click(timeout=300)
+        assert time.monotonic() - began < 5
+        ui.set_default_timeout(300)
+        began = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await ui.locator("#never").wait_for()
+        assert time.monotonic() - began < 5
+        ui.set_default_timeout(10_000)
+        await ui.get_by_test_id("total").click(timeout=5_000)
         jpg = await ui.get_by_test_id("total").screenshot(path=tmp / "el.jpg", quality=60)
         assert jpg[:3] == b"\xff\xd8\xff"
         assert (tmp / "el.jpg").read_bytes() == jpg

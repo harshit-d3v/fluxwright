@@ -74,13 +74,31 @@ async fn with_page<T, F>(lease: &LeaseSlot, f: F) -> PyResult<T>
 where
     F: for<'a> FnOnce(&'a fluxwright::PageLease) -> BoxFuture<'a, fluxwright::Result<T>>,
 {
+    with_page_in(lease, None, f).await
+}
+
+/// Playwright's `timeout` in milliseconds: 0 means no timeout, and anything that is not a time
+/// (negative, NaN) leaves the default in place.
+fn call_timeout(ms: Option<f64>) -> Option<Duration> {
+    match ms {
+        Some(ms) if ms == 0.0 => Some(Duration::from_secs(365 * 24 * 60 * 60)),
+        Some(ms) if ms > 0.0 && ms.is_finite() => Some(Duration::from_secs_f64(ms / 1000.0)),
+        _ => None,
+    }
+}
+
+/// `with_page` with the call's own timeout in place of the page's and the engine's.
+async fn with_page_in<T, F>(lease: &LeaseSlot, timeout: Option<Duration>, f: F) -> PyResult<T>
+where
+    F: for<'a> FnOnce(&'a fluxwright::PageLease) -> BoxFuture<'a, fluxwright::Result<T>>,
+{
     let mut closing = lease.closing.subscribe();
     let guard = lease.page.read().await;
     let Some(p) = guard.as_ref() else {
         return Err(closed());
     };
     tokio::select! {
-        r = f(p) => r.map_err(error),
+        r = fluxwright::with_timeout(timeout, f(p)) => r.map_err(error),
         _ = async { let _ = closing.wait_for(|c| *c).await; } => Err(closed()),
     }
 }
@@ -93,8 +111,25 @@ where
         + Send
         + 'static,
 {
+    run_in(py, lease, None, f)
+}
+
+/// `run` with the call's `timeout` option (milliseconds).
+fn run_in<'py, T, F>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    timeout: Option<f64>,
+    f: F,
+) -> PyResult<Bound<'py, PyAny>>
+where
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+    F: for<'a> FnOnce(&'a fluxwright::PageLease) -> BoxFuture<'a, fluxwright::Result<T>>
+        + Send
+        + 'static,
+{
     let lease = lease.clone();
-    future_into_py(py, async move { with_page(&lease, f).await })
+    let timeout = call_timeout(timeout);
+    future_into_py(py, async move { with_page_in(&lease, timeout, f).await })
 }
 
 static RT: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio"));
@@ -559,12 +594,13 @@ impl Page {
         })
     }
 
-    #[pyo3(signature = (url, *, wait_until=None))]
+    #[pyo3(signature = (url, *, wait_until=None, timeout=None))]
     fn goto<'py>(
         &self,
         py: Python<'py>,
         url: String,
         wait_until: Option<String>,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let wait = match wait_until.as_deref() {
             None | Some("load") => fluxwright::WaitUntil::Load,
@@ -577,7 +613,7 @@ impl Page {
             )))
             }
         };
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.goto_with(&url, wait).await.map(none) })
         })
     }
@@ -590,29 +626,39 @@ impl Page {
         run(py, &self.lease, |p| Box::pin(p.content()))
     }
 
-    fn click<'py>(&self, py: Python<'py>, selector: String) -> PyResult<Bound<'py, PyAny>> {
-        run(py, &self.lease, move |p| {
+    #[pyo3(signature = (selector, *, timeout=None))]
+    fn click<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.click(selector.as_str()).await.map(none) })
         })
     }
 
+    #[pyo3(signature = (selector, value, *, timeout=None))]
     fn fill<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         value: String,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.fill(selector.as_str(), &value).await.map(none) })
         })
     }
 
+    #[pyo3(signature = (selector, *, timeout=None))]
     fn wait_for_selector<'py>(
         &self,
         py: Python<'py>,
         selector: String,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.wait_for_selector(selector.as_str()).await.map(none) })
         })
     }
@@ -634,7 +680,8 @@ impl Page {
     /// PNG or JPEG bytes; with `path`, also written there (its extension picks the type when
     /// `type` is not given). `clip` is `{x, y, width, height}` relative to the viewport, or to
     /// the page with `full_page`.
-    #[pyo3(signature = (*, path=None, full_page=None, r#type=None, quality=None, clip=None, omit_background=None))]
+    #[pyo3(signature = (*, path=None, full_page=None, r#type=None, quality=None, clip=None, omit_background=None,
+        timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn screenshot<'py>(
         &self,
@@ -645,7 +692,9 @@ impl Page {
         quality: Option<u32>,
         clip: Option<Bound<'py, PyAny>>,
         omit_background: Option<bool>,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let timeout = call_timeout(timeout);
         let mut shot = shot_options(path.as_deref(), r#type.as_deref(), quality, omit_background)?;
         shot.full_page = full_page.unwrap_or(false);
         if let Some(clip) = clip {
@@ -654,7 +703,7 @@ impl Page {
         }
         let lease = self.lease.clone();
         future_into_py(py, async move {
-            let image = with_page(&lease, move |p| {
+            let image = with_page_in(&lease, timeout, move |p| {
                 Box::pin(async move { p.screenshot_with(&shot).await })
             })
             .await?;
@@ -727,6 +776,17 @@ impl Page {
                 None => Ok(pdf),
             }
         })
+    }
+
+    /// The timeout in milliseconds for this page's calls from now on, navigation included; 0
+    /// for none. A call's own `timeout` wins.
+    fn set_default_timeout(&self, timeout: f64) {
+        self.set_timeouts(timeout, false);
+    }
+
+    /// The timeout in milliseconds for this page's `goto` from now on; 0 for none.
+    fn set_default_navigation_timeout(&self, timeout: f64) {
+        self.set_timeouts(timeout, true);
     }
 
     fn set_viewport_size<'py>(
@@ -908,6 +968,20 @@ impl Page {
 }
 
 impl Page {
+    fn set_timeouts(&self, ms: f64, navigation: bool) {
+        // Only close() holds the page for writing, and a closed page needs no timeout.
+        let Ok(page) = self.lease.page.try_read() else {
+            return;
+        };
+        if let (Some(page), Some(timeout)) = (page.as_ref(), call_timeout(Some(ms))) {
+            if navigation {
+                page.set_default_navigation_timeout(timeout);
+            } else {
+                page.set_default_timeout(timeout);
+            }
+        }
+    }
+
     fn now<T>(&self, f: impl FnOnce(&fluxwright::PageLease) -> T) -> PyResult<T> {
         if *self.lease.closing.borrow() {
             return Err(closed());
@@ -934,38 +1008,47 @@ struct Locator {
 
 #[pymethods]
 impl Locator {
-    fn click<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (*, timeout=None))]
+    fn click<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let sel = self.selector.clone();
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.click(&sel).await.map(none) })
         })
     }
 
-    fn fill<'py>(&self, py: Python<'py>, value: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (value, *, timeout=None))]
+    fn fill<'py>(
+        &self,
+        py: Python<'py>,
+        value: String,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let sel = self.selector.clone();
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.fill(&sel, &value).await.map(none) })
         })
     }
 
     /// Waits until visible.
-    fn wait_for<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (*, timeout=None))]
+    fn wait_for<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let sel = self.selector.clone();
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.wait_for_selector(&sel).await.map(none) })
         })
     }
 
-    fn text_content<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (*, timeout=None))]
+    fn text_content<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let sel = self.selector.clone();
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.text_content(&sel).await })
         })
     }
 
     /// PNG or JPEG of the element, once it is visible and still; with `path`, also written
     /// there (its extension picks the type when `type` is not given).
-    #[pyo3(signature = (*, path=None, r#type=None, quality=None, omit_background=None))]
+    #[pyo3(signature = (*, path=None, r#type=None, quality=None, omit_background=None, timeout=None))]
     fn screenshot<'py>(
         &self,
         py: Python<'py>,
@@ -973,12 +1056,14 @@ impl Locator {
         r#type: Option<String>,
         quality: Option<u32>,
         omit_background: Option<bool>,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let timeout = call_timeout(timeout);
         let shot = shot_options(path.as_deref(), r#type.as_deref(), quality, omit_background)?;
         let sel = self.selector.clone();
         let lease = self.lease.clone();
         future_into_py(py, async move {
-            let image = with_page(&lease, move |p| {
+            let image = with_page_in(&lease, timeout, move |p| {
                 Box::pin(async move { p.element_screenshot_with(&sel, &shot).await })
             })
             .await?;
@@ -991,9 +1076,10 @@ impl Locator {
 
     /// `{x, y, width, height}` relative to the viewport, without scrolling; `None` when the
     /// element is not visible.
-    fn bounding_box<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (*, timeout=None))]
+    fn bounding_box<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let sel = self.selector.clone();
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move {
                 let b = p.bounding_box(&sel).await?;
                 Ok(b.map(|b| Json(serde_json::json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height }))))
@@ -1003,16 +1089,17 @@ impl Locator {
 
     /// Calls the JavaScript function `expression` with the element and `arg` (`null` for
     /// Python's `None`, as in Playwright) in the page's own world, and returns its result.
-    #[pyo3(signature = (expression, arg=None))]
+    #[pyo3(signature = (expression, arg=None, *, timeout=None))]
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
         expression: String,
         arg: Option<Bound<'py, PyAny>>,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let arg = Some(arg.map(|a| to_json(&a)).transpose()?.unwrap_or_default());
         let sel = self.selector.clone();
-        run(py, &self.lease, move |p| {
+        run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.evaluate_on(&sel, &expression, arg).await.map(Json) })
         })
     }

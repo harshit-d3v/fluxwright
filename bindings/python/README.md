@@ -95,7 +95,7 @@ The sync API runs every call on one event loop in a background thread, so its ob
 | `page.wait_for_selector(selector)` | Waits until visible (Playwright's default state) |
 | `page.close()` / `browser.close()` | Dispose the context / shut down |
 
-Timeouts are in milliseconds, as in Playwright. Errors are `fluxwright.Error`, and `fluxwright.TimeoutError` when something ran out of time.
+Timeouts are in milliseconds, as in Playwright. `goto`, `click`, `fill`, `wait_for_selector`, `screenshot` and the locator actions take a per-call `timeout=` (0 for none), and `page.set_default_timeout(ms)` / `page.set_default_navigation_timeout(ms)` change the page's defaults (the engine's are 10 s for actions and 30 s for navigation). Errors are `fluxwright.Error`, and `fluxwright.TimeoutError` when something ran out of time.
 
 Close pages when a job is done, in a `finally`, so a job that raises gives its slot back too:
 

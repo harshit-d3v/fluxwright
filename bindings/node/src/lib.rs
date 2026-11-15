@@ -355,6 +355,30 @@ where
         > + Send
         + 'static,
 {
+    with_page_in(slot, None, f).await
+}
+
+/// Playwright's `timeout` option in milliseconds: 0 means no timeout, and anything that is
+/// not a time (negative, NaN) leaves the default in place.
+fn call_timeout(ms: Option<f64>) -> Option<std::time::Duration> {
+    match ms {
+        Some(ms) if ms == 0.0 => Some(std::time::Duration::from_secs(365 * 24 * 3600)),
+        Some(ms) if ms > 0.0 && ms.is_finite() => Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
+        _ => None,
+    }
+}
+
+/// `with_page` with the call's own timeout in place of the page's and the engine's.
+async fn with_page_in<T, F>(slot: LeaseSlot, timeout: Option<std::time::Duration>, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: for<'a> FnOnce(
+            &'a fluxwright::PageLease,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = fluxwright::Result<T>> + Send + 'a>,
+        > + Send
+        + 'static,
+{
     RT.spawn(async move {
         let mut closing = slot.closing.subscribe();
         let g = slot.page.read().await;
@@ -362,7 +386,7 @@ where
             return Err("page closed".to_string());
         };
         tokio::select! {
-            r = f(p) => r.map_err(|e| e.to_string()),
+            r = fluxwright::with_timeout(timeout, f(p)) => r.map_err(|e| e.to_string()),
             _ = async { let _ = closing.wait_for(|closed| *closed).await; } => Err("page closed".to_string()),
         }
     })
@@ -389,34 +413,42 @@ pub struct GetByRoleOptions {
 pub struct Locator {
     lease: LeaseSlot,
     selector: fluxwright::Selector,
+    /// From `_withTimeout`: the `timeout` option of the call this locator was made for.
+    timeout: Option<std::time::Duration>,
 }
 
 #[napi]
 impl Locator {
+    /// This locator with `timeout` (milliseconds; 0 for none) for its actions.
+    #[napi(js_name = "_withTimeout")]
+    pub fn with_timeout(&self, timeout: f64) -> Locator {
+        Locator { lease: self.lease.clone(), selector: self.selector.clone(), timeout: call_timeout(Some(timeout)) }
+    }
+
     #[napi]
     pub async fn click(&self) -> Result<()> {
         let sel = self.selector.clone();
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.click(&sel).await })).await
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.click(&sel).await })).await
     }
 
     #[napi]
     pub async fn fill(&self, value: String) -> Result<()> {
         let sel = self.selector.clone();
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.fill(&sel, &value).await })).await
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.fill(&sel, &value).await })).await
     }
 
     /// Waits until visible.
     #[napi]
     pub async fn wait_for(&self) -> Result<()> {
         let sel = self.selector.clone();
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.wait_for_selector(&sel).await }))
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.wait_for_selector(&sel).await }))
             .await
     }
 
     #[napi]
     pub async fn text_content(&self) -> Result<Option<String>> {
         let sel = self.selector.clone();
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.text_content(&sel).await })).await
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.text_content(&sel).await })).await
     }
 
     /// The `index`th match (0-based; negative counts from the end).
@@ -480,8 +512,9 @@ impl Locator {
     #[napi]
     pub async fn screenshot(&self, options: Option<ScreenshotOptions>) -> Result<Buffer> {
         let sel = self.selector.clone();
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout)).or(self.timeout);
         let options = shot_options(options)?;
-        let image = with_page(self.lease.clone(), move |p| {
+        let image = with_page_in(self.lease.clone(), timeout, move |p| {
             Box::pin(async move { p.element_screenshot_with(&sel, &options).await })
         })
         .await?;
@@ -492,7 +525,7 @@ impl Locator {
     #[napi]
     pub async fn bounding_box(&self) -> Result<Option<BoundingBox>> {
         let sel = self.selector.clone();
-        let b = with_page(self.lease.clone(), move |p| Box::pin(async move { p.bounding_box(&sel).await })).await?;
+        let b = with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.bounding_box(&sel).await })).await?;
         Ok(b.map(|b| BoundingBox { x: b.x, y: b.y, width: b.width, height: b.height }))
     }
 
@@ -501,7 +534,7 @@ impl Locator {
     #[napi]
     pub async fn evaluate(&self, function_source: String, arg: Option<serde_json::Value>) -> Result<serde_json::Value> {
         let sel = self.selector.clone();
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.evaluate_on(&sel, &function_source, arg).await }))
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.evaluate_on(&sel, &function_source, arg).await }))
             .await
     }
 }
@@ -512,7 +545,7 @@ impl Locator {
     }
 
     fn then_selector(&self, selector: fluxwright::Selector) -> Locator {
-        Locator { lease: self.lease.clone(), selector }
+        Locator { lease: self.lease.clone(), selector, timeout: self.timeout }
     }
 }
 
@@ -563,6 +596,7 @@ impl FrameLocator {
         Locator {
             lease: self.lease.clone(),
             selector: fluxwright::Selector { frames: self.frames.clone(), query },
+            timeout: None,
         }
     }
 }
@@ -821,6 +855,8 @@ pub struct GotoOptions {
     /// Default "load".
     #[napi(ts_type = "'load' | 'domcontentloaded' | 'networkidle' | 'commit'")]
     pub wait_until: Option<String>,
+    /// Milliseconds; 0 for no timeout. Default: the page's or the engine's navigation timeout.
+    pub timeout: Option<f64>,
 }
 
 #[napi(object)]
@@ -836,6 +872,8 @@ pub struct ScreenshotOptions {
     pub clip: Option<BoundingBox>,
     /// A transparent background instead of the default white one (PNG).
     pub omit_background: Option<bool>,
+    /// Milliseconds; 0 for no timeout. Default: the page's or the engine's action timeout.
+    pub timeout: Option<f64>,
 }
 
 /// Lengths: a number of pixels, or a string with `px`, `in`, `cm` or `mm`.
@@ -1007,6 +1045,7 @@ impl Page {
 
     #[napi]
     pub async fn goto(&self, url: String, options: Option<GotoOptions>) -> Result<()> {
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
         let wait_until = match options.and_then(|o| o.wait_until).as_deref() {
             None | Some("load") => fluxwright::WaitUntil::Load,
             Some("domcontentloaded") => fluxwright::WaitUntil::DomContentLoaded,
@@ -1018,7 +1057,8 @@ impl Page {
                 )))
             }
         };
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.goto_with(&url, wait_until).await })).await
+        with_page_in(self.lease.clone(), timeout, move |p| Box::pin(async move { p.goto_with(&url, wait_until).await }))
+            .await
     }
 
     #[napi]
@@ -1048,8 +1088,11 @@ impl Page {
 
     #[napi]
     pub async fn screenshot(&self, options: Option<ScreenshotOptions>) -> Result<Buffer> {
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
         let options = shot_options(options)?;
-        let image = with_page(self.lease.clone(), move |p| Box::pin(async move { p.screenshot_with(&options).await })).await?;
+        let image =
+            with_page_in(self.lease.clone(), timeout, move |p| Box::pin(async move { p.screenshot_with(&options).await }))
+                .await?;
         Ok(image.into())
     }
 
@@ -1241,9 +1284,36 @@ impl Page {
     pub fn is_closed(&self) -> bool {
         *self.lease.closing.borrow()
     }
+
+    /// The timeout in milliseconds for this page's calls from now on, navigation included; 0
+    /// for none. A call's own `timeout` option wins.
+    #[napi]
+    pub fn set_default_timeout(&self, timeout: f64) {
+        self.set_timeouts(timeout, false);
+    }
+
+    /// The timeout in milliseconds for this page's `goto` from now on; 0 for none.
+    #[napi]
+    pub fn set_default_navigation_timeout(&self, timeout: f64) {
+        self.set_timeouts(timeout, true);
+    }
 }
 
 impl Page {
+    fn set_timeouts(&self, ms: f64, navigation: bool) {
+        // Only close() holds the page for writing, and a closed page needs no timeout.
+        let Ok(page) = self.lease.page.try_read() else {
+            return;
+        };
+        if let (Some(page), Some(timeout)) = (page.as_ref(), call_timeout(Some(ms))) {
+            if navigation {
+                page.set_default_navigation_timeout(timeout);
+            } else {
+                page.set_default_timeout(timeout);
+            }
+        }
+    }
+
     fn top(&self) -> FrameLocator {
         FrameLocator { lease: self.lease.clone(), frames: Vec::new() }
     }

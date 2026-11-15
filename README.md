@@ -51,7 +51,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. The names are Playwright's, so a Playwright script for these features runs after changing its import. In Node, an option Fluxwright does not implement, such as a per-call `timeout`, throws a TypeError instead of being ignored (new in the next release: 0.6.0 ignored them), so such a script fails loudly at the call rather than quietly doing something else.
+Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. The names are Playwright's, so a Playwright script for these features runs after changing its import. In Node, an option Fluxwright does not implement, such as a click's `button`, throws a TypeError instead of being ignored (new in the next release: 0.6.0 ignored them), so such a script fails loudly at the call rather than quietly doing something else.
 
 ## What a page can do
 
