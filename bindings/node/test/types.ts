@@ -11,8 +11,12 @@ export async function typed(): Promise<void> {
   // @ts-expect-error the result of `() => 1` is a number
   const wrong: string = await page.evaluate(() => 1)
   const png: Buffer = await page.screenshot({ fullPage: true })
+  const jpeg: Buffer = await page.screenshot({ type: 'jpeg', quality: 80, clip: { x: 0, y: 0, width: 10, height: 10 } })
+  const pdf: Buffer = await page.pdf({ format: 'A4', margin: { top: '1cm', left: 20 }, printBackground: true, path: 'p.pdf' })
+  // @ts-expect-error webp is not a screenshot type
+  await page.screenshot({ type: 'webp' })
   await fluxwright.chromium.launch()
-  void [title, sum, upper, expression, wrong, png]
+  void [title, sum, upper, expression, wrong, png, jpeg, pdf]
 
   const state: StorageState = await page.storageState({ path: 'state.json' })
   await browser.newPage({ storageState: state, locale: 'de-DE', colorScheme: 'dark', permissions: ['geolocation'] })
@@ -24,6 +28,8 @@ export async function typed(): Promise<void> {
   const box: { x: number; width: number } | null = await item.boundingBox()
   const length: number = await item.evaluate((el: { textContent: string }, n: number) => el.textContent.length + n, 1)
   const shot: Buffer = await page.getByLabel('Email').screenshot({ path: 'el.png' })
+  // @ts-expect-error element screenshots take no clip
+  await page.getByLabel('Email').screenshot({ clip: { x: 0, y: 0, width: 1, height: 1 } })
   const errors: Error[] = await page.pageErrors()
   const logs: { type: string; text: string }[] = await page.consoleMessages()
   void [box, length, shot, errors, logs, page.getByPlaceholder('city').first().last(), await page.screenshot({ path: 'p.png' })]

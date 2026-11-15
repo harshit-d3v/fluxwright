@@ -11,8 +11,9 @@ pub use fluxwright_core::{
 };
 
 pub use fluxwright_cdp::{
-    find_browser, find_chrome, sweep_stale_profiles, BoundingBox, ColorScheme, ConsoleMessage,
-    Cookie, Dialog, Download, Emulation, Fulfill, Geolocation, InterceptedRequest, LaunchOptions,
-    LogEntry, NetEvent, NetRequest, NetResponse, OriginStorage, Overrides, PageError, Proxy,
-    ResourceType, Selector, StorageItem, StorageState, WaitUntil,
+    find_browser, find_chrome, sweep_stale_profiles, BoundingBox, Clip, ColorScheme,
+    ConsoleMessage, Cookie, Dialog, Download, Emulation, Fulfill, Geolocation, ImageFormat,
+    InterceptedRequest, LaunchOptions, LogEntry, NetEvent, NetRequest, NetResponse, OriginStorage,
+    Overrides, PageError, PdfMargin, PdfOptions, Proxy, ResourceType, ScreenshotOptions, Selector,
+    StorageItem, StorageState, WaitUntil,
 };

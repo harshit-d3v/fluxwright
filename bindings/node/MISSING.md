@@ -17,7 +17,8 @@ napi would silently ignore an option the binding does not implement, so it throw
 - A per-call `timeout`, except on `waitForResponse`, `waitForRequest` and `waitForDownload`: the engine's own timeouts apply
 - `waitForSelector` and `locator.waitFor` with a `state` other than `visible`, or `strict`
 - Click and fill options (`button`, `clickCount`, `modifiers`, `position`, `force`, ...)
-- Screenshots other than PNG (`type: 'jpeg'` or a `.jpg` path), and `quality`, `clip`, `omitBackground`, `mask`, ...
+- Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, `timeout`, and WebP (see `docs/DECISIONS.md`)
+- `page.pdf()` works only in headless mode (headed browsers reject with an error)
 - `newPage` / `newContext` options the README does not list (`extraHTTPHeaders`, `javaScriptEnabled`, `ignoreHTTPSErrors`, `baseURL`, `httpCredentials`, `offline`, ...), and `launch` options other than its five (`args`; for `proxy`, give `newPage` one)
 - `page.locator(selector, options)` (use `.filter({ hasText })`), `filter` options other than `hasText`, `getByRole` options other than `name` and `exact`
 - `page.route(url, handler, { times })`, `route.fallback(overrides)`, `route.fulfill({ response })`, `context.cookies(urls)`, `page.close({ runBeforeUnload })`

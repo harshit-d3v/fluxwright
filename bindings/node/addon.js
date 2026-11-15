@@ -33,7 +33,24 @@ const NONE = {}
 const EXACT = { exact: true }
 const VISIBLE = { state: ['visible'] }
 const TIMEOUT = { timeout: true }
-const SHOT = { path: true, type: ['png'] }
+const SHOT = { path: true, type: ['png', 'jpeg'], quality: true, omitBackground: true }
+const PDF = {
+  path: true,
+  format: true,
+  width: true,
+  height: true,
+  margin: true,
+  landscape: true,
+  printBackground: true,
+  scale: true,
+  pageRanges: true,
+  preferCSSPageSize: true,
+  displayHeaderFooter: true,
+  headerTemplate: true,
+  footerTemplate: true,
+  outline: true,
+  tagged: true,
+}
 const LAUNCH = { maxBrowsers: true, executablePath: true, headless: true, queueTimeout: true, memoryCeilingMb: true }
 const PAGE = {
   proxy: true,
@@ -612,20 +629,39 @@ try {
     return (await pageErrors.call(this)).map(toError)
   }
   for (const [Class, label, allowed] of [
-    [native.Page, 'page', { fullPage: true, ...SHOT }],
+    [native.Page, 'page', { fullPage: true, clip: true, ...SHOT }],
     [native.Locator, 'locator', SHOT],
   ]) {
     const screenshot = Class.prototype.screenshot
     Class.prototype.screenshot = async function (options) {
       checkOptions(`${label}.screenshot`, options, allowed)
-      // Playwright picks JPEG from the extension: PNG bytes there would make a broken file.
-      if (!options?.type && /\.jpe?g$/i.test(options?.path ?? '')) {
-        throw new TypeError(`${label}.screenshot: only PNG is supported, not ${options.path} (see MISSING.md)`)
+      if (options?.clip != null) {
+        checkOptions(`${label}.screenshot clip`, options.clip, { x: true, y: true, width: true, height: true })
       }
-      const png = await screenshot.call(this, options)
-      if (options?.path) await save(options.path, png)
-      return png
+      // As Playwright: without a type, the path's extension picks it.
+      let type = options?.type
+      if (!type && options?.path) {
+        const ext = /\.([^./\\]+)$/.exec(options.path)?.[1]?.toLowerCase()
+        type = ext === 'png' ? 'png' : ext === 'jpg' || ext === 'jpeg' ? 'jpeg' : undefined
+        if (!type) throw new TypeError(`${label}.screenshot: ${options.path}: only .png, .jpg and .jpeg are supported`)
+      }
+      const image = await screenshot.call(this, type ? { ...options, type } : options)
+      if (options?.path) await save(options.path, image)
+      return image
     }
+  }
+  // Playwright's lengths are numbers of pixels or strings with a unit; the engine takes strings.
+  const length = (v) => (typeof v === 'number' ? String(v) : v)
+  const pdf = native.Page.prototype.pdf
+  native.Page.prototype.pdf = async function (options) {
+    checkOptions('page.pdf', options, PDF)
+    if (options?.margin != null) {
+      checkOptions('page.pdf margin', options.margin, { top: true, right: true, bottom: true, left: true })
+    }
+    const margin = options?.margin && Object.fromEntries(Object.entries(options.margin).map(([k, v]) => [k, length(v)]))
+    const bytes = await pdf.call(this, options && { ...options, width: length(options.width), height: length(options.height), margin })
+    if (options?.path) await save(options.path, bytes)
+    return bytes
   }
   const builders = [
     ['locator', 1, NONE],

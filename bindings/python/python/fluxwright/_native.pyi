@@ -1,10 +1,10 @@
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from collections.abc import Awaitable, Mapping
 
 from ._errors import Error
-from ._types import FloatRect
+from ._types import FloatRect, PdfMargins
 
 _Path = str | PathLike[str]
 
@@ -51,8 +51,37 @@ class Page:
     def evaluate(self, expression: str, arg: Any = None) -> Awaitable[Any]:
         """Runs JavaScript in the page and returns its JSON result, awaiting promises. A function
         (``"(x) => x * 2"``) is called with ``arg``; anything else is evaluated as is."""
-    def screenshot(self, *, path: _Path | None = None, full_page: bool | None = None) -> Awaitable[bytes]:
-        """PNG; with ``path``, also written there."""
+    def screenshot(
+        self,
+        *,
+        path: _Path | None = None,
+        full_page: bool | None = None,
+        type: Literal["png", "jpeg"] | None = None,
+        quality: int | None = None,
+        clip: FloatRect | None = None,
+        omit_background: bool | None = None,
+    ) -> Awaitable[bytes]:
+        """PNG or JPEG; with ``path``, also written there (extension picks type if omitted)."""
+    def pdf(
+        self,
+        *,
+        path: _Path | None = None,
+        format: str | None = None,
+        width: str | float | None = None,
+        height: str | float | None = None,
+        margin: PdfMargins | None = None,
+        landscape: bool | None = None,
+        print_background: bool | None = None,
+        scale: float | None = None,
+        page_ranges: str | None = None,
+        prefer_css_page_size: bool | None = None,
+        display_header_footer: bool | None = None,
+        header_template: str | None = None,
+        footer_template: str | None = None,
+        outline: bool | None = None,
+        tagged: bool | None = None,
+    ) -> Awaitable[bytes]:
+        """The page printed to PDF (headless only); with ``path``, also written there."""
     def set_viewport_size(self, viewport_size: Mapping[str, int]) -> Awaitable[None]: ...
     def storage_state(self, *, path: _Path | None = None) -> Awaitable[dict[str, Any]]:
         """Every cookie in this page's context plus localStorage of the current origin, in
@@ -89,8 +118,15 @@ class Locator:
     def wait_for(self) -> Awaitable[None]:
         """Waits until visible."""
     def text_content(self) -> Awaitable[str | None]: ...
-    def screenshot(self, *, path: _Path | None = None) -> Awaitable[bytes]:
-        """PNG of the element, once it is visible and still; with ``path``, also written there."""
+    def screenshot(
+        self,
+        *,
+        path: _Path | None = None,
+        type: Literal["png", "jpeg"] | None = None,
+        quality: int | None = None,
+        omit_background: bool | None = None,
+    ) -> Awaitable[bytes]:
+        """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""
     def bounding_box(self) -> Awaitable[FloatRect | None]:
         """``{x, y, width, height}`` relative to the viewport, without scrolling; ``None`` when
         the element is not visible."""

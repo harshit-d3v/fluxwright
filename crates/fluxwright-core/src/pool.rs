@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use fluxwright_cdp::{
     BoundingBox, CdpBrowser, CdpPage, ConsoleMessage, ContextId, Download, DownloadQueue, InterceptedRequest, LogEntry,
-    PageError, PageLog, Proxy,
-    ResourceType, Selector,
+    PageError, PageLog, PdfOptions, Proxy,
+    ResourceType, ScreenshotOptions, Selector,
 };
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -925,17 +925,28 @@ impl PageLease {
     }
 
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
-        Ok(self
-            .page
-            .screenshot(false, self.engine.config.action_timeout)
-            .await?)
+        self.screenshot_with(&ScreenshotOptions::default()).await
     }
 
     /// PNG of the whole scrollable page, not just the viewport.
     pub async fn screenshot_full_page(&self) -> Result<Vec<u8>> {
+        self.screenshot_with(&ScreenshotOptions { full_page: true, ..Default::default() })
+            .await
+    }
+
+    /// PNG or JPEG, of the viewport, the whole page or a clip.
+    pub async fn screenshot_with(&self, options: &ScreenshotOptions) -> Result<Vec<u8>> {
         Ok(self
             .page
-            .screenshot(true, self.engine.config.action_timeout)
+            .screenshot(options, self.engine.config.action_timeout)
+            .await?)
+    }
+
+    /// The page printed to PDF (headless Chrome only).
+    pub async fn pdf(&self, options: &PdfOptions) -> Result<Vec<u8>> {
+        Ok(self
+            .page
+            .pdf(options, self.engine.config.action_timeout)
             .await?)
     }
 
@@ -1074,9 +1085,19 @@ impl PageLease {
 
     /// PNG of the first match, once it is visible and still.
     pub async fn element_screenshot(&self, selector: impl Into<Selector>) -> Result<Vec<u8>> {
+        self.element_screenshot_with(selector, &ScreenshotOptions::default())
+            .await
+    }
+
+    /// PNG or JPEG of the first match, once it is visible and still.
+    pub async fn element_screenshot_with(
+        &self,
+        selector: impl Into<Selector>,
+        options: &ScreenshotOptions,
+    ) -> Result<Vec<u8>> {
         Ok(self
             .page
-            .element_screenshot(&selector.into(), self.engine.config.action_timeout)
+            .element_screenshot(&selector.into(), options, self.engine.config.action_timeout)
             .await?)
     }
 
@@ -1210,6 +1231,11 @@ impl<'a> Locator<'a> {
     /// PNG of the element, once it is visible and still.
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
         self.lease.element_screenshot(&self.selector).await
+    }
+
+    /// PNG or JPEG of the element, once it is visible and still.
+    pub async fn screenshot_with(&self, options: &ScreenshotOptions) -> Result<Vec<u8>> {
+        self.lease.element_screenshot_with(&self.selector, options).await
     }
 
     pub async fn bounding_box(&self) -> Result<Option<BoundingBox>> {

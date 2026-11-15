@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use fluxwright::{BrowserEngine, JobOptions, QueueFullMode};
+use fluxwright::{BrowserEngine, JobOptions, PdfOptions, QueueFullMode};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 

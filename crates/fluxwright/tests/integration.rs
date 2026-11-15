@@ -207,6 +207,114 @@ async fn element_screenshots() {
     assert_eq!(page.evaluate(&check(yellow)).await.unwrap(), json!("40|20|255 255 0|255 255 0"));
 }
 
+/// PDFs and the screenshot formats: real PDF, JPEG and WebP bytes, a clip relative to the
+/// viewport, a transparent background that resets, locator options and headed PDF rejection.
+#[tokio::test(flavor = "multi_thread")]
+async fn pdf_and_screenshot_formats() {
+    use base64::Engine;
+    use fluxwright::{Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotOptions};
+
+    let eng = engine(1, 1).await;
+    let page = eng.acquire_job(&JobOptions::default().viewport(400, 300)).await.unwrap();
+    page.goto(concat!(
+        "data:text/html,<body style='margin:0'><div style='height:2000px'></div>",
+        "<div id=box style='width:40px;height:20px;margin-left:10px;background:%23f00'></div><h1>Report</h1>",
+    ))
+    .await
+    .unwrap();
+
+    let pdf = page
+        .pdf(&PdfOptions {
+            format: Some("A4".into()),
+            landscape: true,
+            print_background: true,
+            scale: Some(0.9),
+            page_ranges: Some("1".into()),
+            margin: PdfMargin {
+                top: Some("10mm".into()),
+                right: Some("10mm".into()),
+                bottom: Some("10mm".into()),
+                left: Some("10mm".into()),
+            },
+            display_header_footer: true,
+            header_template: Some("<span class=title></span>".into()),
+            footer_template: Some("<span class=pageNumber></span>".into()),
+            outline: true,
+            tagged: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(pdf.starts_with(b"%PDF-"), "not a PDF: {:?}", &pdf[..pdf.len().min(8)]);
+    let err = page
+        .pdf(&PdfOptions { format: Some("A9".into()), ..Default::default() })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown format"), "{err}");
+
+    let png = page.screenshot().await.unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+
+    let jpeg = page
+        .screenshot_with(&ScreenshotOptions { format: ImageFormat::Jpeg, quality: Some(50), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(jpeg[..3], [0xFF, 0xD8, 0xFF], "not a JPEG");
+
+    let webp = page
+        .screenshot_with(&ScreenshotOptions { format: ImageFormat::Webp, quality: Some(80), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(webp.len() >= 12 && &webp[..4] == b"RIFF" && &webp[8..12] == b"WEBP", "not a WebP");
+
+    let err = page
+        .screenshot_with(&ScreenshotOptions { quality: Some(50), ..Default::default() })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("JPEG and WebP only"), "{err}");
+
+    let box_jpeg = page
+        .locator("#box")
+        .screenshot_with(&ScreenshotOptions { format: ImageFormat::Jpeg, quality: Some(60), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(box_jpeg[..3], [0xFF, 0xD8, 0xFF], "locator screenshot not a JPEG");
+
+    // width|height|RGBA of the first pixel|RGBA of the last one.
+    let check = |png: Vec<u8>| {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        format!(
+            r#"(async () => {{
+                const img = new Image(); img.src = 'data:image/png;base64,{b64}'; await img.decode();
+                const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+                const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+                const px = (x, y) => [...g.getImageData(x, y, 1, 1).data].join(' ');
+                return [img.width, img.height, px(0, 0), px(img.width - 1, img.height - 1)].join('|');
+            }})()"#
+        )
+    };
+    // The red box sits at y = 2000; scrolled to 1900 it is 100 px down the viewport.
+    page.evaluate("scrollTo(0, 1900)").await.unwrap();
+    let clip = Clip { x: 10.0, y: 100.0, width: 40.0, height: 20.0 };
+    let red = page.screenshot_with(&ScreenshotOptions { clip: Some(clip), ..Default::default() }).await.unwrap();
+    assert_eq!(page.evaluate(&check(red)).await.unwrap(), json!("40|20|255 0 0 255|255 0 0 255"));
+
+    let clear = page
+        .screenshot_with(&ScreenshotOptions { omit_background: true, ..Default::default() })
+        .await
+        .unwrap();
+    let px = page.evaluate(&check(clear)).await.unwrap();
+    assert!(px.as_str().unwrap().starts_with("400|300|0 0 0 0|"), "{px}");
+    let white = page.screenshot().await.unwrap();
+    let px = page.evaluate(&check(white)).await.unwrap();
+    assert!(px.as_str().unwrap().starts_with("400|300|255 255 255 255|"), "{px}");
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// boundingBox needs no scrolling and is relative to the top-level viewport; evaluate runs in
 /// the page's own world, so page globals are there.
 #[tokio::test(flavor = "multi_thread")]

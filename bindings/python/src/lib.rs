@@ -317,6 +317,86 @@ struct Size {
     height: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClipRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// A Playwright length: a number of pixels, or a string with a unit.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Length {
+    Pixels(f64),
+    Text(String),
+}
+
+impl Length {
+    fn text(self) -> String {
+        match self {
+            Length::Pixels(n) => n.to_string(),
+            Length::Text(s) => s,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Margin {
+    top: Option<Length>,
+    right: Option<Length>,
+    bottom: Option<Length>,
+    left: Option<Length>,
+}
+
+fn length(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
+    options::<Length>(value, what).map(Length::text)
+}
+
+/// The screenshot type as Playwright picks it: `type`, else the extension of `path`, else PNG.
+fn shot_options(
+    path: Option<&Path>,
+    kind: Option<&str>,
+    quality: Option<u32>,
+    omit_background: Option<bool>,
+) -> PyResult<fluxwright::ScreenshotOptions> {
+    let kind = match (kind, path) {
+        (Some(k), _) => Some(k),
+        (None, Some(p)) => {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+            Some(match ext.as_str() {
+                "png" => "png",
+                "jpg" | "jpeg" => "jpeg",
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "screenshot: {}: only .png, .jpg and .jpeg are supported",
+                        p.display()
+                    )))
+                }
+            })
+        }
+        (None, None) => None,
+    };
+    let format = match kind {
+        None | Some("png") => fluxwright::ImageFormat::Png,
+        Some("jpeg") => fluxwright::ImageFormat::Jpeg,
+        Some(k) => return Err(PyValueError::new_err(format!("screenshot: type {k:?} is not png or jpeg"))),
+    };
+    if format == fluxwright::ImageFormat::Png && quality.is_some() {
+        return Err(PyValueError::new_err("screenshot: quality is for JPEG only"));
+    }
+    Ok(fluxwright::ScreenshotOptions {
+        format,
+        // Over 255 becomes 255, which the engine rejects as over 100.
+        quality: quality.map(|q| q.min(255) as u8),
+        omit_background: omit_background.unwrap_or(false),
+        ..Default::default()
+    })
+}
+
 /// Saved storage: what `storage_state()` returned, or the path of the JSON file it saved.
 fn storage(value: &Bound<'_, PyAny>) -> PyResult<fluxwright::StorageState> {
     match value.extract::<PathBuf>() {
@@ -551,29 +631,100 @@ impl Page {
         })
     }
 
-    #[pyo3(signature = (*, path=None, full_page=None))]
+    /// PNG or JPEG bytes; with `path`, also written there (its extension picks the type when
+    /// `type` is not given). `clip` is `{x, y, width, height}` relative to the viewport, or to
+    /// the page with `full_page`.
+    #[pyo3(signature = (*, path=None, full_page=None, r#type=None, quality=None, clip=None, omit_background=None))]
+    #[allow(clippy::too_many_arguments)]
     fn screenshot<'py>(
         &self,
         py: Python<'py>,
         path: Option<PathBuf>,
         full_page: Option<bool>,
+        r#type: Option<String>,
+        quality: Option<u32>,
+        clip: Option<Bound<'py, PyAny>>,
+        omit_background: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let full_page = full_page.unwrap_or(false);
+        let mut shot = shot_options(path.as_deref(), r#type.as_deref(), quality, omit_background)?;
+        shot.full_page = full_page.unwrap_or(false);
+        if let Some(clip) = clip {
+            let c: ClipRect = options(&clip, "clip")?;
+            shot.clip = Some(fluxwright::Clip { x: c.x, y: c.y, width: c.width, height: c.height });
+        }
         let lease = self.lease.clone();
         future_into_py(py, async move {
-            let png = with_page(&lease, move |p| {
-                Box::pin(async move {
-                    if full_page {
-                        p.screenshot_full_page().await
-                    } else {
-                        p.screenshot().await
-                    }
-                })
+            let image = with_page(&lease, move |p| {
+                Box::pin(async move { p.screenshot_with(&shot).await })
             })
             .await?;
             match path {
-                Some(path) => save_blocking(path, png).await,
-                None => Ok(png),
+                Some(path) => save_blocking(path, image).await,
+                None => Ok(image),
+            }
+        })
+    }
+
+    /// The page printed to PDF, as Playwright's `page.pdf` (headless only); with `path`, also
+    /// written there. Lengths (`width`, `height`, the `margin` sides) are numbers of pixels or
+    /// strings with `px`, `in`, `cm` or `mm`.
+    #[pyo3(signature = (*, path=None, format=None, width=None, height=None, margin=None, landscape=None,
+        print_background=None, scale=None, page_ranges=None, prefer_css_page_size=None,
+        display_header_footer=None, header_template=None, footer_template=None, outline=None, tagged=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn pdf<'py>(
+        &self,
+        py: Python<'py>,
+        path: Option<PathBuf>,
+        format: Option<String>,
+        width: Option<Bound<'py, PyAny>>,
+        height: Option<Bound<'py, PyAny>>,
+        margin: Option<Bound<'py, PyAny>>,
+        landscape: Option<bool>,
+        print_background: Option<bool>,
+        scale: Option<f64>,
+        page_ranges: Option<String>,
+        prefer_css_page_size: Option<bool>,
+        display_header_footer: Option<bool>,
+        header_template: Option<String>,
+        footer_template: Option<String>,
+        outline: Option<bool>,
+        tagged: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let margin = match margin {
+            Some(m) => {
+                let m: Margin = options(&m, "margin")?;
+                fluxwright::PdfMargin {
+                    top: m.top.map(Length::text),
+                    right: m.right.map(Length::text),
+                    bottom: m.bottom.map(Length::text),
+                    left: m.left.map(Length::text),
+                }
+            }
+            None => Default::default(),
+        };
+        let pdf_options = fluxwright::PdfOptions {
+            format,
+            width: width.map(|w| length(&w, "width")).transpose()?,
+            height: height.map(|h| length(&h, "height")).transpose()?,
+            margin,
+            landscape: landscape.unwrap_or(false),
+            print_background: print_background.unwrap_or(false),
+            scale,
+            page_ranges,
+            prefer_css_page_size: prefer_css_page_size.unwrap_or(false),
+            display_header_footer: display_header_footer.unwrap_or(false),
+            header_template,
+            footer_template,
+            outline: outline.unwrap_or(false),
+            tagged: tagged.unwrap_or(false),
+        };
+        let lease = self.lease.clone();
+        future_into_py(py, async move {
+            let pdf = with_page(&lease, move |p| Box::pin(async move { p.pdf(&pdf_options).await })).await?;
+            match path {
+                Some(path) => save_blocking(path, pdf).await,
+                None => Ok(pdf),
             }
         })
     }
@@ -812,23 +963,28 @@ impl Locator {
         })
     }
 
-    /// PNG of the element, once it is visible and still; with `path`, also written there.
-    #[pyo3(signature = (*, path=None))]
+    /// PNG or JPEG of the element, once it is visible and still; with `path`, also written
+    /// there (its extension picks the type when `type` is not given).
+    #[pyo3(signature = (*, path=None, r#type=None, quality=None, omit_background=None))]
     fn screenshot<'py>(
         &self,
         py: Python<'py>,
         path: Option<PathBuf>,
+        r#type: Option<String>,
+        quality: Option<u32>,
+        omit_background: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let shot = shot_options(path.as_deref(), r#type.as_deref(), quality, omit_background)?;
         let sel = self.selector.clone();
         let lease = self.lease.clone();
         future_into_py(py, async move {
-            let png = with_page(&lease, move |p| {
-                Box::pin(async move { p.element_screenshot(&sel).await })
+            let image = with_page(&lease, move |p| {
+                Box::pin(async move { p.element_screenshot_with(&sel, &shot).await })
             })
             .await?;
             match path {
-                Some(path) => save_blocking(path, png).await,
-                None => Ok(png),
+                Some(path) => save_blocking(path, image).await,
+                None => Ok(image),
             }
         })
     }

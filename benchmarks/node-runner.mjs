@@ -9,6 +9,7 @@ const jobs = Number(process.env.BENCH_JOBS || 20);
 const nBrowsers = Math.max(1, Number(process.env.BENCH_BROWSERS || 1));
 const nCtx = Math.max(1, Number(process.env.BENCH_CONTEXTS || 1));
 const scenario = process.env.BENCH_SCENARIO || "node-smoke";
+const isPdf = scenario.endsWith("-pdfs");
 const slotTarget = nBrowsers * nCtx;
 const concurrency = Math.min(jobs, slotTarget, 24);
 const jobTimeoutMs = 30_000;
