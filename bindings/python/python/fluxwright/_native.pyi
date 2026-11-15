@@ -52,8 +52,14 @@ class Page:
         """Scrolls into view and waits until the element is enabled, stable and not covered.
         ``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
     def fill(self, selector: str, value: str, *, timeout: float | None = None) -> Awaitable[None]: ...
-    def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]:
-        """Waits until visible."""
+    def wait_for_selector(
+        self,
+        selector: str,
+        *,
+        state: Literal["attached", "detached", "visible", "hidden"] | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]:
+        """Waits until ``state``: visible by default."""
     def evaluate(self, expression: str, arg: Any = None) -> Awaitable[Any]:
         """Runs JavaScript in the page and returns its JSON result, awaiting promises. A function
         (``"(x) => x * 2"``) is called with ``arg``; anything else is evaluated as is."""
@@ -123,8 +129,13 @@ class Locator:
     def click(self, *, timeout: float | None = None) -> Awaitable[None]:
         """``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
     def fill(self, value: str, *, timeout: float | None = None) -> Awaitable[None]: ...
-    def wait_for(self, *, timeout: float | None = None) -> Awaitable[None]:
-        """Waits until visible."""
+    def wait_for(
+        self,
+        *,
+        state: Literal["attached", "detached", "visible", "hidden"] | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]:
+        """Waits until ``state``: visible by default."""
     def text_content(self, *, timeout: float | None = None) -> Awaitable[str | None]: ...
     def screenshot(
         self,

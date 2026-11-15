@@ -180,13 +180,16 @@ declare module './index' {
     /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
     click(selector: string, options?: { timeout?: number }): Promise<void>
     fill(selector: string, value: string, options?: { timeout?: number }): Promise<void>
-    waitForSelector(selector: string, options?: { state?: 'visible'; timeout?: number }): Promise<void>
+    waitForSelector(
+      selector: string,
+      options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; timeout?: number },
+    ): Promise<void>
   }
   interface Locator {
     /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
     click(options?: { timeout?: number }): Promise<void>
     fill(value: string, options?: { timeout?: number }): Promise<void>
-    waitFor(options?: { state?: 'visible'; timeout?: number }): Promise<void>
+    waitFor(options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; timeout?: number }): Promise<void>
     textContent(options?: { timeout?: number }): Promise<string | null>
     boundingBox(options?: { timeout?: number }): Promise<{ x: number; y: number; width: number; height: number } | null>
     /**

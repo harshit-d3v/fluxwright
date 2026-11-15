@@ -1036,6 +1036,18 @@ impl PageLease {
         Ok(())
     }
 
+    /// Waits for the selector to be attached, detached, visible or hidden.
+    pub async fn wait_for_selector_state(
+        &self,
+        selector: impl Into<Selector>,
+        state: fluxwright_cdp::WaitState,
+    ) -> Result<()> {
+        Ok(self
+            .page
+            .wait_for_selector_state(&selector.into(), state, self.action_timeout())
+            .await?)
+    }
+
     /// `textContent` of the first match, once it exists.
     pub async fn text_content(&self, selector: impl Into<Selector>) -> Result<Option<String>> {
         Ok(self
