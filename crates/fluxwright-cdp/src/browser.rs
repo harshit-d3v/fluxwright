@@ -69,6 +69,7 @@ pub(crate) struct TargetState {
 pub struct CdpBrowser {
     pub id: BrowserId,
     pub pid: u32,
+    pub headless: bool,
     pub ws_endpoint: Option<String>,
     conn: Arc<Connection>,
     _child: Mutex<Option<Child>>,
@@ -86,10 +87,10 @@ pub struct CdpBrowser {
 impl CdpBrowser {
     pub async fn launch(opts: LaunchOptions) -> Result<Arc<Self>> {
         let launched = launch_chrome(&opts).await?;
-        Self::from_launched(launched).await
+        Self::from_launched(launched, opts.headless).await
     }
 
-    async fn from_launched(launched: Launched) -> Result<Arc<Self>> {
+    async fn from_launched(launched: Launched, headless: bool) -> Result<Arc<Self>> {
         let (conn, ws_endpoint) = match launched.transport {
             #[cfg(windows)]
             Transport::WebSocket(url) => {
@@ -122,6 +123,7 @@ impl CdpBrowser {
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
             pid: launched.pid,
+            headless,
             ws_endpoint,
             conn: conn.clone(),
             _child: Mutex::new(Some(launched.child)),
@@ -217,6 +219,7 @@ impl CdpBrowser {
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
             pid: 0,
+            headless: true,
             ws_endpoint: Some(ws_url),
             conn: conn.clone(),
             _child: Mutex::new(None),
@@ -631,6 +634,7 @@ impl CdpBrowser {
             browser: self.conn.clone(),
             browser_pid: self.pid,
             browser_id: self.id,
+            headless: self.headless,
             context_id: ctx.clone(),
             target_id: TargetId(target_id),
             session_id: SessionId(session_id),
@@ -1189,6 +1193,7 @@ mod tests {
         let browser = CdpBrowser {
             id: BrowserId(Uuid::new_v4()),
             pid: 0,
+            headless: true,
             ws_endpoint: Some(ws_url),
             conn: conn.clone(),
             _child: Mutex::new(None),
@@ -1283,6 +1288,7 @@ mod tests {
         let browser = Arc::new(CdpBrowser {
             id: BrowserId(Uuid::new_v4()),
             pid: 0,
+            headless: true,
             ws_endpoint: Some(ws_url),
             conn: conn.clone(),
             _child: Mutex::new(None),

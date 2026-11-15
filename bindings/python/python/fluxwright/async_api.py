@@ -37,7 +37,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from . import _native
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage, Download, FrameLocator, Locator
-from ._types import FloatRect, Geolocation, ProxySettings, StorageState, URLMatch, ViewportSize
+from ._types import FloatRect, Geolocation, PdfMargins, ProxySettings, StorageState, URLMatch, ViewportSize
 
 __all__ = [
     "Browser",
@@ -53,6 +53,7 @@ __all__ = [
     "Geolocation",
     "Locator",
     "Page",
+    "PdfMargins",
     "Playwright",
     "PlaywrightContextManager",
     "ProxySettings",

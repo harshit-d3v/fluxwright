@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use base64::Engine;
-use fluxwright::{netguard, JobOptions, PageLease, Priority, WaitUntil};
+use fluxwright::{
+    netguard, Clip, ImageFormat, JobOptions, PageLease, PdfMargin, PdfOptions, Priority,
+    ScreenshotOptions, WaitUntil,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -13,6 +16,9 @@ pub const MAX_CONSOLE_TEXT_BYTES: usize = 2048;
 pub const MAX_NETWORK_ENTRIES: usize = 256;
 pub const MAX_NETWORK_URL_BYTES: usize = 2048;
 pub const MAX_SCREENSHOT_BYTES: usize = MAX_RESULT_BYTES / 4 * 3;
+/// Shares the screenshot raw-byte cap: retained job results sit in memory up to `MAX_RESULT_BYTES`
+/// (1 MiB) JSON, and base64 encoding adds 4/3 expansion (~768 KiB raw fills the 1 MiB envelope).
+pub const MAX_PDF_BYTES: usize = MAX_SCREENSHOT_BYTES;
 const MAX_STEPS: usize = 64;
 
 /// Steps run in order on one fresh page. No host-side scripts or filesystem paths are accepted.
@@ -75,6 +81,12 @@ impl JobRequest {
                 }
                 Step::Evaluate { expression } if expression.trim().is_empty() => {
                     return Err("evaluate expression must not be empty".into());
+                }
+                Step::Screenshot { .. } => {
+                    step.screenshot_options().and_then(|o| o.validate().map_err(|e| e.to_string()))?;
+                }
+                Step::Pdf { .. } => {
+                    step.pdf_options().and_then(|o| o.validate().map_err(|e| e.to_string()))?;
                 }
                 _ => {}
             }
@@ -139,7 +151,97 @@ pub enum Step {
     Screenshot {
         #[serde(default)]
         full_page: bool,
+        #[serde(rename = "type", default)]
+        kind: ServerImageFormat,
+        quality: Option<u8>,
+        clip: Option<ServerClip>,
+        #[serde(default)]
+        omit_background: bool,
     },
+    Pdf {
+        format: Option<String>,
+        width: Option<ServerLength>,
+        height: Option<ServerLength>,
+        margin: Option<ServerPdfMargin>,
+        #[serde(default)]
+        landscape: bool,
+        #[serde(default)]
+        print_background: bool,
+        scale: Option<f64>,
+        page_ranges: Option<String>,
+        #[serde(default)]
+        prefer_css_page_size: bool,
+        #[serde(default)]
+        display_header_footer: bool,
+        header_template: Option<String>,
+        footer_template: Option<String>,
+        #[serde(default)]
+        outline: bool,
+        #[serde(default)]
+        tagged: bool,
+    },
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerImageFormat {
+    #[default]
+    Png,
+    Jpeg,
+    Webp,
+}
+
+impl ServerImageFormat {
+    fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    fn into_core(self) -> ImageFormat {
+        match self {
+            Self::Png => ImageFormat::Png,
+            Self::Jpeg => ImageFormat::Jpeg,
+            Self::Webp => ImageFormat::Webp,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerClip {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ServerLength {
+    String(String),
+    Number(f64),
+}
+
+impl ServerLength {
+    fn into_string(&self) -> Result<String, String> {
+        match self {
+            Self::String(s) => Ok(s.clone()),
+            Self::Number(n) if n.is_finite() => Ok(n.to_string()),
+            Self::Number(_) => Err("pdf: invalid non-finite length".into()),
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerPdfMargin {
+    pub top: Option<ServerLength>,
+    pub right: Option<ServerLength>,
+    pub bottom: Option<ServerLength>,
+    pub left: Option<ServerLength>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -153,6 +255,79 @@ pub enum NavigationWait {
 }
 
 impl Step {
+    fn screenshot_options(&self) -> Result<ScreenshotOptions, String> {
+        let Step::Screenshot {
+            full_page,
+            kind,
+            quality,
+            clip,
+            omit_background,
+        } = self
+        else {
+            unreachable!();
+        };
+        Ok(ScreenshotOptions {
+            full_page: *full_page,
+            format: kind.into_core(),
+            quality: *quality,
+            clip: clip.map(|c| Clip {
+                x: c.x,
+                y: c.y,
+                width: c.width,
+                height: c.height,
+            }),
+            omit_background: *omit_background,
+        })
+    }
+
+    fn pdf_options(&self) -> Result<PdfOptions, String> {
+        let Step::Pdf {
+            format,
+            width,
+            height,
+            margin,
+            landscape,
+            print_background,
+            scale,
+            page_ranges,
+            prefer_css_page_size,
+            display_header_footer,
+            header_template,
+            footer_template,
+            outline,
+            tagged,
+        } = self
+        else {
+            unreachable!();
+        };
+        let len = |v: &Option<ServerLength>| v.as_ref().map(ServerLength::into_string).transpose();
+        let m = match margin {
+            Some(m) => PdfMargin {
+                top: len(&m.top)?,
+                right: len(&m.right)?,
+                bottom: len(&m.bottom)?,
+                left: len(&m.left)?,
+            },
+            None => PdfMargin::default(),
+        };
+        Ok(PdfOptions {
+            format: format.clone(),
+            width: len(width)?,
+            height: len(height)?,
+            margin: m,
+            landscape: *landscape,
+            print_background: *print_background,
+            scale: *scale,
+            page_ranges: page_ranges.clone(),
+            prefer_css_page_size: *prefer_css_page_size,
+            display_header_footer: *display_header_footer,
+            header_template: header_template.clone(),
+            footer_template: footer_template.clone(),
+            outline: *outline,
+            tagged: *tagged,
+        })
+    }
+
     pub(crate) async fn execute(&self, page: &PageLease) -> fluxwright::Result<Value> {
         match self {
             Step::Goto { url, wait_until } => {
@@ -184,21 +359,15 @@ impl Step {
             Step::Evaluate { expression } => page.evaluate(expression).await,
             Step::Title {} => Ok(Value::String(page.title().await?)),
             Step::Content {} => Ok(Value::String(page.content().await?)),
-            Step::Screenshot { full_page } => {
-                let bytes = if *full_page {
-                    page.screenshot_full_page().await?
-                } else {
-                    page.screenshot().await?
-                };
-                if bytes.len() > MAX_SCREENSHOT_BYTES {
-                    return Err(fluxwright::Error::Other(
-                        "screenshot exceeds the result limit".into(),
-                    ));
-                }
-                Ok(serde_json::json!({
-                    "mime_type": "image/png",
-                    "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-                }))
+            Step::Screenshot { kind, .. } => {
+                let opts = self.screenshot_options().map_err(fluxwright::Error::Other)?;
+                let bytes = page.screenshot_with(&opts).await?;
+                encoded_blob(kind.mime(), &bytes, MAX_SCREENSHOT_BYTES, "screenshot")
+            }
+            Step::Pdf { .. } => {
+                let opts = self.pdf_options().map_err(fluxwright::Error::Other)?;
+                let bytes = page.pdf_within(&opts, MAX_PDF_BYTES).await?;
+                encoded_blob("application/pdf", &bytes, MAX_PDF_BYTES, "pdf")
             }
         }
     }
@@ -213,8 +382,22 @@ impl Step {
             Step::Title {} => "title",
             Step::Content {} => "content",
             Step::Screenshot { .. } => "screenshot",
+            Step::Pdf { .. } => "pdf",
         }
     }
+}
+
+fn encoded_blob(mime: &str, bytes: &[u8], limit: usize, what: &str) -> fluxwright::Result<Value> {
+    if bytes.len() > limit {
+        return Err(fluxwright::Error::Other(format!(
+            "{what} exceeds the result limit ({} bytes > {limit})",
+            bytes.len()
+        )));
+    }
+    Ok(serde_json::json!({
+        "mime_type": mime,
+        "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +604,11 @@ mod tests {
             json!({ "steps": [{ "action": "title" }], "timeout_ms": 0 }),
             json!({ "steps": [{ "action": "title" }], "timeout_ms": 300001 }),
             json!({ "steps": [{ "action": "title" }], "retries": 4 }),
+            json!({ "steps": [{ "action": "screenshot", "quality": 80 }] }),
+            json!({ "steps": [{ "action": "screenshot", "clip": { "x": 0, "y": 0, "width": 0, "height": 10 } }] }),
+            json!({ "steps": [{ "action": "pdf", "format": "A9" }] }),
+            json!({ "steps": [{ "action": "pdf", "scale": 3.0 }] }),
+            json!({ "steps": [{ "action": "pdf", "margin": { "top": "10pt" } }] }),
         ] {
             let job: JobRequest = serde_json::from_value(value).unwrap();
             assert!(job.validate().is_err());
@@ -429,11 +617,13 @@ mod tests {
             "steps": [{ "action": "title" }], "script": "host code"
         }))
         .is_err());
-        for action in ["screenshot", "title", "content"] {
+        for action in ["screenshot", "pdf", "title", "content"] {
             assert!(serde_json::from_value::<Step>(json!({
                 "action": action, "path": "secret.png"
             }))
             .is_err());
         }
+        assert!(serde_json::from_value::<Step>(json!({ "action": "pdf", "format": "A4", "width": 800, "margin": { "top": "10mm", "left": 24 } })).is_ok());
+        assert!(serde_json::from_value::<Step>(json!({ "action": "pdf", "margin": { "bogus": 1 } })).is_err());
     }
 }

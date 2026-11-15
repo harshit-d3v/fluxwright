@@ -155,8 +155,45 @@ async def async_smoke(base: str, tmp: Path) -> None:
         assert await ui.locator("#e").evaluate("(el, suffix) => el.value + suffix", "!") == "a@b.c!"
         assert await ui.locator("#e").evaluate("(el, x) => x === null") is True
         png = await ui.get_by_test_id("total").screenshot(path=tmp / "el.png")
+        assert png[:4] == b"\x89PNG"
         assert (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")) == (40, 20)
         assert (tmp / "el.png").read_bytes() == png
+        jpg = await ui.get_by_test_id("total").screenshot(path=tmp / "el.jpg", quality=60)
+        assert jpg[:3] == b"\xff\xd8\xff"
+        assert (tmp / "el.jpg").read_bytes() == jpg
+        clip = await ui.screenshot(clip={"x": 10, "y": 50, "width": 40, "height": 20})
+        assert clip[:4] == b"\x89PNG"
+        assert (int.from_bytes(clip[16:20], "big"), int.from_bytes(clip[20:24], "big")) == (40, 20)
+        clear = await ui.screenshot(omit_background=True)
+        assert clear[:4] == b"\x89PNG"
+        pdf_bytes = await ui.pdf(
+            path=tmp / "report.pdf",
+            format="A4",
+            landscape=True,
+            print_background=True,
+            scale=0.9,
+            page_ranges="1",
+            margin={"top": 20, "bottom": "1cm"},
+            display_header_footer=True,
+            header_template="<span class=title></span>",
+            footer_template="<span class=pageNumber></span>",
+            outline=True,
+            tagged=True,
+        )
+        assert pdf_bytes[:5] == b"%PDF-"
+        assert (tmp / "report.pdf").read_bytes() == pdf_bytes
+        with pytest.raises(ValueError, match="not png or jpeg"):
+            await ui.screenshot(type="webp")
+        with pytest.raises(ValueError, match="only .png, .jpg and .jpeg"):
+            await ui.screenshot(path=tmp / "out.webp")
+        with pytest.raises(ValueError, match="JPEG only"):
+            await ui.screenshot(type="png", quality=50)
+        with pytest.raises(TypeError):
+            await ui.screenshot(animations="disabled")  # type: ignore[call-arg]
+        with pytest.raises(Error, match="unknown format"):
+            await ui.pdf(format="A9")
+        with pytest.raises(ValueError):
+            await ui.pdf(margin={"bogus": 1})  # type: ignore[typeddict-unknown-key]
         for _ in range(50):
             if await ui.page_errors():
                 break
@@ -580,6 +617,10 @@ def test_sync_api(base, tmp_path):
             page.evaluate(CLICK_REPORT)
         info.value.save_as(tmp_path / "report.csv")
         assert (tmp_path / "report.csv").read_text() == "a,b\n1,2\n"
+        page.goto("data:text/html,<div id=box style='width:30px;height:15px;background:blue'>hi</div>")
+        assert page.screenshot(type="jpeg", quality=60)[:3] == b"\xff\xd8\xff"
+        assert page.locator("#box").screenshot(type="jpeg")[:3] == b"\xff\xd8\xff"
+        assert page.pdf(format="Letter", margin={"top": "10mm"})[:5] == b"%PDF-"
         page.close()
 
         # One browser shared by a pool of threads.

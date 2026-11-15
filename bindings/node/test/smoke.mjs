@@ -78,7 +78,16 @@ try {
   await page.waitForSelector('p', { state: 'visible' })
   assert.throws(() => page.locator('p', { hasText: 'x' }), TypeError)
   await assert.rejects(page.click('p', { button: 'right' }), TypeError)
-  await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.jpg') }), TypeError)
+  await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.gif') }), TypeError)
+  await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.webp') }), TypeError)
+  await assert.rejects(page.screenshot({ type: 'webp' }), TypeError)
+  await assert.rejects(page.screenshot({ animations: 'disabled' }), TypeError)
+  await assert.rejects(page.screenshot({ mask: [] }), TypeError)
+  await assert.rejects(page.screenshot({ clip: { x: 0, y: 0, width: 10, height: 10, extra: 1 } }), TypeError)
+  await assert.rejects(page.screenshot({ type: 'png', quality: 50 }), /JPEG only/)
+  await assert.rejects(page.pdf({ format: 'A9' }), /unknown format/)
+  await assert.rejects(page.pdf({ landscpe: true }), TypeError)
+  await assert.rejects(page.pdf({ margin: { bogus: 10 } }), TypeError)
   await assert.rejects(browser.newPage({ extraHTTPHeaders: { a: '1' } }), TypeError)
   await page.close()
 
@@ -149,6 +158,32 @@ try {
   assert.equal(await ui.locator('#e').evaluate((el, suffix) => el.value + suffix, '!'), 'a@b.c!')
   const png = await ui.getByTestId('total').screenshot({ path: join(tmpdir(), `fluxwright-el-${process.pid}.png`) })
   assert.deepEqual([png.readUInt32BE(16), png.readUInt32BE(20)], [40, 20]) // PNG width and height
+  // JPEG from the path's extension, a clip, and a PDF.
+  const jpegPath = join(tmpdir(), `fluxwright-el-${process.pid}.jpg`)
+  const jpeg = await ui.getByTestId('total').screenshot({ path: jpegPath, quality: 60 })
+  assert.deepEqual([...jpeg.subarray(0, 3)], [0xff, 0xd8, 0xff])
+  assert.deepEqual(await readFile(jpegPath), jpeg)
+  const clip = await ui.screenshot({ clip: { x: 10, y: 50, width: 40, height: 20 } })
+  assert.deepEqual([clip.readUInt32BE(16), clip.readUInt32BE(20)], [40, 20])
+  const clear = await ui.screenshot({ omitBackground: true })
+  assert.equal(clear.subarray(0, 4).toString('latin1'), '\x89PNG')
+  const pdfPath = join(tmpdir(), `fluxwright-${process.pid}.pdf`)
+  const pdf = await ui.pdf({
+    path: pdfPath,
+    format: 'A4',
+    landscape: true,
+    printBackground: true,
+    scale: 0.9,
+    pageRanges: '1',
+    margin: { top: 20, bottom: '1cm' },
+    displayHeaderFooter: true,
+    headerTemplate: '<span class=title></span>',
+    footerTemplate: '<span class=pageNumber></span>',
+    outline: true,
+    tagged: true,
+  })
+  assert.equal(pdf.subarray(0, 5).toString(), '%PDF-')
+  assert.deepEqual(await readFile(pdfPath), pdf)
   for (let i = 0; i < 50 && (await ui.pageErrors()).length === 0; i++) await new Promise((r) => setTimeout(r, 20))
   assert.ok((await ui.consoleMessages()).some((m) => m.type === 'log' && m.text === 'ready 1'))
   const [late] = await ui.pageErrors()

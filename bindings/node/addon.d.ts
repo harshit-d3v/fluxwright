@@ -1,5 +1,5 @@
 export * from './index'
-import { Chromium, ConsoleMessage, NewPageOptions, Page, ScreenshotOptions, StorageState, Browser } from './index'
+import { Chromium, ConsoleMessage, NewPageOptions, Page, PdfOptions, ScreenshotOptions, StorageState, Browser } from './index'
 /**
  * Playwright-style export: `chromium.launch(...)`, which is `Chromium.launch` after a check that
  * every option is one Fluxwright implements (others throw a TypeError).
@@ -7,6 +7,14 @@ import { Chromium, ConsoleMessage, NewPageOptions, Page, ScreenshotOptions, Stor
 export const chromium: Pick<typeof Chromium, 'launch'>
 declare const fluxwright: { chromium: typeof chromium }
 export default fluxwright
+
+/** Playwright's `page.pdf` options. */
+export type PDFOptions = Omit<PdfOptions, 'width' | 'height' | 'margin'> & {
+  width?: string | number
+  height?: string | number
+  margin?: { top?: string | number; right?: string | number; bottom?: string | number; left?: string | number }
+  path?: string
+}
 
 /**
  * A request, as in Playwright: the same object for all of one request's events and for
@@ -124,8 +132,13 @@ declare module './index' {
     storageState(options?: { path?: string }): Promise<StorageState>
     /** Exceptions nothing caught so far, as `Error` objects. */
     pageErrors(): Promise<Error[]>
-    /** Also writes the PNG to `path`. */
+    /** Also writes the image to `path`; without `type`, its extension picks PNG or JPEG. */
     screenshot(options?: ScreenshotOptions & { path?: string }): Promise<Buffer>
+    /**
+     * The page printed to PDF, as Playwright's `page.pdf` (headless only). Lengths are numbers of
+     * pixels or strings with `px`, `in`, `cm` or `mm`. Also writes the file to `path`.
+     */
+    pdf(options?: PDFOptions): Promise<Buffer>
     /**
      * Hands matching requests of this page, its popups and iframes to `handler`, as Playwright's
      * `page.route`. The handler added last runs first. Call it before navigating. Answer before
@@ -171,7 +184,7 @@ declare module './index' {
      * its result. The function is sent as source text: it can't use variables from Node.
      */
     evaluate<R, Arg = undefined>(pageFunction: (element: any, arg: Arg) => R, arg?: Arg): Promise<Awaited<R>>
-    /** Also writes the PNG to `path`. */
-    screenshot(options?: { path?: string }): Promise<Buffer>
+    /** Also writes the image to `path`; without `type`, its extension picks PNG or JPEG. */
+    screenshot(options?: Omit<ScreenshotOptions, 'fullPage' | 'clip'> & { path?: string }): Promise<Buffer>
   }
 }
