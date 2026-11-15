@@ -49,6 +49,17 @@ A remote browser gets one connection, so set concurrency with `--max-contexts`. 
 the wait counts toward the job's deadline. Only `goto` steps are counted, not clicks or redirects
 that move a page to another host.
 
+`--journal <file>` keeps accepted jobs across restarts. Every accepted job is appended to the
+file and marked done when it succeeds, fails or is cancelled by a client. On start, jobs with no
+done mark are queued again under their old ids, so a client polling `/v1/jobs/{id}` finds its job
+after the restart. Three things to know:
+
+- A job that was running when the server stopped runs again from its first step, so a click or a
+  form submission can happen twice. Use it for jobs that are safe to repeat.
+- Results are not kept: a job that had finished is gone after a restart (404).
+- The file holds the job steps as sent, URLs and typed values included. It is created
+  owner-only on Linux and macOS; put it somewhere only the server can read.
+
 Without `--max-browsers` or `--memory-ceiling-mb`, the engine sizes itself to the machine.
 `--max-contexts` defaults to 8 per browser. Ctrl+C (and SIGTERM on Unix) stops admission,
 cancels outstanding jobs, and shuts down Chrome, allowing up to 10 seconds for lease cleanup.

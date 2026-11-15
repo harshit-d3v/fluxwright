@@ -5,6 +5,7 @@
 
 pub mod dashboard;
 mod job;
+mod journal;
 pub mod prometheus;
 pub mod telemetry;
 
@@ -50,6 +51,10 @@ pub struct ServerConfig {
     /// Bounds running, queued and retained completed jobs together. Completed jobs are evicted
     /// oldest-first to admit new work; active jobs are never evicted.
     pub max_jobs: usize,
+    /// A file that keeps accepted jobs across restarts: jobs that had not ended when the server
+    /// stopped are queued again, under their old ids, when it starts. A job that was running
+    /// runs again from its first step.
+    pub journal: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +63,8 @@ pub enum ConfigError {
     InvalidToken,
     #[error("max_jobs must be between 1 and 4096")]
     InvalidCapacity,
+    #[error("the job journal could not be opened: {0}")]
+    Journal(std::io::Error),
 }
 
 impl ServerConfig {
@@ -68,6 +75,7 @@ impl ServerConfig {
         Ok(Self {
             token,
             max_jobs: 128,
+            journal: None,
         })
     }
 }
@@ -82,6 +90,7 @@ pub(crate) struct Inner {
     token: Vec<u8>,
     max_jobs: usize,
     registry: Mutex<Registry>,
+    journal: Option<journal::Journal>,
 }
 
 struct Registry {
@@ -187,6 +196,14 @@ impl Inner {
     }
 }
 
+impl Inner {
+    fn journal_done(&self, id: Uuid) {
+        if let Some(journal) = &self.journal {
+            journal.done(id);
+        }
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         // Workers and completion monitors hold Weak<Inner>, so dropping the last server/router
@@ -205,20 +222,40 @@ impl HttpServer {
         if !(1..=4096).contains(&config.max_jobs) {
             return Err(ConfigError::InvalidCapacity);
         }
-        Ok(Self {
-            inner: Arc::new(Inner {
-                engine,
-                token: config.token.into_bytes(),
-                max_jobs: config.max_jobs,
-                registry: Mutex::new(Registry {
-                    accepting: true,
-                    jobs: VecDeque::new(),
-                    succeeded_jobs: 0,
-                    failed_jobs: 0,
-                    cancelled_jobs: 0,
-                }),
+        let (journal, unfinished) = match &config.journal {
+            Some(path) => {
+                let (journal, jobs) = journal::Journal::open(path).map_err(ConfigError::Journal)?;
+                (Some(journal), jobs)
+            }
+            None => (None, Vec::new()),
+        };
+        let inner = Arc::new(Inner {
+            engine,
+            token: config.token.into_bytes(),
+            max_jobs: config.max_jobs,
+            registry: Mutex::new(Registry {
+                accepting: true,
+                jobs: VecDeque::new(),
+                succeeded_jobs: 0,
+                failed_jobs: 0,
+                cancelled_jobs: 0,
             }),
-        })
+            journal,
+        });
+        // All of them, even past max_jobs: they were accepted once, and new work waits for room.
+        let mut registry = inner.registry.lock().unwrap();
+        for (id, request) in unfinished {
+            match serde_json::from_value::<JobRequest>(request) {
+                Ok(request) if request.validate().is_ok() => {
+                    tracing::info!(job_id = %id, "queued again from the journal");
+                    enqueue(&inner, &mut registry, id, request, JobTraceContext::from_headers(None));
+                }
+                // Written by a version with other rules: it cannot run, so it is over.
+                _ => inner.journal_done(id),
+            }
+        }
+        drop(registry);
+        Ok(Self { inner })
     }
 
     pub fn router(&self) -> Router {
@@ -328,17 +365,20 @@ async fn response_headers(request: Request, next: Next) -> Response {
 async fn submit(
     State(inner): State<Arc<Inner>>,
     headers: axum::http::HeaderMap,
-    payload: Result<Json<JobRequest>, JsonRejection>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let Json(request) =
+    // Kept as sent as well, for the journal: the request type only reads, it does not write.
+    let Json(raw) =
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
+    let request: JobRequest = serde_json::from_value(raw.clone()).map_err(|e| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_request", e.to_string())
+    })?;
     request
         .validate()
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
     let traceparent = headers.get("traceparent").and_then(|v| v.to_str().ok());
     let trace_ctx = JobTraceContext::from_headers(traceparent);
-    let trace_id = trace_ctx.trace_id.clone();
     let outbound_tp = trace_ctx.to_traceparent();
 
     let mut registry = inner.registry.lock().unwrap();
@@ -363,39 +403,12 @@ async fn submit(
     }
 
     let id = Uuid::new_v4();
-    let job = Job {
-        id,
-        status: JobStatus::Queued,
-        submitted_at: now_ms(),
-        started_at: None,
-        finished_at: None,
-        attempts: 0,
-        step_index: None,
-        results: None,
-        error: None,
-        trace_id: Some(trace_id),
-        failure_evidence: None,
-    };
-    let weak = Arc::downgrade(&inner);
-    let engine = inner.engine.clone();
-    let worker_state = weak.clone();
-    let worker_ctx = trace_ctx.clone();
-    let task =
-        tokio::spawn(async move { execute(engine, request, worker_state, id, worker_ctx).await });
-    registry.jobs.push_back(Record {
-        job: job.clone(),
-        abort: Some(task.abort_handle()),
-    });
+    // Before the worker starts, so a job is never running without being on file.
+    if let Some(journal) = &inner.journal {
+        journal.submitted(id, &raw);
+    }
+    let job = enqueue(&inner, &mut registry, id, request, trace_ctx);
     drop(registry);
-
-    // A separate monitor records panics as failures, updates lifetime counters, and waits for a
-    // cancelled task to actually drop its lease. Its Weak reference does not keep a discarded server alive.
-    tokio::spawn(async move {
-        let outcome = task.await;
-        if let Some(inner) = weak.upgrade() {
-            finish_job(&inner, id, outcome);
-        }
-    });
 
     let mut response = (StatusCode::ACCEPTED, Json(job)).into_response();
     response.headers_mut().insert(
@@ -408,6 +421,48 @@ async fn submit(
             .insert(header::HeaderName::from_static("traceparent"), tp_val);
     }
     Ok(response)
+}
+
+/// Registers a job as queued and starts its worker. The caller holds the registry lock.
+fn enqueue(
+    inner: &Arc<Inner>,
+    registry: &mut Registry,
+    id: Uuid,
+    request: JobRequest,
+    trace_ctx: JobTraceContext,
+) -> Job {
+    let job = Job {
+        id,
+        status: JobStatus::Queued,
+        submitted_at: now_ms(),
+        started_at: None,
+        finished_at: None,
+        attempts: 0,
+        step_index: None,
+        results: None,
+        error: None,
+        trace_id: Some(trace_ctx.trace_id.clone()),
+        failure_evidence: None,
+    };
+    let weak = Arc::downgrade(inner);
+    let engine = inner.engine.clone();
+    let worker_state = weak.clone();
+    let task =
+        tokio::spawn(async move { execute(engine, request, worker_state, id, trace_ctx).await });
+    registry.jobs.push_back(Record {
+        job: job.clone(),
+        abort: Some(task.abort_handle()),
+    });
+
+    // A separate monitor records panics as failures, updates lifetime counters, and waits for a
+    // cancelled task to actually drop its lease. Its Weak reference does not keep a discarded server alive.
+    tokio::spawn(async move {
+        let outcome = task.await;
+        if let Some(inner) = weak.upgrade() {
+            finish_job(&inner, id, outcome);
+        }
+    });
+    job
 }
 
 /// Records how a job's worker ended, and counts it, unless the job already ended (a cancel).
@@ -451,6 +506,8 @@ fn finish_job(
         JobStatus::Succeeded => registry.succeeded_jobs += 1,
         _ => registry.failed_jobs += 1,
     }
+    drop(registry);
+    inner.journal_done(id);
     tracing::info!(job_id = %id, ?status, "HTTP job finished");
 }
 
@@ -855,6 +912,9 @@ async fn cancel(
     if let Some(abort) = abort {
         abort.abort();
     }
+    drop(registry);
+    // A job the client cancelled is over. One the shutdown cancels is not: it runs again.
+    inner.journal_done(id);
     Ok(Json(job_clone))
 }
 

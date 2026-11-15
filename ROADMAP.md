@@ -30,6 +30,7 @@ Implement these milestones in order, verifying each before starting the next:
 4. [x] **Bring your own browsers:** `connectOverCDP` in the Rust engine and `fluxwright serve --cdp-endpoint` (Node/Python binding exposure still pending).
 5. [x] **Docker image** with Chrome and Fluxwright.
 6. [x] **Per-host limits:** a cap on the pages on one host at once and a minimum delay between navigations to it, across the fleet.
+7. [x] **Jobs that survive a restart:** `fluxwright serve --journal <file>` queues unfinished jobs again on start.
 
 ## Later: many machines
 

@@ -44,6 +44,9 @@ enum Cmd {
         /// Milliseconds between the starts of two navigations to one host, at least.
         #[arg(long)]
         min_host_delay_ms: Option<NonZeroU64>,
+        /// Keep accepted jobs in this file, and queue the unfinished ones again on start.
+        #[arg(long)]
+        journal: Option<std::path::PathBuf>,
     },
     Start {
         #[arg(long, default_value_t = 4)]
@@ -94,6 +97,7 @@ async fn main() -> Result<()> {
             cdp_endpoint,
             max_per_host,
             min_host_delay_ms,
+            journal,
         } => {
             http_daemon(
                 listen,
@@ -104,6 +108,7 @@ async fn main() -> Result<()> {
                 cdp_endpoint,
                 max_per_host,
                 min_host_delay_ms,
+                journal,
             )
             .await
         }
@@ -140,6 +145,7 @@ async fn http_daemon(
     cdp_endpoint: Option<String>,
     max_per_host: Option<NonZeroUsize>,
     min_host_delay_ms: Option<NonZeroU64>,
+    journal: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let token = std::env::var("FLUXWRIGHT_SERVER_TOKEN").map_err(|_| {
         anyhow::anyhow!(
@@ -148,6 +154,7 @@ async fn http_daemon(
     })?;
     let mut config = ServerConfig::new(token)?;
     config.max_jobs = max_jobs;
+    config.journal = journal;
     anyhow::ensure!(max_jobs <= 4096, "--max-jobs must be between 1 and 4096");
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -424,8 +431,9 @@ mod tests {
                 cdp_endpoint,
                 max_per_host,
                 min_host_delay_ms,
+                journal,
             } => {
-                assert!(max_per_host.is_none() && min_host_delay_ms.is_none());
+                assert!(max_per_host.is_none() && min_host_delay_ms.is_none() && journal.is_none());
                 assert_eq!(listen, "0.0.0.0:7331".parse::<SocketAddr>().unwrap());
                 assert!(max_browsers.is_none());
                 assert_eq!(max_contexts.get(), 8);

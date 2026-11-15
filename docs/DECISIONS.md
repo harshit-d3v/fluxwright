@@ -101,3 +101,20 @@ Running a headless browser fleet inside containers requires matching glibc/syste
 
 4. **Cgroup auto-tuning (`--memory` and `--cpus`)**:
    Instead of hardcoding container pool sizes in the `Dockerfile`, the default `CMD ["serve", "--listen", "0.0.0.0:7331"]` relies on `fluxwright-core`'s Linux cgroup v1/v2 inspection. Passing `--memory` and `--cpus` to `docker run` automatically scales the default browser count and sets the 75% memory ceiling to the container's cgroup allocation.
+
+## 2026-11-15 — Jobs that survive a restart: an append-only journal, not a database
+
+`fluxwright serve --journal <file>` appends each accepted job as one JSON line and a second line
+when it ends; on start, jobs with no end line are queued again under their old ids, and the file
+is rewritten with just those.
+
+- **Why a file and not SQLite:** the server needs two operations, "remember this job" and
+  "forget it", and one reader, at startup. A journal does that in about a hundred lines with no
+  new dependency; SQLite would add a C library to the build and the Docker image for no query we
+  need. Revisit when results must survive too, or when several servers share one queue.
+- **At least once:** a job that was running when the server stopped runs again from its first
+  step. Exactly-once would need per-step checkpoints and idempotent steps, which a click is not.
+- **Only work, not results:** finished jobs are not kept, so the file stays as small as the
+  queue. A client that polls after a restart gets 404 for a job that had already finished.
+- **Durability:** each line is synced to disk before the job starts, so a job is never running
+  without being on file. That costs about a millisecond per submission.
