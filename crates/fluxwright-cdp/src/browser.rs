@@ -63,7 +63,7 @@ pub(crate) struct TargetState {
     r#type: String,
     url: String,
     browser_context_id: Option<String>,
-    waiting: Vec<tokio::sync::oneshot::Sender<String>>,
+    waiting: Vec<tokio::sync::oneshot::Sender<Result<String>>>,
 }
 
 pub struct CdpBrowser {
@@ -355,38 +355,46 @@ impl CdpBrowser {
                 // page never reaches a caller with its domains still being enabled.
                 let me = self.clone();
                 tokio::spawn(async move {
-                    if prepare_session(&me.conn, &session_id, &ty, waiting, setup)
-                        .await
-                        .is_ok()
-                    {
-                        let waiters = match me.targets.lock().await.get_mut(&target_id) {
-                            Some(t) => {
-                                t.session_id = Some(session_id.clone());
-                                std::mem::take(&mut t.waiting)
+                    match prepare_session(&me.conn, &session_id, &ty, waiting, setup).await {
+                        Ok(()) => {
+                            let waiters = match me.targets.lock().await.get_mut(&target_id) {
+                                Some(t) => {
+                                    t.session_id = Some(session_id.clone());
+                                    std::mem::take(&mut t.waiting)
+                                }
+                                None => Vec::new(), // destroyed while preparing
+                            };
+                            for w in waiters {
+                                let _ = w.send(Ok(session_id.clone()));
                             }
-                            None => Vec::new(), // destroyed while preparing
-                        };
-                        for w in waiters {
-                            let _ = w.send(session_id.clone());
                         }
-                    } else {
-                        let _ = me
-                            .conn
-                            .call(
-                                "Target.detachFromTarget",
-                                json!({ "sessionId": session_id }),
-                                None,
-                                Duration::from_secs(5),
-                            )
-                            .await;
-                        // Dropping `waiting` wakes wait_for_session immediately with SessionGone
-                        // instead of exposing an unprepared session or stalling until timeout.
-                        let _ = me
-                            .targets
-                            .lock()
-                            .await
-                            .get_mut(&target_id)
-                            .map(|t| std::mem::take(&mut t.waiting));
+                        Err(e) => {
+                            let _ = me
+                                .conn
+                                .call(
+                                    "Target.detachFromTarget",
+                                    json!({ "sessionId": session_id }),
+                                    None,
+                                    Duration::from_secs(5),
+                                )
+                                .await;
+                            // Wakes wait_for_session immediately with the prepare failure instead
+                            // of exposing an unprepared session or stalling until timeout.
+                            let waiters = me
+                                .targets
+                                .lock()
+                                .await
+                                .get_mut(&target_id)
+                                .map(|t| std::mem::take(&mut t.waiting))
+                                .unwrap_or_default();
+                            let msg = e.to_string();
+                            let mut err = Some(e);
+                            for w in waiters {
+                                let _ = w.send(Err(err
+                                    .take()
+                                    .unwrap_or_else(|| Error::Other(msg.clone()))));
+                            }
+                        }
                     }
                 });
             }
@@ -656,7 +664,8 @@ impl CdpBrowser {
             // No explicit Target.attachToTarget: browser-level auto-attach covers new pages,
             // and a second attach opens a second session that duplicates every event.
             match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(sid)) => Ok(sid),
+                Ok(Ok(Ok(sid))) => Ok(sid),
+                Ok(Ok(Err(e))) => Err(e),
                 Ok(Err(_)) => Err(Error::SessionGone(target_id.into())),
                 Err(_) => Err(Error::timeout("attachToTarget", timeout.as_millis() as u64)),
             }
@@ -942,10 +951,12 @@ async fn prepare_session(
     // Pipelined: Chrome runs a session's commands in order, so one round trip instead of
     // one per command. Sequential calls cost ~1 s per page on a busy browser.
     let methods: Vec<&'static str> = calls.iter().map(|(m, _)| *m).collect();
+    // Busy runners (macOS full Chrome under 300-page churn) can take >5 s to boot a renderer
+    // and process pipelined domain enables + runIfWaitingForDebugger; match navigation_timeout.
     let results = futures_util::future::join_all(
         calls
             .into_iter()
-            .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(5))),
+            .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(30))),
     )
     .await;
     check_prepare_results(session_id, methods.into_iter().zip(results).collect())
@@ -1076,10 +1087,7 @@ mod tests {
             let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
             let body = r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/q"}"#;
             let resp = format!(
-                "HTTP/1.1 200 OK
-Content-Length: {}
-
-{body}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(resp.as_bytes()).await.unwrap();
