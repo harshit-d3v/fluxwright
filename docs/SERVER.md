@@ -160,7 +160,8 @@ failed job returns **409**.
 | `evaluate` | `expression` | JSON value, evaluated in the page, **not** on the host |
 | `title` | None | String |
 | `content` | None | HTML string |
-| `screenshot` | Optional `full_page` (default `false`) | `{ "mime_type": "image/png", "base64": "…" }` |
+| `screenshot` | Optional `full_page` (default `false`), `type` (`"png"` \| `"jpeg"` \| `"webp"`), `quality` (0–100, JPEG/WebP only), `clip` (`{ x, y, width, height }`), `omit_background` | `{ "mime_type": "image/png" \| "image/jpeg" \| "image/webp", "base64": "…" }` |
+| `pdf` | Optional `format`, `width`, `height`, `margin` (`{ top, right, bottom, left }`), `landscape`, `print_background`, `scale` (0.1–2), `page_ranges`, `prefer_css_page_size`, `display_header_footer`, `header_template`, `footer_template`, `outline`, `tagged` | `{ "mime_type": "application/pdf", "base64": "…" }` |
 
 Selectors support the engine's CSS, `text=…`, `role=…`, and chained `>>` syntax. `wait_until`
 accepts `load`, `domcontentloaded`, `networkidle`, or `commit`. Explicit `goto` URLs must use
@@ -180,7 +181,9 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 - `retries`: **0–3**, default **0**. Only retryable engine errors are retried within the deadline.
   Retries replay **the entire job**. Enable them only when its side effects are safe to repeat.
 - Combined JSON step results: **1 MiB** per job. Oversized output fails the job; it is not
-  silently truncated. This bounds retained output, not transient Chrome/CDP memory.
+  silently truncated. Single `screenshot` and `pdf` outputs are capped at **768 KiB** raw
+  (`MAX_SCREENSHOT_BYTES` / `MAX_PDF_BYTES`), because base64 expansion puts them at the 1 MiB
+  retained-results limit. This bounds retained output, not transient Chrome/CDP memory.
 - `--max-jobs`: **1–4096**, default **128**, counting active jobs and retained results together.
   When full, the oldest submitted completed record is evicted first. Active jobs (including
   cancellation still being processed) are never evicted. If no completed record is available,

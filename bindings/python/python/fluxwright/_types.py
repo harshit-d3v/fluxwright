@@ -43,3 +43,10 @@ class _Coordinates(TypedDict):
 
 class Geolocation(_Coordinates, total=False):
     accuracy: float
+
+
+class PdfMargins(TypedDict, total=False):
+    top: str | float
+    right: str | float
+    bottom: str | float
+    left: str | float

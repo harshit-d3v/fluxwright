@@ -61,7 +61,7 @@ Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. T
 | Find | `getByRole(role, { name })`, `getByText`, `getByLabel`, `getByPlaceholder`, `getByTestId`, `locator(css \| "text=…" \| "role=…")`, `frameLocator(iframe)` for same- and cross-origin iframes. Narrow with `nth(i)`, `first()`, `last()`, `filter({ hasText })` and chained getBy… calls |
 | Act | `click()` and `fill()` wait until the element is visible, enabled, stable and not covered; `waitFor()`, `waitForSelector()` |
 | Read | `title()`, `content()`, `textContent()`, `evaluate(fn, arg)` or `evaluate("expression")`, `locator.evaluate((el, arg) => …)`, `locator.boundingBox()` |
-| Capture | `screenshot({ fullPage, path })`, `locator.screenshot({ path })` (also inside scrolling containers and iframes), `setViewportSize({ width, height })` |
+| Capture | `screenshot({ fullPage, path, type, quality, clip, omitBackground })` in PNG or JPEG, `locator.screenshot(...)` (also inside scrolling containers and iframes), `pdf({ format, margin, printBackground, ... })` with Playwright's options (headless), `setViewportSize({ width, height })` |
 | Errors | `consoleMessages()` and `pageErrors()` from the page, its popups and iframes, so a job can fail on JavaScript errors; `page.on('console' \| 'pageerror', handler)` as they happen |
 | Requests | `page.route(url, handler)` to fulfill, change or abort requests (`route.fulfill({ json })`, `route.continue({ headers })`, `route.abort()`, `route.fallback()`), with globs, RegExps or functions |
 | Downloads | `page.waitForDownload()` then `download.saveAs(path)`; each job's files stay in its own folder until the page closes |

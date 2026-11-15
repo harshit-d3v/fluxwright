@@ -476,12 +476,16 @@ impl Locator {
         self.then(fluxwright::Selector::test_id(&test_id))
     }
 
-    /// PNG of the element, once it is visible and still.
+    /// PNG or JPEG of the element, once it is visible and still.
     #[napi]
-    pub async fn screenshot(&self) -> Result<Buffer> {
+    pub async fn screenshot(&self, options: Option<ScreenshotOptions>) -> Result<Buffer> {
         let sel = self.selector.clone();
-        let png = with_page(self.lease.clone(), move |p| Box::pin(async move { p.element_screenshot(&sel).await })).await?;
-        Ok(png.into())
+        let options = shot_options(options)?;
+        let image = with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.element_screenshot_with(&sel, &options).await })
+        })
+        .await?;
+        Ok(image.into())
     }
 
     /// The element's box relative to the viewport, without scrolling; null when it is not visible.
@@ -821,7 +825,93 @@ pub struct GotoOptions {
 
 #[napi(object)]
 pub struct ScreenshotOptions {
+    /// The whole scrollable page (page screenshots only).
     pub full_page: Option<bool>,
+    /// Default "png".
+    #[napi(js_name = "type", ts_type = "'png' | 'jpeg'")]
+    pub kind: Option<String>,
+    /// 0–100, JPEG only.
+    pub quality: Option<u32>,
+    /// Relative to the viewport, or to the page with `fullPage` (page screenshots only).
+    pub clip: Option<BoundingBox>,
+    /// A transparent background instead of the default white one (PNG).
+    pub omit_background: Option<bool>,
+}
+
+/// Lengths: a number of pixels, or a string with `px`, `in`, `cm` or `mm`.
+#[napi(object)]
+pub struct PdfMargin {
+    pub top: Option<String>,
+    pub right: Option<String>,
+    pub bottom: Option<String>,
+    pub left: Option<String>,
+}
+
+#[napi(object)]
+pub struct PdfOptions {
+    /// Letter (default), Legal, Tabloid, Ledger, A0–A6. `width` and `height` win over it.
+    pub format: Option<String>,
+    pub width: Option<String>,
+    pub height: Option<String>,
+    pub margin: Option<PdfMargin>,
+    pub landscape: Option<bool>,
+    pub print_background: Option<bool>,
+    /// 0.1–2, default 1.
+    pub scale: Option<f64>,
+    /// Such as "1-5, 8". All pages when unset.
+    pub page_ranges: Option<String>,
+    #[napi(js_name = "preferCSSPageSize")]
+    pub prefer_css_page_size: Option<bool>,
+    pub display_header_footer: Option<bool>,
+    pub header_template: Option<String>,
+    pub footer_template: Option<String>,
+    pub outline: Option<bool>,
+    pub tagged: Option<bool>,
+}
+
+fn shot_options(options: Option<ScreenshotOptions>) -> Result<fluxwright::ScreenshotOptions> {
+    let Some(o) = options else {
+        return Ok(Default::default());
+    };
+    let format = match o.kind.as_deref() {
+        None | Some("png") => fluxwright::ImageFormat::Png,
+        Some("jpeg") => fluxwright::ImageFormat::Jpeg,
+        Some(t) => return Err(Error::from_reason(format!("screenshot: type {t:?} is not png or jpeg"))),
+    };
+    if format == fluxwright::ImageFormat::Png && o.quality.is_some() {
+        return Err(Error::from_reason("screenshot: quality is for JPEG only"));
+    }
+    Ok(fluxwright::ScreenshotOptions {
+        full_page: o.full_page.unwrap_or(false),
+        format,
+        // Over 255 becomes 255, which the engine rejects as over 100.
+        quality: o.quality.map(|q| q.min(255) as u8),
+        clip: o.clip.map(|c| fluxwright::Clip { x: c.x, y: c.y, width: c.width, height: c.height }),
+        omit_background: o.omit_background.unwrap_or(false),
+    })
+}
+
+fn pdf_options(options: Option<PdfOptions>) -> fluxwright::PdfOptions {
+    let Some(o) = options else {
+        return Default::default();
+    };
+    let m = o.margin.map(|m| fluxwright::PdfMargin { top: m.top, right: m.right, bottom: m.bottom, left: m.left });
+    fluxwright::PdfOptions {
+        format: o.format,
+        width: o.width,
+        height: o.height,
+        margin: m.unwrap_or_default(),
+        landscape: o.landscape.unwrap_or(false),
+        print_background: o.print_background.unwrap_or(false),
+        scale: o.scale,
+        page_ranges: o.page_ranges,
+        prefer_css_page_size: o.prefer_css_page_size.unwrap_or(false),
+        display_header_footer: o.display_header_footer.unwrap_or(false),
+        header_template: o.header_template,
+        footer_template: o.footer_template,
+        outline: o.outline.unwrap_or(false),
+        tagged: o.tagged.unwrap_or(false),
+    }
 }
 
 #[napi(object)]
@@ -958,12 +1048,17 @@ impl Page {
 
     #[napi]
     pub async fn screenshot(&self, options: Option<ScreenshotOptions>) -> Result<Buffer> {
-        let full_page = options.and_then(|o| o.full_page).unwrap_or(false);
-        let png = with_page(self.lease.clone(), move |p| {
-            Box::pin(async move { if full_page { p.screenshot_full_page().await } else { p.screenshot().await } })
-        })
-        .await?;
-        Ok(png.into())
+        let options = shot_options(options)?;
+        let image = with_page(self.lease.clone(), move |p| Box::pin(async move { p.screenshot_with(&options).await })).await?;
+        Ok(image.into())
+    }
+
+    /// The page printed to PDF (headless only).
+    #[napi]
+    pub async fn pdf(&self, options: Option<PdfOptions>) -> Result<Buffer> {
+        let options = pdf_options(options);
+        let pdf = with_page(self.lease.clone(), move |p| Box::pin(async move { p.pdf(&options).await })).await?;
+        Ok(pdf.into())
     }
 
     #[napi]

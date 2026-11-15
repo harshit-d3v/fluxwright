@@ -69,8 +69,8 @@ export declare class Locator {
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByTestId(testId: string): Locator
-  /** PNG of the element, once it is visible and still. */
-  screenshot(): Promise<Buffer>
+  /** PNG or JPEG of the element, once it is visible and still. */
+  screenshot(options?: ScreenshotOptions | undefined | null): Promise<Buffer>
   /** The element's box relative to the viewport, without scrolling; null when it is not visible. */
   boundingBox(): Promise<BoundingBox | null>
   /**
@@ -107,6 +107,8 @@ export declare class Page {
   fill(selector: string, value: string): Promise<void>
   evaluate(expression: string): Promise<any>
   screenshot(options?: ScreenshotOptions | undefined | null): Promise<Buffer>
+  /** The page printed to PDF (headless only). */
+  pdf(options?: PdfOptions | undefined | null): Promise<Buffer>
   setViewportSize(size: ViewportSize): Promise<void>
   waitForSelector(selector: string): Promise<void>
   /** CSS, `text=`, or `role=` selector. */
@@ -336,6 +338,34 @@ export interface PageErrorInfo {
   stack: string
 }
 
+/** Lengths: a number of pixels, or a string with `px`, `in`, `cm` or `mm`. */
+export interface PdfMargin {
+  top?: string
+  right?: string
+  bottom?: string
+  left?: string
+}
+
+export interface PdfOptions {
+  /** Letter (default), Legal, Tabloid, Ledger, A0–A6. `width` and `height` win over it. */
+  format?: string
+  width?: string
+  height?: string
+  margin?: PdfMargin
+  landscape?: boolean
+  printBackground?: boolean
+  /** 0.1–2, default 1. */
+  scale?: number
+  /** Such as "1-5, 8". All pages when unset. */
+  pageRanges?: string
+  preferCSSPageSize?: boolean
+  displayHeaderFooter?: boolean
+  headerTemplate?: string
+  footerTemplate?: string
+  outline?: boolean
+  tagged?: boolean
+}
+
 export interface ProxyOptions {
   /** `http://host:port`, `socks5://host:port`, ... */
   server: string
@@ -346,7 +376,16 @@ export interface ProxyOptions {
 }
 
 export interface ScreenshotOptions {
+  /** The whole scrollable page (page screenshots only). */
   fullPage?: boolean
+  /** Default "png". */
+  type?: 'png' | 'jpeg'
+  /** 0–100, JPEG only. */
+  quality?: number
+  /** Relative to the viewport, or to the page with `fullPage` (page screenshots only). */
+  clip?: BoundingBox
+  /** A transparent background instead of the default white one (PNG). */
+  omitBackground?: boolean
 }
 
 export interface StorageItem {

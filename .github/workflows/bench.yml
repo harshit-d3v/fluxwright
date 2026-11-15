@@ -51,9 +51,9 @@ jobs:
           {
             echo "### Benchmarks: $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB, $(date -u +%F)"
             echo
-            echo "| tool | scenario | jobs | jobs/s | p95 ms | failures |"
-            echo "|---|---|---|---|---|---|"
-            node -e "for (const r of require('./bench-results/latest.json')) console.log('| ' + [r.tool, r.scenario, r.jobs, r.jobs_per_second.toFixed(1), r.p95_latency_ms, (r.failure_rate * 100).toFixed(1) + '%'].join(' | ') + ' |')"
+            echo "| tool | scenario | jobs | jobs/s | peak MB | p95 ms | failures |"
+            echo "|---|---|---|---|---|---|---|"
+            node -e "for (const r of require('./bench-results/latest.json')) console.log('| ' + [r.tool, r.scenario, r.jobs, r.jobs_per_second.toFixed(1), r.peak_memory_mb, r.p95_latency_ms, (r.failure_rate * 100).toFixed(1) + '%'].join(' | ') + ' |')"
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:

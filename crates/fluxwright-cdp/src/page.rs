@@ -15,6 +15,7 @@ use crate::log::{DownloadResult, PageLog};
 
 /// Finished downloads, oldest first.
 pub type DownloadQueue = tokio::sync::mpsc::UnboundedReceiver<DownloadResult>;
+use crate::render::ScreenshotOptions;
 use crate::route::InterceptedRequest;
 use crate::error::{Error, Result};
 
@@ -248,6 +249,7 @@ pub struct CdpPage {
     pub browser: Arc<Connection>,
     pub browser_pid: u32,
     pub browser_id: BrowserId,
+    pub headless: bool,
     pub context_id: ContextId,
     pub target_id: TargetId,
     pub session_id: SessionId,
@@ -604,26 +606,32 @@ impl CdpPage {
         Ok(())
     }
 
-    pub async fn screenshot(&self, full_page: bool, timeout: Duration) -> Result<Vec<u8>> {
-        let mut params = json!({ "format": "png" });
-        if full_page {
+    pub async fn screenshot(&self, options: &ScreenshotOptions, timeout: Duration) -> Result<Vec<u8>> {
+        let mut params = json!({});
+        if options.full_page || options.clip.is_some() {
             let m = self.call("Page.getLayoutMetrics", json!({}), timeout).await?;
-            let size = if m["cssContentSize"].is_object() { &m["cssContentSize"] } else { &m["contentSize"] };
             params["captureBeyondViewport"] = json!(true);
-            params["clip"] = json!({
-                "x": 0, "y": 0, "width": size["width"], "height": size["height"], "scale": 1
-            });
+            params["clip"] = match options.clip {
+                Some(c) => {
+                    if !(c.width > 0.0 && c.height > 0.0) {
+                        return Err(Error::Other("screenshot: the clip is empty".into()));
+                    }
+                    // Without full_page the clip is relative to the viewport: add the scroll.
+                    let (dx, dy) = if options.full_page {
+                        (0.0, 0.0)
+                    } else {
+                        let vp = if m["cssLayoutViewport"].is_object() { &m["cssLayoutViewport"] } else { &m["layoutViewport"] };
+                        (vp["pageX"].as_f64().unwrap_or(0.0), vp["pageY"].as_f64().unwrap_or(0.0))
+                    };
+                    json!({ "x": c.x + dx, "y": c.y + dy, "width": c.width, "height": c.height, "scale": 1 })
+                }
+                None => {
+                    let size = if m["cssContentSize"].is_object() { &m["cssContentSize"] } else { &m["contentSize"] };
+                    json!({ "x": 0, "y": 0, "width": size["width"], "height": size["height"], "scale": 1 })
+                }
+            };
         }
-        let res = self
-            .call("Page.captureScreenshot", params, timeout)
-            .await?;
-        let b64 = res["data"]
-            .as_str()
-            .ok_or_else(|| Error::Other("screenshot: no data".into()))?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| Error::Other(e.to_string()))
+        self.capture(params, options, timeout).await
     }
 
     /// The first match's box relative to the top-level viewport, without scrolling; `None`
@@ -748,32 +756,26 @@ impl CdpPage {
 
     /// PNG of the first match, once it is visible and still. Elements in iframes, below the
     /// fold, or taller than the viewport work too.
-    pub async fn element_screenshot(&self, sel: &Selector, timeout: Duration) -> Result<Vec<u8>> {
+    pub async fn element_screenshot(&self, sel: &Selector, options: &ScreenshotOptions, timeout: Duration) -> Result<Vec<u8>> {
+        if options.full_page || options.clip.is_some() {
+            return Err(Error::Other("element screenshot: full_page and clip are for page screenshots".into()));
+        }
         let (b, _) = self.wait_element(sel, Wait::Box, timeout).await?;
         // The box is in viewport coordinates; the clip is in document coordinates.
         let m = self.call("Page.getLayoutMetrics", json!({}), timeout).await?;
         let vp = if m["cssLayoutViewport"].is_object() { &m["cssLayoutViewport"] } else { &m["layoutViewport"] };
         let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(0.0);
-        let res = self
-            .call(
-                "Page.captureScreenshot",
-                json!({
-                    "format": "png",
-                    "captureBeyondViewport": true,
-                    "clip": {
-                        "x": f(&b, "x") + f(vp, "pageX"),
-                        "y": f(&b, "y") + f(vp, "pageY"),
-                        "width": f(&b, "width"),
-                        "height": f(&b, "height"),
-                        "scale": 1
-                    }
-                }),
-                timeout,
-            )
-            .await?;
-        let b64 = res["data"].as_str().ok_or_else(|| Error::Other("screenshot: no data".into()))?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| Error::Other(e.to_string()))
+        let params = json!({
+            "captureBeyondViewport": true,
+            "clip": {
+                "x": f(&b, "x") + f(vp, "pageX"),
+                "y": f(&b, "y") + f(vp, "pageY"),
+                "width": f(&b, "width"),
+                "height": f(&b, "height"),
+                "scale": 1
+            }
+        });
+        self.capture(params, options, timeout).await
     }
 
     /// Waits until the element is visible (Playwright's default `waitForSelector` state):

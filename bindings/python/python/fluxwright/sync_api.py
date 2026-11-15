@@ -23,14 +23,14 @@ import threading
 from contextlib import contextmanager, suppress
 from os import PathLike
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 from collections.abc import Awaitable, Callable, Iterator
 
 from . import _native
 from . import async_api as _a
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage
-from ._types import FloatRect, Geolocation, ProxySettings, StorageState, URLMatch, ViewportSize
+from ._types import FloatRect, Geolocation, PdfMargins, ProxySettings, StorageState, URLMatch, ViewportSize
 
 __all__ = [
     "Browser",
@@ -46,6 +46,7 @@ __all__ = [
     "Geolocation",
     "Locator",
     "Page",
+    "PdfMargins",
     "Playwright",
     "PlaywrightContextManager",
     "ProxySettings",
@@ -183,9 +184,16 @@ class Locator(_Finders):
         """Relative to the viewport, without scrolling; ``None`` when the element is not visible."""
         return _run(self._impl.bounding_box)
 
-    def screenshot(self, *, path: str | PathLike[str] | None = None) -> bytes:
-        """PNG of the element, once it is visible and still; with ``path``, also written there."""
-        return _run(self._impl.screenshot, path=path)
+    def screenshot(
+        self,
+        *,
+        path: str | PathLike[str] | None = None,
+        type: Literal["png", "jpeg"] | None = None,
+        quality: int | None = None,
+        omit_background: bool | None = None,
+    ) -> bytes:
+        """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""
+        return _run(self._impl.screenshot, path=path, type=type, quality=quality, omit_background=omit_background)
 
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         """Calls the JavaScript function ``expression`` with the element and ``arg``."""
@@ -471,9 +479,65 @@ class Page(_Finders):
         (``"(x) => x * 2"``) is called with ``arg``; anything else is evaluated as is."""
         return _run(self._impl.evaluate, expression, arg)
 
-    def screenshot(self, *, path: str | PathLike[str] | None = None, full_page: bool | None = None) -> bytes:
-        """PNG; with ``path``, also written there."""
-        return _run(self._impl.screenshot, path=path, full_page=full_page)
+    def screenshot(
+        self,
+        *,
+        path: str | PathLike[str] | None = None,
+        full_page: bool | None = None,
+        type: Literal["png", "jpeg"] | None = None,
+        quality: int | None = None,
+        clip: FloatRect | None = None,
+        omit_background: bool | None = None,
+    ) -> bytes:
+        """PNG or JPEG; with ``path``, also written there (extension picks type if omitted)."""
+        return _run(
+            self._impl.screenshot,
+            path=path,
+            full_page=full_page,
+            type=type,
+            quality=quality,
+            clip=clip,
+            omit_background=omit_background,
+        )
+
+    def pdf(
+        self,
+        *,
+        path: str | PathLike[str] | None = None,
+        format: str | None = None,
+        width: str | float | None = None,
+        height: str | float | None = None,
+        margin: PdfMargins | None = None,
+        landscape: bool | None = None,
+        print_background: bool | None = None,
+        scale: float | None = None,
+        page_ranges: str | None = None,
+        prefer_css_page_size: bool | None = None,
+        display_header_footer: bool | None = None,
+        header_template: str | None = None,
+        footer_template: str | None = None,
+        outline: bool | None = None,
+        tagged: bool | None = None,
+    ) -> bytes:
+        """The page printed to PDF (headless only); with ``path``, also written there."""
+        return _run(
+            self._impl.pdf,
+            path=path,
+            format=format,
+            width=width,
+            height=height,
+            margin=margin,
+            landscape=landscape,
+            print_background=print_background,
+            scale=scale,
+            page_ranges=page_ranges,
+            prefer_css_page_size=prefer_css_page_size,
+            display_header_footer=display_header_footer,
+            header_template=header_template,
+            footer_template=footer_template,
+            outline=outline,
+            tagged=tagged,
+        )
 
     def set_viewport_size(self, viewport_size: ViewportSize) -> None:
         _run(self._impl.set_viewport_size, viewport_size)

@@ -93,7 +93,10 @@ async fn executes_steps_returns_results_and_isolates_jobs() {
         { "action": "click", "selector": "#go" },
         { "action": "evaluate", "expression": "document.querySelector('#name').value" },
         { "action": "title" },
-        { "action": "screenshot" }
+        { "action": "screenshot" },
+        { "action": "screenshot", "type": "jpeg", "quality": 60 },
+        { "action": "screenshot", "type": "webp", "quality": 80 },
+        { "action": "pdf", "format": "A4", "print_background": true }
     ] }),
     )
     .await;
@@ -105,6 +108,22 @@ async fn executes_steps_returns_results_and_isolates_jobs() {
     assert_eq!(results[4], "forms");
     assert_eq!(results[5]["mime_type"], "image/png");
     assert!(results[5]["base64"].as_str().unwrap().starts_with("iVBOR"));
+    use base64::Engine;
+    assert_eq!(results[6]["mime_type"], "image/jpeg");
+    let jpg = base64::engine::general_purpose::STANDARD
+        .decode(results[6]["base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(jpg[..3], [0xFF, 0xD8, 0xFF]);
+    assert_eq!(results[7]["mime_type"], "image/webp");
+    let webp = base64::engine::general_purpose::STANDARD
+        .decode(results[7]["base64"].as_str().unwrap())
+        .unwrap();
+    assert!(webp.len() >= 12 && &webp[..4] == b"RIFF" && &webp[8..12] == b"WEBP");
+    assert_eq!(results[8]["mime_type"], "application/pdf");
+    let pdf = base64::engine::general_purpose::STANDARD
+        .decode(results[8]["base64"].as_str().unwrap())
+        .unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
 
     let set_cookie = submit(
         &server,
