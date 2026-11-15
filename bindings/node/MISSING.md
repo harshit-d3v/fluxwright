@@ -4,7 +4,7 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 
 ## Planned (see [ROADMAP.md](https://github.com/harshit-d3v/fluxwright/blob/main/ROADMAP.md))
 
-- Mobile and touch emulation (`isMobile`, `hasTouch`), `emulateMedia` after the page opens
+- `emulateMedia` after the page opens
 - `page.on('popup')`, which needs pages beyond the one a context holds
 - `getByAltText`, `getByTitle`, `filter({ has })`, strict mode
 - `connectOverCDP` in Node bindings (supported in Rust engine and HTTP server via `--cdp-endpoint`)
@@ -19,7 +19,7 @@ napi would silently ignore an option the binding does not implement, so it throw
 - Click and fill options (`button`, `clickCount`, `modifiers`, `position`, `force`, ...)
 - Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and WebP (see `docs/DECISIONS.md`)
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)
-- `newPage` / `newContext` options the README does not list (`extraHTTPHeaders`, `javaScriptEnabled`, `ignoreHTTPSErrors`, `baseURL`, `httpCredentials`, `offline`, ...), and `launch` options other than its five (`args`; for `proxy`, give `newPage` one)
+- `newPage` / `newContext` options the README does not list (`baseURL`, `httpCredentials`, `bypassCSP`, `recordVideo`, ...), and `launch` options other than its five (`args`; for `proxy`, give `newPage` one)
 - `page.locator(selector, options)` (use `.filter({ hasText })`), `filter` options other than `hasText`, `getByRole` options other than `name` and `exact`
 - `page.route(url, handler, { times })`, `route.fallback(overrides)`, `route.fulfill({ response })`, `context.cookies(urls)`, `page.close({ runBeforeUnload })`
 

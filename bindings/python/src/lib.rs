@@ -511,7 +511,8 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (*, proxy=None, user_agent=None, locale=None, timezone_id=None, geolocation=None,
                         permissions=None, viewport=None, device_scale_factor=None, color_scheme=None,
-                        storage_state=None))]
+                        is_mobile=None, has_touch=None, extra_http_headers=None, ignore_https_errors=None,
+                        java_script_enabled=None, offline=None, storage_state=None))]
     fn new_page<'py>(
         &self,
         py: Python<'py>,
@@ -524,6 +525,12 @@ impl Engine {
         viewport: Option<Bound<'py, PyAny>>,
         device_scale_factor: Option<f64>,
         color_scheme: Option<String>,
+        is_mobile: Option<bool>,
+        has_touch: Option<bool>,
+        extra_http_headers: Option<HashMap<String, String>>,
+        ignore_https_errors: Option<bool>,
+        java_script_enabled: Option<bool>,
+        offline: Option<bool>,
         storage_state: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let color_scheme = match color_scheme {
@@ -558,6 +565,12 @@ impl Engine {
                 viewport: viewport.map(|v| (v.width, v.height)),
                 device_scale_factor,
                 color_scheme,
+                is_mobile: is_mobile.unwrap_or(false),
+                has_touch: has_touch.unwrap_or(false),
+                extra_http_headers: extra_http_headers.unwrap_or_default().into_iter().collect(),
+                ignore_https_errors: ignore_https_errors.unwrap_or(false),
+                javascript_enabled: java_script_enabled,
+                offline: offline.unwrap_or(false),
             },
             permissions: permissions.unwrap_or_default(),
             storage_state: storage_state.map(|s| storage(&s)).transpose()?,
