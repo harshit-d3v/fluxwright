@@ -72,7 +72,7 @@ async fn serve_guarded(mut requests: UnboundedReceiver<InterceptedRequest>) {
 }
 
 /// The host of a web request URL, lower-cased, without port, userinfo, path or query.
-fn url_host(url: &str) -> Option<String> {
+pub(crate) fn url_host(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
     let authority = rest.split(['/', '?', '#', '\\']).next()?;
     let host = authority.rsplit('@').next()?;

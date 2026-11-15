@@ -38,6 +38,12 @@ enum Cmd {
         /// Connect to an external browser over CDP (e.g. ws://... or http://...) instead of launching local Chrome.
         #[arg(long)]
         cdp_endpoint: Option<String>,
+        /// Pages that may be on one host at once, across the fleet.
+        #[arg(long)]
+        max_per_host: Option<NonZeroUsize>,
+        /// Milliseconds between the starts of two navigations to one host, at least.
+        #[arg(long)]
+        min_host_delay_ms: Option<NonZeroU64>,
     },
     Start {
         #[arg(long, default_value_t = 4)]
@@ -86,6 +92,8 @@ async fn main() -> Result<()> {
             max_jobs,
             memory_ceiling_mb,
             cdp_endpoint,
+            max_per_host,
+            min_host_delay_ms,
         } => {
             http_daemon(
                 listen,
@@ -94,6 +102,8 @@ async fn main() -> Result<()> {
                 max_jobs.get(),
                 memory_ceiling_mb,
                 cdp_endpoint,
+                max_per_host,
+                min_host_delay_ms,
             )
             .await
         }
@@ -128,6 +138,8 @@ async fn http_daemon(
     max_jobs: usize,
     memory_ceiling_mb: Option<NonZeroU64>,
     cdp_endpoint: Option<String>,
+    max_per_host: Option<NonZeroUsize>,
+    min_host_delay_ms: Option<NonZeroU64>,
 ) -> Result<()> {
     let token = std::env::var("FLUXWRIGHT_SERVER_TOKEN").map_err(|_| {
         anyhow::anyhow!(
@@ -154,6 +166,12 @@ async fn http_daemon(
     }
     if let Some(ceiling) = memory_ceiling_mb {
         builder = builder.memory_ceiling_mb(ceiling.get());
+    }
+    if let Some(n) = max_per_host {
+        builder = builder.max_concurrency_per_host(n.get());
+    }
+    if let Some(ms) = min_host_delay_ms {
+        builder = builder.min_delay_per_host(Duration::from_millis(ms.get()));
     }
     let engine = builder.build().await?;
     let server = HttpServer::new(engine, config)?;
@@ -404,7 +422,10 @@ mod tests {
                 max_jobs,
                 memory_ceiling_mb,
                 cdp_endpoint,
+                max_per_host,
+                min_host_delay_ms,
             } => {
+                assert!(max_per_host.is_none() && min_host_delay_ms.is_none());
                 assert_eq!(listen, "0.0.0.0:7331".parse::<SocketAddr>().unwrap());
                 assert!(max_browsers.is_none());
                 assert_eq!(max_contexts.get(), 8);
