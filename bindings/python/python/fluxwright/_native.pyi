@@ -17,6 +17,8 @@ class Engine:
         headless: bool | None = None,
         queue_timeout: float | None = None,
         memory_ceiling_mb: int | None = None,
+        max_concurrency_per_host: int | None = None,
+        min_delay_per_host: float | None = None,
     ) -> Awaitable[Engine]: ...
     def new_page(
         self,

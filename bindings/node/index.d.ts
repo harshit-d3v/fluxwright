@@ -270,6 +270,13 @@ export interface LaunchOptions {
    * more. Default: 75% of the memory free at launch.
    */
   memoryCeilingMb?: number
+  /**
+   * Pages that may be on one host at once, across the fleet: a `goto` to a full host waits.
+   * 0 or unset: no limit.
+   */
+  maxConcurrencyPerHost?: number
+  /** Milliseconds between the starts of two `goto`s to one host, at least. 0 or unset: none. */
+  minDelayPerHost?: number
 }
 
 /** One console message or uncaught error, for `page.on`. */

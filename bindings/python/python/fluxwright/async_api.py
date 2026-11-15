@@ -869,6 +869,8 @@ class BrowserType:
         max_browsers: int | None = None,
         queue_timeout: float | None = None,
         memory_ceiling_mb: int | None = None,
+        max_concurrency_per_host: int | None = None,
+        min_delay_per_host: float | None = None,
     ) -> Browser:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
         one per 4 CPUs, 8 pages each), headless unless ``headless=False``. New pages wait while
@@ -877,13 +879,18 @@ class BrowserType:
         Playwright does; ``executable_path`` or ``FLUXWRIGHT_CHROMIUM`` picks the binary. When
         every slot is busy, ``new_page`` waits its turn however long the queue is; with
         ``queue_timeout`` (milliseconds) it raises ``TimeoutError`` after that long instead,
-        counting a browser start when one is needed."""
+        counting a browser start when one is needed. For polite crawling,
+        ``max_concurrency_per_host`` caps the pages on one host at once across the fleet and
+        ``min_delay_per_host`` (milliseconds) spaces the ``goto`` calls to it: a ``goto`` waits
+        its turn."""
         engine = await _native.Engine.launch(
             max_browsers=max_browsers,
             executable_path=executable_path,
             headless=headless,
             queue_timeout=queue_timeout,
             memory_ceiling_mb=memory_ceiling_mb,
+            max_concurrency_per_host=max_concurrency_per_host,
+            min_delay_per_host=min_delay_per_host,
         )
         browser = Browser(engine)
         if self._launched is not None:

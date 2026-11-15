@@ -77,6 +77,7 @@ The full Node API is in [bindings/node/README.md](bindings/node/README.md) and t
 - **A queue with priorities:** when every slot is busy, jobs wait by priority, or fail fast if you would rather shed load.
 - **A memory ceiling:** no new work starts while the fleet's real memory footprint is over budget (PSS on Linux, private bytes on Windows).
 - **Recycling:** a browser restarts after a number of jobs, an age or a memory threshold, and finishes its running jobs first.
+- **Polite crawling:** a cap on the pages on one host at once and a minimum delay between navigations to it, kept across the whole fleet (`maxConcurrencyPerHost`, `minDelayPerHost`).
 - **Crash recovery:** a dead browser fails its jobs at once and they retry on a healthy one. Chrome is tied to the engine process, so it never outlives it.
 - **For AI agents:** an MCP server lets Claude, Codex or Cursor drive the fleet.
 

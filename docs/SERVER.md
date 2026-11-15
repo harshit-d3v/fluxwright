@@ -44,6 +44,11 @@ cargo run --release -p fluxwright-cli -- serve \
 
 A remote browser gets one connection, so set concurrency with `--max-contexts`. More connections to the same browser (`--max-browsers`) each attach to every page, and each answers dialogs on pages it does not own. Closing or recycling a connection never closes the remote browser; it only disposes of the contexts that connection created.
 
+`--max-per-host <n>` caps the pages on one host at once across the fleet, and
+`--min-host-delay-ms <ms>` spaces the navigations to one host: a `goto` step waits its turn, and
+the wait counts toward the job's deadline. Only `goto` steps are counted, not clicks or redirects
+that move a page to another host.
+
 Without `--max-browsers` or `--memory-ceiling-mb`, the engine sizes itself to the machine.
 `--max-contexts` defaults to 8 per browser. Ctrl+C (and SIGTERM on Unix) stops admission,
 cancels outstanding jobs, and shuts down Chrome, allowing up to 10 seconds for lease cleanup.

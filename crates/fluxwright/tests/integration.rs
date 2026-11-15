@@ -207,6 +207,42 @@ async fn element_screenshots() {
     assert_eq!(page.evaluate(&check(yellow)).await.unwrap(), json!("40|20|255 255 0|255 255 0"));
 }
 
+/// Per-host limits reach `goto`: with one page per host, a second page waits until the first
+/// leaves, and navigations to a host start the configured delay apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_host_limits_gate_goto() {
+    let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .max_concurrency_per_host(1)
+        .min_delay_per_host(Duration::from_millis(300))
+        .build()
+        .await
+        .unwrap();
+    let first = eng.acquire().await.unwrap();
+    let second = eng.acquire().await.unwrap();
+    let start = std::time::Instant::now();
+    first.goto(&srv.base_url).await.unwrap();
+    first.goto(&srv.base_url).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(300), "{:?}", start.elapsed());
+
+    let url = srv.base_url.clone();
+    let waiting = tokio::spawn(async move {
+        second.goto(&url).await.unwrap();
+        second
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!waiting.is_finished(), "a second page got onto a host limited to one");
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(20), waiting)
+        .await
+        .expect("the freed place was never taken")
+        .unwrap();
+    drop(second);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// boundingBox needs no scrolling and is relative to the top-level viewport; evaluate runs in
 /// the page's own world, so page globals are there.
 #[tokio::test(flavor = "multi_thread")]

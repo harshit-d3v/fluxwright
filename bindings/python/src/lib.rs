@@ -347,7 +347,9 @@ struct Engine {
 #[pymethods]
 impl Engine {
     #[staticmethod]
-    #[pyo3(signature = (*, max_browsers=None, executable_path=None, headless=None, queue_timeout=None, memory_ceiling_mb=None))]
+    #[pyo3(signature = (*, max_browsers=None, executable_path=None, headless=None, queue_timeout=None,
+        memory_ceiling_mb=None, max_concurrency_per_host=None, min_delay_per_host=None))]
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         py: Python<'_>,
         max_browsers: Option<usize>,
@@ -355,6 +357,8 @@ impl Engine {
         headless: Option<bool>,
         queue_timeout: Option<f64>,
         memory_ceiling_mb: Option<u64>,
+        max_concurrency_per_host: Option<usize>,
+        min_delay_per_host: Option<f64>,
     ) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
             // new_page waits its turn however long the queue is, so starting every job at once
@@ -369,6 +373,13 @@ impl Engine {
             }
             if let Some(mb) = memory_ceiling_mb {
                 b = b.memory_ceiling_mb(mb);
+            }
+            if let Some(n) = max_concurrency_per_host {
+                b = b.max_concurrency_per_host(n);
+            }
+            // Milliseconds, as Playwright's timeouts; a negative or NaN delay is no delay.
+            if let Some(ms) = min_delay_per_host.filter(|ms| *ms > 0.0 && ms.is_finite()) {
+                b = b.min_delay_per_host(Duration::from_secs_f64(ms / 1000.0));
             }
             if let Some(exe) = executable_path {
                 b = b.chrome(exe);

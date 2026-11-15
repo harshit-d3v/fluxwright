@@ -34,7 +34,15 @@ const EXACT = { exact: true }
 const VISIBLE = { state: ['visible'] }
 const TIMEOUT = { timeout: true }
 const SHOT = { path: true, type: ['png'] }
-const LAUNCH = { maxBrowsers: true, executablePath: true, headless: true, queueTimeout: true, memoryCeilingMb: true }
+const LAUNCH = {
+  maxBrowsers: true,
+  executablePath: true,
+  headless: true,
+  queueTimeout: true,
+  memoryCeilingMb: true,
+  maxConcurrencyPerHost: true,
+  minDelayPerHost: true,
+}
 const PAGE = {
   proxy: true,
   userAgent: true,
