@@ -62,14 +62,14 @@ await browser.close();
 | `page.waitForDownload({ timeout? })` | The next download the page finished (ones that finished earlier queue up, so call it before or after the click): `url()`, `suggestedFilename()`, `path()`, `saveAs(path)`. Files are deleted when the page closes. `timeout: 0` waits as long as it takes |
 | `page.consoleMessages()` / `page.pageErrors()` | What the page, its popups and iframes logged (`{ type, text }`), and the exceptions nothing caught (`Error` objects), the last 1000 of each. Fail a job with `assert.deepEqual(await page.pageErrors(), [])` |
 | `page.setViewportSize({ width, height })` | CSS-pixel viewport for this page |
-| `page.waitForSelector(selector)` | Waits until visible (Playwright's default state) |
+| `page.waitForSelector(selector, { state?, timeout? })` | Waits until `state`: `visible` (the default), `attached`, `hidden` or `detached`, as in Playwright |
 | `page.close()` / `browser.close()` | Dispose context / shut down. `page.close()` does not wait for calls still running on the page: they reject with `page closed` |
 
 Close pages when a job is done. A page you forget is cleaned up when Node garbage-collects it, which may be much later, also when its listeners and routes use it.
 
 `goto`, `click`, `fill`, `waitForSelector`, `screenshot` and the locator actions take Playwright's per-call `timeout` (ms; 0 for none), and `page.setDefaultTimeout(ms)` / `page.setDefaultNavigationTimeout(ms)` change the page's defaults (the engine's are 10 s for actions and 30 s for navigation).
 
-An option Fluxwright does not implement (`waitForSelector` states other than `visible`, screenshot `mask`/`animations`/`caret`, click options such as `button`, ...) throws a TypeError rather than being ignored. See `MISSING.md` for these and the Playwright features that are planned or out of scope.
+An option Fluxwright does not implement (screenshot `mask`/`animations`/`caret`, click options such as `button`, ...) throws a TypeError rather than being ignored. See `MISSING.md` for these and the Playwright features that are planned or out of scope.
 
 ## Develop
 

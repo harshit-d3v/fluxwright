@@ -77,6 +77,16 @@ where
     with_page_in(lease, None, f).await
 }
 
+/// Playwright's `state`: attached, detached, visible (the default) or hidden.
+fn wait_state(state: Option<String>) -> PyResult<fluxwright::WaitState> {
+    match state {
+        Some(s) => s
+            .parse::<fluxwright::WaitState>()
+            .map_err(|e| PyValueError::new_err(e.to_string())),
+        None => Ok(Default::default()),
+    }
+}
+
 /// Playwright's `timeout` in milliseconds: 0 means no timeout, and anything that is not a time
 /// (negative, NaN) leaves the default in place.
 fn call_timeout(ms: Option<f64>) -> Option<Duration> {
@@ -651,15 +661,17 @@ impl Page {
         })
     }
 
-    #[pyo3(signature = (selector, *, timeout=None))]
+    #[pyo3(signature = (selector, *, state=None, timeout=None))]
     fn wait_for_selector<'py>(
         &self,
         py: Python<'py>,
         selector: String,
+        state: Option<String>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let state = wait_state(state)?;
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.wait_for_selector(selector.as_str()).await.map(none) })
+            Box::pin(async move { p.wait_for_selector_state(selector.as_str(), state).await.map(none) })
         })
     }
 
@@ -1030,11 +1042,17 @@ impl Locator {
     }
 
     /// Waits until visible.
-    #[pyo3(signature = (*, timeout=None))]
-    fn wait_for<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (*, state=None, timeout=None))]
+    fn wait_for<'py>(
+        &self,
+        py: Python<'py>,
+        state: Option<String>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let sel = self.selector.clone();
+        let state = wait_state(state)?;
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.wait_for_selector(&sel).await.map(none) })
+            Box::pin(async move { p.wait_for_selector_state(&sel, state).await.map(none) })
         })
     }
 

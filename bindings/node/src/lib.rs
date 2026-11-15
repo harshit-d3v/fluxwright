@@ -437,12 +437,18 @@ impl Locator {
         with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.fill(&sel, &value).await })).await
     }
 
-    /// Waits until visible.
+    /// Waits until `state`: attached, detached, visible (the default) or hidden.
     #[napi]
-    pub async fn wait_for(&self) -> Result<()> {
+    pub async fn wait_for(&self, state: Option<String>) -> Result<()> {
         let sel = self.selector.clone();
-        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.wait_for_selector(&sel).await }))
-            .await
+        let state = match state {
+            Some(s) => s.parse::<fluxwright::WaitState>().map_err(|e| Error::from_reason(e.to_string()))?,
+            None => Default::default(),
+        };
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.wait_for_selector_state(&sel, state).await })
+        })
+        .await
     }
 
     #[napi]

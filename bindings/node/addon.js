@@ -31,7 +31,7 @@ async function savePrivate(path, data) {
 // something else. MISSING.md lists what is not implemented.
 const NONE = {}
 const EXACT = { exact: true }
-const VISIBLE = { state: ['visible'] }
+const STATE = { state: ['attached', 'detached', 'visible', 'hidden'] }
 const TIMEOUT = { timeout: true }
 const SHOT = { path: true, type: ['png', 'jpeg'], quality: true, omitBackground: true, timeout: true }
 const PDF = {
@@ -98,7 +98,7 @@ function guard(Class, label, sync, methods) {
           // Playwright's per-call timeout: a locator carries it, and a page method that takes
           // a selector is the same action on that selector's locator.
           const timeout = args[at]?.timeout
-          if (timeout != null && via) return this.locator(args[0])[via](...args.slice(1))
+          if (via && (timeout != null || args[at]?.state != null)) return this.locator(args[0])[via](...args.slice(1))
           if (timeout != null && this._withTimeout) return call.apply(this._withTimeout(timeout), args)
           return call.apply(this, args)
         }
@@ -676,6 +676,11 @@ try {
     ['getByLabel', 1, EXACT],
     ['getByPlaceholder', 1, EXACT],
   ]
+  // The native method takes the state itself, not Playwright's options object.
+  const waitFor = native.Locator.prototype.waitFor
+  native.Locator.prototype.waitFor = function (options) {
+    return waitFor.call(this, options?.state)
+  }
   guard(native.Page, 'page', true, builders)
   guard(native.FrameLocator, 'frameLocator', true, builders)
   guard(native.Locator, 'locator', true, [...builders, ['filter', 0, { hasText: true }]])
@@ -683,12 +688,12 @@ try {
     ['goto', 1, { waitUntil: true, timeout: true }],
     ['click', 1, TIMEOUT, 'click'],
     ['fill', 2, TIMEOUT, 'fill'],
-    ['waitForSelector', 1, { ...VISIBLE, ...TIMEOUT }, 'waitFor'],
+    ['waitForSelector', 1, { ...STATE, ...TIMEOUT }, 'waitFor'],
   ])
   guard(native.Locator, 'locator', false, [
     ['click', 0, TIMEOUT],
     ['fill', 1, TIMEOUT],
-    ['waitFor', 0, { ...VISIBLE, ...TIMEOUT }],
+    ['waitFor', 0, { ...STATE, ...TIMEOUT }],
     ['textContent', 0, TIMEOUT],
     ['boundingBox', 0, TIMEOUT],
   ])

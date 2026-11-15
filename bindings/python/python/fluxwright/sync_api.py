@@ -174,9 +174,14 @@ class Locator(_Finders):
     def fill(self, value: str, *, timeout: float | None = None) -> None:
         _run(self._impl.fill, value, timeout=timeout)
 
-    def wait_for(self, *, timeout: float | None = None) -> None:
-        """Waits until visible."""
-        _run(self._impl.wait_for, timeout=timeout)
+    def wait_for(
+        self,
+        *,
+        state: Literal["attached", "detached", "visible", "hidden"] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Waits until ``state``: visible by default."""
+        _run(self._impl.wait_for, state=state, timeout=timeout)
 
     def text_content(self, *, timeout: float | None = None) -> str | None:
         return _run(self._impl.text_content, timeout=timeout)
@@ -488,9 +493,15 @@ class Page(_Finders):
     def fill(self, selector: str, value: str, *, timeout: float | None = None) -> None:
         _run(self._impl.fill, selector, value, timeout=timeout)
 
-    def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> None:
-        """Waits until visible."""
-        _run(self._impl.wait_for_selector, selector, timeout=timeout)
+    def wait_for_selector(
+        self,
+        selector: str,
+        *,
+        state: Literal["attached", "detached", "visible", "hidden"] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Waits until ``state``: visible by default."""
+        _run(self._impl.wait_for_selector, selector, state=state, timeout=timeout)
 
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         """Runs JavaScript in the page and returns its JSON result, awaiting promises. A function

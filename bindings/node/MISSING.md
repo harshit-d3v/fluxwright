@@ -15,7 +15,7 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 napi would silently ignore an option the binding does not implement, so it throws a TypeError instead. The main ones:
 
 - A per-call `timeout` on `title`, `content`, `evaluate`, `pdf` and `setViewportSize` (Playwright has none there either); `goto`, `click`, `fill`, `waitForSelector`, `screenshot` and the locator actions take one
-- `waitForSelector` and `locator.waitFor` with a `state` other than `visible`, or `strict`
+- `waitForSelector` and `locator.waitFor` with `strict`
 - Click and fill options (`button`, `clickCount`, `modifiers`, `position`, `force`, ...)
 - Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and WebP (see `docs/DECISIONS.md`)
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)

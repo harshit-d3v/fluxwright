@@ -15,5 +15,5 @@ pub use fluxwright_cdp::{
     ConsoleMessage, Cookie, Dialog, Download, Emulation, Fulfill, Geolocation, ImageFormat,
     InterceptedRequest, LaunchOptions, LogEntry, NetEvent, NetRequest, NetResponse, OriginStorage,
     Overrides, PageError, PdfMargin, PdfOptions, Proxy, ResourceType, ScreenshotOptions, Selector,
-    StorageItem, StorageState, WaitUntil,
+    StorageItem, StorageState, WaitState, WaitUntil,
 };
