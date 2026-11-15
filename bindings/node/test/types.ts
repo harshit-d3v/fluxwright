@@ -28,8 +28,6 @@ export async function typed(): Promise<void> {
   const box: { x: number; width: number } | null = await item.boundingBox()
   const length: number = await item.evaluate((el: { textContent: string }, n: number) => el.textContent.length + n, 1)
   const shot: Buffer = await page.getByLabel('Email').screenshot({ path: 'el.png' })
-  // @ts-expect-error element screenshots take no clip
-  await page.getByLabel('Email').screenshot({ clip: { x: 0, y: 0, width: 1, height: 1 } })
   const errors: Error[] = await page.pageErrors()
   const logs: { type: string; text: string }[] = await page.consoleMessages()
   void [box, length, shot, errors, logs, page.getByPlaceholder('city').first().last(), await page.screenshot({ path: 'p.png' })]

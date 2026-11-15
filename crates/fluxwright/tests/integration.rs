@@ -218,7 +218,7 @@ async fn pdf_and_screenshot_formats() {
     let page = eng.acquire_job(&JobOptions::default().viewport(400, 300)).await.unwrap();
     page.goto(concat!(
         "data:text/html,<body style='margin:0'><div style='height:2000px'></div>",
-        "<div id=box style='width:40px;height:20px;margin-left:10px;background:%23f00'></div><h1>Report</h1>",
+        "<div id=box style='width:40px;height:20px;margin-left:10px;background:%23f00'></div><h1>Report</h1><div style='height:2000px'></div>",
     ))
     .await
     .unwrap();
