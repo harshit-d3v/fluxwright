@@ -104,14 +104,17 @@ async def async_smoke(base: str, tmp: Path) -> None:
             viewport={"width": 600, "height": 500},
             device_scale_factor=2,
             color_scheme="dark",
+            has_touch=True,
+            extra_http_headers={"x-flux": "1"},
         )
         await emulated.goto(base)
         assert (await emulated.title()).startswith("FluxSmoke/1|fr-FR")
         settings = await emulated.evaluate(
             "() => [navigator.language, Intl.DateTimeFormat().resolvedOptions().timeZone, innerWidth,"
-            " devicePixelRatio, matchMedia('(prefers-color-scheme: dark)').matches].join('|')"
+            " devicePixelRatio, matchMedia('(prefers-color-scheme: dark)').matches,"
+            " navigator.maxTouchPoints > 0].join('|')"
         )
-        assert settings == "fr-FR|Europe/Paris|600|2|true"
+        assert settings == "fr-FR|Europe/Paris|600|2|true|true"
         await emulated.close()
         with pytest.raises(ValueError, match="color_scheme"):
             await browser.new_page(color_scheme="purple")

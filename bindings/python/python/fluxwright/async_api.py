@@ -700,6 +700,12 @@ class Browser:
         viewport: ViewportSize | None = None,
         device_scale_factor: float | None = None,
         color_scheme: str | None = None,
+        is_mobile: bool | None = None,
+        has_touch: bool | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        ignore_https_errors: bool | None = None,
+        java_script_enabled: bool | None = None,
+        offline: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
     ) -> Page:
         """A page in a fresh browser context; every option applies to this page only, with
@@ -717,6 +723,12 @@ class Browser:
             viewport=viewport,
             device_scale_factor=device_scale_factor,
             color_scheme=color_scheme,
+            is_mobile=is_mobile,
+            has_touch=has_touch,
+            extra_http_headers=extra_http_headers,
+            ignore_https_errors=ignore_https_errors,
+            java_script_enabled=java_script_enabled,
+            offline=offline,
             storage_state=storage_state,
         )
         return Page(lease)
@@ -733,6 +745,12 @@ class Browser:
         viewport: ViewportSize | None = None,
         device_scale_factor: float | None = None,
         color_scheme: str | None = None,
+        is_mobile: bool | None = None,
+        has_touch: bool | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        ignore_https_errors: bool | None = None,
+        java_script_enabled: bool | None = None,
+        offline: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
     ) -> BrowserContext:
         """A browser context with ``new_page``'s options, as Playwright's ``new_context``. Each
@@ -747,6 +765,12 @@ class Browser:
             viewport=viewport,
             device_scale_factor=device_scale_factor,
             color_scheme=color_scheme,
+            is_mobile=is_mobile,
+            has_touch=has_touch,
+            extra_http_headers=extra_http_headers,
+            ignore_https_errors=ignore_https_errors,
+            java_script_enabled=java_script_enabled,
+            offline=offline,
             storage_state=storage_state,
         )
         return BrowserContext(self, options)

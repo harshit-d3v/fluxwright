@@ -20,6 +20,18 @@ pub struct Emulation {
     pub viewport: Option<(u32, u32)>,
     pub device_scale_factor: Option<f64>,
     pub color_scheme: Option<ColorScheme>,
+    /// The mobile viewport: the meta viewport tag counts and touch scrollbars show.
+    pub is_mobile: bool,
+    /// Touch events, `ontouchstart` and `navigator.maxTouchPoints`.
+    pub has_touch: bool,
+    /// Sent with every request the page makes.
+    pub extra_http_headers: Vec<(String, String)>,
+    /// Load pages whose certificate Chrome would refuse (self-signed, expired, wrong host).
+    pub ignore_https_errors: bool,
+    /// `Some(false)` stops the page's own scripts; `evaluate` still runs.
+    pub javascript_enabled: Option<bool>,
+    /// No network: requests fail and `navigator.onLine` is false.
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,7 +103,27 @@ impl Emulation {
                 json!({ "features": [{ "name": "prefers-color-scheme", "value": scheme.as_str() }] }),
             ));
         }
-        if page && (self.viewport.is_some() || self.device_scale_factor.is_some()) {
+        if self.has_touch {
+            calls.push(("Emulation.setTouchEmulationEnabled", json!({ "enabled": true })));
+        }
+        if self.javascript_enabled == Some(false) {
+            calls.push(("Emulation.setScriptExecutionDisabled", json!({ "value": true })));
+        }
+        if !self.extra_http_headers.is_empty() {
+            let headers: serde_json::Map<String, Value> =
+                self.extra_http_headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+            calls.push(("Network.setExtraHTTPHeaders", json!({ "headers": headers })));
+        }
+        if self.ignore_https_errors {
+            calls.push(("Security.setIgnoreCertificateErrors", json!({ "ignore": true })));
+        }
+        if self.offline {
+            calls.push((
+                "Network.emulateNetworkConditions",
+                json!({ "offline": true, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1 }),
+            ));
+        }
+        if page && (self.viewport.is_some() || self.device_scale_factor.is_some() || self.is_mobile) {
             // 0 keeps the window's size, or the screen's scale.
             let (width, height) = self.viewport.unwrap_or((0, 0));
             calls.push((
@@ -100,7 +132,7 @@ impl Emulation {
                     "width": width,
                     "height": height,
                     "deviceScaleFactor": self.device_scale_factor.unwrap_or(0.0),
-                    "mobile": false
+                    "mobile": self.is_mobile
                 }),
             ));
         }
@@ -286,6 +318,30 @@ mod tests {
         state.origins[0].local_storage.push(StorageItem { name: "k".into(), value: "it's".into() });
         let js = state.restore_script().unwrap();
         assert!(js.contains(r#""http://a.test":[["k","it's"]]"#), "{js}");
+    }
+
+    #[test]
+    fn page_options_become_their_cdp_calls() {
+        let e = Emulation {
+            is_mobile: true,
+            has_touch: true,
+            extra_http_headers: vec![("X-Job".into(), "7".into())],
+            ignore_https_errors: true,
+            javascript_enabled: Some(false),
+            offline: true,
+            ..Default::default()
+        };
+        let calls = e.calls(true);
+        let find = |name: &str| calls.iter().find(|(m, _)| *m == name).map(|(_, p)| p.clone());
+        assert_eq!(find("Emulation.setTouchEmulationEnabled").unwrap()["enabled"], true);
+        assert_eq!(find("Emulation.setScriptExecutionDisabled").unwrap()["value"], true);
+        assert_eq!(find("Network.setExtraHTTPHeaders").unwrap()["headers"]["X-Job"], "7");
+        assert_eq!(find("Security.setIgnoreCertificateErrors").unwrap()["ignore"], true);
+        assert_eq!(find("Network.emulateNetworkConditions").unwrap()["offline"], true);
+        assert_eq!(find("Emulation.setDeviceMetricsOverride").unwrap()["mobile"], true);
+        // Nothing asked for, nothing sent.
+        assert!(Emulation::default().calls(true).is_empty());
+        assert!(Emulation { javascript_enabled: Some(true), ..Default::default() }.calls(true).is_empty());
     }
 
     #[test]

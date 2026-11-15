@@ -65,7 +65,7 @@ Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. T
 | Errors | `consoleMessages()` and `pageErrors()` from the page, its popups and iframes, so a job can fail on JavaScript errors; `page.on('console' \| 'pageerror', handler)` as they happen |
 | Requests | `page.route(url, handler)` to fulfill, change or abort requests (`route.fulfill({ json })`, `route.continue({ headers })`, `route.abort()`, `route.fallback()`), with globs, RegExps or functions |
 | Downloads | `page.waitForDownload()` then `download.saveAs(path)`; each job's files stay in its own folder until the page closes |
-| Emulate | `newPage({ userAgent, locale, timezoneId, geolocation, permissions, viewport, deviceScaleFactor, colorScheme })`, Playwright's option names |
+| Emulate | `newPage({ userAgent, locale, timezoneId, geolocation, permissions, viewport, deviceScaleFactor, colorScheme, isMobile, hasTouch, extraHTTPHeaders, ignoreHTTPSErrors, javaScriptEnabled, offline })`, Playwright's option names |
 | Sessions | `page.storageState({ path })` saves cookies and localStorage; `newPage({ storageState })` starts from them, so you log in once. Playwright's file format |
 | Network | a proxy per page, with a username and password; blocking by resource type or URL (Rust `JobOptions`) |
 
