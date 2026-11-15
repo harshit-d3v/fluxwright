@@ -34,7 +34,7 @@ Implement these milestones in order, verifying each before starting the next:
 
 ## Later: many machines
 
-One queue with workers on several hosts: the step from one machine to a cluster.
+One queue with workers on several hosts: the step from one machine to a cluster. A design is up for review in [docs/CLUSTER.md](docs/CLUSTER.md); nothing is built yet.
 
 ## Distribution and trust (ongoing)
 
