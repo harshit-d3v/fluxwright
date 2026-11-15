@@ -89,6 +89,16 @@ try {
   await assert.rejects(page.pdf({ landscpe: true }), TypeError)
   await assert.rejects(page.pdf({ margin: { bogus: 10 } }), TypeError)
   await assert.rejects(browser.newPage({ extraHTTPHeaders: { a: '1' } }), TypeError)
+  // A call's timeout, then the page's default, replace the engine's 10 s.
+  let began = Date.now()
+  await assert.rejects(page.waitForSelector('#never', { timeout: 300 }))
+  await assert.rejects(page.locator('#never').click({ timeout: 300 }))
+  assert.ok(Date.now() - began < 5000, `per-call timeouts took ${Date.now() - began} ms`)
+  page.setDefaultTimeout(300)
+  began = Date.now()
+  await assert.rejects(page.click('#never'))
+  assert.ok(Date.now() - began < 5000, `the default timeout took ${Date.now() - began} ms`)
+  await page.click('p', { timeout: 5000 })
   await page.close()
 
   // Per-page emulation, with Playwright's option names.

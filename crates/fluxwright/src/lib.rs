@@ -5,7 +5,7 @@
 
 pub use fluxwright_core::netguard;
 pub use fluxwright_core::{
-    BrowserInfo, BrowserSource, Downloads, Engine as BrowserEngine, EngineBuilder, EngineConfig,
+    with_timeout, BrowserInfo, BrowserSource, Downloads, Engine as BrowserEngine, EngineBuilder, EngineConfig,
     Error, FrameLocator, JobOptions, LocalChromium, Locator, MetricsSnapshot, PageLease, Priority,
     QueueFullMode, RemoteCdp, Result,
 };

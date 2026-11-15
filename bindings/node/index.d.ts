@@ -51,6 +51,8 @@ export declare class InterceptedRoute {
 
 /** Lazy, like Playwright's: every action runs the query again. */
 export declare class Locator {
+  /** This locator with `timeout` (milliseconds; 0 for none) for its actions. */
+  _withTimeout(timeout: number): Locator
   click(): Promise<void>
   fill(value: string): Promise<void>
   /** Waits until visible. */
@@ -157,6 +159,13 @@ export declare class Page {
   close(): Promise<void>
   /** Whether `close()` was called (or is under way). */
   isClosed(): boolean
+  /**
+   * The timeout in milliseconds for this page's calls from now on, navigation included; 0
+   * for none. A call's own `timeout` option wins.
+   */
+  setDefaultTimeout(timeout: number): void
+  /** The timeout in milliseconds for this page's `goto` from now on; 0 for none. */
+  setDefaultNavigationTimeout(timeout: number): void
 }
 
 /**
@@ -250,6 +259,8 @@ export interface GetByTextOptions {
 export interface GotoOptions {
   /** Default "load". */
   waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit'
+  /** Milliseconds; 0 for no timeout. Default: the page's or the engine's navigation timeout. */
+  timeout?: number
 }
 
 export interface LaunchOptions {
@@ -386,6 +397,8 @@ export interface ScreenshotOptions {
   clip?: BoundingBox
   /** A transparent background instead of the default white one (PNG). */
   omitBackground?: boolean
+  /** Milliseconds; 0 for no timeout. Default: the page's or the engine's action timeout. */
+  timeout?: number
 }
 
 export interface StorageItem {
