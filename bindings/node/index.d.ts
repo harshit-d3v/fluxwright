@@ -330,6 +330,18 @@ export interface NewPageOptions {
   viewport?: ViewportSize
   deviceScaleFactor?: number
   colorScheme?: 'light' | 'dark' | 'no-preference'
+  /** The mobile viewport: the meta viewport tag counts. */
+  isMobile?: boolean
+  /** Touch events and `navigator.maxTouchPoints`. */
+  hasTouch?: boolean
+  /** Sent with every request the page makes. */
+  extraHTTPHeaders?: Record<string, string>
+  /** Load pages whose certificate Chrome would refuse. */
+  ignoreHTTPSErrors?: boolean
+  /** False stops the page's own scripts; `evaluate` still runs. */
+  javaScriptEnabled?: boolean
+  /** No network: requests fail and `navigator.onLine` is false. */
+  offline?: boolean
   /**
    * Cookies and localStorage to start from: what `page.storageState()` returned, or the
    * path of the JSON file it saved.

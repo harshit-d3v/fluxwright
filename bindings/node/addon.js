@@ -62,6 +62,12 @@ const PAGE = {
   viewport: true,
   deviceScaleFactor: true,
   colorScheme: true,
+  isMobile: true,
+  hasTouch: true,
+  extraHTTPHeaders: true,
+  ignoreHTTPSErrors: true,
+  javaScriptEnabled: true,
+  offline: true,
   storageState: true,
 }
 const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true }

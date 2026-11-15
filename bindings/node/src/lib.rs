@@ -705,6 +705,20 @@ pub struct NewPageOptions {
     pub device_scale_factor: Option<f64>,
     #[napi(ts_type = "'light' | 'dark' | 'no-preference'")]
     pub color_scheme: Option<String>,
+    /// The mobile viewport: the meta viewport tag counts.
+    pub is_mobile: Option<bool>,
+    /// Touch events and `navigator.maxTouchPoints`.
+    pub has_touch: Option<bool>,
+    /// Sent with every request the page makes.
+    #[napi(js_name = "extraHTTPHeaders")]
+    pub extra_http_headers: Option<HashMap<String, String>>,
+    /// Load pages whose certificate Chrome would refuse.
+    #[napi(js_name = "ignoreHTTPSErrors")]
+    pub ignore_https_errors: Option<bool>,
+    /// False stops the page's own scripts; `evaluate` still runs.
+    pub java_script_enabled: Option<bool>,
+    /// No network: requests fail and `navigator.onLine` is false.
+    pub offline: Option<bool>,
     /// Cookies and localStorage to start from: what `page.storageState()` returned, or the
     /// path of the JSON file it saved.
     #[napi(ts_type = "StorageState | string")]
@@ -849,6 +863,12 @@ fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
             viewport: o.viewport.map(|v| (v.width, v.height)),
             device_scale_factor: o.device_scale_factor,
             color_scheme,
+            is_mobile: o.is_mobile.unwrap_or(false),
+            has_touch: o.has_touch.unwrap_or(false),
+            extra_http_headers: o.extra_http_headers.unwrap_or_default().into_iter().collect(),
+            ignore_https_errors: o.ignore_https_errors.unwrap_or(false),
+            javascript_enabled: o.java_script_enabled,
+            offline: o.offline.unwrap_or(false),
         },
         permissions: o.permissions.unwrap_or_default(),
         storage_state: o.storage_state.map(Into::into),

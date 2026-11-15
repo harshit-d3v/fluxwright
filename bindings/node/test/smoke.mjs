@@ -97,7 +97,7 @@ try {
   await assert.rejects(page.pdf({ format: 'A9' }), /unknown format/)
   await assert.rejects(page.pdf({ landscpe: true }), TypeError)
   await assert.rejects(page.pdf({ margin: { bogus: 10 } }), TypeError)
-  await assert.rejects(browser.newPage({ extraHTTPHeaders: { a: '1' } }), TypeError)
+  await assert.rejects(browser.newPage({ baseURL: 'http://localhost' }), TypeError)
   // A call's timeout, then the page's default, replace the engine's 10 s.
   let began = Date.now()
   await assert.rejects(page.waitForSelector('#never', { timeout: 300 }))
@@ -118,6 +118,8 @@ try {
     viewport: { width: 600, height: 500 },
     deviceScaleFactor: 2,
     colorScheme: 'dark',
+    hasTouch: true,
+    extraHTTPHeaders: { 'x-flux': '1' },
   })
   await emulated.goto(base)
   assert.match(await emulated.title(), /^FluxSmoke\/1\|fr-FR/)
@@ -129,9 +131,10 @@ try {
         innerWidth,
         devicePixelRatio,
         matchMedia('(prefers-color-scheme: dark)').matches,
+        navigator.maxTouchPoints > 0,
       ].join('|'),
     ),
-    'fr-FR|Europe/Paris|600|2|true',
+    'fr-FR|Europe/Paris|600|2|true|true',
   )
   await emulated.close()
   await assert.rejects(browser.newPage({ colorScheme: 'purple' }), /colorScheme/)

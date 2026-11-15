@@ -207,6 +207,32 @@ async fn element_screenshots() {
     assert_eq!(page.evaluate(&check(yellow)).await.unwrap(), json!("40|20|255 255 0|255 255 0"));
 }
 
+/// Touch, no scripts and no network, as Playwright's hasTouch, javaScriptEnabled and offline.
+#[tokio::test(flavor = "multi_thread")]
+async fn touch_scripts_off_and_offline() {
+    let eng = engine(1, 2).await;
+    let mut opts = JobOptions::default().viewport(390, 800);
+    opts.emulation.is_mobile = true;
+    opts.emulation.has_touch = true;
+    opts.emulation.offline = true;
+    let page = eng.acquire_job(&opts).await.unwrap();
+    page.goto("data:text/html,<meta name=viewport content='width=device-width'><title>t</title>").await.unwrap();
+    let seen = page
+        .evaluate("[navigator.maxTouchPoints > 0, 'ontouchstart' in window, navigator.onLine, innerWidth].join('|')")
+        .await
+        .unwrap();
+    assert_eq!(seen, json!("true|true|false|390"));
+    drop(page);
+
+    let mut opts = JobOptions::default();
+    opts.emulation.javascript_enabled = Some(false);
+    let page = eng.acquire_job(&opts).await.unwrap();
+    page.goto("data:text/html,<title>static</title><script>document.title = 'ran'</script>").await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "static");
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// PDFs and the screenshot formats: real PDF, JPEG and WebP bytes, a clip relative to the
 /// viewport, a transparent background that resets, locator options and headed PDF rejection.
 #[tokio::test(flavor = "multi_thread")]

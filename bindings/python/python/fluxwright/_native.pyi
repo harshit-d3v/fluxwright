@@ -30,6 +30,12 @@ class Engine:
         viewport: Mapping[str, Any] | None = None,
         device_scale_factor: float | None = None,
         color_scheme: str | None = None,
+        is_mobile: bool | None = None,
+        has_touch: bool | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        ignore_https_errors: bool | None = None,
+        java_script_enabled: bool | None = None,
+        offline: bool | None = None,
         storage_state: Mapping[str, Any] | _Path | None = None,
     ) -> Awaitable[Lease]: ...
     def close(self) -> Awaitable[None]: ...
