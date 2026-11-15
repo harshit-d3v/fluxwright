@@ -667,6 +667,11 @@ pub struct LaunchOptions {
     /// Memory budget in MB for all Chrome processes together: new pages wait while they use
     /// more. Default: 75% of the memory free at launch.
     pub memory_ceiling_mb: Option<u32>,
+    /// Pages that may be on one host at once, across the fleet: a `goto` to a full host waits.
+    /// 0 or unset: no limit.
+    pub max_concurrency_per_host: Option<u32>,
+    /// Milliseconds between the starts of two `goto`s to one host, at least. 0 or unset: none.
+    pub min_delay_per_host: Option<u32>,
 }
 
 /// `queueTimeout` as the engine's acquire timeout.
@@ -991,9 +996,17 @@ pub struct Chromium {}
 impl Chromium {
     #[napi]
     pub async fn launch(options: Option<LaunchOptions>) -> Result<Browser> {
-        let (max, exe, headless, queue_timeout, ceiling) = match options {
-            Some(o) => (o.max_browsers, o.executable_path, o.headless, o.queue_timeout, o.memory_ceiling_mb),
-            None => (None, None, None, None, None),
+        let (max, exe, headless, queue_timeout, ceiling, per_host, host_delay) = match options {
+            Some(o) => (
+                o.max_browsers,
+                o.executable_path,
+                o.headless,
+                o.queue_timeout,
+                o.memory_ceiling_mb,
+                o.max_concurrency_per_host,
+                o.min_delay_per_host,
+            ),
+            None => (None, None, None, None, None, None, None),
         };
         let engine = RT
             .spawn(async move {
@@ -1009,6 +1022,12 @@ impl Chromium {
                 }
                 if let Some(mb) = ceiling {
                     b = b.memory_ceiling_mb(mb as u64);
+                }
+                if let Some(n) = per_host {
+                    b = b.max_concurrency_per_host(n as usize);
+                }
+                if let Some(ms) = host_delay {
+                    b = b.min_delay_per_host(std::time::Duration::from_millis(ms as u64));
                 }
                 if let Some(exe) = exe {
                     b = b.chrome(exe);

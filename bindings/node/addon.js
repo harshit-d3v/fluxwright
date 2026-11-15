@@ -51,7 +51,15 @@ const PDF = {
   outline: true,
   tagged: true,
 }
-const LAUNCH = { maxBrowsers: true, executablePath: true, headless: true, queueTimeout: true, memoryCeilingMb: true }
+const LAUNCH = {
+  maxBrowsers: true,
+  executablePath: true,
+  headless: true,
+  queueTimeout: true,
+  memoryCeilingMb: true,
+  maxConcurrencyPerHost: true,
+  minDelayPerHost: true,
+}
 const PAGE = {
   proxy: true,
   userAgent: true,

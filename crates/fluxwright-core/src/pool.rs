@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::config::{EngineConfig, JobOptions, Priority, QueueFullMode};
 use crate::error::{Error, Result};
+use crate::hosts::{HostLimits, HostSlot};
 use crate::metrics::{Counters, MetricsSnapshot};
 use crate::process::{current_process_rss_bytes, process_tree_memory_map};
 use crate::source::BrowserSource;
@@ -32,6 +33,7 @@ struct Inner {
     rss_cache: Mutex<(Option<Instant>, HashMap<u32, u64>)>,
     rss_refreshing: AtomicBool,
     grants: Arc<tokio::sync::Semaphore>,
+    hosts: HostLimits,
 }
 
 struct State {
@@ -103,6 +105,8 @@ pub struct PageLease {
     dialog_listeners: DialogListeners,
     /// `set_default_timeout` and `set_default_navigation_timeout`, when called.
     default_timeouts: std::sync::Mutex<(Option<Duration>, Option<Duration>)>,
+    /// This page's place on the host it navigated to, when hosts are limited.
+    host_slot: HostSlot,
 }
 
 tokio::task_local! {
@@ -144,6 +148,7 @@ fn route_dialogs(mut dialogs: tokio::sync::mpsc::UnboundedReceiver<fluxwright_cd
 impl Engine {
     pub fn new(config: EngineConfig, source: Arc<dyn BrowserSource>) -> Self {
         let inner = Arc::new(Inner {
+            hosts: HostLimits::new(config.max_concurrency_per_host, config.min_delay_per_host),
             config,
             source,
             state: Mutex::new(State {
@@ -703,6 +708,7 @@ impl Inner {
             download_dir,
             dialog_listeners,
             default_timeouts: Default::default(),
+            host_slot: HostSlot::default(),
         })
     }
 
@@ -953,6 +959,7 @@ impl PageLease {
     }
 
     pub async fn goto_with(&self, url: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
+        self.engine.hosts.enter(url, &self.host_slot).await;
         self.page
             .goto(url, wait_until, self.navigation_timeout())
             .await?;
@@ -1435,6 +1442,16 @@ impl EngineBuilder {
     }
     pub fn acquire_timeout(mut self, d: Duration) -> Self {
         self.config.acquire_timeout = d;
+        self
+    }
+    /// At most `n` pages on one host at once, across the fleet; a `goto` to a full host waits.
+    pub fn max_concurrency_per_host(mut self, n: usize) -> Self {
+        self.config.max_concurrency_per_host = Some(n);
+        self
+    }
+    /// At least `d` between the starts of two `goto`s to one host.
+    pub fn min_delay_per_host(mut self, d: Duration) -> Self {
+        self.config.min_delay_per_host = Some(d);
         self
     }
     pub fn navigation_timeout(mut self, d: Duration) -> Self {

@@ -29,6 +29,7 @@ Implement these milestones in order, verifying each before starting the next:
 3. [x] **Failure evidence:** per-job bounded network log, console output, and a screenshot on failure.
 4. [x] **Bring your own browsers:** `connectOverCDP` in the Rust engine and `fluxwright serve --cdp-endpoint` (Node/Python binding exposure still pending).
 5. [x] **Docker image** with Chrome and Fluxwright.
+6. [x] **Per-host limits:** a cap on the pages on one host at once and a minimum delay between navigations to it, across the fleet.
 
 ## Later: many machines
 
