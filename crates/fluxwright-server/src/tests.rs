@@ -782,7 +782,7 @@ fn eviction_keeps_active_jobs() {
         failed_jobs: 0,
         cancelled_jobs: 0,
     };
-    assert!(registry.make_room(4));
+    assert!(registry.make_room(5));
     let left: Vec<JobStatus> = registry.jobs.iter().map(|r| r.job.status).collect();
     assert_eq!(
         left,
@@ -793,7 +793,7 @@ fn eviction_keeps_active_jobs() {
             JobStatus::Running
         ]
     );
-    assert!(registry.make_room(3));
+    assert!(registry.make_room(4));
     let left: Vec<JobStatus> = registry.jobs.iter().map(|r| r.job.status).collect();
     assert_eq!(
         left,
