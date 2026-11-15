@@ -55,8 +55,8 @@ export declare class Locator {
   _withTimeout(timeout: number): Locator
   click(): Promise<void>
   fill(value: string): Promise<void>
-  /** Waits until visible. */
-  waitFor(): Promise<void>
+  /** Waits until `state`: attached, detached, visible (the default) or hidden. */
+  waitFor(state?: string | undefined | null): Promise<void>
   textContent(): Promise<string | null>
   /** The `index`th match (0-based; negative counts from the end). */
   nth(index: number): Locator

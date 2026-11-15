@@ -135,6 +135,34 @@ impl fmt::Display for Selector {
     }
 }
 
+/// What `wait_for_selector_state` waits for: Playwright's `state` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaitState {
+    /// In the DOM, visible or not.
+    Attached,
+    /// Not in the DOM.
+    Detached,
+    /// In the DOM with a non-empty box and not `visibility: hidden`.
+    #[default]
+    Visible,
+    /// Not visible, or not in the DOM.
+    Hidden,
+}
+
+impl std::str::FromStr for WaitState {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "attached" => Self::Attached,
+            "detached" => Self::Detached,
+            "visible" => Self::Visible,
+            "hidden" => Self::Hidden,
+            _ => return Err(Error::Other(format!("state must be attached, detached, visible or hidden, not {s:?}"))),
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Wait {
     Attached,
@@ -782,6 +810,48 @@ impl CdpPage {
     /// non-empty box, not `visibility: hidden`. Opacity 0 counts as visible, as in Playwright.
     pub async fn wait_for_selector(&self, sel: &Selector, timeout: Duration) -> Result<Value> {
         Ok(self.wait_element(sel, Wait::Visible, timeout).await?.0)
+    }
+
+    /// Waits for the selector to reach `state`, as Playwright's `waitForSelector({ state })`.
+    pub async fn wait_for_selector_state(&self, sel: &Selector, state: WaitState, timeout: Duration) -> Result<()> {
+        let (wait, present) = match state {
+            WaitState::Attached => (Wait::Attached, true),
+            WaitState::Visible => (Wait::Visible, true),
+            WaitState::Detached => (Wait::Attached, false),
+            WaitState::Hidden => (Wait::Visible, false),
+        };
+        if present {
+            return self.wait_element(sel, wait, timeout).await.map(|_| ());
+        }
+        // Waiting for it to go: poll until the check that `wait` makes fails.
+        let mode = if wait == Wait::Attached { "attached" } else { "visible" };
+        let expr = engine_call(&sel.query, mode);
+        let start = Instant::now();
+        loop {
+            if self.browser.is_dead() {
+                return Err(Error::BrowserDead { pid: self.browser_pid });
+            }
+            match self.scope(&sel.frames, false, timeout).await? {
+                // Its iframe is gone or not there yet, so the element is not there either.
+                Err(_) => return Ok(()),
+                Ok((scope, _)) => match self.eval_in(&scope, &expr, true, timeout).await {
+                    Ok(r) if r["value"]["ok"].as_bool() == Some(true) => {}
+                    Ok(r) if r["value"]["fatal"].as_bool() == Some(true) => {
+                        let reason = r["value"]["reason"].as_str().unwrap_or("unknown").to_string();
+                        return Err(Error::NotActionable { selector: sel.to_string(), reason });
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.is_retryable() => return Err(e),
+                    // Mid-navigation the context can vanish; ask the new document.
+                    Err(_) => self.forget_world(&scope).await,
+                },
+            }
+            if start.elapsed() > timeout {
+                let what = if wait == Wait::Attached { "still attached" } else { "still visible" };
+                return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// `textContent` of the first match, once it exists (visible or not).

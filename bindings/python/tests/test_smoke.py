@@ -171,6 +171,17 @@ async def async_smoke(base: str, tmp: Path) -> None:
             await ui.locator("#never").wait_for()
         assert time.monotonic() - began < 5
         ui.set_default_timeout(10_000)
+        # The other states: hidden and detached wait for it to go, attached takes a hidden one.
+        await ui.wait_for_selector("#never", state="hidden")
+        await ui.locator("#never").wait_for(state="detached")
+        with pytest.raises(TimeoutError):
+            await ui.wait_for_selector("#e", state="hidden", timeout=300)
+        await ui.evaluate("() => setTimeout(() => (e.style.display = 'none'), 100)")
+        await ui.wait_for_selector("#e", state="hidden")
+        await ui.wait_for_selector("#e", state="attached")
+        with pytest.raises(ValueError):
+            await ui.wait_for_selector("#e", state="gone")
+        await ui.evaluate("() => (e.style.display = '')")
         await ui.get_by_test_id("total").click(timeout=5_000)
         jpg = await ui.get_by_test_id("total").screenshot(path=tmp / "el.jpg", quality=60)
         assert jpg[:3] == b"\xff\xd8\xff"

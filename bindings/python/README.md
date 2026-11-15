@@ -92,7 +92,7 @@ The sync API runs every call on one event loop in a background thread, so its ob
 | `page.expect_download(timeout=None)` / `page.wait_for_download(timeout=None)` | A finished download: `.url`, `.suggested_filename`, `path()`, `save_as(path)`. `expect_download` waits for one the `with` block starts; `wait_for_download` also returns ones that finished before the call, oldest first. Files are deleted when the page closes. `timeout=0` waits as long as it takes |
 | `page.console_messages()` / `page.page_errors()` | What the page, its popups and iframes logged, and the exceptions nothing caught, the last 1000 of each. Fail a job with `assert await page.page_errors() == []` |
 | `page.set_viewport_size({"width", "height"})` | CSS-pixel viewport for this page |
-| `page.wait_for_selector(selector)` | Waits until visible (Playwright's default state) |
+| `page.wait_for_selector(selector, state=None, timeout=None)` | Waits until `state`: `visible` (the default), `attached`, `hidden` or `detached`, as in Playwright |
 | `page.close()` / `browser.close()` | Dispose the context / shut down |
 
 Timeouts are in milliseconds, as in Playwright. `goto`, `click`, `fill`, `wait_for_selector`, `screenshot` and the locator actions take a per-call `timeout=` (0 for none), and `page.set_default_timeout(ms)` / `page.set_default_navigation_timeout(ms)` change the page's defaults (the engine's are 10 s for actions and 30 s for navigation). Errors are `fluxwright.Error`, and `fluxwright.TimeoutError` when something ran out of time.

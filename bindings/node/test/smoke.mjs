@@ -74,8 +74,17 @@ try {
   assert.equal(await page.evaluate(new Calc().triple, 2), 6)
   await assert.rejects(page.evaluate(Math.max), /can't be sent to the page/)
   // Options Fluxwright does not implement throw instead of being ignored.
-  await assert.rejects(page.waitForSelector('p', { state: 'hidden' }), TypeError)
+  await assert.rejects(page.waitForSelector('p', { state: 'gone' }), TypeError)
   await page.waitForSelector('p', { state: 'visible' })
+  // The other states: hidden and detached wait for it to go, attached takes a hidden element.
+  await page.waitForSelector('#never', { state: 'hidden' })
+  await page.locator('#never').waitFor({ state: 'detached' })
+  await assert.rejects(page.waitForSelector('p', { state: 'hidden', timeout: 300 }))
+  await page.evaluate(() => setTimeout(() => (document.querySelector('p').style.display = 'none'), 100))
+  await page.waitForSelector('p', { state: 'hidden' })
+  await page.waitForSelector('p', { state: 'attached' })
+  await assert.rejects(page.locator('p').waitFor({ timeout: 300 }))
+  await page.evaluate(() => (document.querySelector('p').style.display = ''))
   assert.throws(() => page.locator('p', { hasText: 'x' }), TypeError)
   await assert.rejects(page.click('p', { button: 'right' }), TypeError)
   await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.gif') }), TypeError)
