@@ -803,3 +803,32 @@ fn eviction_keeps_active_jobs() {
     assert!(!registry.make_room(3));
     assert_eq!(registry.jobs.len(), 3);
 }
+
+/// Jobs still open when the server stops are queued again, under their ids, by the next one. A
+/// job the client cancelled is over and stays over.
+#[tokio::test]
+async fn unfinished_jobs_run_again_after_a_restart() {
+    let path = std::env::temp_dir().join(format!("fluxwright-server-journal-{}.jsonl", Uuid::new_v4()));
+    let start = || async {
+        let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+        config.max_jobs = 4;
+        config.journal = Some(path.clone());
+        HttpServer::new(idle_engine().await, config).unwrap()
+    };
+    let server = start().await;
+    let kept = submit_job(&server).await;
+    let cancelled = submit_job(&server).await;
+    let response = call(&server, "DELETE", &format!("/v1/jobs/{}", cancelled.id), Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server.shutdown(Duration::ZERO).await.unwrap();
+    drop(server);
+
+    let server = start().await;
+    let ids: Vec<Uuid> = server.inner.registry.lock().unwrap().jobs.iter().map(|r| r.job.id).collect();
+    assert_eq!(ids, [kept.id]);
+    let response = call(&server, "GET", &format!("/v1/jobs/{}", kept.id), Body::empty()).await;
+    assert_eq!(body(response).await["status"], "queued");
+    server.shutdown(Duration::ZERO).await.unwrap();
+    drop(server);
+    let _ = std::fs::remove_file(&path);
+}
