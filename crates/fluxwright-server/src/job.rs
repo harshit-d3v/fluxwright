@@ -366,7 +366,7 @@ impl Step {
             }
             Step::Pdf { .. } => {
                 let opts = self.pdf_options().map_err(fluxwright::Error::Other)?;
-                let bytes = page.pdf(&opts).await?;
+                let bytes = page.pdf_within(&opts, MAX_PDF_BYTES).await?;
                 encoded_blob("application/pdf", &bytes, MAX_PDF_BYTES, "pdf")
             }
         }

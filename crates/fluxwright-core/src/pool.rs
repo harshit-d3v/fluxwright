@@ -944,9 +944,15 @@ impl PageLease {
 
     /// The page printed to PDF (headless Chrome only).
     pub async fn pdf(&self, options: &PdfOptions) -> Result<Vec<u8>> {
+        self.pdf_within(options, fluxwright_cdp::MAX_PDF_BYTES).await
+    }
+
+    /// `pdf`, failing without reading on once the PDF is over `max_bytes`: for a caller that
+    /// must bound what one job can make it hold.
+    pub async fn pdf_within(&self, options: &PdfOptions, max_bytes: usize) -> Result<Vec<u8>> {
         Ok(self
             .page
-            .pdf(options, self.engine.config.action_timeout)
+            .pdf(options, max_bytes, self.engine.config.action_timeout)
             .await?)
     }
 

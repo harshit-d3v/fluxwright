@@ -100,6 +100,15 @@ fn inches(len: &str) -> Result<f64> {
     }
 }
 
+/// The largest PDF `pdf()` reads when the caller sets no limit of its own.
+pub const MAX_PDF_BYTES: usize = 256 * 1024 * 1024;
+/// A clip side, in CSS pixels (Chrome's texture limit), and a clip's area in pixels: more
+/// would have the browser allocate gigabytes for one image.
+const MAX_CLIP_SIDE: f64 = 16_384.0;
+const MAX_CLIP_AREA: f64 = 64_000_000.0;
+/// Paper sides and margins, in inches: a poster, not a way to make Chrome lay out kilometres.
+const MAX_PAPER_INCHES: f64 = 200.0;
+
 impl ScreenshotOptions {
     pub fn validate(&self) -> Result<()> {
         if let Some(quality) = self.quality {
@@ -123,6 +132,16 @@ impl ScreenshotOptions {
                 && c.height > 0.0)
             {
                 return Err(Error::Other("screenshot: the clip is empty".into()));
+            }
+            if c.width > MAX_CLIP_SIDE
+                || c.height > MAX_CLIP_SIDE
+                || c.width * c.height > MAX_CLIP_AREA
+                || c.x.abs() > 1e7
+                || c.y.abs() > 1e7
+            {
+                return Err(Error::Other(format!(
+                    "screenshot: the clip is too large (at most {MAX_CLIP_SIDE} px a side and {MAX_CLIP_AREA} px in all)"
+                )));
             }
         }
         Ok(())
@@ -149,7 +168,17 @@ impl PdfOptions {
         if !(0.1..=2.0).contains(&scale) {
             return Err(Error::Other(format!("pdf: scale {scale} is outside 0.1–2")));
         }
-        let margin = |m: &Option<String>| m.as_deref().map_or(Ok(0.0), inches);
+        let margin = |m: &Option<String>| match m.as_deref().map_or(Ok(0.0), inches) {
+            Ok(v) if v > MAX_PAPER_INCHES => Err(Error::Other(format!(
+                "pdf: a margin of {v} in is over {MAX_PAPER_INCHES} in"
+            ))),
+            other => other,
+        };
+        if width > MAX_PAPER_INCHES || height > MAX_PAPER_INCHES {
+            return Err(Error::Other(format!(
+                "pdf: paper of {width} x {height} in is over {MAX_PAPER_INCHES} in a side"
+            )));
+        }
         let mut params = json!({
             "landscape": self.landscape,
             "displayHeaderFooter": self.display_header_footer,
@@ -188,7 +217,8 @@ fn decode(b64: &str) -> Result<Vec<u8>> {
 
 impl CdpPage {
     /// The page printed to PDF, as for print media. Chrome prints only when headless.
-    pub async fn pdf(&self, options: &PdfOptions, timeout: Duration) -> Result<Vec<u8>> {
+    /// Fails, without reading on, once the PDF is over `max_bytes`.
+    pub async fn pdf(&self, options: &PdfOptions, max_bytes: usize, timeout: Duration) -> Result<Vec<u8>> {
         if !self.headless {
             return Err(Error::Other("pdf: only works in headless mode".into()));
         }
@@ -197,12 +227,12 @@ impl CdpPage {
             .as_str()
             .ok_or_else(|| Error::Other("pdf: no stream".into()))?
             .to_string();
-        let read = self.read_stream(&handle, timeout).await;
+        let read = self.read_stream(&handle, max_bytes, timeout).await;
         let _ = self.call("IO.close", json!({ "handle": handle }), timeout).await;
         read
     }
 
-    async fn read_stream(&self, handle: &str, timeout: Duration) -> Result<Vec<u8>> {
+    async fn read_stream(&self, handle: &str, max_bytes: usize, timeout: Duration) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
             let chunk = self
@@ -213,6 +243,9 @@ impl CdpPage {
                 out.extend(decode(data)?);
             } else {
                 out.extend_from_slice(data.as_bytes());
+            }
+            if out.len() > max_bytes {
+                return Err(Error::Other(format!("pdf: larger than the limit of {max_bytes} bytes")));
             }
             // Anything but an explicit `eof: false` ends it, so a malformed answer can't loop.
             if chunk["eof"].as_bool() != Some(false) {
@@ -372,7 +405,7 @@ mod tests {
         };
 
         let err = page
-            .pdf(&PdfOptions::default(), Duration::from_secs(5))
+            .pdf(&PdfOptions::default(), MAX_PDF_BYTES, Duration::from_secs(5))
             .await
             .unwrap_err()
             .to_string();
@@ -380,7 +413,7 @@ mod tests {
 
         page.headless = true;
         let err = page
-            .pdf(&PdfOptions::default(), Duration::from_secs(5))
+            .pdf(&PdfOptions::default(), MAX_PDF_BYTES, Duration::from_secs(5))
             .await
             .unwrap_err()
             .to_string();
