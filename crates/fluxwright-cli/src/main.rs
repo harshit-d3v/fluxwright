@@ -523,9 +523,17 @@ mod tests {
                 max_per_host,
                 min_host_delay_ms,
                 journal,
+                join,
+                worker_id,
             } => {
-                assert!(max_per_host.is_none() && min_host_delay_ms.is_none() && journal.is_none());
-                assert_eq!(listen, "0.0.0.0:7331".parse::<SocketAddr>().unwrap());
+                assert!(
+                    max_per_host.is_none()
+                        && min_host_delay_ms.is_none()
+                        && journal.is_none()
+                        && join.is_none()
+                        && worker_id.is_none()
+                );
+                assert_eq!(listen, Some("0.0.0.0:7331".parse::<SocketAddr>().unwrap()));
                 assert!(max_browsers.is_none());
                 assert_eq!(max_contexts.get(), 8);
                 assert_eq!(max_jobs.get(), 128);
@@ -534,6 +542,16 @@ mod tests {
             }
             _ => panic!("expected Cmd::Serve"),
         }
+        assert!(Cli::try_parse_from(["fluxwright", "coordinate", "--max-jobs", "256"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "fluxwright",
+            "serve",
+            "--join",
+            "http://127.0.0.1:7331",
+            "--worker-id",
+            "w1",
+        ])
+        .is_ok());
     }
 
     #[test]
