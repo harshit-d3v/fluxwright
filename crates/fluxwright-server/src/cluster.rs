@@ -308,7 +308,6 @@ pub(crate) async fn result(
                 record.job.results = Some(req.results.take().unwrap_or_default());
                 record.job.error = None;
                 record.job.failure_evidence = None;
-                registry.succeeded_jobs += 1;
             }
             JobStatus::Failed => {
                 record.job.status = JobStatus::Failed;
@@ -322,12 +321,17 @@ pub(crate) async fn result(
                         record.job.failure_evidence = Some(evidence);
                     }
                 }
-                registry.failed_jobs += 1;
             }
             _ => unreachable!(),
         }
+        let snapshot = record.job.clone();
+        match req.status {
+            JobStatus::Succeeded => registry.succeeded_jobs += 1,
+            JobStatus::Failed => registry.failed_jobs += 1,
+            _ => unreachable!(),
+        }
         done_ids.push(id);
-        record.job.clone()
+        snapshot
     };
 
     for finished_id in done_ids {
