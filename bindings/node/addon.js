@@ -51,7 +51,15 @@ const PDF = {
   outline: true,
   tagged: true,
 }
-const LAUNCH = { maxBrowsers: true, executablePath: true, headless: true, queueTimeout: true, memoryCeilingMb: true }
+const LAUNCH = {
+  maxBrowsers: true,
+  executablePath: true,
+  headless: true,
+  queueTimeout: true,
+  memoryCeilingMb: true,
+  maxConcurrencyPerHost: true,
+  minDelayPerHost: true,
+}
 const PAGE = {
   proxy: true,
   userAgent: true,
@@ -68,6 +76,9 @@ const PAGE = {
   ignoreHTTPSErrors: true,
   javaScriptEnabled: true,
   offline: true,
+  baseURL: true,
+  httpCredentials: { username: true, password: true },
+  bypassCSP: true,
   storageState: true,
 }
 const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true }
@@ -85,6 +96,9 @@ function checkOptions(method, options, allowed) {
     if (Array.isArray(ok) && !ok.includes(value)) {
       const supported = ok.map((v) => JSON.stringify(v)).join(', ')
       throw new TypeError(`${method}: ${key} ${JSON.stringify(value)} is not supported, only ${supported} (see MISSING.md)`)
+    }
+    if (typeof ok === 'object' && !Array.isArray(ok)) {
+      checkOptions(`${method} ${key}`, value, ok)
     }
   }
 }
@@ -104,7 +118,7 @@ function guard(Class, label, sync, methods) {
           // Playwright's per-call timeout: a locator carries it, and a page method that takes
           // a selector is the same action on that selector's locator.
           const timeout = args[at]?.timeout
-          if (via && (timeout != null || args[at]?.state != null)) return this.locator(args[0])[via](...args.slice(1))
+          if (via) return this.locator(args[0])[via](...args.slice(1))
           if (timeout != null && this._withTimeout) return call.apply(this._withTimeout(timeout), args)
           return call.apply(this, args)
         }
@@ -513,6 +527,7 @@ class BrowserContext {
   #opening = false
   #closed = false
   #routes = []
+  #cookies = []
 
   constructor(browser, options) {
     this.#browser = browser
@@ -534,6 +549,7 @@ class BrowserContext {
     try {
       const page = await this.#browser.newPage(this.#options)
       try {
+        if (this.#cookies.length) await page._addCookies(this.#cookies)
         for (const [url, handler] of this.#routes) await page.route(url, handler)
         // close() ran while the page was coming: it would otherwise stay open on a closed context.
         if (this.#closed) throw new Error('browserContext.newPage: the context is closed')
@@ -568,6 +584,48 @@ class BrowserContext {
   async cookies(urls) {
     if (urls !== undefined) throw new TypeError('browserContext.cookies: filtering by URL is not supported (see MISSING.md)')
     return (await this.storageState()).cookies
+  }
+
+  async addCookies(cookies) {
+    if (!Array.isArray(cookies)) throw new TypeError('browserContext.addCookies: cookies must be an array')
+    const normalized = cookies.map((c) => {
+      checkOptions('browserContext.addCookies cookie', c, {
+        name: true,
+        value: true,
+        url: true,
+        domain: true,
+        path: true,
+        expires: true,
+        httpOnly: true,
+        secure: true,
+        sameSite: ['Strict', 'Lax', 'None'],
+        partitionKey: true,
+        _crHasCrossSiteAncestor: true,
+      })
+      if ((c.domain == null) === (c.url == null)) {
+        throw new TypeError('browserContext.addCookies: each cookie needs url or domain, not both')
+      }
+      return {
+        name: c.name,
+        value: c.value,
+        domain: c.domain ?? c.url ?? '',
+        path: c.path ?? '/',
+        expires: c.expires ?? -1,
+        httpOnly: c.httpOnly ?? false,
+        secure: c.secure ?? false,
+        sameSite: c.sameSite ?? 'Lax',
+        partitionKey: c.partitionKey,
+        _crHasCrossSiteAncestor: c._crHasCrossSiteAncestor,
+      }
+    })
+    if (this.#page) return this.#page._addCookies(normalized)
+    this.#cookies.push(...normalized)
+  }
+
+  async clearCookies(options) {
+    checkOptions('browserContext.clearCookies', options, NONE)
+    this.#cookies = []
+    if (this.#page) await this.#page._clearCookies()
   }
 
   async close(options) {
@@ -681,7 +739,19 @@ try {
     ['getByRole', 1, { name: true, exact: true }],
     ['getByLabel', 1, EXACT],
     ['getByPlaceholder', 1, EXACT],
+    ['getByAltText', 1, EXACT],
+    ['getByTitle', 1, EXACT],
   ]
+  native.Page.prototype.emulateMedia = async function (options) {
+    checkOptions('page.emulateMedia', options, {
+      media: ['screen', 'print'],
+      colorScheme: ['light', 'dark', 'no-preference'],
+    })
+    const has = (k) => options != null && Object.hasOwn(options, k) && options[k] !== undefined
+    const media = has('media') ? (options.media ?? '') : undefined
+    const scheme = has('colorScheme') ? (options.colorScheme ?? '') : undefined
+    return this._emulateMedia(media, scheme)
+  }
   // The native method takes the state itself, not Playwright's options object.
   const waitFor = native.Locator.prototype.waitFor
   native.Locator.prototype.waitFor = function (options) {
@@ -717,6 +787,10 @@ try {
       checkOptions('chromium.launch', options, LAUNCH)
       return native.Chromium.launch(options)
     },
+    connectOverCDP: async (endpointURL, options) => {
+      checkOptions('chromium.connectOverCDP', options, NONE)
+      return native.Chromium.connectOverCDP(endpointURL)
+    },
   }
   module.exports.default = module.exports
 } catch (err) {
@@ -731,6 +805,9 @@ try {
   module.exports = {
     chromium: {
       launch: async () => {
+        throw error
+      },
+      connectOverCDP: async () => {
         throw error
       },
     },

@@ -30,7 +30,16 @@ from . import _native
 from . import async_api as _a
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage
-from ._types import FloatRect, Geolocation, PdfMargins, ProxySettings, StorageState, URLMatch, ViewportSize
+from ._types import (
+    FloatRect,
+    Geolocation,
+    HttpCredentials,
+    PdfMargins,
+    ProxySettings,
+    StorageState,
+    URLMatch,
+    ViewportSize,
+)
 
 __all__ = [
     "Browser",
@@ -44,6 +53,7 @@ __all__ = [
     "FloatRect",
     "FrameLocator",
     "Geolocation",
+    "HttpCredentials",
     "Locator",
     "Page",
     "PdfMargins",
@@ -151,6 +161,12 @@ class _Finders:
 
     def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator:
         return Locator(self._impl.get_by_placeholder(text, exact=exact))
+
+    def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(self._impl.get_by_alt_text(text, exact=exact))
+
+    def get_by_title(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(self._impl.get_by_title(text, exact=exact))
 
     def get_by_test_id(self, test_id: str) -> Locator:
         return Locator(self._impl.get_by_test_id(test_id))
@@ -573,6 +589,15 @@ class Page(_Finders):
     def set_viewport_size(self, viewport_size: ViewportSize) -> None:
         _run(self._impl.set_viewport_size, viewport_size)
 
+    def emulate_media(
+        self,
+        *,
+        media: Literal["screen", "print"] | None = _a._UNSET,
+        color_scheme: Literal["light", "dark", "no-preference"] | None = _a._UNSET,
+    ) -> None:
+        """Changes CSS ``media`` and/or ``prefers-color-scheme``; ``None`` resets either."""
+        _run(self._impl.emulate_media, media=media, color_scheme=color_scheme)
+
     def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
         """Every cookie in this page's context plus localStorage of the current origin; with
         ``path``, also saved as JSON for ``new_page(storage_state=path)``."""
@@ -763,6 +788,9 @@ class Browser:
         ignore_https_errors: bool | None = None,
         java_script_enabled: bool | None = None,
         offline: bool | None = None,
+        base_url: str | None = None,
+        http_credentials: HttpCredentials | None = None,
+        bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
     ) -> Page:
         """A page in a fresh browser context; every option applies to this page only, with
@@ -785,6 +813,9 @@ class Browser:
                 ignore_https_errors=ignore_https_errors,
                 java_script_enabled=java_script_enabled,
                 offline=offline,
+                base_url=base_url,
+                http_credentials=http_credentials,
+                bypass_csp=bypass_csp,
                 storage_state=storage_state,
             )
         )
@@ -807,6 +838,9 @@ class Browser:
         ignore_https_errors: bool | None = None,
         java_script_enabled: bool | None = None,
         offline: bool | None = None,
+        base_url: str | None = None,
+        http_credentials: HttpCredentials | None = None,
+        bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
     ) -> BrowserContext:
         """A browser context with ``new_page``'s options, as Playwright's ``new_context``. Each
@@ -827,6 +861,9 @@ class Browser:
             ignore_https_errors=ignore_https_errors,
             java_script_enabled=java_script_enabled,
             offline=offline,
+            base_url=base_url,
+            http_credentials=http_credentials,
+            bypass_csp=bypass_csp,
             storage_state=storage_state,
         )
         return BrowserContext(self, options)
@@ -858,6 +895,7 @@ class BrowserContext:
         self._opening = False
         self._closed = False
         self._routes: list[tuple[URLMatch, Callable[..., Any]]] = []
+        self._cookies: list[dict[str, Any]] = []
 
     @property
     def browser(self) -> Browser:
@@ -877,6 +915,8 @@ class BrowserContext:
         try:
             page = self._browser.new_page(**self._options)
             try:
+                if self._cookies:
+                    _run(page._impl._add_cookies, list(self._cookies))
                 for url, handler in self._routes:
                     page.route(url, handler)
                 # close() from another thread while the page was coming: it would otherwise stay
@@ -916,6 +956,23 @@ class BrowserContext:
         cookies: list[dict[str, Any]] = self.storage_state()["cookies"]
         return cookies
 
+    def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
+        """Adds cookies to this context."""
+        with self._lock:
+            if self._page is None:
+                self._cookies.extend(cookies)
+                return
+            page = self._page
+        _run(page._impl._add_cookies, cookies)
+
+    def clear_cookies(self) -> None:
+        """Clears every cookie in this context."""
+        with self._lock:
+            self._cookies.clear()
+            page = self._page
+        if page is not None:
+            _run(page._impl._clear_cookies)
+
     def close(self) -> None:
         """Closes the context's page; the context opens no other."""
         with self._lock:
@@ -947,13 +1004,17 @@ class BrowserType:
         max_browsers: int | None = None,
         queue_timeout: float | None = None,
         memory_ceiling_mb: int | None = None,
+        max_concurrency_per_host: int | None = None,
+        min_delay_per_host: float | None = None,
     ) -> Browser:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
         one per 4 CPUs, 8 pages each), headless unless ``headless=False``. New pages wait while
         all Chrome processes together use more than ``memory_ceiling_mb`` (default 75% of the
         memory free at launch). When every slot is busy, ``new_page`` waits its turn however long
         the queue is; with ``queue_timeout`` (milliseconds) it raises ``TimeoutError`` after that
-        long instead, counting a browser start when one is needed."""
+        long instead, counting a browser start when one is needed. ``max_concurrency_per_host``
+        caps the pages on one host at once across the fleet and ``min_delay_per_host``
+        (milliseconds) spaces the ``goto`` calls to it: a ``goto`` waits its turn."""
         return Browser(
             _run(
                 self._impl.launch,
@@ -962,8 +1023,14 @@ class BrowserType:
                 max_browsers=max_browsers,
                 queue_timeout=queue_timeout,
                 memory_ceiling_mb=memory_ceiling_mb,
+                max_concurrency_per_host=max_concurrency_per_host,
+                min_delay_per_host=min_delay_per_host,
             )
         )
+
+    def connect_over_cdp(self, endpoint_url: str) -> Browser:
+        """Connects to an existing browser over the Chrome DevTools Protocol (``ws://...`` or ``http://...``)."""
+        return Browser(_run(self._impl.connect_over_cdp, endpoint_url))
 
 
 class Playwright:

@@ -341,6 +341,42 @@ async fn pdf_and_screenshot_formats() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+/// Per-host limits reach `goto`: with one page per host, a second page waits until the first
+/// leaves, and navigations to a host start the configured delay apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_host_limits_gate_goto() {
+    let srv = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .max_concurrency_per_host(1)
+        .min_delay_per_host(Duration::from_millis(300))
+        .build()
+        .await
+        .unwrap();
+    let first = eng.acquire().await.unwrap();
+    let second = eng.acquire().await.unwrap();
+    let start = std::time::Instant::now();
+    first.goto(&srv.base_url).await.unwrap();
+    first.goto(&srv.base_url).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(300), "{:?}", start.elapsed());
+
+    let url = srv.base_url.clone();
+    let waiting = tokio::spawn(async move {
+        second.goto(&url).await.unwrap();
+        second
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!waiting.is_finished(), "a second page got onto a host limited to one");
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(20), waiting)
+        .await
+        .expect("the freed place was never taken")
+        .unwrap();
+    drop(second);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 /// boundingBox needs no scrolling and is relative to the top-level viewport; evaluate runs in
 /// the page's own world, so page globals are there.
 #[tokio::test(flavor = "multi_thread")]
@@ -1615,4 +1651,69 @@ async fn connect_over_cdp_to_running_browser() {
 async fn connect_over_cdp_invalid_endpoint_fails_cleanly() {
     let err = BrowserEngine::connect_over_cdp("ws://127.0.0.1:1/invalid").await;
     assert!(err.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alt_title_emulate_media_and_cookies() {
+    let eng = engine(1, 1).await;
+    let opts = fluxwright::JobOptions {
+        emulation: fluxwright::Emulation {
+            bypass_csp: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let page = eng.acquire_job(&opts).await.unwrap();
+    page.goto(
+        "data:text/html,<style>@media print { p { color: rgb(255, 0, 0); } }</style>\
+         <img alt='Site Logo' title='Hover Info'><p>T</p>",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page.get_by_alt_text("Site Logo", true)
+            .evaluate("(el) => el.tagName", None)
+            .await
+            .unwrap(),
+        json!("IMG")
+    );
+    assert_eq!(
+        page.get_by_title("hover", false)
+            .evaluate("(el) => el.getAttribute('alt')", None)
+            .await
+            .unwrap(),
+        json!("Site Logo")
+    );
+    page.emulate_media(Some("print"), Some("dark")).await.unwrap();
+    assert_eq!(
+        page.evaluate("getComputedStyle(document.querySelector('p')).color")
+            .await
+            .unwrap(),
+        json!("rgb(255, 0, 0)")
+    );
+    assert_eq!(
+        page.evaluate("matchMedia('(prefers-color-scheme: dark)').matches")
+            .await
+            .unwrap(),
+        json!(true)
+    );
+    page.emulate_media(Some(""), Some("")).await.unwrap();
+    page.goto("http://example.com").await.ok();
+    page.add_cookies(&[fluxwright::Cookie {
+        name: "a".into(),
+        value: "1".into(),
+        domain: "https://example.com".into(),
+        path: String::new(),
+        expires: -1.0,
+        http_only: false,
+        secure: false,
+        same_site: "Lax".into(),
+        partition_key: None,
+        cross_site_ancestor: None,
+    }])
+    .await
+    .unwrap();
+    page.clear_cookies().await.unwrap();
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }

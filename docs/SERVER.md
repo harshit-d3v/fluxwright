@@ -44,6 +44,22 @@ cargo run --release -p fluxwright-cli -- serve \
 
 A remote browser gets one connection, so set concurrency with `--max-contexts`. More connections to the same browser (`--max-browsers`) each attach to every page, and each answers dialogs on pages it does not own. Closing or recycling a connection never closes the remote browser; it only disposes of the contexts that connection created.
 
+`--max-per-host <n>` caps the pages on one host at once across the fleet, and
+`--min-host-delay-ms <ms>` spaces the navigations to one host: a `goto` step waits its turn, and
+the wait counts toward the job's deadline. Only `goto` steps are counted, not clicks or redirects
+that move a page to another host.
+
+`--journal <file>` keeps accepted jobs across restarts. Every accepted job is appended to the
+file and marked done when it succeeds, fails or is cancelled by a client. On start, jobs with no
+done mark are queued again under their old ids, so a client polling `/v1/jobs/{id}` finds its job
+after the restart. Three things to know:
+
+- A job that was running when the server stopped runs again from its first step, so a click or a
+  form submission can happen twice. Use it for jobs that are safe to repeat.
+- Results are not kept: a job that had finished is gone after a restart (404).
+- The file holds the job steps as sent, URLs and typed values included. It is created
+  owner-only on Linux and macOS; put it somewhere only the server can read.
+
 Without `--max-browsers` or `--memory-ceiling-mb`, the engine sizes itself to the machine.
 `--max-contexts` defaults to 8 per browser. Ctrl+C (and SIGTERM on Unix) stops admission,
 cancels outstanding jobs, and shuts down Chrome, allowing up to 10 seconds for lease cleanup.
@@ -352,6 +368,20 @@ firewall, and deployment-level access/rate controls. Do not send the token over 
 plaintext networks or expose this listener directly to the internet. No per-tenant isolation,
 DNS/IP egress filtering, durable queue, or idempotency key is provided in this first version.
 The Chrome sandbox stays enabled by default; do not disable it just to run the server.
+
+## Cluster mode (coordinator and workers)
+
+Run one coordinator without local browsers, and join one or more browser-running workers from any machine on the same private network (see [docs/CLUSTER.md](CLUSTER.md)):
+
+```bash
+# On the coordinator host:
+FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright coordinate --listen 127.0.0.1:7331 --journal queue.jsonl
+
+# On each worker host:
+FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright serve --join http://127.0.0.1:7331
+```
+
+Workers pull up to their local capacity (`POST /v1/workers/{worker}/lease`), extend 30-second leases every 10 seconds (`POST /v1/workers/{worker}/heartbeat`), abort client-cancelled jobs, and post results or failure evidence (`POST /v1/jobs/{id}/result`). Expired leases requeue within `retries` or fail with `"worker lost"`.
 
 ## Development checks
 

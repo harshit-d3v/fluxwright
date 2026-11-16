@@ -198,6 +198,18 @@
       const m = matcher(body);
       return pick([...root.querySelectorAll('[placeholder]')], (el) => m.is(norm(el.getAttribute('placeholder'))), first);
     },
+    alt: (body, root, first) => {
+      const m = matcher(body);
+      return pick(
+        [...root.querySelectorAll('img[alt],area[alt],input[type=image][alt]')],
+        (el) => m.is(norm(el.getAttribute('alt'))),
+        first,
+      );
+    },
+    title: (body, root, first) => {
+      const m = matcher(body);
+      return pick([...root.querySelectorAll('[title]')], (el) => m.is(norm(el.getAttribute('title'))), first);
+    },
     testid: (body, root, first) => {
       const id = body.startsWith('"') ? JSON.parse(body) : body;
       return pick([...root.querySelectorAll('[data-testid]')], (el) => el.getAttribute('data-testid') === id, first);
@@ -210,7 +222,7 @@
     const parts = split(sel);
     let found = null; // null until the first part searched the document
     parts.forEach((part, i) => {
-      const m = /^(css|text|role|label|placeholder|testid|nth|has-text)=([\s\S]*)$/.exec(part);
+      const m = /^(css|text|role|label|placeholder|alt|title|testid|nth|has-text)=([\s\S]*)$/.exec(part);
       const [engine, body] = m ? [m[1], m[2]] : ['css', part];
       if ((engine === 'nth' || engine === 'has-text') && found === null) {
         throw new SyntaxError(engine + '= needs a selector before it');

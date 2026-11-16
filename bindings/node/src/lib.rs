@@ -361,9 +361,12 @@ where
 /// Playwright's `timeout` option in milliseconds: 0 means no timeout, and anything that is
 /// not a time (negative, NaN) leaves the default in place.
 fn call_timeout(ms: Option<f64>) -> Option<std::time::Duration> {
+    const YEAR: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
     match ms {
-        Some(ms) if ms == 0.0 => Some(std::time::Duration::from_secs(365 * 24 * 3600)),
-        Some(ms) if ms > 0.0 && ms.is_finite() => Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
+        Some(ms) if ms == 0.0 => Some(YEAR),
+        Some(ms) if ms > 0.0 && ms.is_finite() => {
+            Some(std::time::Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(YEAR).min(YEAR))
+        }
         _ => None,
     }
 }
@@ -510,6 +513,16 @@ impl Locator {
     }
 
     #[napi]
+    pub fn get_by_alt_text(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.then(fluxwright::Selector::alt_text(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    #[napi]
+    pub fn get_by_title(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.then(fluxwright::Selector::title(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    #[napi]
     pub fn get_by_test_id(&self, test_id: String) -> Locator {
         self.then(fluxwright::Selector::test_id(&test_id))
     }
@@ -637,6 +650,16 @@ impl FrameLocator {
         self.find(fluxwright::Selector::placeholder(&text, exact(options.and_then(|o| o.exact))))
     }
 
+    #[napi]
+    pub fn get_by_alt_text(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.find(fluxwright::Selector::alt_text(&text, exact(options.and_then(|o| o.exact))))
+    }
+
+    #[napi]
+    pub fn get_by_title(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.find(fluxwright::Selector::title(&text, exact(options.and_then(|o| o.exact))))
+    }
+
     /// `data-testid`, exact.
     #[napi]
     pub fn get_by_test_id(&self, test_id: String) -> Locator {
@@ -667,6 +690,11 @@ pub struct LaunchOptions {
     /// Memory budget in MB for all Chrome processes together: new pages wait while they use
     /// more. Default: 75% of the memory free at launch.
     pub memory_ceiling_mb: Option<u32>,
+    /// Pages that may be on one host at once, across the fleet: a `goto` to a full host waits.
+    /// 0 or unset: no limit.
+    pub max_concurrency_per_host: Option<u32>,
+    /// Milliseconds between the starts of two `goto`s to one host, at least. 0 or unset: none.
+    pub min_delay_per_host: Option<u32>,
 }
 
 /// `queueTimeout` as the engine's acquire timeout.
@@ -719,6 +747,14 @@ pub struct NewPageOptions {
     pub java_script_enabled: Option<bool>,
     /// No network: requests fail and `navigator.onLine` is false.
     pub offline: Option<bool>,
+    /// Base URL for relative `goto` calls.
+    #[napi(js_name = "baseURL")]
+    pub base_url: Option<String>,
+    /// HTTP Basic/Digest credentials.
+    pub http_credentials: Option<HttpCredentials>,
+    /// Bypass the page's Content-Security-Policy.
+    #[napi(js_name = "bypassCSP")]
+    pub bypass_csp: Option<bool>,
     /// Cookies and localStorage to start from: what `page.storageState()` returned, or the
     /// path of the JSON file it saved.
     #[napi(ts_type = "StorageState | string")]
@@ -869,11 +905,20 @@ fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
             ignore_https_errors: o.ignore_https_errors.unwrap_or(false),
             javascript_enabled: o.java_script_enabled,
             offline: o.offline.unwrap_or(false),
+            bypass_csp: o.bypass_csp.unwrap_or(false),
         },
         permissions: o.permissions.unwrap_or_default(),
         storage_state: o.storage_state.map(Into::into),
+        base_url: o.base_url,
+        http_credentials: o.http_credentials.map(|c| (c.username, c.password)),
         ..Default::default()
     })
+}
+
+#[napi(object)]
+pub struct HttpCredentials {
+    pub username: String,
+    pub password: String,
 }
 
 #[napi(object)]
@@ -991,9 +1036,17 @@ pub struct Chromium {}
 impl Chromium {
     #[napi]
     pub async fn launch(options: Option<LaunchOptions>) -> Result<Browser> {
-        let (max, exe, headless, queue_timeout, ceiling) = match options {
-            Some(o) => (o.max_browsers, o.executable_path, o.headless, o.queue_timeout, o.memory_ceiling_mb),
-            None => (None, None, None, None, None),
+        let (max, exe, headless, queue_timeout, ceiling, per_host, host_delay) = match options {
+            Some(o) => (
+                o.max_browsers,
+                o.executable_path,
+                o.headless,
+                o.queue_timeout,
+                o.memory_ceiling_mb,
+                o.max_concurrency_per_host,
+                o.min_delay_per_host,
+            ),
+            None => (None, None, None, None, None, None, None),
         };
         let engine = RT
             .spawn(async move {
@@ -1010,6 +1063,12 @@ impl Chromium {
                 if let Some(mb) = ceiling {
                     b = b.memory_ceiling_mb(mb as u64);
                 }
+                if let Some(n) = per_host {
+                    b = b.max_concurrency_per_host(n as usize);
+                }
+                if let Some(ms) = host_delay {
+                    b = b.min_delay_per_host(std::time::Duration::from_millis(ms as u64));
+                }
                 if let Some(exe) = exe {
                     b = b.chrome(exe);
                 }
@@ -1017,6 +1076,25 @@ impl Chromium {
                     b = b.headless(h);
                 }
                 b.build().await
+            })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(Browser { inner: engine })
+    }
+
+    /// Connects to an existing browser over the Chrome DevTools Protocol (`ws://...` or `http://...`).
+    #[napi(js_name = "connectOverCDP")]
+    pub async fn connect_over_cdp(endpoint_url: String) -> Result<Browser> {
+        let engine = RT
+            .spawn(async move {
+                fluxwright::BrowserEngine::builder()
+                    .connect_over_cdp(endpoint_url)
+                    .max_contexts_per_browser(8)
+                    .queue_capacity(usize::MAX)
+                    .acquire_timeout(queue_wait(None))
+                    .build()
+                    .await
             })
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
@@ -1098,16 +1176,6 @@ impl Page {
     }
 
     #[napi]
-    pub async fn click(&self, selector: String) -> Result<()> {
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.click(&selector).await })).await
-    }
-
-    #[napi]
-    pub async fn fill(&self, selector: String, value: String) -> Result<()> {
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.fill(&selector, &value).await })).await
-    }
-
-    #[napi]
     pub async fn evaluate(&self, expression: String) -> Result<serde_json::Value> {
         with_page(self.lease.clone(), move |p| Box::pin(async move { p.evaluate(&expression).await })).await
     }
@@ -1136,11 +1204,6 @@ impl Page {
             .await
     }
 
-    #[napi]
-    pub async fn wait_for_selector(&self, selector: String) -> Result<()> {
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.wait_for_selector(&selector).await })).await
-    }
-
     /// CSS, `text=`, or `role=` selector.
     #[napi]
     pub fn locator(&self, selector: String) -> Locator {
@@ -1165,6 +1228,16 @@ impl Page {
     #[napi]
     pub fn get_by_placeholder(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
         self.top().get_by_placeholder(text, options)
+    }
+
+    #[napi]
+    pub fn get_by_alt_text(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.top().get_by_alt_text(text, options)
+    }
+
+    #[napi]
+    pub fn get_by_title(&self, text: String, options: Option<GetByTextOptions>) -> Locator {
+        self.top().get_by_title(text, options)
     }
 
     #[napi]
@@ -1322,6 +1395,39 @@ impl Page {
     #[napi]
     pub fn set_default_navigation_timeout(&self, timeout: f64) {
         self.set_timeouts(timeout, true);
+    }
+
+    #[napi(js_name = "_addCookies")]
+    pub async fn add_cookies(&self, cookies: Vec<Cookie>) -> Result<()> {
+        let cookies: Vec<fluxwright::Cookie> = cookies
+            .into_iter()
+            .map(|c| fluxwright::Cookie {
+                name: c.name,
+                value: c.value,
+                domain: c.domain,
+                path: c.path,
+                expires: c.expires,
+                http_only: c.http_only,
+                secure: c.secure,
+                same_site: c.same_site,
+                partition_key: c.partition_key,
+                cross_site_ancestor: c.cr_has_cross_site_ancestor,
+            })
+            .collect();
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.add_cookies(&cookies).await })).await
+    }
+
+    #[napi(js_name = "_clearCookies")]
+    pub async fn clear_cookies(&self) -> Result<()> {
+        with_page(self.lease.clone(), |p| Box::pin(async move { p.clear_cookies().await })).await
+    }
+
+    #[napi(js_name = "_emulateMedia")]
+    pub async fn emulate_media(&self, media: Option<String>, color_scheme: Option<String>) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.emulate_media(media.as_deref(), color_scheme.as_deref()).await })
+        })
+        .await
     }
 }
 
