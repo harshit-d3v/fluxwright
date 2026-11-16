@@ -54,9 +54,14 @@ export async function typed(): Promise<void> {
   const data: unknown = await resp.json()
   const req = await page.waitForRequest((r) => r.method() === 'POST')
   void [data, req.postData()]
-  const context = await browser.newContext({ userAgent: 'Ctx', storageState: 'state.json' })
+  const context = await browser.newContext({ userAgent: 'Ctx', storageState: 'state.json', baseURL: 'https://example.com', bypassCSP: true, httpCredentials: { username: 'u', password: 'p' } })
+  await context.addCookies([{ name: 'c', value: 'v', url: 'https://example.com' }])
+  await context.clearCookies()
   await context.route('**/api', (route) => route.abort())
   const only = await context.newPage()
+  await only.emulateMedia({ media: 'print', colorScheme: 'dark' })
+  void [only.getByAltText('Logo', { exact: true }), only.getByTitle('Tooltip')]
+  if (false) await chromium.connectOverCDP('ws://127.0.0.1:9222')
   const closed: boolean = only.isClosed()
   const cookies: { name: string }[] = await context.cookies()
   void [closed, cookies, context.pages().length, context.browser()]

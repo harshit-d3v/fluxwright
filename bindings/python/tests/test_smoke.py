@@ -2,6 +2,7 @@
 chrome-headless-shell (see the README)."""
 
 import asyncio
+import base64
 import gc
 import os
 import re
@@ -36,6 +37,7 @@ class Handler(BaseHTTPRequestHandler):
     stand in for."""
 
     def do_GET(self):
+        status = 200
         headers = {"Content-Type": "text/html"}
         if self.path.startswith("/report"):
             headers = {"Content-Disposition": f'attachment; filename="{self.path[1:]}.csv"'}
@@ -46,11 +48,23 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api":
             headers = {"Content-Type": "application/json"}
             body = b'{"real":true}'
+        elif self.path == "/auth":
+            expected = "Basic " + base64.b64encode(b"u:p").decode()
+            if self.headers.get("Authorization") != expected:
+                status = 401
+                headers = {"WWW-Authenticate": 'Basic realm="test"'}
+                body = b"denied"
+            else:
+                headers = {"Content-Type": "text/plain"}
+                body = b"authed"
+        elif self.path == "/csp":
+            headers = {"Content-Type": "text/html", "Content-Security-Policy": "script-src 'none'"}
+            body = b'<p id="n">0</p><script>document.getElementById("n").textContent="1"</script>'
         else:
             if self.path == "/login":
                 headers["Set-Cookie"] = "sid=s3cret; Path=/"
             body = f"<title>{self.headers.get('user-agent')}|{self.headers.get('accept-language')}</title>".encode()
-        self.send_response(200)
+        self.send_response(status)
         for name, value in headers.items():
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
@@ -589,16 +603,47 @@ def test_contexts(base):
 async def context_smoke(base: str) -> None:
     async with async_playwright() as p:
         browser = await p.chromium.launch(max_browsers=1)
-        # new_context(): its options and routes apply to its one page.
-        context = await browser.new_context(user_agent="CtxSmoke/1")
+        # new_context(): its options, cookies and routes apply to its one page.
+        context = await browser.new_context(
+            user_agent="CtxSmoke/1",
+            base_url=base,
+            bypass_csp=True,
+            http_credentials={"username": "u", "password": "p"},
+        )
+        await context.add_cookies([{"name": "pre", "value": "yes", "url": base}])
         await context.route("**/api", lambda route: route.fulfill(body="from the context"))
         assert context.pages == []
         page = await context.new_page()
-        await page.goto(f"{base}/login")
+        await page.goto("/login")
         assert (await page.title()).startswith("CtxSmoke/1")
         assert await page.evaluate(FETCH_API) == "from the context"
         assert context.pages == [page]
-        assert any(c["name"] == "sid" for c in await context.cookies())
+        cookies = await context.cookies()
+        assert any(c["name"] == "sid" for c in cookies)
+        assert any(c["name"] == "pre" for c in cookies)
+        await context.add_cookies([{"name": "mid", "value": "2", "url": base}])
+        assert any(c["name"] == "mid" for c in await context.cookies())
+        await context.clear_cookies()
+        assert await context.cookies() == []
+        await page.goto("/csp")
+        assert await page.locator("#n").text_content() == "1"
+        await page.goto("/auth")
+        assert await page.locator("body").text_content() == "authed"
+        await page.goto(
+            "data:text/html,<style>@media print { p { color: rgb(255, 0, 0); } }</style>"
+            '<img alt="Site Logo" title="Hover Info"><p>T</p>'
+        )
+        assert await page.get_by_alt_text("Site Logo", exact=True).evaluate("(el) => el.tagName") == "IMG"
+        assert await page.get_by_title("hover").evaluate("(el) => el.getAttribute('alt')") == "Site Logo"
+        await page.emulate_media(media="print", color_scheme="dark")
+        assert (
+            await page.evaluate("() => getComputedStyle(document.querySelector('p')).color")
+            == "rgb(255, 0, 0)"
+        )
+        assert await page.evaluate("() => matchMedia('(prefers-color-scheme: dark)').matches") is True
+        await page.emulate_media(media=None, color_scheme=None)
+        with pytest.raises(Error):
+            await p.chromium.connect_over_cdp("ws://127.0.0.1:1/invalid")
         with pytest.raises(Error, match="holds one page"):
             await context.new_page()
         await context.close()
@@ -609,12 +654,18 @@ async def context_smoke(base: str) -> None:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(max_browsers=1)
-        with browser.new_context(locale="de-DE") as context:
+        with browser.new_context(locale="de-DE", base_url=base) as context:
+            context.add_cookies([{"name": "sync", "value": "1", "url": base}])
             context.route("**/api", lambda route: route.fulfill(body="sync context"))
             page = context.new_page()
-            page.goto(base)
+            page.goto("/")
             assert "|de-DE" in page.title()
             assert page.evaluate(FETCH_API) == "sync context"
+            assert any(c["name"] == "sync" for c in context.cookies())
+            context.clear_cookies()
+            assert context.cookies() == []
+            page.emulate_media(media="print")
+            page.emulate_media(media=None)
         assert page.is_closed()
 
 

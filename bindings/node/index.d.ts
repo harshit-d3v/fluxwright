@@ -17,6 +17,8 @@ export declare class Browser {
 
 export declare class Chromium {
   static launch(options?: LaunchOptions | undefined | null): Promise<Browser>
+  /** Connects to an existing browser over the Chrome DevTools Protocol (`ws://...` or `http://...`). */
+  static connectOverCDP(endpointUrl: string): Promise<Browser>
 }
 
 /** An iframe, same- or cross-origin, to find elements in. */
@@ -27,6 +29,8 @@ export declare class FrameLocator {
   /** `<label>`, `aria-labelledby` or `aria-label`; case-insensitive substring unless `exact`. */
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByAltText(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByTitle(text: string, options?: GetByTextOptions | undefined | null): Locator
   /** `data-testid`, exact. */
   getByTestId(testId: string): Locator
   /** A nested iframe inside this one. */
@@ -70,6 +74,8 @@ export declare class Locator {
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByAltText(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByTitle(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByTestId(testId: string): Locator
   /** PNG or JPEG of the element, once it is visible and still. */
   screenshot(options?: ScreenshotOptions | undefined | null): Promise<Buffer>
@@ -116,6 +122,8 @@ export declare class Page {
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByAltText(text: string, options?: GetByTextOptions | undefined | null): Locator
+  getByTitle(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByTestId(testId: string): Locator
   frameLocator(selector: string): FrameLocator
   /**
@@ -163,6 +171,9 @@ export declare class Page {
   setDefaultTimeout(timeout: number): void
   /** The timeout in milliseconds for this page's `goto` from now on; 0 for none. */
   setDefaultNavigationTimeout(timeout: number): void
+  _addCookies(cookies: Array<Cookie>): Promise<void>
+  _clearCookies(): Promise<void>
+  _emulateMedia(media?: string | undefined | null, colorScheme?: string | undefined | null): Promise<void>
 }
 
 /**
@@ -260,6 +271,11 @@ export interface GotoOptions {
   timeout?: number
 }
 
+export interface HttpCredentials {
+  username: string
+  password: string
+}
+
 export interface LaunchOptions {
   /**
    * Default: one per 4 CPUs, with 8 pages each. The fleet's memory budget is 75% of the
@@ -346,6 +362,12 @@ export interface NewPageOptions {
   javaScriptEnabled?: boolean
   /** No network: requests fail and `navigator.onLine` is false. */
   offline?: boolean
+  /** Base URL for relative `goto` calls. */
+  baseURL?: string
+  /** HTTP Basic/Digest credentials. */
+  httpCredentials?: HttpCredentials
+  /** Bypass the page's Content-Security-Policy. */
+  bypassCSP?: boolean
   /**
    * Cookies and localStorage to start from: what `page.storageState()` returned, or the
    * path of the JSON file it saved.
