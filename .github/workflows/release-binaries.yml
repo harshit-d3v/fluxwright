@@ -1,0 +1,70 @@
+name: release-binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+          # 22.04 for glibc 2.35 so binaries load on older distros too.
+          - host: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p fluxwright-cli -p fluxwright-mcp
+      - name: Package archives
+        shell: bash
+        run: |
+          mkdir -p dist
+          dir="target/${{ matrix.target }}/release"
+          ext="${{ matrix.ext }}"
+          if [ "${{ matrix.host }}" = "windows-latest" ]; then
+            7z a "dist/fluxwright-${{ matrix.target }}.zip" "./$dir/fluxwright$ext" "./$dir/fluxwright-mcp$ext"
+          else
+            tar -czf "dist/fluxwright-${{ matrix.target }}.tar.gz" -C "$dir" "fluxwright$ext" "fluxwright-mcp$ext"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber

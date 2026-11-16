@@ -766,7 +766,15 @@ fn eviction_keeps_active_jobs() {
                 trace_id: None,
                 failure_evidence: None,
             },
+            request: JobRequest {
+                steps: vec![Step::Title {}],
+                timeout_ms: 60_000,
+                retries: 0,
+                priority: JobPriority::Normal,
+            },
             abort: active.then(|| tokio::spawn(std::future::pending::<()>()).abort_handle()),
+            worker: None,
+            lease_until: None,
         }
     };
     let mut registry = Registry {
@@ -802,4 +810,217 @@ fn eviction_keeps_active_jobs() {
     // Only active jobs left: no room, and none of them evicted.
     assert!(!registry.make_room(3));
     assert_eq!(registry.jobs.len(), 3);
+}
+
+/// Jobs still open when the server stops are queued again, under their ids, by the next one. A
+/// job the client cancelled is over and stays over.
+#[tokio::test]
+async fn unfinished_jobs_run_again_after_a_restart() {
+    let path = std::env::temp_dir().join(format!("fluxwright-server-journal-{}.jsonl", Uuid::new_v4()));
+    let start = || async {
+        let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+        config.max_jobs = 4;
+        config.journal = Some(path.clone());
+        HttpServer::new(idle_engine().await, config).unwrap()
+    };
+    let server = start().await;
+    let kept = submit_job(&server).await;
+    let cancelled = submit_job(&server).await;
+    let response = call(&server, "DELETE", &format!("/v1/jobs/{}", cancelled.id), Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server.shutdown(Duration::ZERO).await.unwrap();
+    drop(server);
+
+    let server = start().await;
+    let ids: Vec<Uuid> = server.inner.registry.lock().unwrap().jobs.iter().map(|r| r.job.id).collect();
+    assert_eq!(ids, [kept.id]);
+    let response = call(&server, "GET", &format!("/v1/jobs/{}", kept.id), Body::empty()).await;
+    assert_eq!(body(response).await["status"], "queued");
+    server.shutdown(Duration::ZERO).await.unwrap();
+    drop(server);
+    let _ = std::fs::remove_file(&path);
+}
+
+async fn submit_priority(server: &HttpServer, priority: &str, retries: u32) -> Job {
+    let payload = serde_json::json!({
+        "priority": priority,
+        "retries": retries,
+        "steps": [{ "action": "title" }],
+    });
+    let response = call(server, "POST", "/v1/jobs", payload.to_string()).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    serde_json::from_value(body(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn coordinator_leases_by_priority_and_age_heartbeats_and_cancels() {
+    let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+    config.max_jobs = 8;
+    let server = HttpServer::coordinator(config).unwrap();
+
+    assert_eq!(call(&server, "GET", "/v1/stats", Body::empty()).await.status(), StatusCode::OK);
+    assert_eq!(call(&server, "GET", "/metrics", Body::empty()).await.status(), StatusCode::OK);
+
+    let low = submit_priority(&server, "low", 0).await;
+    let norm = submit_priority(&server, "normal", 0).await;
+    let high1 = submit_priority(&server, "high", 0).await;
+    let high2 = submit_priority(&server, "high", 0).await;
+
+    let res = call(&server, "POST", "/v1/workers/worker-1/lease", r#"{"max_jobs":2}"#).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let b1 = body(res).await;
+    let jobs1 = b1["jobs"].as_array().unwrap();
+    assert_eq!(jobs1.len(), 2);
+    assert_eq!(jobs1[0]["id"], high1.id.to_string());
+    assert_eq!(jobs1[1]["id"], high2.id.to_string());
+    assert_eq!(jobs1[0]["attempts"], 1);
+    assert_eq!(jobs1[0]["trace_id"], high1.trace_id.as_deref().unwrap());
+
+    let res = call(&server, "POST", "/v1/workers/worker-2/lease", r#"{"max_jobs":5}"#).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let b2 = body(res).await;
+    let jobs2 = b2["jobs"].as_array().unwrap();
+    assert_eq!(jobs2.len(), 2);
+    assert_eq!(jobs2[0]["id"], norm.id.to_string());
+    assert_eq!(jobs2[1]["id"], low.id.to_string());
+
+    let empty = body(call(&server, "POST", "/v1/workers/worker-2/lease", r#"{"max_jobs":5}"#).await).await;
+    assert!(empty["jobs"].as_array().unwrap().is_empty());
+
+    let hb1 = serde_json::json!({
+        "jobs": [{ "id": high1.id, "step_index": 2, "attempts": 1 }]
+    });
+    let hb_res = call(&server, "POST", "/v1/workers/worker-1/heartbeat", hb1.to_string()).await;
+    assert_eq!(hb_res.status(), StatusCode::OK);
+    assert_eq!(body(hb_res).await["cancelled"], serde_json::json!([]));
+
+    let status = body(call(&server, "GET", &format!("/v1/jobs/{}", high1.id), Body::empty()).await).await;
+    assert_eq!(status["status"], "running");
+    assert_eq!(status["step_index"], 2);
+
+    assert_eq!(
+        call(&server, "DELETE", &format!("/v1/jobs/{}", high1.id), Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let hb2 = serde_json::json!({
+        "jobs": [
+            { "id": high1.id, "step_index": 2, "attempts": 1 },
+            { "id": high2.id, "step_index": 0, "attempts": 1 }
+        ]
+    });
+    let hb2_body = body(call(&server, "POST", "/v1/workers/worker-1/heartbeat", hb2.to_string()).await).await;
+    assert_eq!(hb2_body["cancelled"], serde_json::json!([high1.id]));
+
+    let wrong = serde_json::json!({
+        "worker": "worker-1",
+        "status": "succeeded",
+        "attempts": 1,
+        "step_index": 0,
+        "results": ["Example"]
+    });
+    assert_eq!(
+        call(&server, "POST", &format!("/v1/jobs/{}/result", norm.id), wrong.to_string())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let ok = serde_json::json!({
+        "worker": "worker-2",
+        "status": "succeeded",
+        "attempts": 1,
+        "step_index": 0,
+        "results": ["Example"]
+    });
+    let res = call(&server, "POST", &format!("/v1/jobs/{}/result", low.id), ok.to_string()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let done = body(res).await;
+    assert_eq!(done["status"], "succeeded");
+    assert_eq!(done["results"], serde_json::json!(["Example"]));
+
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_expires_leases_requeues_retries_and_rejects_stale_worker_with_409() {
+    let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+    config.max_jobs = 8;
+    let server = HttpServer::coordinator(config).unwrap();
+    server.set_lease_timeout(Duration::from_millis(60));
+
+    let retryable = submit_priority(&server, "normal", 1).await;
+    let once = submit_priority(&server, "normal", 0).await;
+
+    let res = call(&server, "POST", "/v1/workers/worker-dead/lease", r#"{"max_jobs":2}"#).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body(res).await["jobs"].as_array().unwrap().len(), 2);
+
+    tokio::time::sleep(Duration::from_millis(140)).await;
+
+    let once_state = body(call(&server, "GET", &format!("/v1/jobs/{}", once.id), Body::empty()).await).await;
+    assert_eq!(once_state["status"], "failed");
+    assert_eq!(once_state["error"], "worker lost");
+
+    let retry_state = body(call(&server, "GET", &format!("/v1/jobs/{}", retryable.id), Body::empty()).await).await;
+    assert_eq!(retry_state["status"], "queued");
+
+    let stale = serde_json::json!({
+        "worker": "worker-dead",
+        "status": "succeeded",
+        "attempts": 1,
+        "step_index": 0,
+        "results": ["late"]
+    });
+    assert_eq!(
+        call(&server, "POST", &format!("/v1/jobs/{}/result", retryable.id), stale.to_string())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let res2 = body(call(&server, "POST", "/v1/workers/worker-alive/lease", r#"{"max_jobs":2}"#).await).await;
+    let jobs2 = res2["jobs"].as_array().unwrap();
+    assert_eq!(jobs2.len(), 1);
+    assert_eq!(jobs2[0]["id"], retryable.id.to_string());
+    assert_eq!(jobs2[0]["attempts"], 2);
+
+    assert_eq!(
+        call(&server, "POST", &format!("/v1/jobs/{}/result", retryable.id), stale.to_string())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let failed = serde_json::json!({
+        "worker": "worker-alive",
+        "status": "failed",
+        "attempts": 2,
+        "step_index": 0,
+        "error": "boom",
+        "failure_evidence": {
+            "console": [{ "kind": "error", "text": "boom" }],
+            "network": []
+        }
+    });
+    let res3 = call(&server, "POST", &format!("/v1/jobs/{}/result", retryable.id), failed.to_string()).await;
+    assert_eq!(res3.status(), StatusCode::OK);
+    let done = body(res3).await;
+    assert_eq!(done["status"], "failed");
+    assert_eq!(done["attempts"], 2);
+    assert_eq!(done["failure_evidence"]["console"][0]["text"], "boom");
+
+    assert!(matches!(
+        cluster::CoordinatorEndpoint::parse("https://coordinator:7331"),
+        Err(ConfigError::InvalidCoordinator(_))
+    ));
+    assert!(matches!(
+        cluster::CoordinatorEndpoint::parse("http://example.com?bad"),
+        Err(ConfigError::InvalidCoordinator(_))
+    ));
+    assert!(cluster::CoordinatorEndpoint::parse("http://[::1]:7331/sub/").is_ok());
+
+    server.shutdown(Duration::ZERO).await.unwrap();
 }

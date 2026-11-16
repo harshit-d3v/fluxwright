@@ -22,7 +22,7 @@ pub const MAX_PDF_BYTES: usize = MAX_SCREENSHOT_BYTES;
 const MAX_STEPS: usize = 64;
 
 /// Steps run in order on one fresh page. No host-side scripts or filesystem paths are accepted.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobRequest {
     pub steps: Vec<Step>,
@@ -39,7 +39,7 @@ fn default_timeout() -> u64 {
     60_000
 }
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobPriority {
     Low,
@@ -120,7 +120,7 @@ fn web_url(url: &str) -> bool {
     })
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Step {
     Goto {
@@ -182,7 +182,7 @@ pub enum Step {
     },
 }
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerImageFormat {
     #[default]
@@ -209,7 +209,7 @@ impl ServerImageFormat {
     }
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerClip {
     pub x: f64,
@@ -218,7 +218,7 @@ pub struct ServerClip {
     pub height: f64,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ServerLength {
     String(String),
@@ -235,7 +235,7 @@ impl ServerLength {
     }
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerPdfMargin {
     pub top: Option<ServerLength>,
@@ -244,7 +244,7 @@ pub struct ServerPdfMargin {
     pub left: Option<ServerLength>,
 }
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NavigationWait {
     #[default]

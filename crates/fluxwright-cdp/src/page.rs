@@ -73,6 +73,16 @@ impl Selector {
         Self::matching("placeholder", text, exact)
     }
 
+    /// The `alt=` query behind `get_by_alt_text`: `<img>`, `<area>` or `<input type="image">`.
+    pub fn alt_text(text: &str, exact: bool) -> String {
+        Self::matching("alt", text, exact)
+    }
+
+    /// The `title=` query behind `get_by_title`.
+    pub fn title(text: &str, exact: bool) -> String {
+        Self::matching("title", text, exact)
+    }
+
     /// The `testid=` query behind `get_by_test_id`: `data-testid`, exact.
     pub fn test_id(id: &str) -> String {
         format!("testid={}", serde_json::to_string(id).unwrap())
@@ -584,20 +594,86 @@ impl CdpPage {
         Ok(())
     }
 
+    /// Adds cookies to this page's context.
+    pub async fn add_cookies(&self, cookies: &[Cookie], timeout: Duration) -> Result<()> {
+        if cookies.is_empty() {
+            return Ok(());
+        }
+        let cookies: Vec<Value> = cookies.iter().map(Cookie::to_cdp).collect();
+        self.browser
+            .call(
+                "Storage.setCookies",
+                json!({ "cookies": cookies, "browserContextId": self.context_id.0 }),
+                None,
+                timeout,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Clears every cookie in this page's context.
+    pub async fn clear_cookies(&self, timeout: Duration) -> Result<()> {
+        self.browser
+            .call(
+                "Storage.clearCookies",
+                json!({ "browserContextId": self.context_id.0 }),
+                None,
+                timeout,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Changes the CSS media type and/or `prefers-color-scheme` (`""` resets either).
+    pub async fn emulate_media(
+        &self,
+        media: Option<&str>,
+        color_scheme: Option<&str>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let mut params = json!({});
+        if let Some(m) = media {
+            if !matches!(m, "screen" | "print" | "") {
+                return Err(Error::Other(format!(
+                    "media must be screen, print or null, not {m:?}"
+                )));
+            }
+            params["media"] = json!(m);
+        }
+        if let Some(cs) = color_scheme {
+            if !matches!(cs, "light" | "dark" | "no-preference" | "") {
+                return Err(Error::Other(format!(
+                    "colorScheme must be light, dark, no-preference or null, not {cs:?}"
+                )));
+            }
+            params["features"] = json!([{ "name": "prefers-color-scheme", "value": cs }]);
+        }
+        self.call("Emulation.setEmulatedMedia", params, timeout).await?;
+        Ok(())
+    }
+
+    /// Supplies HTTP Basic/Digest authentication credentials for this context.
+    pub async fn set_http_credentials(
+        &self,
+        credentials: &(String, String),
+        timeout: Duration,
+    ) -> Result<()> {
+        let fetch = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(self.context_id.0.clone()).or_default();
+            setup.http_auth = Some(credentials.clone());
+            fetch_params(setup)
+        };
+        if let Some(params) = fetch {
+            self.call("Fetch.enable", params, timeout).await?;
+        }
+        Ok(())
+    }
+
     /// Starts this page's context from saved cookies and localStorage. Call it before the
     /// first navigation.
     pub async fn set_storage_state(&self, state: &StorageState, timeout: Duration) -> Result<()> {
-        if !state.cookies.is_empty() {
-            let cookies: Vec<Value> = state.cookies.iter().map(Cookie::to_cdp).collect();
-            self.browser
-                .call(
-                    "Storage.setCookies",
-                    json!({ "cookies": cookies, "browserContextId": self.context_id.0 }),
-                    None,
-                    timeout,
-                )
-                .await?;
-        }
+        self.add_cookies(&state.cookies, timeout).await?;
         if let Some(source) = state.restore_script() {
             self.setups.lock().await.entry(self.context_id.0.clone()).or_default().init_scripts.push(source.clone());
             self.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": source }), timeout).await?;
@@ -635,15 +711,13 @@ impl CdpPage {
     }
 
     pub async fn screenshot(&self, options: &ScreenshotOptions, timeout: Duration) -> Result<Vec<u8>> {
+        options.validate()?;
         let mut params = json!({});
         if options.full_page || options.clip.is_some() {
             let m = self.call("Page.getLayoutMetrics", json!({}), timeout).await?;
             params["captureBeyondViewport"] = json!(true);
             params["clip"] = match options.clip {
                 Some(c) => {
-                    if !(c.width > 0.0 && c.height > 0.0) {
-                        return Err(Error::Other("screenshot: the clip is empty".into()));
-                    }
                     // Without full_page the clip is relative to the viewport: add the scroll.
                     let (dx, dy) = if options.full_page {
                         (0.0, 0.0)
@@ -1031,16 +1105,18 @@ pub(crate) struct ContextSetup {
     pub(crate) types: Vec<ResourceType>,
     pub(crate) urls: Vec<String>,
     pub(crate) proxy_auth: Option<(String, String)>,
+    pub(crate) http_auth: Option<(String, String)>,
     /// Requests already given credentials: a second challenge means they were rejected.
     pub(crate) answered: std::collections::HashSet<String>,
 }
 
-/// `Fetch.enable` for a context, or `None` when it needs no Fetch at all. Proxy credentials
+/// `Fetch.enable` for a context, or `None` when it needs no Fetch at all. Credentials
 /// need every request paused: Chrome only reports auth challenges for paused requests (and
 /// rejects an empty pattern list with `handleAuthRequests`). So does interception, which hands
 /// each request to the job.
 pub(crate) fn fetch_params(setup: &ContextSetup) -> Option<Value> {
-    let patterns: Vec<Value> = if setup.proxy_auth.is_some() || setup.routes.is_some() {
+    let auth = setup.proxy_auth.is_some() || setup.http_auth.is_some();
+    let patterns: Vec<Value> = if auth || setup.routes.is_some() {
         vec![json!({ "urlPattern": "*", "requestStage": "Request" })]
     } else {
         setup
@@ -1052,7 +1128,7 @@ pub(crate) fn fetch_params(setup: &ContextSetup) -> Option<Value> {
     if patterns.is_empty() {
         return None;
     }
-    Some(json!({ "patterns": patterns, "handleAuthRequests": setup.proxy_auth.is_some() }))
+    Some(json!({ "patterns": patterns, "handleAuthRequests": auth }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

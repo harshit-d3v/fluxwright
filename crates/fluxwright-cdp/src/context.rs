@@ -32,6 +32,8 @@ pub struct Emulation {
     pub javascript_enabled: Option<bool>,
     /// No network: requests fail and `navigator.onLine` is false.
     pub offline: bool,
+    /// Bypass the page's Content-Security-Policy (`Page.setBypassCSP`).
+    pub bypass_csp: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,6 +124,9 @@ impl Emulation {
                 "Network.emulateNetworkConditions",
                 json!({ "offline": true, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1 }),
             ));
+        }
+        if page && self.bypass_csp {
+            calls.push(("Page.setBypassCSP", json!({ "enabled": true })));
         }
         if page && (self.viewport.is_some() || self.device_scale_factor.is_some() || self.is_mobile) {
             // 0 keeps the window's size, or the screen's scale.
@@ -231,12 +236,16 @@ impl Cookie {
         let mut c = json!({
             "name": self.name,
             "value": self.value,
-            "domain": self.domain,
-            "path": self.path,
             "httpOnly": self.http_only,
             "secure": self.secure,
-            "sameSite": self.same_site,
+            "sameSite": if self.same_site.is_empty() { "Lax" } else { &self.same_site },
         });
+        if self.domain.starts_with("http://") || self.domain.starts_with("https://") {
+            c["url"] = json!(self.domain);
+        } else {
+            c["domain"] = json!(self.domain);
+            c["path"] = json!(if self.path.is_empty() { "/" } else { &self.path });
+        }
         if self.expires >= 0.0 {
             c["expires"] = json!(self.expires);
         }
@@ -329,6 +338,7 @@ mod tests {
             ignore_https_errors: true,
             javascript_enabled: Some(false),
             offline: true,
+            bypass_csp: true,
             ..Default::default()
         };
         let calls = e.calls(true);
@@ -338,6 +348,7 @@ mod tests {
         assert_eq!(find("Network.setExtraHTTPHeaders").unwrap()["headers"]["X-Job"], "7");
         assert_eq!(find("Security.setIgnoreCertificateErrors").unwrap()["ignore"], true);
         assert_eq!(find("Network.emulateNetworkConditions").unwrap()["offline"], true);
+        assert_eq!(find("Page.setBypassCSP").unwrap()["enabled"], true);
         assert_eq!(find("Emulation.setDeviceMetricsOverride").unwrap()["mobile"], true);
         // Nothing asked for, nothing sent.
         assert!(Emulation::default().calls(true).is_empty());

@@ -35,6 +35,10 @@ pub struct EngineConfig {
     pub navigation_timeout: Duration,
     pub action_timeout: Duration,
     pub job_timeout: Duration,
+    /// Pages that may be on one host at once, across the fleet. `None` (and 0): no limit.
+    pub max_concurrency_per_host: Option<usize>,
+    /// The least time between the starts of two `goto`s to one host. `None`: no delay.
+    pub min_delay_per_host: Option<Duration>,
 }
 
 /// Browsers and the fleet's memory budget (MB) for a machine with `cpus` CPUs and
@@ -95,6 +99,8 @@ impl Default for EngineConfig {
             navigation_timeout: Duration::from_secs(30),
             action_timeout: Duration::from_secs(10),
             job_timeout: Duration::from_secs(60),
+            max_concurrency_per_host: None,
+            min_delay_per_host: None,
         }
     }
 }
@@ -118,6 +124,10 @@ pub struct JobOptions {
     pub permissions: Vec<String>,
     /// Cookies and localStorage to start from, e.g. saved by `PageLease::storage_state`.
     pub storage_state: Option<StorageState>,
+    /// Base URL for relative `goto` calls.
+    pub base_url: Option<String>,
+    /// HTTP Basic/Digest authentication credentials.
+    pub http_credentials: Option<(String, String)>,
 }
 
 impl Default for JobOptions {
@@ -134,6 +144,8 @@ impl Default for JobOptions {
             emulation: Emulation::default(),
             permissions: Vec::new(),
             storage_state: None,
+            base_url: None,
+            http_credentials: None,
         }
     }
 }

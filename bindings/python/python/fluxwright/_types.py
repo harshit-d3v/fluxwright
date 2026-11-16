@@ -50,3 +50,8 @@ class PdfMargins(TypedDict, total=False):
     right: str | float
     bottom: str | float
     left: str | float
+
+
+class HttpCredentials(TypedDict):
+    username: str
+    password: str

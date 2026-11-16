@@ -513,11 +513,17 @@ impl CdpBrowser {
                     return;
                 };
                 let ctx = self.context_of_session(&sid).await;
+                let is_proxy = ev.params["authChallenge"]["source"] == "Proxy";
                 let mut response = json!({ "response": "Default" });
-                if let (Some(ctx), true) = (ctx, ev.params["authChallenge"]["source"] == "Proxy") {
+                if let Some(ctx) = ctx {
                     if let Some(setup) = self.setups.lock().await.get_mut(&ctx) {
-                        if let Some((user, pass)) = setup.proxy_auth.clone() {
-                            response = if setup.answered.insert(id.clone()) {
+                        let creds = if is_proxy {
+                            setup.proxy_auth.clone()
+                        } else {
+                            setup.http_auth.clone()
+                        };
+                        if let Some((user, pass)) = creds {
+                            response = if setup.answered.insert(format!("{is_proxy}:{id}")) {
                                 json!({ "response": "ProvideCredentials", "username": user, "password": pass })
                             } else {
                                 json!({ "response": "CancelAuth" })

@@ -519,3 +519,73 @@ async fn executes_job_via_remote_cdp_engine() {
     server.shutdown(Duration::from_secs(5)).await.unwrap();
     drop(chrome);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_pulls_and_executes_jobs_from_coordinator() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let coordinator = HttpServer::coordinator(ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = listener.local_addr().unwrap();
+    let coord_router = coordinator.router();
+    let coord_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, coord_router).await;
+    });
+
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let worker = fluxwright_server::spawn_worker(
+        engine.clone(),
+        format!("http://{coord_addr}"),
+        TOKEN.into(),
+        Some("http-test-worker".into()),
+        2,
+    )
+    .unwrap();
+
+    let ok_sub = submit(
+        &coordinator,
+        json!({ "steps": [
+            { "action": "goto", "url": format!("{}/forms", fixture.base_url) },
+            { "action": "fill", "selector": "#name", "value": "Cluster" },
+            { "action": "click", "selector": "#go" },
+            { "action": "title" }
+        ] }),
+    )
+    .await;
+
+    let fail_sub = submit(
+        &coordinator,
+        json!({
+            "timeout_ms": 1200,
+            "steps": [
+                { "action": "goto", "url": format!("{}/forms", fixture.base_url) },
+                { "action": "wait_for_selector", "selector": "#missing-cluster-el" }
+            ]
+        }),
+    )
+    .await;
+
+    let ok_job = finish(&coordinator, ok_sub).await;
+    assert_eq!(ok_job.status, JobStatus::Succeeded, "{:?}", ok_job.error);
+    assert_eq!(ok_job.results.unwrap()[3], "forms");
+
+    let fail_job = finish(&coordinator, fail_sub).await;
+    assert_eq!(fail_job.status, JobStatus::Failed);
+    let shot = fail_job
+        .evidence()
+        .and_then(|e| e.screenshot.as_ref())
+        .expect("cluster failure evidence includes screenshot");
+    assert!(shot.starts_with("iVBOR"));
+
+    worker.abort();
+    coord_task.abort();
+    let _ = engine.shutdown(Duration::from_secs(5)).await;
+    coordinator.shutdown(Duration::ZERO).await.unwrap();
+    fixture.abort();
+}
