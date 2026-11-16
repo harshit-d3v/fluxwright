@@ -105,14 +105,11 @@ export declare class Page {
   goto(url: string, options?: GotoOptions | undefined | null): Promise<void>
   title(): Promise<string>
   content(): Promise<string>
-  click(selector: string): Promise<void>
-  fill(selector: string, value: string): Promise<void>
   evaluate(expression: string): Promise<any>
   screenshot(options?: ScreenshotOptions | undefined | null): Promise<Buffer>
   /** The page printed to PDF (headless only). */
   pdf(options?: PdfOptions | undefined | null): Promise<Buffer>
   setViewportSize(size: ViewportSize): Promise<void>
-  waitForSelector(selector: string): Promise<void>
   /** CSS, `text=`, or `role=` selector. */
   locator(selector: string): Locator
   getByText(text: string, options?: GetByTextOptions | undefined | null): Locator

@@ -635,15 +635,13 @@ impl CdpPage {
     }
 
     pub async fn screenshot(&self, options: &ScreenshotOptions, timeout: Duration) -> Result<Vec<u8>> {
+        options.validate()?;
         let mut params = json!({});
         if options.full_page || options.clip.is_some() {
             let m = self.call("Page.getLayoutMetrics", json!({}), timeout).await?;
             params["captureBeyondViewport"] = json!(true);
             params["clip"] = match options.clip {
                 Some(c) => {
-                    if !(c.width > 0.0 && c.height > 0.0) {
-                        return Err(Error::Other("screenshot: the clip is empty".into()));
-                    }
                     // Without full_page the clip is relative to the viewport: add the scroll.
                     let (dx, dy) = if options.full_page {
                         (0.0, 0.0)
