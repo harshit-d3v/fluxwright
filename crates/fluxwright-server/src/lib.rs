@@ -3,6 +3,7 @@
 //! Exposes job submission, lifecycle management, Prometheus metrics, OpenTelemetry
 //! tracing spans per job, and a live fleet dashboard. See `docs/SERVER.md`.
 
+mod cluster;
 pub mod dashboard;
 mod job;
 mod journal;
@@ -13,6 +14,7 @@ pub mod telemetry;
 mod tests;
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +32,7 @@ use tokio::task::AbortHandle;
 use tracing::Instrument;
 use uuid::Uuid;
 
+pub use cluster::spawn_worker;
 pub use dashboard::dashboard_html;
 pub use job::{
     ConsoleEntry, FailureEvidence, Job, JobPriority, JobRequest, JobStatus, NavigationWait,
@@ -57,6 +60,8 @@ pub struct ServerConfig {
     pub journal: Option<std::path::PathBuf>,
 }
 
+const DEFAULT_LEASE_TIMEOUT_MS: u64 = 30_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("the server token must be 32-256 printable ASCII characters without whitespace")]
@@ -65,6 +70,8 @@ pub enum ConfigError {
     InvalidCapacity,
     #[error("the job journal could not be opened: {0}")]
     Journal(std::io::Error),
+    #[error("invalid coordinator configuration: {0}")]
+    InvalidCoordinator(String),
 }
 
 impl ServerConfig {
@@ -86,9 +93,10 @@ pub struct HttpServer {
 }
 
 pub(crate) struct Inner {
-    engine: BrowserEngine,
+    engine: Option<BrowserEngine>,
     token: Vec<u8>,
     max_jobs: usize,
+    lease_ms: AtomicU64,
     registry: Mutex<Registry>,
     journal: Option<journal::Journal>,
 }
@@ -103,7 +111,10 @@ struct Registry {
 
 struct Record {
     job: Job,
+    request: JobRequest,
     abort: Option<AbortHandle>,
+    worker: Option<String>,
+    lease_until: Option<u64>,
 }
 
 impl Registry {
@@ -127,10 +138,18 @@ impl Registry {
 }
 
 impl Inner {
+    pub(crate) fn lease_ms(&self) -> u64 {
+        self.lease_ms.load(Ordering::Relaxed)
+    }
+
     pub async fn prometheus_text(&self) -> String {
-        let fleet = self.engine.metrics().await;
-        let metrics = {
-            let reg = self.registry.lock().unwrap();
+        let fleet = match &self.engine {
+            Some(engine) => engine.metrics().await,
+            None => Default::default(),
+        };
+        let (metrics, expired) = {
+            let mut reg = self.registry.lock().unwrap();
+            let expired = cluster::expire_leases(&mut reg, now_ms());
             let mut queued = 0;
             let mut running = 0;
             for r in &reg.jobs {
@@ -140,59 +159,78 @@ impl Inner {
                     _ => {}
                 }
             }
-            ServerMetrics {
-                fleet,
-                queued_jobs: queued,
-                running_jobs: running,
-                succeeded_jobs: reg.succeeded_jobs,
-                failed_jobs: reg.failed_jobs,
-                cancelled_jobs: reg.cancelled_jobs,
-                max_jobs: self.max_jobs,
-            }
+            (
+                ServerMetrics {
+                    fleet,
+                    queued_jobs: queued,
+                    running_jobs: running,
+                    succeeded_jobs: reg.succeeded_jobs,
+                    failed_jobs: reg.failed_jobs,
+                    cancelled_jobs: reg.cancelled_jobs,
+                    max_jobs: self.max_jobs,
+                },
+                expired,
+            )
         };
+        for id in expired {
+            self.journal_done(id);
+        }
         metrics.to_prometheus_text()
     }
 
     pub async fn dashboard_snapshot(&self) -> Value {
-        let fleet = self.engine.metrics().await;
-        let reg = self.registry.lock().unwrap();
-        let mut queued = 0;
-        let mut running = 0;
-        let mut jobs = Vec::with_capacity(reg.jobs.len().min(DASHBOARD_JOBS));
-        for r in reg.jobs.iter().rev() {
-            match r.job.status {
-                JobStatus::Queued => queued += 1,
-                JobStatus::Running => running += 1,
-                _ => {}
+        let fleet = match &self.engine {
+            Some(engine) => engine.metrics().await,
+            None => Default::default(),
+        };
+        let (snapshot, expired) = {
+            let mut reg = self.registry.lock().unwrap();
+            let expired = cluster::expire_leases(&mut reg, now_ms());
+            let mut queued = 0;
+            let mut running = 0;
+            let mut jobs = Vec::with_capacity(reg.jobs.len().min(DASHBOARD_JOBS));
+            for r in reg.jobs.iter().rev() {
+                match r.job.status {
+                    JobStatus::Queued => queued += 1,
+                    JobStatus::Running => running += 1,
+                    _ => {}
+                }
+                if jobs.len() == DASHBOARD_JOBS {
+                    continue;
+                }
+                jobs.push(json!({
+                    "id": r.job.id,
+                    "status": r.job.status,
+                    "submitted_at": r.job.submitted_at,
+                    "started_at": r.job.started_at,
+                    "finished_at": r.job.finished_at,
+                    "attempts": r.job.attempts,
+                    "step_index": r.job.step_index,
+                    "error": r.job.error,
+                    "trace_id": r.job.trace_id,
+                    "has_evidence": r.job.failure_evidence.is_some(),
+                }));
             }
-            if jobs.len() == DASHBOARD_JOBS {
-                continue;
-            }
-            jobs.push(json!({
-                "id": r.job.id,
-                "status": r.job.status,
-                "submitted_at": r.job.submitted_at,
-                "started_at": r.job.started_at,
-                "finished_at": r.job.finished_at,
-                "attempts": r.job.attempts,
-                "step_index": r.job.step_index,
-                "error": r.job.error,
-                "trace_id": r.job.trace_id,
-                "has_evidence": r.job.failure_evidence.is_some(),
-            }));
+            (
+                json!({
+                    "fleet": fleet,
+                    "server": {
+                        "queued_jobs": queued,
+                        "running_jobs": running,
+                        "succeeded_jobs": reg.succeeded_jobs,
+                        "failed_jobs": reg.failed_jobs,
+                        "cancelled_jobs": reg.cancelled_jobs,
+                        "max_jobs": self.max_jobs,
+                    },
+                    "jobs": jobs,
+                }),
+                expired,
+            )
+        };
+        for id in expired {
+            self.journal_done(id);
         }
-        json!({
-            "fleet": fleet,
-            "server": {
-                "queued_jobs": queued,
-                "running_jobs": running,
-                "succeeded_jobs": reg.succeeded_jobs,
-                "failed_jobs": reg.failed_jobs,
-                "cancelled_jobs": reg.cancelled_jobs,
-                "max_jobs": self.max_jobs,
-            },
-            "jobs": jobs,
-        })
+        snapshot
     }
 }
 
@@ -219,6 +257,22 @@ impl Drop for Inner {
 
 impl HttpServer {
     pub fn new(engine: BrowserEngine, config: ServerConfig) -> Result<Self, ConfigError> {
+        Self::build(Some(engine), config)
+    }
+
+    /// Creates a coordinator HTTP server that accepts and distributes jobs to pulling workers
+    /// without running any local browsers.
+    pub fn coordinator(config: ServerConfig) -> Result<Self, ConfigError> {
+        Self::build(None, config)
+    }
+
+    /// Overrides the cluster worker lease expiration window (default 30 seconds).
+    pub fn set_lease_timeout(&self, timeout: Duration) {
+        let ms = timeout.as_millis().clamp(1, u64::MAX as u128) as u64;
+        self.inner.lease_ms.store(ms, Ordering::Relaxed);
+    }
+
+    fn build(engine: Option<BrowserEngine>, config: ServerConfig) -> Result<Self, ConfigError> {
         if !(1..=4096).contains(&config.max_jobs) {
             return Err(ConfigError::InvalidCapacity);
         }
@@ -233,6 +287,7 @@ impl HttpServer {
             engine,
             token: config.token.into_bytes(),
             max_jobs: config.max_jobs,
+            lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
             registry: Mutex::new(Registry {
                 accepting: true,
                 jobs: VecDeque::new(),
@@ -248,7 +303,13 @@ impl HttpServer {
             match serde_json::from_value::<JobRequest>(request) {
                 Ok(request) if request.validate().is_ok() => {
                     tracing::info!(job_id = %id, "queued again from the journal");
-                    enqueue(&inner, &mut registry, id, request, JobTraceContext::from_headers(None));
+                    enqueue(
+                        &inner,
+                        &mut registry,
+                        id,
+                        request,
+                        JobTraceContext::from_headers(None),
+                    );
                 }
                 // Written by a version with other rules: it cannot run, so it is over.
                 _ => inner.journal_done(id),
@@ -259,12 +320,22 @@ impl HttpServer {
     }
 
     pub fn router(&self) -> Router {
-        let protected = Router::new()
+        let small = Router::new()
             .route("/v1/jobs", post(submit))
             .route("/v1/jobs/{id}", get(job_status).delete(cancel))
+            .route("/v1/workers/{worker}/lease", post(cluster::lease))
+            .route("/v1/workers/{worker}/heartbeat", post(cluster::heartbeat))
             .route("/v1/stats", get(stats))
             .route("/v1/events", get(dashboard::dashboard_events))
             .route("/metrics", get(metrics_endpoint))
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
+
+        let result_route = Router::new()
+            .route("/v1/jobs/{id}/result", post(cluster::result))
+            .layer(DefaultBodyLimit::max(MAX_RESULT_BYTES * 2 + MAX_REQUEST_BYTES));
+
+        let protected = small
+            .merge(result_route)
             .route_layer(middleware::from_fn_with_state(
                 self.inner.clone(),
                 authorize,
@@ -282,7 +353,6 @@ impl HttpServer {
             .fallback(|| async {
                 ApiError::new(StatusCode::NOT_FOUND, "not_found", "endpoint not found")
             })
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
             .layer(middleware::from_fn(response_headers))
             .with_state(self.inner.clone())
     }
@@ -299,6 +369,8 @@ impl HttpServer {
                     record.job.status = JobStatus::Cancelled;
                     record.job.finished_at = Some(now_ms());
                     record.job.error = Some("server shutting down".into());
+                    record.worker = None;
+                    record.lease_until = None;
                     newly_cancelled += 1;
                     if let Some(abort) = record.abort.take() {
                         abort.abort();
@@ -307,7 +379,10 @@ impl HttpServer {
             }
             registry.cancelled_jobs += newly_cancelled;
         }
-        self.inner.engine.shutdown(grace).await
+        match &self.inner.engine {
+            Some(engine) => engine.shutdown(grace).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -381,34 +456,49 @@ async fn submit(
     let trace_ctx = JobTraceContext::from_headers(traceparent);
     let outbound_tp = trace_ctx.to_traceparent();
 
-    let mut registry = inner.registry.lock().unwrap();
-    if !registry.accepting {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "shutting_down",
-            "the server is shutting down",
-        ));
-    }
-    if !registry.make_room(inner.max_jobs) {
-        let mut error = ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "capacity_exceeded",
-            "all job slots are busy",
-        )
-        .into_response();
-        error
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        return Ok(error);
-    }
+    let (job, expired) = {
+        let mut registry = inner.registry.lock().unwrap();
+        let expired = cluster::expire_leases(&mut registry, now_ms());
+        if !registry.accepting {
+            drop(registry);
+            for eid in expired {
+                inner.journal_done(eid);
+            }
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shutting_down",
+                "the server is shutting down",
+            ));
+        }
+        if !registry.make_room(inner.max_jobs) {
+            drop(registry);
+            for eid in expired {
+                inner.journal_done(eid);
+            }
+            let mut error = ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "capacity_exceeded",
+                "all job slots are busy",
+            )
+            .into_response();
+            error
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return Ok(error);
+        }
 
-    let id = Uuid::new_v4();
-    // Before the worker starts, so a job is never running without being on file.
-    if let Some(journal) = &inner.journal {
-        journal.submitted(id, &raw);
+        let id = Uuid::new_v4();
+        // Before the worker starts, so a job is never running without being on file.
+        if let Some(journal) = &inner.journal {
+            journal.submitted(id, &raw);
+        }
+        let job = enqueue(&inner, &mut registry, id, request, trace_ctx);
+        (job, expired)
+    };
+    for eid in expired {
+        inner.journal_done(eid);
     }
-    let job = enqueue(&inner, &mut registry, id, request, trace_ctx);
-    drop(registry);
+    let id = job.id;
 
     let mut response = (StatusCode::ACCEPTED, Json(job)).into_response();
     response.headers_mut().insert(
@@ -423,7 +513,8 @@ async fn submit(
     Ok(response)
 }
 
-/// Registers a job as queued and starts its worker. The caller holds the registry lock.
+/// Registers a job as queued and starts its local worker if running with an engine.
+/// In coordinator mode, the job waits in `Queued` state for a remote worker lease.
 fn enqueue(
     inner: &Arc<Inner>,
     registry: &mut Registry,
@@ -444,24 +535,39 @@ fn enqueue(
         trace_id: Some(trace_ctx.trace_id.clone()),
         failure_evidence: None,
     };
-    let weak = Arc::downgrade(inner);
-    let engine = inner.engine.clone();
-    let worker_state = weak.clone();
-    let task =
-        tokio::spawn(async move { execute(engine, request, worker_state, id, trace_ctx).await });
-    registry.jobs.push_back(Record {
-        job: job.clone(),
-        abort: Some(task.abort_handle()),
-    });
+    if let Some(engine) = inner.engine.clone() {
+        let weak = Arc::downgrade(inner);
+        let worker_state = weak.clone();
+        let req_clone = request.clone();
+        let task = tokio::spawn(async move {
+            let progress = Arc::new(Mutex::new(ExecutionProgress::default()));
+            execute_job(engine, req_clone, Some(worker_state), id, trace_ctx, 0, progress).await
+        });
+        registry.jobs.push_back(Record {
+            job: job.clone(),
+            request,
+            abort: Some(task.abort_handle()),
+            worker: None,
+            lease_until: None,
+        });
 
-    // A separate monitor records panics as failures, updates lifetime counters, and waits for a
-    // cancelled task to actually drop its lease. Its Weak reference does not keep a discarded server alive.
-    tokio::spawn(async move {
-        let outcome = task.await;
-        if let Some(inner) = weak.upgrade() {
-            finish_job(&inner, id, outcome);
-        }
-    });
+        // A separate monitor records panics as failures, updates lifetime counters, and waits for a
+        // cancelled task to actually drop its lease. Its Weak reference does not keep a discarded server alive.
+        tokio::spawn(async move {
+            let outcome = task.await;
+            if let Some(inner) = weak.upgrade() {
+                finish_job(&inner, id, outcome);
+            }
+        });
+    } else {
+        registry.jobs.push_back(Record {
+            job: job.clone(),
+            request,
+            abort: None,
+            worker: None,
+            lease_until: None,
+        });
+    }
     job
 }
 
@@ -511,12 +617,21 @@ fn finish_job(
     tracing::info!(job_id = %id, ?status, "HTTP job finished");
 }
 
-async fn execute(
+#[derive(Clone, Default)]
+pub(crate) struct ExecutionProgress {
+    pub(crate) attempts: u32,
+    pub(crate) step_index: Option<usize>,
+    pub(crate) failure_evidence: Option<FailureEvidence>,
+}
+
+pub(crate) async fn execute_job(
     engine: BrowserEngine,
     request: JobRequest,
-    inner: Weak<Inner>,
+    inner: Option<Weak<Inner>>,
     id: Uuid,
     trace_ctx: JobTraceContext,
+    initial_attempts: u32,
+    progress: Arc<Mutex<ExecutionProgress>>,
 ) -> fluxwright::Result<Vec<Value>> {
     let timeout = Duration::from_millis(request.timeout_ms);
     let priority_label = match request.priority {
@@ -526,6 +641,7 @@ async fn execute(
     };
     let options = request.options();
     let steps = Arc::new(request.steps);
+    let attempt_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let job_span = tracing::info_span!(
         "fluxwright.job",
@@ -546,15 +662,31 @@ async fn execute(
             engine.run(options, move |page| {
                 let steps = steps.clone();
                 let inner = inner.clone();
+                let progress = progress.clone();
+                let attempt_count = attempt_count.clone();
                 let trace_id = trace_ctx.trace_id.clone();
                 async move {
-                    update(&inner, id, |job| {
-                        job.status = JobStatus::Running;
-                        job.started_at.get_or_insert_with(now_ms);
-                        job.attempts += 1;
-                        job.step_index = None;
-                        job.failure_evidence = None;
-                    });
+                    let n = attempt_count.fetch_add(1, Ordering::Relaxed);
+                    let total_attempts = if n == 0 && initial_attempts > 0 {
+                        initial_attempts
+                    } else {
+                        initial_attempts.saturating_add(n).max(n + 1)
+                    };
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.attempts = total_attempts;
+                        p.step_index = None;
+                        p.failure_evidence = None;
+                    }
+                    if let Some(weak) = &inner {
+                        update(weak, id, |job| {
+                            job.status = JobStatus::Running;
+                            job.started_at.get_or_insert_with(now_ms);
+                            job.attempts = total_attempts;
+                            job.step_index = None;
+                            job.failure_evidence = None;
+                        });
+                    }
 
                     let mut net_rx = page.subscribe_network();
                     let mut log_rx = page.subscribe_logs();
@@ -574,7 +706,10 @@ async fn execute(
 
                     for (index, step) in steps.iter().enumerate() {
                         drain_evidence(&mut net_rx, &mut log_rx, &mut accumulator);
-                        update(&inner, id, |job| job.step_index = Some(index));
+                        progress.lock().unwrap().step_index = Some(index);
+                        if let Some(weak) = &inner {
+                            update(weak, id, |job| job.step_index = Some(index));
+                        }
                         let step_span = tracing::info_span!(
                             "fluxwright.step",
                             otel.name = "fluxwright.step",
@@ -663,12 +798,14 @@ async fn execute(
                         accumulator.sync_page_logs(&page);
 
                         let evidence = accumulator.finalize(failure_screenshot);
-
-                        update(&inner, id, |job| {
-                            if !evidence.is_empty() {
-                                job.failure_evidence = Some(evidence);
+                        if !evidence.is_empty() {
+                            progress.lock().unwrap().failure_evidence = Some(evidence.clone());
+                            if let Some(weak) = &inner {
+                                update(weak, id, |job| {
+                                    job.failure_evidence = Some(evidence);
+                                });
                             }
-                        });
+                        }
                     }
 
                     // Drop schedules context disposal even if the enclosing deadline/cancellation fires.
@@ -877,13 +1014,20 @@ async fn job_status(
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
-    let registry = inner.registry.lock().unwrap();
-    let record = registry
-        .jobs
-        .iter()
-        .find(|r| r.job.id == id)
-        .ok_or_else(not_found)?;
-    Ok(Json(record.job.clone()))
+    let (job, expired) = {
+        let mut registry = inner.registry.lock().unwrap();
+        let expired = cluster::expire_leases(&mut registry, now_ms());
+        let job = registry
+            .jobs
+            .iter()
+            .find(|r| r.job.id == id)
+            .map(|r| r.job.clone());
+        (job, expired)
+    };
+    for eid in expired {
+        inner.journal_done(eid);
+    }
+    job.map(Json).ok_or_else(not_found)
 }
 
 async fn cancel(
@@ -892,12 +1036,28 @@ async fn cancel(
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
     let mut registry = inner.registry.lock().unwrap();
+    let expired = cluster::expire_leases(&mut registry, now_ms());
     let (job_clone, abort) = {
-        let record = registry.find_mut(id).ok_or_else(not_found)?;
+        let Some(record) = registry.find_mut(id) else {
+            drop(registry);
+            for eid in expired {
+                inner.journal_done(eid);
+            }
+            return Err(not_found());
+        };
         if record.job.status == JobStatus::Cancelled {
-            return Ok(Json(record.job.clone()));
+            let job = record.job.clone();
+            drop(registry);
+            for eid in expired {
+                inner.journal_done(eid);
+            }
+            return Ok(Json(job));
         }
         if record.job.status.terminal() {
+            drop(registry);
+            for eid in expired {
+                inner.journal_done(eid);
+            }
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "already_finished",
@@ -906,6 +1066,8 @@ async fn cancel(
         }
         record.job.status = JobStatus::Cancelled;
         record.job.finished_at = Some(now_ms());
+        record.worker = None;
+        record.lease_until = None;
         (record.job.clone(), record.abort.clone())
     };
     registry.cancelled_jobs += 1;
@@ -913,13 +1075,19 @@ async fn cancel(
         abort.abort();
     }
     drop(registry);
+    for eid in expired {
+        inner.journal_done(eid);
+    }
     // A job the client cancelled is over. One the shutdown cancels is not: it runs again.
     inner.journal_done(id);
     Ok(Json(job_clone))
 }
 
 async fn stats(State(inner): State<Arc<Inner>>) -> Json<fluxwright::MetricsSnapshot> {
-    Json(inner.engine.metrics().await)
+    match &inner.engine {
+        Some(engine) => Json(engine.metrics().await),
+        None => Json(Default::default()),
+    }
 }
 
 async fn metrics_endpoint(State(inner): State<Arc<Inner>>) -> Response {

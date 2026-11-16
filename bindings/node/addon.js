@@ -77,7 +77,7 @@ const PAGE = {
   javaScriptEnabled: true,
   offline: true,
   baseURL: true,
-  httpCredentials: true,
+  httpCredentials: { username: true, password: true },
   bypassCSP: true,
   storageState: true,
 }
@@ -96,6 +96,9 @@ function checkOptions(method, options, allowed) {
     if (Array.isArray(ok) && !ok.includes(value)) {
       const supported = ok.map((v) => JSON.stringify(v)).join(', ')
       throw new TypeError(`${method}: ${key} ${JSON.stringify(value)} is not supported, only ${supported} (see MISSING.md)`)
+    }
+    if (typeof ok === 'object' && !Array.isArray(ok)) {
+      checkOptions(`${method} ${key}`, value, ok)
     }
   }
 }
@@ -599,8 +602,8 @@ class BrowserContext {
         partitionKey: true,
         _crHasCrossSiteAncestor: true,
       })
-      if (c.domain == null && c.url == null) {
-        throw new TypeError('browserContext.addCookies: each cookie needs url or domain')
+      if ((c.domain == null) === (c.url == null)) {
+        throw new TypeError('browserContext.addCookies: each cookie needs url or domain, not both')
       }
       return {
         name: c.name,

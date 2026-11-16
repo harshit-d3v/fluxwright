@@ -1,6 +1,6 @@
-# Many machines (design, not built)
+# Many machines (cluster mode)
 
-Status: a proposal for review. Nothing here is implemented.
+Status: core coordinator and pulling worker loop implemented in `0.7.0`. Remaining later items: SQLite store, separate worker token, coordinator-wide per-host limits, and a worker table on the dashboard.
 
 ## Goal
 
@@ -20,11 +20,8 @@ clients ──HTTP──▶ coordinator ◀──HTTP (pull)── worker (fluxw
 
 Two roles, one binary:
 
-- **Coordinator** (`fluxwright coordinate`): the public job API of today's server (`POST
-  /v1/jobs`, `GET` and `DELETE /v1/jobs/{id}`), with no browsers of its own. It holds the queue
-  and the results.
-- **Worker** (`fluxwright serve --join <coordinator-url>`): today's server, plus a loop that
-  asks the coordinator for work. It runs each job on its own fleet with the code that exists.
+- **Coordinator** (`fluxwright coordinate [--listen ADDR] [--max-jobs N] [--journal FILE]`): the public job API (`POST /v1/jobs`, `GET` and `DELETE /v1/jobs/{id}`), plus worker lease, heartbeat, and result endpoints, with no browsers of its own.
+- **Worker** (`fluxwright serve --join <http://coordinator-url> [--worker-id NAME]`): today's server (defaulting `--listen` to `127.0.0.1:0` when `--join` is passed), plus a pull loop that asks the coordinator for work, heartbeats every 10 seconds, aborts cancelled jobs, and posts outcomes (with failure evidence) back. Uses `FLUXWRIGHT_SERVER_TOKEN` for bearer authentication; place TLS termination on a reverse proxy when crossing untrusted networks.
 
 Workers pull; the coordinator never connects to a worker. So workers need no open port, sit
 behind NAT without trouble, and a new one joins by starting.

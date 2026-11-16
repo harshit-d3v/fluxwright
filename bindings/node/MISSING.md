@@ -18,7 +18,7 @@ napi would silently ignore an option the binding does not implement, so it throw
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)
 - `newPage` / `newContext` options the README does not list (`recordVideo`, ...), and `launch` options other than the supported ones (`args`; for `proxy`, give `newPage` one)
 - `page.locator(selector, options)` (use `.filter({ hasText })`), `filter` options other than `hasText`, `getByRole` options other than `name` and `exact`
-- `page.route(url, handler, { times })`, `route.fallback(overrides)`, `route.fulfill({ response })`, `context.cookies(urls)`, `page.close({ runBeforeUnload })`
+- `page.route(url, handler, { times })`, `route.fallback(overrides)`, `route.fulfill({ response })`, `context.cookies(urls)`, `context.clearCookies({ name, domain, path })`, `page.close({ runBeforeUnload })`
 
 ## Out of scope
 
