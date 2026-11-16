@@ -17,8 +17,9 @@ pub(crate) type HostSlot = Mutex<Option<(String, OwnedSemaphorePermit)>>;
 
 struct Host {
     slots: Arc<Semaphore>,
-    /// When the next navigation to this host may start.
-    next: Instant,
+    /// When the next navigation to this host may start. The mutex is held across `sleep_until`
+    /// so a cancelled `enter` never pushes the next navigation's start time forward.
+    next: Arc<tokio::sync::Mutex<Instant>>,
 }
 
 pub(crate) struct HostLimits {
@@ -63,14 +64,14 @@ impl HostLimits {
             }
         }
         if let Some(delay) = self.min_delay {
-            let start = {
+            let next = {
                 let mut hosts = self.hosts.lock().unwrap();
-                let h = entry(&mut hosts, &host, self.max.unwrap_or(1));
-                let start = h.next.max(Instant::now());
-                h.next = start + delay;
-                start
+                entry(&mut hosts, &host, self.max.unwrap_or(1)).next.clone()
             };
+            let mut next = next.lock().await;
+            let start = (*next).max(Instant::now());
             tokio::time::sleep_until(start).await;
+            *next = Instant::now() + delay;
         }
     }
 }
@@ -78,12 +79,16 @@ impl HostLimits {
 fn entry<'a>(hosts: &'a mut HashMap<String, Host>, host: &str, max: usize) -> &'a mut Host {
     if hosts.len() >= KEEP && !hosts.contains_key(host) {
         let now = Instant::now();
-        // In use (a permit held or waited for keeps a second reference) or still spacing.
-        hosts.retain(|_, h| Arc::strong_count(&h.slots) > 1 || h.next > now);
+        // In use (a permit or delay lock held or waited for keeps a second reference) or still spacing.
+        hosts.retain(|_, h| {
+            Arc::strong_count(&h.slots) > 1
+                || Arc::strong_count(&h.next) > 1
+                || h.next.try_lock().is_ok_and(|t| *t > now)
+        });
     }
     hosts.entry(host.to_string()).or_insert_with(|| Host {
         slots: Arc::new(Semaphore::new(max)),
-        next: Instant::now(),
+        next: Arc::new(tokio::sync::Mutex::new(Instant::now())),
     })
 }
 
@@ -126,6 +131,29 @@ mod tests {
         let other = Instant::now();
         limits.enter("https://b.example/", &HostSlot::default()).await;
         assert!(other.elapsed() < Duration::from_millis(60), "{:?}", other.elapsed());
+
+        // Cancelled waits must not push the next navigation's start time forward.
+        let limits = Arc::new(HostLimits::new(None, Some(Duration::from_millis(200))));
+        limits.enter("https://c.example/", &HostSlot::default()).await;
+        let cancelled: Vec<_> = (0..10)
+            .map(|_| {
+                let l = limits.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(10),
+                        l.enter("https://c.example/", &HostSlot::default()),
+                    )
+                    .await;
+                })
+            })
+            .collect();
+        for h in cancelled {
+            h.await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(210)).await;
+        let after = Instant::now();
+        limits.enter("https://c.example/", &HostSlot::default()).await;
+        assert!(after.elapsed() < Duration::from_millis(100), "after={:?}", after.elapsed());
     }
 
     #[tokio::test]

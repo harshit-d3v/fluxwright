@@ -112,7 +112,7 @@ function guard(Class, label, sync, methods) {
           // Playwright's per-call timeout: a locator carries it, and a page method that takes
           // a selector is the same action on that selector's locator.
           const timeout = args[at]?.timeout
-          if (via && (timeout != null || args[at]?.state != null)) return this.locator(args[0])[via](...args.slice(1))
+          if (via) return this.locator(args[0])[via](...args.slice(1))
           if (timeout != null && this._withTimeout) return call.apply(this._withTimeout(timeout), args)
           return call.apply(this, args)
         }

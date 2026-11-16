@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use fluxwright::{BrowserEngine, JobOptions, QueueFullMode};
+use fluxwright::{BrowserEngine, JobOptions, PdfOptions, QueueFullMode};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -59,6 +59,9 @@ impl Record {
         self.jobs_per_gb = self.jobs_per_second / (watch.peak_mb.max(1) as f64 / 1024.0);
         self.browsers_killed = watch.killed;
         self.leaked_processes = watch.leaked;
+        if self.scenario.starts_with("soak-") {
+            self.memory_samples_mb = watch.samples;
+        }
         self
     }
 }
@@ -71,20 +74,30 @@ fn snapshot() -> System {
 
 /// `root` and every process it started, in one snapshot. Threads are not processes.
 fn tree(sys: &System, root: u32) -> Vec<Pid> {
-    let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+    let mut children: HashMap<Pid, Vec<(Pid, u64)>> = HashMap::new();
     for (pid, p) in sys.processes() {
         if p.thread_kind().is_some() {
             continue;
         }
         if let Some(parent) = p.parent() {
-            children.entry(parent).or_default().push(*pid);
+            children.entry(parent).or_default().push((*pid, p.start_time()));
         }
     }
-    let mut found = vec![Pid::from_u32(root)];
+    let root_pid = Pid::from_u32(root);
+    let mut seen = HashSet::from([root_pid]);
+    let mut found = vec![root_pid];
     let mut at = 0;
     while at < found.len() {
-        if let Some(kids) = children.get(&found[at]) {
-            found.extend(kids.iter().filter(|k| !found.contains(k)).copied().collect::<Vec<_>>());
+        let pid = found[at];
+        let born = sys.process(pid).map_or(0, |p| p.start_time());
+        if let Some(kids) = children.get(&pid) {
+            for &(kid, start) in kids {
+                // Windows keeps a dead parent's pid on surviving children, and a new process can
+                // reuse that pid: skip kids older than pid so reused pids never pull in outsiders.
+                if start >= born && seen.insert(kid) {
+                    found.push(kid);
+                }
+            }
         }
         at += 1;
     }
@@ -102,6 +115,7 @@ struct Watched {
     peak_mb: u64,
     killed: u32,
     leaked: u32,
+    samples: Vec<u64>,
 }
 
 /// Samples the memory of `root`'s process tree four times a second on its own thread, so no
@@ -109,7 +123,7 @@ struct Watched {
 /// driver started every two seconds.
 struct Watch {
     stop: Arc<AtomicBool>,
-    thread: std::thread::JoinHandle<(u64, u32, HashSet<Pid>)>,
+    thread: std::thread::JoinHandle<(u64, u32, HashSet<(Pid, u64)>, Vec<u64>)>,
 }
 
 impl Watch {
@@ -117,14 +131,25 @@ impl Watch {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::spawn(move || {
-            let (mut peak, mut killed, mut seen) = (0u64, 0u32, HashSet::new());
+            let (mut peak, mut killed, mut seen, mut samples) =
+                (0u64, 0u32, HashSet::new(), Vec::new());
             let mut last_kill = Instant::now();
+            let mut next_sample = Instant::now();
             while !flag.load(Ordering::Relaxed) {
                 let sys = snapshot();
                 let pids = tree(&sys, root);
                 let bytes: u64 = pids.iter().filter_map(|p| sys.process(*p)).map(|p| p.memory()).sum();
-                peak = peak.max(bytes / (1024 * 1024));
-                seen.extend(pids.iter().filter(|p| is_chrome(&sys, **p)).copied());
+                let mb = bytes / (1024 * 1024);
+                peak = peak.max(mb);
+                if Instant::now() >= next_sample {
+                    samples.push(mb);
+                    next_sample += Duration::from_secs(60);
+                }
+                seen.extend(
+                    pids.iter()
+                        .filter(|p| is_chrome(&sys, **p))
+                        .filter_map(|p| sys.process(*p).map(|proc| (*p, proc.start_time()))),
+                );
                 if chaos && last_kill.elapsed() >= Duration::from_secs(2) {
                     // A browser is a Chrome the driver itself started; its renderers hang off it.
                     let browsers: Vec<Pid> = pids
@@ -143,7 +168,7 @@ impl Watch {
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
-            (peak, killed, seen)
+            (peak, killed, seen, samples)
         });
         Self { stop, thread }
     }
@@ -151,11 +176,16 @@ impl Watch {
     /// Call once the tool has shut down: whatever Chrome it started and left behind is a leak.
     fn finish(self) -> Watched {
         self.stop.store(true, Ordering::Relaxed);
-        let (peak_mb, killed, seen) = self.thread.join().unwrap_or_default();
+        let (peak_mb, killed, seen, samples) = self.thread.join().unwrap_or_default();
         std::thread::sleep(Duration::from_secs(2));
         let sys = snapshot();
-        let leaked = seen.iter().filter(|p| is_chrome(&sys, **p)).count() as u32;
-        Watched { peak_mb, killed, leaked }
+        let leaked = seen
+            .iter()
+            .filter(|&&(p, born)| {
+                is_chrome(&sys, p) && sys.process(p).is_some_and(|proc| proc.start_time() == born)
+            })
+            .count() as u32;
+        Watched { peak_mb, killed, leaked, samples }
     }
 }
 
@@ -174,6 +204,7 @@ async fn main() -> Result<()> {
         ("100-concurrent", 8, 16, 100, false),
         ("500-concurrent", 10, 20, 500, false),
         ("1000-queued", 4, 8, 1000, false),
+        ("100-pdfs", 4, 8, 100, false),
     ];
     if args.chaos {
         scenarios.push(("chaos-1000-queued", 4, 8, 1000, true));
@@ -189,7 +220,12 @@ async fn main() -> Result<()> {
         eprintln!("scenario {name} jobs={jobs} browsers={browsers} ctx={ctx}");
         let rec = run_fluxwright(&url, name, browsers, ctx, jobs, chaos, chrome.as_ref()).await?;
         records.push(rec);
-        for tool in ["playwright", "puppeteer"] {
+        let tools: &[&str] = if name.ends_with("-pdfs") {
+            &["playwright"]
+        } else {
+            &["playwright", "puppeteer"]
+        };
+        for &tool in tools {
             if let Some(rec) = run_node_tool(tool, name, jobs, browsers, ctx, chaos, &url, chrome.as_ref()) {
                 records.push(rec);
             } else {
@@ -282,6 +318,7 @@ async fn run_fluxwright(
             .await;
     }
 
+    let is_pdf = scenario.ends_with("-pdfs");
     let watch = Watch::start(std::process::id(), chaos);
     // As node-runner.mjs does: min(jobs, slots, 24) workers, each timing only its own job. Spawning
     // every job at once timed the queue too, so these latencies were not comparable.
@@ -301,7 +338,22 @@ async fn run_fluxwright(
                         let url = url.clone();
                         async move {
                             page.goto(&url).await?;
-                            let _ = page.title().await?;
+                            if is_pdf {
+                                let pdf = page
+                                    .pdf(&PdfOptions {
+                                        format: Some("A4".into()),
+                                        print_background: true,
+                                        ..Default::default()
+                                    })
+                                    .await?;
+                                if !pdf.starts_with(b"%PDF-") {
+                                    return Err(fluxwright::Error::Other(
+                                        "unexpected pdf output".into(),
+                                    ));
+                                }
+                            } else {
+                                let _ = page.title().await?;
+                            }
                             Ok(())
                         }
                     })
@@ -362,22 +414,11 @@ async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<R
     }
     let engine = builder.build().await?;
     let watch = Watch::start(std::process::id(), false);
-    let me = std::process::id();
-    let memory_now = move || {
-        let sys = snapshot();
-        tree(&sys, me).iter().filter_map(|p| sys.process(*p)).map(|p| p.memory()).sum::<u64>() / (1024 * 1024)
-    };
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);
     let (mut jobs, mut failures) = (0u32, 0u32);
     let mut latencies = Vec::new();
-    let mut samples = Vec::new();
-    let mut next_sample = Instant::now();
     let start = Instant::now();
     while Instant::now() < deadline {
-        if Instant::now() >= next_sample {
-            samples.push(tokio::task::spawn_blocking(memory_now).await?);
-            next_sample += Duration::from_secs(60);
-        }
         let url = url.to_string();
         jobs += 1;
         let t0 = Instant::now();
@@ -413,7 +454,7 @@ async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<R
         failure_rate: if jobs == 0 { 0.0 } else { failures as f64 / jobs as f64 },
         browsers_killed: 0,
         leaked_processes: 0,
-        memory_samples_mb: samples,
+        memory_samples_mb: Vec::new(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
         chrome: chrome.map(|p| p.display().to_string()),

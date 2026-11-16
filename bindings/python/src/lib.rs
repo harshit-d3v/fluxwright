@@ -90,9 +90,12 @@ fn wait_state(state: Option<String>) -> PyResult<fluxwright::WaitState> {
 /// Playwright's `timeout` in milliseconds: 0 means no timeout, and anything that is not a time
 /// (negative, NaN) leaves the default in place.
 fn call_timeout(ms: Option<f64>) -> Option<Duration> {
+    const YEAR: Duration = Duration::from_secs(365 * 24 * 60 * 60);
     match ms {
-        Some(ms) if ms == 0.0 => Some(Duration::from_secs(365 * 24 * 60 * 60)),
-        Some(ms) if ms > 0.0 && ms.is_finite() => Some(Duration::from_secs_f64(ms / 1000.0)),
+        Some(ms) if ms == 0.0 => Some(YEAR),
+        Some(ms) if ms > 0.0 && ms.is_finite() => {
+            Some(Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(YEAR).min(YEAR))
+        }
         _ => None,
     }
 }

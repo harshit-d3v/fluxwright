@@ -361,9 +361,12 @@ where
 /// Playwright's `timeout` option in milliseconds: 0 means no timeout, and anything that is
 /// not a time (negative, NaN) leaves the default in place.
 fn call_timeout(ms: Option<f64>) -> Option<std::time::Duration> {
+    const YEAR: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
     match ms {
-        Some(ms) if ms == 0.0 => Some(std::time::Duration::from_secs(365 * 24 * 3600)),
-        Some(ms) if ms > 0.0 && ms.is_finite() => Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
+        Some(ms) if ms == 0.0 => Some(YEAR),
+        Some(ms) if ms > 0.0 && ms.is_finite() => {
+            Some(std::time::Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(YEAR).min(YEAR))
+        }
         _ => None,
     }
 }
@@ -1117,16 +1120,6 @@ impl Page {
     }
 
     #[napi]
-    pub async fn click(&self, selector: String) -> Result<()> {
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.click(&selector).await })).await
-    }
-
-    #[napi]
-    pub async fn fill(&self, selector: String, value: String) -> Result<()> {
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.fill(&selector, &value).await })).await
-    }
-
-    #[napi]
     pub async fn evaluate(&self, expression: String) -> Result<serde_json::Value> {
         with_page(self.lease.clone(), move |p| Box::pin(async move { p.evaluate(&expression).await })).await
     }
@@ -1153,11 +1146,6 @@ impl Page {
     pub async fn set_viewport_size(&self, size: ViewportSize) -> Result<()> {
         with_page(self.lease.clone(), move |p| Box::pin(async move { p.set_viewport_size(size.width, size.height).await }))
             .await
-    }
-
-    #[napi]
-    pub async fn wait_for_selector(&self, selector: String) -> Result<()> {
-        with_page(self.lease.clone(), move |p| Box::pin(async move { p.wait_for_selector(&selector).await })).await
     }
 
     /// CSS, `text=`, or `role=` selector.

@@ -63,7 +63,14 @@ async function runPool(browsers, newContext) {
             try {
               const page = await ctx.newPage();
               await page.goto(url, { waitUntil: "load", timeout: jobTimeoutMs });
-              await page.title();
+              if (isPdf) {
+                const pdf = await page.pdf({ format: "A4", printBackground: true });
+                if (!pdf || pdf.subarray(0, 5).toString("latin1") !== "%PDF-") {
+                  throw new Error("unexpected pdf output");
+                }
+              } else {
+                await page.title();
+              }
             } finally {
               await ctx.close();
             }
