@@ -76,6 +76,9 @@ const PAGE = {
   ignoreHTTPSErrors: true,
   javaScriptEnabled: true,
   offline: true,
+  baseURL: true,
+  httpCredentials: true,
+  bypassCSP: true,
   storageState: true,
 }
 const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true }
@@ -521,6 +524,7 @@ class BrowserContext {
   #opening = false
   #closed = false
   #routes = []
+  #cookies = []
 
   constructor(browser, options) {
     this.#browser = browser
@@ -542,6 +546,7 @@ class BrowserContext {
     try {
       const page = await this.#browser.newPage(this.#options)
       try {
+        if (this.#cookies.length) await page._addCookies(this.#cookies)
         for (const [url, handler] of this.#routes) await page.route(url, handler)
         // close() ran while the page was coming: it would otherwise stay open on a closed context.
         if (this.#closed) throw new Error('browserContext.newPage: the context is closed')
@@ -576,6 +581,48 @@ class BrowserContext {
   async cookies(urls) {
     if (urls !== undefined) throw new TypeError('browserContext.cookies: filtering by URL is not supported (see MISSING.md)')
     return (await this.storageState()).cookies
+  }
+
+  async addCookies(cookies) {
+    if (!Array.isArray(cookies)) throw new TypeError('browserContext.addCookies: cookies must be an array')
+    const normalized = cookies.map((c) => {
+      checkOptions('browserContext.addCookies cookie', c, {
+        name: true,
+        value: true,
+        url: true,
+        domain: true,
+        path: true,
+        expires: true,
+        httpOnly: true,
+        secure: true,
+        sameSite: ['Strict', 'Lax', 'None'],
+        partitionKey: true,
+        _crHasCrossSiteAncestor: true,
+      })
+      if (c.domain == null && c.url == null) {
+        throw new TypeError('browserContext.addCookies: each cookie needs url or domain')
+      }
+      return {
+        name: c.name,
+        value: c.value,
+        domain: c.domain ?? c.url ?? '',
+        path: c.path ?? '/',
+        expires: c.expires ?? -1,
+        httpOnly: c.httpOnly ?? false,
+        secure: c.secure ?? false,
+        sameSite: c.sameSite ?? 'Lax',
+        partitionKey: c.partitionKey,
+        _crHasCrossSiteAncestor: c._crHasCrossSiteAncestor,
+      }
+    })
+    if (this.#page) return this.#page._addCookies(normalized)
+    this.#cookies.push(...normalized)
+  }
+
+  async clearCookies(options) {
+    checkOptions('browserContext.clearCookies', options, NONE)
+    this.#cookies = []
+    if (this.#page) await this.#page._clearCookies()
   }
 
   async close(options) {
@@ -689,7 +736,19 @@ try {
     ['getByRole', 1, { name: true, exact: true }],
     ['getByLabel', 1, EXACT],
     ['getByPlaceholder', 1, EXACT],
+    ['getByAltText', 1, EXACT],
+    ['getByTitle', 1, EXACT],
   ]
+  native.Page.prototype.emulateMedia = async function (options) {
+    checkOptions('page.emulateMedia', options, {
+      media: ['screen', 'print'],
+      colorScheme: ['light', 'dark', 'no-preference'],
+    })
+    const has = (k) => options != null && Object.hasOwn(options, k) && options[k] !== undefined
+    const media = has('media') ? (options.media ?? '') : undefined
+    const scheme = has('colorScheme') ? (options.colorScheme ?? '') : undefined
+    return this._emulateMedia(media, scheme)
+  }
   // The native method takes the state itself, not Playwright's options object.
   const waitFor = native.Locator.prototype.waitFor
   native.Locator.prototype.waitFor = function (options) {
@@ -725,6 +784,10 @@ try {
       checkOptions('chromium.launch', options, LAUNCH)
       return native.Chromium.launch(options)
     },
+    connectOverCDP: async (endpointURL, options) => {
+      checkOptions('chromium.connectOverCDP', options, NONE)
+      return native.Chromium.connectOverCDP(endpointURL)
+    },
   }
   module.exports.default = module.exports
 } catch (err) {
@@ -739,6 +802,9 @@ try {
   module.exports = {
     chromium: {
       launch: async () => {
+        throw error
+      },
+      connectOverCDP: async () => {
         throw error
       },
     },

@@ -107,6 +107,8 @@ pub struct PageLease {
     default_timeouts: std::sync::Mutex<(Option<Duration>, Option<Duration>)>,
     /// This page's place on the host it navigated to, when hosts are limited.
     host_slot: HostSlot,
+    /// Base URL for relative `goto` calls.
+    base_url: std::sync::Mutex<Option<String>>,
 }
 
 tokio::task_local! {
@@ -223,6 +225,12 @@ impl Engine {
             .await?;
         apply_blocking(&page, opts).await?;
         let timeout = Duration::from_secs(5);
+        if let Some(base) = &opts.base_url {
+            *page.base_url.lock().unwrap() = Some(base.clone());
+        }
+        if let Some(creds) = &opts.http_credentials {
+            page.page.set_http_credentials(creds, timeout).await?;
+        }
         page.page.grant_permissions(&opts.permissions, timeout).await?;
         if let Some(state) = &opts.storage_state {
             page.page.set_storage_state(state, timeout).await?;
@@ -709,6 +717,7 @@ impl Inner {
             dialog_listeners,
             default_timeouts: Default::default(),
             host_slot: HostSlot::default(),
+            base_url: Default::default(),
         })
     }
 
@@ -953,15 +962,32 @@ impl PageLease {
         Ok(self.page.storage_state(self.action_timeout()).await?)
     }
 
+    pub async fn add_cookies(&self, cookies: &[fluxwright_cdp::Cookie]) -> Result<()> {
+        Ok(self.page.add_cookies(cookies, self.action_timeout()).await?)
+    }
+
+    pub async fn clear_cookies(&self) -> Result<()> {
+        Ok(self.page.clear_cookies(self.action_timeout()).await?)
+    }
+
+    pub async fn emulate_media(&self, media: Option<&str>, color_scheme: Option<&str>) -> Result<()> {
+        Ok(self
+            .page
+            .emulate_media(media, color_scheme, self.action_timeout())
+            .await?)
+    }
+
     /// Navigates and waits for the `load` event.
     pub async fn goto(&self, url: &str) -> Result<()> {
         self.goto_with(url, fluxwright_cdp::WaitUntil::Load).await
     }
 
     pub async fn goto_with(&self, url: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
-        self.engine.hosts.enter(url, &self.host_slot).await;
+        let base = self.base_url.lock().unwrap().clone();
+        let url = resolve_url(base.as_deref(), url);
+        self.engine.hosts.enter(&url, &self.host_slot).await;
         self.page
-            .goto(url, wait_until, self.navigation_timeout())
+            .goto(&url, wait_until, self.navigation_timeout())
             .await?;
         Ok(())
     }
@@ -1088,6 +1114,14 @@ impl PageLease {
 
     pub fn get_by_placeholder(&self, text: &str, exact: bool) -> Locator<'_> {
         self.locator(Selector::placeholder(text, exact))
+    }
+
+    pub fn get_by_alt_text(&self, text: &str, exact: bool) -> Locator<'_> {
+        self.locator(Selector::alt_text(text, exact))
+    }
+
+    pub fn get_by_title(&self, text: &str, exact: bool) -> Locator<'_> {
+        self.locator(Selector::title(text, exact))
     }
 
     /// `data-testid`, exact.
@@ -1299,6 +1333,14 @@ impl<'a> Locator<'a> {
         self.then(&Selector::placeholder(text, exact))
     }
 
+    pub fn get_by_alt_text(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.then(&Selector::alt_text(text, exact))
+    }
+
+    pub fn get_by_title(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.then(&Selector::title(text, exact))
+    }
+
     pub fn get_by_test_id(&self, id: &str) -> Locator<'a> {
         self.then(&Selector::test_id(id))
     }
@@ -1371,6 +1413,14 @@ impl<'a> FrameLocator<'a> {
 
     pub fn get_by_placeholder(&self, text: &str, exact: bool) -> Locator<'a> {
         self.locator(Selector::placeholder(text, exact))
+    }
+
+    pub fn get_by_alt_text(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.locator(Selector::alt_text(text, exact))
+    }
+
+    pub fn get_by_title(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.locator(Selector::title(text, exact))
     }
 
     pub fn get_by_test_id(&self, id: &str) -> Locator<'a> {
@@ -1515,6 +1565,36 @@ impl EngineBuilder {
         }
         Ok(engine)
     }
+}
+
+fn resolve_url(base: Option<&str>, url: &str) -> String {
+    let Some(base) = base.filter(|_| {
+        !url.contains("://")
+            && !url.starts_with("about:")
+            && !url.starts_with("data:")
+            && !url.starts_with("javascript:")
+    }) else {
+        return url.to_string();
+    };
+    if url.starts_with("//") {
+        if let Some((scheme, _)) = base.split_once("://") {
+            return format!("{scheme}:{url}");
+        }
+    }
+    if url.starts_with('/') {
+        if let Some((scheme, rest)) = base.split_once("://") {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+            return format!("{scheme}://{authority}{url}");
+        }
+    }
+    let dir = match base.find("://").map(|i| i + 3) {
+        Some(after_scheme) => match base[after_scheme..].rfind('/') {
+            Some(slash) => &base[..=after_scheme + slash],
+            None => return format!("{base}/{}", url.trim_start_matches("./")),
+        },
+        None => base,
+    };
+    format!("{dir}{}", url.trim_start_matches("./"))
 }
 
 #[cfg(test)]
@@ -1784,5 +1864,16 @@ mod tests {
         let _ = inflight.await;
         assert!(eng.inner.state.lock().await.browsers.is_empty());
         assert_eq!(eng.inner.state.lock().await.launching, 0);
+    }
+
+    #[test]
+    fn resolve_url_handles_relative_and_absolute_paths() {
+        assert_eq!(resolve_url(None, "/a"), "/a");
+        assert_eq!(resolve_url(Some("http://127.0.0.1:8080/sub/page.html"), "/a"), "http://127.0.0.1:8080/a");
+        assert_eq!(resolve_url(Some("http://127.0.0.1:8080/sub/page.html"), "b.html"), "http://127.0.0.1:8080/sub/b.html");
+        assert_eq!(resolve_url(Some("http://127.0.0.1:8080"), "b.html"), "http://127.0.0.1:8080/b.html");
+        assert_eq!(resolve_url(Some("http://127.0.0.1:8080/"), "//cdn.test/x.js"), "http://cdn.test/x.js");
+        assert_eq!(resolve_url(Some("http://127.0.0.1:8080/"), "https://other.test/y"), "https://other.test/y");
+        assert_eq!(resolve_url(Some("http://127.0.0.1:8080/"), "about:blank"), "about:blank");
     }
 }

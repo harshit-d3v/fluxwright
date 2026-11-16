@@ -4,7 +4,9 @@ import { Chromium, ConsoleMessage, NewPageOptions, Page, PdfOptions, ScreenshotO
  * Playwright-style export: `chromium.launch(...)`, which is `Chromium.launch` after a check that
  * every option is one Fluxwright implements (others throw a TypeError).
  */
-export const chromium: Pick<typeof Chromium, 'launch'>
+export const chromium: Pick<typeof Chromium, 'launch'> & {
+  connectOverCDP(endpointURL: string, options?: Record<string, never>): Promise<Browser>
+}
 declare const fluxwright: { chromium: typeof chromium }
 export default fluxwright
 
@@ -112,6 +114,22 @@ export interface BrowserContext {
   storageState(options?: { path?: string }): Promise<StorageState>
   /** Every cookie in this context. */
   cookies(): Promise<StorageState['cookies']>
+  addCookies(
+    cookies: Array<{
+      name: string
+      value: string
+      url?: string
+      domain?: string
+      path?: string
+      expires?: number
+      httpOnly?: boolean
+      secure?: boolean
+      sameSite?: 'Strict' | 'Lax' | 'None'
+      partitionKey?: string
+      _crHasCrossSiteAncestor?: boolean
+    }>,
+  ): Promise<void>
+  clearCookies(): Promise<void>
   /** Closes the context's page; the context opens no other. */
   close(): Promise<void>
 }
@@ -134,6 +152,11 @@ declare module './index' {
     pageErrors(): Promise<Error[]>
     /** Also writes the image to `path`; without `type`, its extension picks PNG or JPEG. */
     screenshot(options?: ScreenshotOptions & { path?: string }): Promise<Buffer>
+    /** Changes CSS `media` and/or `prefers-color-scheme`; `null` resets either. */
+    emulateMedia(options?: {
+      media?: 'screen' | 'print' | null
+      colorScheme?: 'light' | 'dark' | 'no-preference' | null
+    }): Promise<void>
     /**
      * The page printed to PDF, as Playwright's `page.pdf` (headless only). Lengths are numbers of
      * pixels or strings with `px`, `in`, `cm` or `mm`. Also writes the file to `path`.

@@ -124,6 +124,10 @@ pub struct JobOptions {
     pub permissions: Vec<String>,
     /// Cookies and localStorage to start from, e.g. saved by `PageLease::storage_state`.
     pub storage_state: Option<StorageState>,
+    /// Base URL for relative `goto` calls.
+    pub base_url: Option<String>,
+    /// HTTP Basic/Digest authentication credentials.
+    pub http_credentials: Option<(String, String)>,
 }
 
 impl Default for JobOptions {
@@ -140,6 +144,8 @@ impl Default for JobOptions {
             emulation: Emulation::default(),
             permissions: Vec::new(),
             storage_state: None,
+            base_url: None,
+            http_credentials: None,
         }
     }
 }

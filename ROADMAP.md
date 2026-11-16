@@ -19,6 +19,7 @@ The goal is to be the best engine for running many browser jobs on your own mach
 - **0.5.0:** Playwright scripts need fewer changes: `browser.newContext()` / `new_context()` with `context.newPage()`; `page.on('request' | 'response' | 'requestfinished' | 'requestfailed')` with `response.body()` / `json()`, and `page.waitForResponse` / `waitForRequest` (`expect_response` / `expect_request` in Python); `page.on('dialog')` to accept or dismiss alerts, confirms and prompts. Clicks, boxes and screenshots land right inside iframes that CSS scales or rotates. Fixes a crash on Windows under heavy load (a stack overflow while measuring Chrome's memory). Both bindings are tested on Windows, macOS and Linux.
 - **0.5.1 (PyPI):** a script that ended right after an awaited call could crash at exit on Linux (SIGSEGV, about 1 run in 16 on Python 3.10–3.13). It now exits cleanly.
 - **0.6.0:** the fleet sizes itself: by default a browser per 4 CPUs, and a memory budget of 75% of the memory free at launch (inside a container, its limit), which `memoryCeilingMb` / `memory_ceiling_mb` overrides. Long runs stay healthy: a closed or recycled browser frees its profile folder, tasks and pipes; recycling a browser no longer pauses the pool; callers that gave up leave the queue; idle browsers close without new traffic; Chrome never outlives its engine. Text cut through an emoji no longer makes calls time out, a route reply Chrome rejects no longer leaves the request stuck, and route requests show lower-case header names. In the bindings, an unanswered `beforeunload` is accepted, routed pages and console listeners no longer keep closed pages alive, and `timeout: 0` waits as long as it takes. The MCP server opens web pages only and checks every request the page makes. Benchmarks run on GitHub's runner and time every tool the same way.
+- **0.7.0:** HTTP server mode (`fluxwright serve`) with bearer auth, priorities, cancellation, Prometheus `/metrics`, W3C `traceparent` spans, SSE live dashboard, failure evidence, `--journal` restart persistence, `--max-concurrency-per-host` / `--min-delay-per-host`, and Docker image; `page.pdf()`, JPEG/WebP screenshots with `clip` and `omitBackground`; per-call `timeout` and `setDefaultTimeout` / `setDefaultNavigationTimeout`; `waitForSelector` / `waitFor` states (`attached`, `detached`, `visible`, `hidden`); `isMobile`, `hasTouch`, `extraHTTPHeaders`, `ignoreHTTPSErrors`, `javaScriptEnabled`, `offline`, `baseURL`, `bypassCSP`, and `httpCredentials`; `emulateMedia`, `addCookies` / `clearCookies`, `getByAltText` / `getByTitle`, and `chromium.connectOverCDP` across Rust, Node, and Python.
 
 ## Next: the fleet at scale
 
@@ -27,7 +28,7 @@ Implement these milestones in order, verifying each before starting the next:
 1. [x] **Server mode:** `fluxwright serve` exposes authenticated HTTP job submission, status/results, cancellation, bounded admission/output, priorities and total deadlines. Protocol and browser-backed tests verified. See [docs/SERVER.md](docs/SERVER.md).
 2. [x] **Observability:** a Prometheus endpoint, W3C `traceparent` propagation with `tracing` spans per job and step (visible through any tracing subscriber; no OpenTelemetry SDK export yet), and a live fleet dashboard with real data.
 3. [x] **Failure evidence:** per-job bounded network log, console output, and a screenshot on failure.
-4. [x] **Bring your own browsers:** `connectOverCDP` in the Rust engine and `fluxwright serve --cdp-endpoint` (Node/Python binding exposure still pending).
+4. [x] **Bring your own browsers:** `connectOverCDP` across Rust, Node, Python, and `fluxwright serve --cdp-endpoint`.
 5. [x] **Docker image** with Chrome and Fluxwright.
 6. [x] **Per-host limits:** a cap on the pages on one host at once and a minimum delay between navigations to it, across the fleet.
 7. [x] **Jobs that survive a restart:** `fluxwright serve --journal <file>` queues unfinished jobs again on start.
@@ -39,7 +40,7 @@ One queue with workers on several hosts: the step from one machine to a cluster.
 ## Distribution and trust (ongoing)
 
 - Publish the crates on crates.io.
-- Prebuilt MCP server binaries on GitHub Releases and npm, so AI agents don't need Rust.
+- Prebuilt MCP and CLI binaries workflow configured in `.github/workflows/release-binaries.yml`.
 - Node binding tests and type checks in CI, on all three operating systems.
 - CONTRIBUTING.md, issue templates and good first issues.
 

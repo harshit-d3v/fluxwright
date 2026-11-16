@@ -344,6 +344,33 @@ fn looks_like_function(e: &str) -> bool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Credentials {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CookieInput {
+    name: String,
+    value: String,
+    url: Option<String>,
+    domain: Option<String>,
+    path: Option<String>,
+    expires: Option<f64>,
+    #[serde(alias = "http_only")]
+    http_only: Option<bool>,
+    secure: Option<bool>,
+    #[serde(alias = "same_site")]
+    same_site: Option<String>,
+    #[serde(alias = "partition_key")]
+    partition_key: Option<String>,
+    #[serde(rename = "_crHasCrossSiteAncestor")]
+    cross_site_ancestor: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct ProxyOptions {
     server: String,
     bypass: Option<String>,
@@ -521,12 +548,28 @@ impl Engine {
         })
     }
 
+    #[staticmethod]
+    fn connect_over_cdp(py: Python<'_>, endpoint_url: String) -> PyResult<Bound<'_, PyAny>> {
+        future_into_py(py, async move {
+            let inner = fluxwright::BrowserEngine::builder()
+                .connect_over_cdp(endpoint_url)
+                .max_contexts_per_browser(8)
+                .queue_capacity(usize::MAX)
+                .acquire_timeout(queue_wait(None))
+                .build()
+                .await
+                .map_err(error)?;
+            Ok(Engine { inner })
+        })
+    }
+
     /// A fresh browser context; every option applies to this page only.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (*, proxy=None, user_agent=None, locale=None, timezone_id=None, geolocation=None,
                         permissions=None, viewport=None, device_scale_factor=None, color_scheme=None,
                         is_mobile=None, has_touch=None, extra_http_headers=None, ignore_https_errors=None,
-                        java_script_enabled=None, offline=None, storage_state=None))]
+                        java_script_enabled=None, offline=None, base_url=None, http_credentials=None,
+                        bypass_csp=None, storage_state=None))]
     fn new_page<'py>(
         &self,
         py: Python<'py>,
@@ -545,6 +588,9 @@ impl Engine {
         ignore_https_errors: Option<bool>,
         java_script_enabled: Option<bool>,
         offline: Option<bool>,
+        base_url: Option<String>,
+        http_credentials: Option<Bound<'py, PyAny>>,
+        bypass_csp: Option<bool>,
         storage_state: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let color_scheme = match color_scheme {
@@ -560,6 +606,9 @@ impl Engine {
             .map(|g| options(&g, "geolocation"))
             .transpose()?;
         let viewport: Option<Size> = viewport.map(|v| options(&v, "viewport")).transpose()?;
+        let http_credentials: Option<Credentials> = http_credentials
+            .map(|c| options(&c, "http_credentials"))
+            .transpose()?;
         let opts = fluxwright::JobOptions {
             proxy: proxy.map(|p| fluxwright::Proxy {
                 server: p.server,
@@ -585,9 +634,12 @@ impl Engine {
                 ignore_https_errors: ignore_https_errors.unwrap_or(false),
                 javascript_enabled: java_script_enabled,
                 offline: offline.unwrap_or(false),
+                bypass_csp: bypass_csp.unwrap_or(false),
             },
             permissions: permissions.unwrap_or_default(),
             storage_state: storage_state.map(|s| storage(&s)).transpose()?,
+            base_url,
+            http_credentials: http_credentials.map(|c| (c.username, c.password)),
             ..Default::default()
         };
         let engine = self.inner.clone();
@@ -968,6 +1020,16 @@ impl Page {
         self.top().get_by_placeholder(text, exact)
     }
 
+    #[pyo3(signature = (text, *, exact=None))]
+    fn get_by_alt_text(&self, text: &str, exact: Option<bool>) -> Locator {
+        self.top().get_by_alt_text(text, exact)
+    }
+
+    #[pyo3(signature = (text, *, exact=None))]
+    fn get_by_title(&self, text: &str, exact: Option<bool>) -> Locator {
+        self.top().get_by_title(text, exact)
+    }
+
     fn get_by_test_id(&self, test_id: &str) -> Locator {
         self.top().get_by_test_id(test_id)
     }
@@ -1002,6 +1064,59 @@ impl Page {
     fn intercept<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         run(py, &self.lease, |p| {
             Box::pin(async move { Ok(RouteStream(Arc::new(Mutex::new(p.intercept().await?)))) })
+        })
+    }
+
+    #[pyo3(name = "_emulate_media", signature = (*, media=None, color_scheme=None))]
+    fn emulate_media<'py>(
+        &self,
+        py: Python<'py>,
+        media: Option<String>,
+        color_scheme: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move {
+                p.emulate_media(media.as_deref(), color_scheme.as_deref())
+                    .await
+                    .map(none)
+            })
+        })
+    }
+
+    #[pyo3(name = "_add_cookies")]
+    fn add_cookies<'py>(
+        &self,
+        py: Python<'py>,
+        cookies: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut parsed = Vec::with_capacity(cookies.len());
+        for c in cookies {
+            let item: CookieInput = options(&c, "cookies")?;
+            let domain = item.domain.or(item.url).ok_or_else(|| {
+                PyValueError::new_err("add_cookies: each cookie needs url or domain")
+            })?;
+            parsed.push(fluxwright::Cookie {
+                name: item.name,
+                value: item.value,
+                domain,
+                path: item.path.unwrap_or_else(|| "/".into()),
+                expires: item.expires.unwrap_or(-1.0),
+                http_only: item.http_only.unwrap_or(false),
+                secure: item.secure.unwrap_or(false),
+                same_site: item.same_site.unwrap_or_else(|| "Lax".into()),
+                partition_key: item.partition_key,
+                cross_site_ancestor: item.cross_site_ancestor,
+            });
+        }
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.add_cookies(&parsed).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clear_cookies")]
+    fn clear_cookies<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, |p| {
+            Box::pin(async move { p.clear_cookies().await.map(none) })
         })
     }
 }
@@ -1208,6 +1323,16 @@ impl Locator {
         ))
     }
 
+    #[pyo3(signature = (text, *, exact=None))]
+    fn get_by_alt_text(&self, text: &str, exact: Option<bool>) -> Locator {
+        self.then(fluxwright::Selector::alt_text(text, exact.unwrap_or(false)))
+    }
+
+    #[pyo3(signature = (text, *, exact=None))]
+    fn get_by_title(&self, text: &str, exact: Option<bool>) -> Locator {
+        self.then(fluxwright::Selector::title(text, exact.unwrap_or(false)))
+    }
+
     fn get_by_test_id(&self, test_id: &str) -> Locator {
         self.then(fluxwright::Selector::test_id(test_id))
     }
@@ -1265,6 +1390,16 @@ impl FrameLocator {
             text,
             exact.unwrap_or(false),
         ))
+    }
+
+    #[pyo3(signature = (text, *, exact=None))]
+    fn get_by_alt_text(&self, text: &str, exact: Option<bool>) -> Locator {
+        self.find(fluxwright::Selector::alt_text(text, exact.unwrap_or(false)))
+    }
+
+    #[pyo3(signature = (text, *, exact=None))]
+    fn get_by_title(&self, text: &str, exact: Option<bool>) -> Locator {
+        self.find(fluxwright::Selector::title(text, exact.unwrap_or(false)))
     }
 
     /// `data-testid`, exact.

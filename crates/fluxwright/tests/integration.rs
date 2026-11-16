@@ -1652,3 +1652,68 @@ async fn connect_over_cdp_invalid_endpoint_fails_cleanly() {
     let err = BrowserEngine::connect_over_cdp("ws://127.0.0.1:1/invalid").await;
     assert!(err.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alt_title_emulate_media_and_cookies() {
+    let eng = engine(1, 1).await;
+    let opts = fluxwright::JobOptions {
+        emulation: fluxwright::Emulation {
+            bypass_csp: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let page = eng.acquire_job(&opts).await.unwrap();
+    page.goto(
+        "data:text/html,<style>@media print { p { color: rgb(255, 0, 0); } }</style>\
+         <img alt='Site Logo' title='Hover Info'><p>T</p>",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page.get_by_alt_text("Site Logo", true)
+            .evaluate("(el) => el.tagName", None)
+            .await
+            .unwrap(),
+        json!("IMG")
+    );
+    assert_eq!(
+        page.get_by_title("hover", false)
+            .evaluate("(el) => el.getAttribute('alt')", None)
+            .await
+            .unwrap(),
+        json!("Site Logo")
+    );
+    page.emulate_media(Some("print"), Some("dark")).await.unwrap();
+    assert_eq!(
+        page.evaluate("getComputedStyle(document.querySelector('p')).color")
+            .await
+            .unwrap(),
+        json!("rgb(255, 0, 0)")
+    );
+    assert_eq!(
+        page.evaluate("matchMedia('(prefers-color-scheme: dark)').matches")
+            .await
+            .unwrap(),
+        json!(true)
+    );
+    page.emulate_media(Some(""), Some("")).await.unwrap();
+    page.goto("http://example.com").await.ok();
+    page.add_cookies(&[fluxwright::Cookie {
+        name: "a".into(),
+        value: "1".into(),
+        domain: "https://example.com".into(),
+        path: String::new(),
+        expires: -1.0,
+        http_only: false,
+        secure: false,
+        same_site: "Lax".into(),
+        partition_key: None,
+        cross_site_ancestor: None,
+    }])
+    .await
+    .unwrap();
+    page.clear_cookies().await.unwrap();
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}

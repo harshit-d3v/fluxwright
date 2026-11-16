@@ -24,6 +24,20 @@ const server = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json')
     return res.end('{"real":true}')
   }
+  if (req.url === '/auth') {
+    if (req.headers.authorization !== `Basic ${Buffer.from('u:p').toString('base64')}`) {
+      res.statusCode = 401
+      res.setHeader('WWW-Authenticate', 'Basic realm="test"')
+      return res.end('denied')
+    }
+    res.setHeader('Content-Type', 'text/plain')
+    return res.end('authed')
+  }
+  if (req.url === '/csp') {
+    res.setHeader('Content-Security-Policy', "script-src 'none'")
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<p id="n">0</p><script>document.getElementById("n").textContent="1"</script>')
+  }
   if (req.url === '/login') res.setHeader('Set-Cookie', 'sid=s3cret; Path=/')
   res.setHeader('Content-Type', 'text/html')
   res.end(`<title>${req.headers['user-agent']}|${req.headers['accept-language']}</title>`)
@@ -418,16 +432,40 @@ try {
   assert.equal(await net.title(), 'left')
   await net.close()
 
-  // browser.newContext(): its options and routes apply to its one page.
-  const context = await browser.newContext({ userAgent: 'CtxSmoke/1' })
+  // browser.newContext(): its options, cookies and routes apply to its one page.
+  const context = await browser.newContext({
+    userAgent: 'CtxSmoke/1',
+    baseURL: base,
+    bypassCSP: true,
+    httpCredentials: { username: 'u', password: 'p' },
+  })
+  await context.addCookies([{ name: 'pre', value: 'yes', url: base }])
   await context.route('**/api', (route) => route.fulfill({ body: 'from the context' }))
   assert.deepEqual(context.pages(), [])
   const inContext = await context.newPage()
-  await inContext.goto(`${base}/login`)
+  await inContext.goto('/login')
   assert.match(await inContext.title(), /^CtxSmoke\/1/)
   assert.equal(await inContext.evaluate(() => fetch('/api').then((r) => r.text())), 'from the context')
   assert.deepEqual(context.pages(), [inContext])
   assert.ok((await context.cookies()).some((c) => c.name === 'sid'))
+  assert.ok((await context.cookies()).some((c) => c.name === 'pre'))
+  await context.addCookies([{ name: 'mid', value: '2', url: base }])
+  assert.ok((await context.cookies()).some((c) => c.name === 'mid'))
+  await context.clearCookies()
+  assert.equal((await context.cookies()).length, 0)
+  await inContext.goto('/csp')
+  assert.equal(await inContext.locator('#n').textContent(), '1')
+  await inContext.goto('/auth')
+  assert.equal(await inContext.locator('body').textContent(), 'authed')
+  await inContext.goto('data:text/html,<style>@media print { p { color: rgb(255, 0, 0); } }</style><img alt="Site Logo" title="Hover Info"><p>T</p>')
+  assert.equal(await inContext.getByAltText('Site Logo', { exact: true }).evaluate((el) => el.tagName), 'IMG')
+  assert.equal(await inContext.getByTitle('hover').evaluate((el) => el.getAttribute('alt')), 'Site Logo')
+  await inContext.emulateMedia({ media: 'print', colorScheme: 'dark' })
+  assert.equal(await inContext.evaluate(() => getComputedStyle(document.querySelector('p')).color), 'rgb(255, 0, 0)')
+  assert.equal(await inContext.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches), true)
+  await inContext.emulateMedia({ media: null, colorScheme: null })
+  await assert.rejects(fluxwright.chromium.connectOverCDP('ws://127.0.0.1:1', { slowMo: 1 }), TypeError)
+  await assert.rejects(fluxwright.chromium.connectOverCDP('ws://127.0.0.1:1'))
   await assert.rejects(context.newPage(), /holds one page/)
   await context.close()
   assert.ok(inContext.isClosed())
