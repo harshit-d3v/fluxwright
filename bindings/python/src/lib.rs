@@ -1092,9 +1092,12 @@ impl Page {
         let mut parsed = Vec::with_capacity(cookies.len());
         for c in cookies {
             let item: CookieInput = options(&c, "cookies")?;
-            let domain = item.domain.or(item.url).ok_or_else(|| {
-                PyValueError::new_err("add_cookies: each cookie needs url or domain")
-            })?;
+            if item.domain.is_some() == item.url.is_some() {
+                return Err(PyValueError::new_err(
+                    "add_cookies: each cookie needs url or domain, not both",
+                ));
+            }
+            let domain = item.domain.or(item.url).expect("checked above");
             parsed.push(fluxwright::Cookie {
                 name: item.name,
                 value: item.value,

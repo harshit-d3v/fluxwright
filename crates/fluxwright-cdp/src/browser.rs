@@ -523,7 +523,7 @@ impl CdpBrowser {
                             setup.http_auth.clone()
                         };
                         if let Some((user, pass)) = creds {
-                            response = if setup.answered.insert(id.clone()) {
+                            response = if setup.answered.insert(format!("{is_proxy}:{id}")) {
                                 json!({ "response": "ProvideCredentials", "username": user, "password": pass })
                             } else {
                                 json!({ "response": "CancelAuth" })

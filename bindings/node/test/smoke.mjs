@@ -111,7 +111,11 @@ try {
   await assert.rejects(page.pdf({ format: 'A9' }), /unknown format/)
   await assert.rejects(page.pdf({ landscpe: true }), TypeError)
   await assert.rejects(page.pdf({ margin: { bogus: 10 } }), TypeError)
-  await assert.rejects(browser.newPage({ baseURL: 'http://localhost' }), TypeError)
+  await assert.rejects(browser.newPage({ recordVideo: { dir: '.' } }), TypeError)
+  await assert.rejects(
+    browser.newPage({ httpCredentials: { username: 'u', password: 'p', send: 'always' } }),
+    TypeError,
+  )
   // A call's timeout, then the page's default, replace the engine's 10 s.
   let began = Date.now()
   await assert.rejects(page.waitForSelector('#never', { timeout: 300 }))

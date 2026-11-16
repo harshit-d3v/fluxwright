@@ -23,8 +23,9 @@ struct Cli {
 enum Cmd {
     /// Serve authenticated browser jobs over HTTP (FLUXWRIGHT_SERVER_TOKEN is required).
     Serve {
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        listen: SocketAddr,
+        /// Listen address for local HTTP endpoints (defaults to 127.0.0.1:7331, or 127.0.0.1:0 with --join).
+        #[arg(long)]
+        listen: Option<SocketAddr>,
         /// Defaults to one browser per four available CPUs.
         #[arg(long)]
         max_browsers: Option<NonZeroUsize>,
@@ -44,6 +45,23 @@ enum Cmd {
         /// Milliseconds between the starts of two navigations to one host, at least.
         #[arg(long)]
         min_host_delay_ms: Option<NonZeroU64>,
+        /// Keep accepted jobs in this file, and queue the unfinished ones again on start.
+        #[arg(long)]
+        journal: Option<std::path::PathBuf>,
+        /// Pull and execute jobs from a coordinator URL (e.g. http://127.0.0.1:7331).
+        #[arg(long)]
+        join: Option<String>,
+        /// Worker name registered with the coordinator when `--join` is set.
+        #[arg(long)]
+        worker_id: Option<String>,
+    },
+    /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
+    Coordinate {
+        #[arg(long, default_value = "127.0.0.1:7331")]
+        listen: SocketAddr,
+        /// Active and retained completed jobs combined (1-4096).
+        #[arg(long, default_value = "128")]
+        max_jobs: NonZeroUsize,
         /// Keep accepted jobs in this file, and queue the unfinished ones again on start.
         #[arg(long)]
         journal: Option<std::path::PathBuf>,
@@ -98,9 +116,18 @@ async fn main() -> Result<()> {
             max_per_host,
             min_host_delay_ms,
             journal,
+            join,
+            worker_id,
         } => {
+            let address = listen.unwrap_or_else(|| {
+                if join.is_some() {
+                    SocketAddr::from(([127, 0, 0, 1], 0))
+                } else {
+                    SocketAddr::from(([127, 0, 0, 1], 7331))
+                }
+            });
             http_daemon(
-                listen,
+                address,
                 max_browsers,
                 max_contexts.get(),
                 max_jobs.get(),
@@ -109,9 +136,16 @@ async fn main() -> Result<()> {
                 max_per_host,
                 min_host_delay_ms,
                 journal,
+                join,
+                worker_id,
             )
             .await
         }
+        Cmd::Coordinate {
+            listen,
+            max_jobs,
+            journal,
+        } => coordinator_daemon(listen, max_jobs.get(), journal).await,
         Cmd::Start {
             max_browsers,
             max_contexts,
@@ -136,6 +170,34 @@ async fn main() -> Result<()> {
     }
 }
 
+fn server_config(max_jobs: usize, journal: Option<std::path::PathBuf>) -> Result<(String, ServerConfig)> {
+    anyhow::ensure!((1..=4096).contains(&max_jobs), "--max-jobs must be between 1 and 4096");
+    let token = std::env::var("FLUXWRIGHT_SERVER_TOKEN").map_err(|_| {
+        anyhow::anyhow!(
+            "set FLUXWRIGHT_SERVER_TOKEN to a random token (32-256 printable ASCII characters)"
+        )
+    })?;
+    let mut config = ServerConfig::new(token.clone())?;
+    config.max_jobs = max_jobs;
+    config.journal = journal;
+    Ok((token, config))
+}
+
+async fn coordinator_daemon(
+    address: SocketAddr,
+    max_jobs: usize,
+    journal: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let (_token, config) = server_config(max_jobs, journal)?;
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let server = HttpServer::coordinator(config)?;
+    eprintln!(
+        "fluxwright coordinator listening on http://{} (bearer authentication required)",
+        listener.local_addr()?
+    );
+    serve_http(listener, address, server, None).await
+}
+
 async fn http_daemon(
     address: SocketAddr,
     max_browsers: Option<NonZeroUsize>,
@@ -146,16 +208,10 @@ async fn http_daemon(
     max_per_host: Option<NonZeroUsize>,
     min_host_delay_ms: Option<NonZeroU64>,
     journal: Option<std::path::PathBuf>,
+    join: Option<String>,
+    worker_id: Option<String>,
 ) -> Result<()> {
-    let token = std::env::var("FLUXWRIGHT_SERVER_TOKEN").map_err(|_| {
-        anyhow::anyhow!(
-            "set FLUXWRIGHT_SERVER_TOKEN to a random token (32-256 printable ASCII characters)"
-        )
-    })?;
-    let mut config = ServerConfig::new(token)?;
-    config.max_jobs = max_jobs;
-    config.journal = journal;
-    anyhow::ensure!(max_jobs <= 4096, "--max-jobs must be between 1 and 4096");
+    let (token, config) = server_config(max_jobs, journal)?;
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
     let mut builder = BrowserEngine::builder();
@@ -181,23 +237,58 @@ async fn http_daemon(
         builder = builder.min_delay_per_host(Duration::from_millis(ms.get()));
     }
     let engine = builder.build().await?;
+    let worker = match join {
+        Some(url) => {
+            let slots = engine
+                .config()
+                .max_browsers
+                .saturating_mul(engine.config().max_contexts_per_browser)
+                .max(1);
+            let handle = fluxwright_server::spawn_worker(
+                engine.clone(),
+                url.clone(),
+                token,
+                worker_id,
+                slots,
+            )?;
+            eprintln!("fluxwright worker joined coordinator {url} ({slots} slots)");
+            Some(handle)
+        }
+        None => None,
+    };
     let server = HttpServer::new(engine, config)?;
     eprintln!(
         "fluxwright HTTP listening on http://{} (bearer authentication required)",
         listener.local_addr()?
     );
+    serve_http(listener, address, server, worker).await
+}
+
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    address: SocketAddr,
+    server: HttpServer,
+    worker: Option<tokio::task::AbortHandle>,
+) -> Result<()> {
     if !address.ip().is_loopback() {
         eprintln!("warning: remote access enabled; use a private network and a TLS reverse proxy; this is a trusted-operator API");
     }
     let shutdown = server.clone();
+    let worker_on_shutdown = worker.clone();
     let result = axum::serve(listener, server.router())
         .with_graceful_shutdown(async move {
             if let Err(error) = shutdown_signal().await {
                 tracing::error!(%error, "could not wait for the shutdown signal");
             }
+            if let Some(w) = worker_on_shutdown {
+                w.abort();
+            }
             let _ = shutdown.shutdown(Duration::from_secs(10)).await;
         })
         .await;
+    if let Some(w) = worker {
+        w.abort();
+    }
     // Also clean up if the listener fails instead of receiving a signal.
     server.shutdown(Duration::from_secs(10)).await?;
     result?;

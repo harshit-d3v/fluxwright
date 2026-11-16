@@ -1568,12 +1568,7 @@ impl EngineBuilder {
 }
 
 fn resolve_url(base: Option<&str>, url: &str) -> String {
-    let Some(base) = base.filter(|_| {
-        !url.contains("://")
-            && !url.starts_with("about:")
-            && !url.starts_with("data:")
-            && !url.starts_with("javascript:")
-    }) else {
+    let Some(base) = base.filter(|_| !url.split(['/', '?', '#']).next().unwrap_or("").contains(':')) else {
         return url.to_string();
     };
     if url.starts_with("//") {
@@ -1875,5 +1870,9 @@ mod tests {
         assert_eq!(resolve_url(Some("http://127.0.0.1:8080/"), "//cdn.test/x.js"), "http://cdn.test/x.js");
         assert_eq!(resolve_url(Some("http://127.0.0.1:8080/"), "https://other.test/y"), "https://other.test/y");
         assert_eq!(resolve_url(Some("http://127.0.0.1:8080/"), "about:blank"), "about:blank");
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080"), "/login?next=http://example.com"),
+            "http://127.0.0.1:8080/login?next=http://example.com"
+        );
     }
 }
