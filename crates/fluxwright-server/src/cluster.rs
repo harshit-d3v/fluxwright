@@ -1,4 +1,5 @@
-//! Coordinator HTTP endpoints and pulling worker loop for running Fluxwright across multiple machines.
+//! Coordinator HTTP endpoints and pulling worker loop (experimental in 0.7.0) for running
+//! Fluxwright across multiple machines.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -13,17 +14,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 use crate::{
-    bounded_error, execute_job, json_len, not_found, now_ms, parse_id, ApiError, ConfigError,
+    bounded_error, execute_job, json_len, not_found, parse_id, ApiError, ConfigError,
     ExecutionProgress, FailureEvidence, Inner, Job, JobPriority, JobRequest, JobStatus,
-    JobTraceContext, Registry, MAX_RESULT_BYTES,
+    JobTraceContext, MAX_RESULT_BYTES,
 };
 
 const MAX_LEASE_BATCH: usize = 64;
+/// Coordinator stops adding queued jobs to one lease response past 2 MiB so batches stay fast and
+/// never hit the worker's 4 MiB read cap even with JSON escaping overhead.
+const MAX_LEASE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024 + 65_536;
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -98,7 +104,7 @@ fn validate_worker(worker: &str) -> Result<(), ApiError> {
 
 /// Requeues or fails leased jobs whose deadline passed without a heartbeat, returning job IDs
 /// that reached a terminal state and must be marked done in the journal once unlocked.
-pub(crate) fn expire_leases(registry: &mut Registry, now: u64) -> Vec<Uuid> {
+pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Uuid> {
     let mut done = Vec::new();
     for record in &mut registry.jobs {
         if record.job.status == JobStatus::Running
@@ -130,16 +136,9 @@ pub(crate) async fn lease(
     let Json(req) =
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
 
-    let now = now_ms();
     let lease_ms = inner.lease_ms();
-    let (leased, expired) = {
-        let mut registry = inner.registry.lock().unwrap();
-        let expired = expire_leases(&mut registry, now);
+    let leased = inner.with_registry(|registry, now| -> Result<Vec<LeasedJob>, ApiError> {
         if !registry.accepting {
-            drop(registry);
-            for id in expired {
-                inner.journal_done(id);
-            }
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "shutting_down",
@@ -148,46 +147,51 @@ pub(crate) async fn lease(
         }
 
         let limit = req.max_jobs.min(MAX_LEASE_BATCH);
-        let mut picked = Vec::with_capacity(limit.min(registry.jobs.len()));
+        let mut candidates: Vec<(usize, LeasedJob)> =
+            Vec::with_capacity(limit.min(registry.jobs.len()));
+        let mut total_bytes: usize = 16; // {"jobs":[]}
         if limit > 0 {
-            for prio in [JobPriority::High, JobPriority::Normal, JobPriority::Low] {
+            'pick: for prio in [JobPriority::High, JobPriority::Normal, JobPriority::Low] {
                 for (idx, record) in registry.jobs.iter().enumerate() {
-                    if picked.len() >= limit {
-                        break;
+                    if candidates.len() >= limit {
+                        break 'pick;
                     }
                     if record.job.status == JobStatus::Queued && record.request.priority == prio {
-                        picked.push(idx);
+                        let candidate = LeasedJob {
+                            id: record.job.id,
+                            request: record.request.clone(),
+                            attempts: record.job.attempts + 1,
+                            trace_id: record.job.trace_id.clone(),
+                        };
+                        let entry_bytes =
+                            json_len(&candidate) + usize::from(!candidates.is_empty());
+                        if !candidates.is_empty()
+                            && total_bytes + entry_bytes > MAX_LEASE_RESPONSE_BYTES
+                        {
+                            break 'pick;
+                        }
+                        total_bytes += entry_bytes;
+                        candidates.push((idx, candidate));
                     }
-                }
-                if picked.len() >= limit {
-                    break;
                 }
             }
         }
 
-        let mut leased = Vec::with_capacity(picked.len());
-        for idx in picked {
+        let mut leased = Vec::with_capacity(candidates.len());
+        for (idx, item) in candidates {
             let record = &mut registry.jobs[idx];
             record.job.status = JobStatus::Running;
             record.job.started_at.get_or_insert(now);
-            record.job.attempts += 1;
+            record.job.attempts = item.attempts;
             record.job.step_index = None;
             record.job.failure_evidence = None;
             record.worker = Some(worker.clone());
             record.lease_until = Some(now.saturating_add(lease_ms));
-            leased.push(LeasedJob {
-                id: record.job.id,
-                request: record.request.clone(),
-                attempts: record.job.attempts,
-                trace_id: record.job.trace_id.clone(),
-            });
+            leased.push(item);
         }
-        (leased, expired)
-    };
+        Ok(leased)
+    })?;
 
-    for id in expired {
-        inner.journal_done(id);
-    }
     Ok(Json(LeaseResponse { jobs: leased }))
 }
 
@@ -200,11 +204,8 @@ pub(crate) async fn heartbeat(
     let Json(req) =
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
 
-    let now = now_ms();
     let lease_ms = inner.lease_ms();
-    let (cancelled, expired) = {
-        let mut registry = inner.registry.lock().unwrap();
-        let expired = expire_leases(&mut registry, now);
+    let cancelled = inner.with_registry(|registry, now| {
         let mut cancelled = Vec::new();
         for item in req.jobs {
             if let Some(record) = registry.find_mut(item.id) {
@@ -221,12 +222,9 @@ pub(crate) async fn heartbeat(
             }
             cancelled.push(item.id);
         }
-        (cancelled, expired)
-    };
+        cancelled
+    });
 
-    for id in expired {
-        inner.journal_done(id);
-    }
     Ok(Json(HeartbeatResponse { cancelled }))
 }
 
@@ -247,8 +245,7 @@ pub(crate) async fn result(
         ));
     }
     if let Some(results) = &req.results {
-        let value = Value::Array(results.clone());
-        if json_len(&value) > MAX_RESULT_BYTES {
+        if json_len(results) > MAX_RESULT_BYTES {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -257,36 +254,14 @@ pub(crate) async fn result(
         }
     }
 
-    let now = now_ms();
-    let mut done_ids = Vec::new();
-    let job = {
-        let mut registry = inner.registry.lock().unwrap();
-        done_ids.extend(expire_leases(&mut registry, now));
-
-        let Some(record) = registry.find_mut(id) else {
-            drop(registry);
-            for expired_id in done_ids {
-                inner.journal_done(expired_id);
-            }
-            return Err(not_found());
-        };
-
+    let (job, finished) = inner.with_registry(|registry, now| -> Result<(Job, bool), ApiError> {
+        let record = registry.find_mut(id).ok_or_else(not_found)?;
         if record.job.status == JobStatus::Cancelled {
-            let snapshot = record.job.clone();
-            drop(registry);
-            for expired_id in done_ids {
-                inner.journal_done(expired_id);
-            }
-            return Ok(Json(snapshot));
+            return Ok((record.job.clone(), false));
         }
-
         if record.job.status != JobStatus::Running
             || record.worker.as_deref() != Some(req.worker.as_str())
         {
-            drop(registry);
-            for expired_id in done_ids {
-                inner.journal_done(expired_id);
-            }
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "lease_lost",
@@ -330,26 +305,33 @@ pub(crate) async fn result(
             JobStatus::Failed => registry.failed_jobs += 1,
             _ => unreachable!(),
         }
-        done_ids.push(id);
-        snapshot
-    };
+        Ok((snapshot, true))
+    })?;
 
-    for finished_id in done_ids {
-        inner.journal_done(finished_id);
+    if finished {
+        inner.journal_done(id);
+        tracing::info!(job_id = %id, status = ?job.status, worker = %req.worker, "cluster job finished");
     }
-    tracing::info!(job_id = %id, status = ?job.status, worker = %req.worker, "cluster job finished");
     Ok(Json(job))
 }
 
 #[derive(Clone)]
 pub(crate) struct CoordinatorEndpoint {
-    host: String,
+    pub(crate) host: String,
     port: u16,
     host_header: String,
     base_path: String,
 }
 
 impl CoordinatorEndpoint {
+    pub(crate) fn is_loopback(&self) -> bool {
+        self.host.eq_ignore_ascii_case("localhost")
+            || self
+                .host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    }
+
     pub(crate) fn parse(url: &str) -> Result<Self, ConfigError> {
         let trimmed = url.trim();
         if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -359,7 +341,7 @@ impl CoordinatorEndpoint {
         }
         if trimmed.starts_with("https://") {
             return Err(ConfigError::InvalidCoordinator(
-                "HTTPS coordinator URLs are not supported natively; terminate TLS in a reverse proxy and point --join at http://"
+                "HTTPS coordinator URLs are not supported natively; terminate TLS in a local reverse proxy/tunnel or use http:// on a trusted private network"
                     .into(),
             ));
         }
@@ -415,15 +397,54 @@ impl CoordinatorEndpoint {
     }
 }
 
+/// Control handle returned by [`spawn_worker`].
+#[derive(Clone)]
+pub struct WorkerHandle {
+    drain_tx: watch::Sender<bool>,
+    finished_rx: watch::Receiver<bool>,
+    abort: AbortHandle,
+    loopback: bool,
+}
+
+impl WorkerHandle {
+    /// Returns true when the configured coordinator host is a loopback address.
+    pub fn coordinator_is_loopback(&self) -> bool {
+        self.loopback
+    }
+
+    /// Stops polling immediately and aborts active leased job tasks.
+    pub fn abort(&self) {
+        let _ = self.drain_tx.send(true);
+        self.abort.abort();
+    }
+
+    /// Stops taking new leases, waits up to `grace` for in-flight jobs and pending result reports
+    /// to finish cleanly, and then aborts whatever remains.
+    pub async fn shutdown(&self, grace: Duration) {
+        let _ = self.drain_tx.send(true);
+        if !*self.finished_rx.borrow() {
+            let mut rx = self.finished_rx.clone();
+            let _ = tokio::time::timeout(grace, async move {
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        self.abort.abort();
+    }
+}
+
 /// Starts a background pull loop that leases jobs from `coordinator_url` and runs them on `engine`.
-/// Aborting the returned handle stops polling and aborts all active leased job tasks.
 pub fn spawn_worker(
     engine: BrowserEngine,
     coordinator_url: String,
     token: String,
     worker_id: Option<String>,
     max_jobs: usize,
-) -> Result<AbortHandle, ConfigError> {
+) -> Result<WorkerHandle, ConfigError> {
     spawn_worker_with(
         engine,
         coordinator_url,
@@ -443,8 +464,9 @@ pub(crate) fn spawn_worker_with(
     max_jobs: usize,
     poll_interval: Duration,
     heartbeat_interval: Duration,
-) -> Result<AbortHandle, ConfigError> {
+) -> Result<WorkerHandle, ConfigError> {
     let endpoint = CoordinatorEndpoint::parse(&coordinator_url)?;
+    let loopback = endpoint.is_loopback();
     let worker_id = match worker_id {
         Some(id) => {
             if validate_worker(&id).is_err() || id.contains(['/', '?', '#']) {
@@ -458,6 +480,8 @@ pub(crate) fn spawn_worker_with(
     };
     let max_jobs = max_jobs.clamp(1, MAX_LEASE_BATCH);
 
+    let (drain_tx, drain_rx) = watch::channel(false);
+    let (finished_tx, finished_rx) = watch::channel(false);
     let handle = tokio::spawn(worker_loop(
         engine,
         endpoint,
@@ -466,8 +490,15 @@ pub(crate) fn spawn_worker_with(
         max_jobs,
         poll_interval,
         heartbeat_interval,
+        drain_rx,
+        finished_tx,
     ));
-    Ok(handle.abort_handle())
+    Ok(WorkerHandle {
+        drain_tx,
+        finished_rx,
+        abort: handle.abort_handle(),
+        loopback,
+    })
 }
 
 fn default_worker_id() -> String {
@@ -496,16 +527,76 @@ struct RunningTask {
     progress: Arc<Mutex<ExecutionProgress>>,
 }
 
-struct TaskGuard(HashMap<Uuid, RunningTask>);
+struct TaskGuard(Arc<Mutex<HashMap<Uuid, RunningTask>>>);
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        for (_, task) in self.0.drain() {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, task) in guard.drain() {
             task.abort.abort();
         }
     }
 }
 
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn heartbeat_loop(
+    ep: CoordinatorEndpoint,
+    token: String,
+    worker_id: String,
+    interval: Duration,
+    active: Arc<Mutex<HashMap<Uuid, RunningTask>>>,
+    wake: Arc<Notify>,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.reset();
+
+    loop {
+        tick.tick().await;
+        let items: Vec<HeartbeatItem> = {
+            let guard = active.lock().unwrap();
+            if guard.is_empty() {
+                continue;
+            }
+            guard
+                .iter()
+                .map(|(&id, t)| {
+                    let p = t.progress.lock().unwrap();
+                    HeartbeatItem {
+                        id,
+                        step_index: p.step_index,
+                        attempts: p.attempts,
+                    }
+                })
+                .collect()
+        };
+        match post_heartbeat(&ep, &token, &worker_id, &items).await {
+            Ok(resp) => {
+                if !resp.cancelled.is_empty() {
+                    let mut guard = active.lock().unwrap();
+                    for cid in resp.cancelled {
+                        if let Some(t) = guard.remove(&cid) {
+                            t.abort.abort();
+                        }
+                    }
+                    wake.notify_one();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, worker = %worker_id, "coordinator heartbeat failed");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     engine: BrowserEngine,
     endpoint: CoordinatorEndpoint,
@@ -514,40 +605,73 @@ async fn worker_loop(
     max_jobs: usize,
     poll_interval: Duration,
     heartbeat_interval: Duration,
+    mut drain_rx: watch::Receiver<bool>,
+    finished_tx: watch::Sender<bool>,
 ) {
-    let mut tasks = TaskGuard(HashMap::new());
+    let active = Arc::new(Mutex::new(HashMap::new()));
+    let _task_guard = TaskGuard(active.clone());
+    let wake = Arc::new(Notify::new());
+    // Heartbeats run in an independent task so slow /lease or /result calls never starve them.
+    let hb_task = tokio::spawn(heartbeat_loop(
+        endpoint.clone(),
+        token.clone(),
+        worker_id.clone(),
+        heartbeat_interval,
+        active.clone(),
+        wake.clone(),
+    ));
+    let _hb_guard = AbortOnDrop(hb_task.abort_handle());
+
     let mut pending_results: VecDeque<(Uuid, ResultRequest)> = VecDeque::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(Uuid, ResultRequest)>();
-
-    let mut hb = tokio::time::interval(heartbeat_interval);
-    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    hb.reset();
 
     let poll_timer = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(poll_timer);
     let mut can_lease = true;
+    let mut draining = *drain_rx.borrow();
     let mut backoff = poll_interval.max(Duration::from_millis(50));
 
     loop {
+        if draining {
+            can_lease = false;
+        }
+
         while let Some((id, req)) = pending_results.front() {
             match post_result(&endpoint, &token, *id, req).await {
                 ResultPost::Delivered | ResultPost::Dropped => {
+                    backoff = poll_interval.max(Duration::from_millis(50));
                     pending_results.pop_front();
                 }
-                ResultPost::Retry => break,
+                ResultPost::Retry => {
+                    poll_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    break;
+                }
             }
         }
 
-        if can_lease && tasks.0.len() < max_jobs && pending_results.len() < max_jobs * 2 {
-            let want = (max_jobs - tasks.0.len()).min(MAX_LEASE_BATCH);
+        let active_len = active.lock().unwrap().len();
+        if draining && active_len == 0 && pending_results.is_empty() {
+            let _ = finished_tx.send(true);
+            return;
+        }
+
+        if !draining && can_lease && active_len < max_jobs && pending_results.len() < max_jobs * 2 {
+            let want = (max_jobs - active_len).min(MAX_LEASE_BATCH);
             match post_lease(&endpoint, &token, &worker_id, want).await {
                 Ok(leased) if !leased.is_empty() => {
                     backoff = poll_interval.max(Duration::from_millis(50));
                     let got = leased.len();
-                    for item in leased {
-                        spawn_leased_job(&engine, &worker_id, item, &done_tx, &mut tasks.0);
+                    {
+                        let mut guard = active.lock().unwrap();
+                        for item in leased {
+                            spawn_leased_job(&engine, &worker_id, item, &done_tx, &mut guard);
+                        }
                     }
-                    if tasks.0.len() >= max_jobs {
+                    let new_len = active.lock().unwrap().len();
+                    if new_len >= max_jobs {
                         can_lease = false;
                     } else if got < want {
                         can_lease = false;
@@ -575,45 +699,31 @@ async fn worker_loop(
             }
         }
 
+        let need_poll_tick = (!draining && !can_lease && active.lock().unwrap().len() < max_jobs)
+            || !pending_results.is_empty();
+
         tokio::select! {
-            _ = &mut poll_timer, if !can_lease && tasks.0.len() < max_jobs => {
-                can_lease = true;
+            _ = drain_rx.changed(), if !draining => {
+                draining = *drain_rx.borrow();
+                can_lease = false;
             }
-            _ = hb.tick() => {
-                if !tasks.0.is_empty() {
-                    let items: Vec<HeartbeatItem> = tasks
-                        .0
-                        .iter()
-                        .map(|(&id, t)| {
-                            let p = t.progress.lock().unwrap();
-                            HeartbeatItem {
-                                id,
-                                step_index: p.step_index,
-                                attempts: p.attempts,
-                            }
-                        })
-                        .collect();
-                    match post_heartbeat(&endpoint, &token, &worker_id, &items).await {
-                        Ok(resp) => {
-                            for cid in resp.cancelled {
-                                if let Some(t) = tasks.0.remove(&cid) {
-                                    t.abort.abort();
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, worker = %worker_id, "coordinator heartbeat failed");
-                        }
-                    }
-                }
+            _ = wake.notified(), if draining => {}
+            _ = &mut poll_timer, if need_poll_tick => {
+                can_lease = !draining;
             }
             Some((id, req)) = done_rx.recv() => {
-                if tasks.0.remove(&id).is_some() {
+                let removed = active.lock().unwrap().remove(&id).is_some();
+                if removed {
                     match post_result(&endpoint, &token, id, &req).await {
                         ResultPost::Delivered | ResultPost::Dropped => {}
-                        ResultPost::Retry => pending_results.push_back((id, req)),
+                        ResultPost::Retry => {
+                            pending_results.push_back((id, req));
+                            poll_timer
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + backoff);
+                        }
                     }
-                    if tasks.0.len() < max_jobs {
+                    if !draining && active.lock().unwrap().len() < max_jobs {
                         can_lease = true;
                     }
                 }
@@ -786,15 +896,17 @@ async fn post_json_raw(
             .map_err(|e| e.to_string())?;
         stream.flush().await.map_err(|e| e.to_string())?;
         let mut raw = Vec::new();
-        let limit = (MAX_RESULT_BYTES * 2 + 65_536) as u64;
         stream
-            .take(limit)
+            .take((MAX_HTTP_RESPONSE_BYTES + 1) as u64)
             .read_to_end(&mut raw)
             .await
             .map_err(|e| e.to_string())?;
+        if raw.len() > MAX_HTTP_RESPONSE_BYTES {
+            return Err("coordinator HTTP response exceeded maximum size".into());
+        }
         Ok::<Vec<u8>, String>(raw)
     };
-    let raw = tokio::time::timeout(Duration::from_secs(15), io)
+    let raw = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, io)
         .await
         .map_err(|_| "coordinator HTTP request timed out".to_string())??;
     let sep = raw

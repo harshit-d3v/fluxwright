@@ -369,19 +369,21 @@ plaintext networks or expose this listener directly to the internet. No per-tena
 DNS/IP egress filtering, durable queue, or idempotency key is provided in this first version.
 The Chrome sandbox stays enabled by default; do not disable it just to run the server.
 
-## Cluster mode (coordinator and workers)
+## Cluster mode (experimental: coordinator and workers)
 
-Run one coordinator without local browsers, and join one or more browser-running workers from any machine on the same private network (see [docs/CLUSTER.md](CLUSTER.md)):
+Run one coordinator without local browsers, and join one or more browser-running workers across machines on a **trusted private network** or encrypted tunnel (see [docs/CLUSTER.md](CLUSTER.md)):
 
 ```bash
-# On the coordinator host:
-FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright coordinate --listen 127.0.0.1:7331 --journal queue.jsonl
+# On the coordinator host (bind a private interface or firewall-restricted IP, e.g. 10.0.1.10):
+FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright coordinate --listen 10.0.1.10:7331 --journal queue.jsonl
 
 # On each worker host:
-FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright serve --join http://127.0.0.1:7331
+FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright serve --join http://10.0.1.10:7331
 ```
 
-Workers pull up to their local capacity (`POST /v1/workers/{worker}/lease`), extend 30-second leases every 10 seconds (`POST /v1/workers/{worker}/heartbeat`), abort client-cancelled jobs, and post results or failure evidence (`POST /v1/jobs/{id}/result`). Expired leases requeue within `retries` or fail with `"worker lost"`.
+Workers pull up to their local capacity (`POST /v1/workers/{worker}/lease`), extend 30-second leases every 10 seconds (`POST /v1/workers/{worker}/heartbeat`), abort client-cancelled jobs, and post results or failure evidence (`POST /v1/jobs/{id}/result`). Those worker routes are exposed only by `fluxwright coordinate`. Expired leases requeue within `retries` or fail with `"worker lost"`. On Ctrl+C / SIGTERM, a worker drains already-leased jobs up to 10 seconds before exiting.
+
+> **Security boundary:** `fluxwright serve --join` currently supports unencrypted `http://` only (no native `https://` client) and shares `FLUXWRIGHT_SERVER_TOKEN` with the client API. Do **not** point `--join` over the public internet or an untrusted network — keep the worker-to-coordinator link inside a private subnet/WireGuard VPN, or route it through a local TLS tunnel/proxy (such as `http://127.0.0.1:8443` via stunnel or Caddy).
 
 ## Development checks
 
