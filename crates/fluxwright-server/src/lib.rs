@@ -331,7 +331,8 @@ impl HttpServer {
         if self.inner.engine.is_none() {
             small = small
                 .route("/v1/workers/{worker}/lease", post(cluster::lease))
-                .route("/v1/workers/{worker}/heartbeat", post(cluster::heartbeat));
+                .route("/v1/workers/{worker}/heartbeat", post(cluster::heartbeat))
+                .route("/v1/workers/{worker}/release", post(cluster::release));
             protected = protected
                 .route("/v1/jobs/{id}/result", post(cluster::result))
                 .layer(DefaultBodyLimit::max(MAX_RESULT_BYTES * 2 + MAX_REQUEST_BYTES));

@@ -78,6 +78,17 @@ pub(crate) struct HeartbeatResponse {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseRequest {
+    pub(crate) jobs: Vec<Uuid>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ReleaseResponse {
+    pub(crate) released: Vec<Uuid>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResultRequest {
     pub(crate) worker: String,
     pub(crate) status: JobStatus,
@@ -226,6 +237,41 @@ pub(crate) async fn heartbeat(
     });
 
     Ok(Json(HeartbeatResponse { cancelled }))
+}
+
+pub(crate) async fn release(
+    State(inner): State<Arc<Inner>>,
+    Path(worker): Path<String>,
+    payload: Result<Json<ReleaseRequest>, JsonRejection>,
+) -> Result<Json<ReleaseResponse>, ApiError> {
+    validate_worker(&worker)?;
+    let Json(req) =
+        payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
+
+    let released = inner.with_registry(|registry, _| {
+        let mut released = Vec::new();
+        for id in req.jobs {
+            if let Some(record) = registry.find_mut(id) {
+                if record.job.status == JobStatus::Running
+                    && record.worker.as_deref() == Some(worker.as_str())
+                {
+                    record.job.status = JobStatus::Queued;
+                    record.job.attempts = record.job.attempts.saturating_sub(1);
+                    if record.job.attempts == 0 {
+                        record.job.started_at = None;
+                    }
+                    record.job.step_index = None;
+                    record.job.failure_evidence = None;
+                    record.worker = None;
+                    record.lease_until = None;
+                    released.push(id);
+                }
+            }
+        }
+        released
+    });
+
+    Ok(Json(ReleaseResponse { released }))
 }
 
 pub(crate) async fn result(
@@ -400,7 +446,7 @@ impl CoordinatorEndpoint {
 /// Control handle returned by [`spawn_worker`].
 #[derive(Clone)]
 pub struct WorkerHandle {
-    drain_tx: watch::Sender<bool>,
+    drain_tx: watch::Sender<Option<Duration>>,
     finished_rx: watch::Receiver<bool>,
     abort: AbortHandle,
     loopback: bool,
@@ -414,17 +460,32 @@ impl WorkerHandle {
 
     /// Stops polling immediately and aborts active leased job tasks.
     pub fn abort(&self) {
-        let _ = self.drain_tx.send(true);
+        self.drain_tx.send_if_modified(|v| {
+            let changed = v.is_none();
+            *v = Some(Duration::ZERO);
+            changed
+        });
         self.abort.abort();
     }
 
     /// Stops taking new leases, waits up to `grace` for in-flight jobs and pending result reports
-    /// to finish cleanly, and then aborts whatever remains.
+    /// to finish cleanly, then releases any remaining unfinished jobs back to the coordinator
+    /// without counting an attempt.
     pub async fn shutdown(&self, grace: Duration) {
-        let _ = self.drain_tx.send(true);
+        self.drain_tx.send_if_modified(|v| {
+            if v.is_none() {
+                *v = Some(grace);
+                true
+            } else {
+                false
+            }
+        });
         if !*self.finished_rx.borrow() {
             let mut rx = self.finished_rx.clone();
-            let _ = tokio::time::timeout(grace, async move {
+            let wait = grace
+                .saturating_add(HTTP_REQUEST_TIMEOUT)
+                .saturating_add(Duration::from_secs(2));
+            let _ = tokio::time::timeout(wait, async move {
                 while !*rx.borrow() {
                     if rx.changed().await.is_err() {
                         break;
@@ -480,7 +541,7 @@ pub(crate) fn spawn_worker_with(
     };
     let max_jobs = max_jobs.clamp(1, MAX_LEASE_BATCH);
 
-    let (drain_tx, drain_rx) = watch::channel(false);
+    let (drain_tx, drain_rx) = watch::channel(None);
     let (finished_tx, finished_rx) = watch::channel(false);
     let handle = tokio::spawn(worker_loop(
         engine,
@@ -605,7 +666,7 @@ async fn worker_loop(
     max_jobs: usize,
     poll_interval: Duration,
     heartbeat_interval: Duration,
-    mut drain_rx: watch::Receiver<bool>,
+    mut drain_rx: watch::Receiver<Option<Duration>>,
     finished_tx: watch::Sender<bool>,
 ) {
     let active = Arc::new(Mutex::new(HashMap::new()));
@@ -620,7 +681,8 @@ async fn worker_loop(
         active.clone(),
         wake.clone(),
     ));
-    let _hb_guard = AbortOnDrop(hb_task.abort_handle());
+    let hb_abort = hb_task.abort_handle();
+    let _hb_guard = AbortOnDrop(hb_abort.clone());
 
     let mut pending_results: VecDeque<(Uuid, ResultRequest)> = VecDeque::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(Uuid, ResultRequest)>();
@@ -628,27 +690,29 @@ async fn worker_loop(
     let poll_timer = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(poll_timer);
     let mut can_lease = true;
-    let mut draining = *drain_rx.borrow();
+    let mut grace_deadline: Option<tokio::time::Instant> = (*drain_rx.borrow_and_update())
+        .map(|grace| tokio::time::Instant::now() + grace);
     let mut backoff = poll_interval.max(Duration::from_millis(50));
 
     loop {
+        if grace_deadline.is_none() {
+            if let Some(grace) = *drain_rx.borrow_and_update() {
+                grace_deadline = Some(tokio::time::Instant::now() + grace);
+            }
+        }
+        let draining = grace_deadline.is_some();
         if draining {
             can_lease = false;
         }
 
-        while let Some((id, req)) = pending_results.front() {
-            match post_result(&endpoint, &token, *id, req).await {
-                ResultPost::Delivered | ResultPost::Dropped => {
-                    backoff = poll_interval.max(Duration::from_millis(50));
-                    pending_results.pop_front();
-                }
-                ResultPost::Retry => {
-                    poll_timer
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + backoff);
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                    break;
-                }
+        if !pending_results.is_empty() {
+            if flush_pending_results(&endpoint, &token, &mut pending_results).await {
+                backoff = poll_interval.max(Duration::from_millis(50));
+            } else {
+                poll_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(5));
             }
         }
 
@@ -656,6 +720,23 @@ async fn worker_loop(
         if draining && active_len == 0 && pending_results.is_empty() {
             let _ = finished_tx.send(true);
             return;
+        }
+
+        if let Some(deadline) = grace_deadline {
+            if tokio::time::Instant::now() >= deadline {
+                release_remaining(
+                    &hb_abort,
+                    &active,
+                    &mut done_rx,
+                    &mut pending_results,
+                    &endpoint,
+                    &token,
+                    &worker_id,
+                )
+                .await;
+                let _ = finished_tx.send(true);
+                return;
+            }
         }
 
         if !draining && can_lease && active_len < max_jobs && pending_results.len() < max_jobs * 2 {
@@ -704,8 +785,28 @@ async fn worker_loop(
 
         tokio::select! {
             _ = drain_rx.changed(), if !draining => {
-                draining = *drain_rx.borrow();
-                can_lease = false;
+                if let Some(grace) = *drain_rx.borrow_and_update() {
+                    grace_deadline = Some(tokio::time::Instant::now() + grace);
+                    can_lease = false;
+                }
+            }
+            _ = async {
+                if let Some(deadline) = grace_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if draining => {
+                release_remaining(
+                    &hb_abort,
+                    &active,
+                    &mut done_rx,
+                    &mut pending_results,
+                    &endpoint,
+                    &token,
+                    &worker_id,
+                )
+                .await;
+                let _ = finished_tx.send(true);
+                return;
             }
             _ = wake.notified(), if draining => {}
             _ = &mut poll_timer, if need_poll_tick => {
@@ -728,6 +829,54 @@ async fn worker_loop(
                     }
                 }
             }
+        }
+    }
+}
+
+async fn flush_pending_results(
+    endpoint: &CoordinatorEndpoint,
+    token: &str,
+    pending_results: &mut VecDeque<(Uuid, ResultRequest)>,
+) -> bool {
+    while let Some((id, req)) = pending_results.front() {
+        match post_result(endpoint, token, *id, req).await {
+            ResultPost::Delivered | ResultPost::Dropped => {
+                pending_results.pop_front();
+            }
+            ResultPost::Retry => return false,
+        }
+    }
+    true
+}
+
+async fn release_remaining(
+    hb_abort: &AbortHandle,
+    active: &Mutex<HashMap<Uuid, RunningTask>>,
+    done_rx: &mut mpsc::UnboundedReceiver<(Uuid, ResultRequest)>,
+    pending_results: &mut VecDeque<(Uuid, ResultRequest)>,
+    endpoint: &CoordinatorEndpoint,
+    token: &str,
+    worker_id: &str,
+) {
+    hb_abort.abort();
+    while let Ok((id, req)) = done_rx.try_recv() {
+        if active.lock().unwrap().remove(&id).is_some() {
+            pending_results.push_back((id, req));
+        }
+    }
+    let _ = flush_pending_results(endpoint, token, pending_results).await;
+    let remaining_ids: Vec<Uuid> = {
+        let mut guard = active.lock().unwrap();
+        let mut ids = Vec::with_capacity(guard.len());
+        for (id, task) in guard.drain() {
+            task.abort.abort();
+            ids.push(id);
+        }
+        ids
+    };
+    if !remaining_ids.is_empty() {
+        if let Err(error) = post_release(endpoint, token, worker_id, &remaining_ids).await {
+            tracing::warn!(%error, worker = %worker_id, count = remaining_ids.len(), "failed to release unfinished jobs on shutdown");
         }
     }
 }
@@ -838,6 +987,25 @@ async fn post_heartbeat(
         return Err(format!("HTTP {status}"));
     }
     serde_json::from_slice(&body).map_err(|e| e.to_string())
+}
+
+async fn post_release(
+    ep: &CoordinatorEndpoint,
+    token: &str,
+    worker: &str,
+    ids: &[Uuid],
+) -> Result<(), String> {
+    let (status, _) = post_json_raw(
+        ep,
+        token,
+        &format!("/v1/workers/{worker}/release"),
+        &ReleaseRequest { jobs: ids.to_vec() },
+    )
+    .await?;
+    if status != 200 {
+        return Err(format!("HTTP {status}"));
+    }
+    Ok(())
 }
 
 enum ResultPost {

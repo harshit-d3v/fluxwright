@@ -46,20 +46,19 @@ ceiling, pages per browser) keep working unchanged: a full worker does not ask.
 | What fails | What happens |
 |---|---|
 | A worker dies or loses the network | Its leases expire after 30 seconds without a heartbeat. The coordinator marks those jobs `queued` again and counts an attempt. A job over its `retries` fails with "worker lost". |
+| A worker restarts cleanly | It stops leasing new work and waits up to 10 seconds to finish in-flight jobs, then calls `POST /v1/workers/{worker}/release` to return any unfinished jobs to `queued` without counting an attempt (even when `retries: 0`). |
 | A worker comes back after its lease expired | Its result call is refused (409: the lease is someone else's now) and it drops the work. One job may have run twice in between: at least once, as with `--journal`. |
-| The coordinator restarts | It replays its journal: queued jobs stay queued; running jobs keep their lease for one more period, so workers that are still alive report in and carry on, and the rest are requeued. Workers retry their calls with backoff until it is back. |
-| The coordinator's disk is lost | Accepted jobs are lost. Run it on a disk you trust, or see "Later". |
+| The coordinator restarts | It replays `--journal`: all unfinished jobs (queued and previously running) are queued again with no worker assigned. Live workers abort interrupted running jobs on their next heartbeat (and drop any late results with `409`), so those jobs rerun from the start — even when `retries: 0`. |
+| The coordinator's disk is lost | Accepted jobs are lost. Run it on a disk you trust. |
 | A job makes Chrome crash every time | The attempt count ends it after `retries`, on whichever workers it lands. |
 
-Side effects can repeat. A job that clicked "buy" and then lost its worker runs again from its
-first step on another one. This is the same rule as the single-server journal, and the docs say
-so: use the cluster for jobs that are safe to repeat, or set `retries: 0`.
+Side effects can repeat. A job that clicked "buy" and then lost its worker, hit a coordinator restart with `--journal`, or exceeded a worker's 10-second shutdown grace runs again from its first step on another worker. `retries: 0` stops re-runs only after a worker crash or lease expiry, **not** across a coordinator `--journal` restart or a worker shutdown release: use the cluster only for repeatable jobs (or skip `--journal` if you strictly prefer failure over a coordinator-restart rerun).
 
 ## Current limits vs planned hardening
 
 Implemented in `0.7.0` (experimental):
 - One coordinator process with in-memory bounded job ring (`--max-jobs`) and optional `--journal` file replay for unfinished jobs.
-- Pull-based leases (`POST /v1/workers/{worker}/lease`), priority + FIFO ordering, 2 MiB batch size cap per lease response, 30 s lease expiration/requeue, dedicated 10 s heartbeat task (`POST /v1/workers/{worker}/heartbeat`), cancellation propagation, `409 Conflict` rejection on late worker results (`POST /v1/jobs/{id}/result`), and graceful worker drain on shutdown.
+- Pull-based leases (`POST /v1/workers/{worker}/lease`), priority + FIFO ordering, 2 MiB batch size cap per lease response, 30 s lease expiration/requeue, dedicated 10 s heartbeat task (`POST /v1/workers/{worker}/heartbeat`), cancellation propagation, `409 Conflict` rejection on late worker results (`POST /v1/jobs/{id}/result`), and graceful worker drain with post-grace `POST /v1/workers/{worker}/release` back into `queued` without counting an attempt.
 
 Planned for later versions:
 - **SQLite store** behind the journal interface, retaining finished results for a configurable TTL across coordinator restarts.
@@ -69,6 +68,6 @@ Planned for later versions:
 
 ## Design choices
 
-- **Single coordinator:** High-availability consensus or an external Redis/Postgres queue is outside Fluxwright's scope. While the coordinator restarts, live workers continue running leased jobs and retry result posts with backoff.
-- **At-least-once delivery:** Crashed workers or expired leases can replay steps from the start, matching `--journal`. Use the cluster for repeatable jobs or set `retries: 0`.
+- **Single coordinator:** High-availability consensus or an external Redis/Postgres queue is outside Fluxwright's scope. While the coordinator is down during a restart, live workers finish in-flight steps and retry result calls with backoff; once a restarted coordinator reloads its `--journal` without prior leases, live workers abort previously running jobs on heartbeat and they restart from step 0.
+- **At-least-once delivery:** Crashed workers, lease expirations, coordinator restarts with `--journal`, and post-grace worker shutdown releases can replay steps from the start.
 - **Bounded retained results:** Finished results remain in the coordinator's `--max-jobs` ring buffer for polling; webhooks and external object stores are out of scope.
