@@ -32,7 +32,7 @@ use tokio::task::AbortHandle;
 use tracing::Instrument;
 use uuid::Uuid;
 
-pub use cluster::spawn_worker;
+pub use cluster::{spawn_worker, WorkerHandle};
 pub use dashboard::dashboard_html;
 pub use job::{
     ConsoleEntry, FailureEvidence, Job, JobPriority, JobRequest, JobStatus, NavigationWait,
@@ -142,14 +142,27 @@ impl Inner {
         self.lease_ms.load(Ordering::Relaxed)
     }
 
+    /// Expires overdue worker leases under the registry lock, runs `f`, and flushes newly
+    /// terminal job IDs to the journal once the lock is dropped.
+    pub(crate) fn with_registry<T>(&self, f: impl FnOnce(&mut Registry, u64) -> T) -> T {
+        let now = now_ms();
+        let (out, expired) = {
+            let mut registry = self.registry.lock().unwrap();
+            let expired = cluster::expire_leases(&mut registry, now);
+            (f(&mut registry, now), expired)
+        };
+        for id in expired {
+            self.journal_done(id);
+        }
+        out
+    }
+
     pub async fn prometheus_text(&self) -> String {
         let fleet = match &self.engine {
             Some(engine) => engine.metrics().await,
             None => Default::default(),
         };
-        let (metrics, expired) = {
-            let mut reg = self.registry.lock().unwrap();
-            let expired = cluster::expire_leases(&mut reg, now_ms());
+        let metrics = self.with_registry(|reg, _| {
             let mut queued = 0;
             let mut running = 0;
             for r in &reg.jobs {
@@ -159,22 +172,16 @@ impl Inner {
                     _ => {}
                 }
             }
-            (
-                ServerMetrics {
-                    fleet,
-                    queued_jobs: queued,
-                    running_jobs: running,
-                    succeeded_jobs: reg.succeeded_jobs,
-                    failed_jobs: reg.failed_jobs,
-                    cancelled_jobs: reg.cancelled_jobs,
-                    max_jobs: self.max_jobs,
-                },
-                expired,
-            )
-        };
-        for id in expired {
-            self.journal_done(id);
-        }
+            ServerMetrics {
+                fleet,
+                queued_jobs: queued,
+                running_jobs: running,
+                succeeded_jobs: reg.succeeded_jobs,
+                failed_jobs: reg.failed_jobs,
+                cancelled_jobs: reg.cancelled_jobs,
+                max_jobs: self.max_jobs,
+            }
+        });
         metrics.to_prometheus_text()
     }
 
@@ -183,9 +190,7 @@ impl Inner {
             Some(engine) => engine.metrics().await,
             None => Default::default(),
         };
-        let (snapshot, expired) = {
-            let mut reg = self.registry.lock().unwrap();
-            let expired = cluster::expire_leases(&mut reg, now_ms());
+        self.with_registry(|reg, _| {
             let mut queued = 0;
             let mut running = 0;
             let mut jobs = Vec::with_capacity(reg.jobs.len().min(DASHBOARD_JOBS));
@@ -211,26 +216,19 @@ impl Inner {
                     "has_evidence": r.job.failure_evidence.is_some(),
                 }));
             }
-            (
-                json!({
-                    "fleet": fleet,
-                    "server": {
-                        "queued_jobs": queued,
-                        "running_jobs": running,
-                        "succeeded_jobs": reg.succeeded_jobs,
-                        "failed_jobs": reg.failed_jobs,
-                        "cancelled_jobs": reg.cancelled_jobs,
-                        "max_jobs": self.max_jobs,
-                    },
-                    "jobs": jobs,
-                }),
-                expired,
-            )
-        };
-        for id in expired {
-            self.journal_done(id);
-        }
-        snapshot
+            json!({
+                "fleet": fleet,
+                "server": {
+                    "queued_jobs": queued,
+                    "running_jobs": running,
+                    "succeeded_jobs": reg.succeeded_jobs,
+                    "failed_jobs": reg.failed_jobs,
+                    "cancelled_jobs": reg.cancelled_jobs,
+                    "max_jobs": self.max_jobs,
+                },
+                "jobs": jobs,
+            })
+        })
     }
 }
 
@@ -320,22 +318,28 @@ impl HttpServer {
     }
 
     pub fn router(&self) -> Router {
-        let small = Router::new()
+        let mut small = Router::new()
             .route("/v1/jobs", post(submit))
             .route("/v1/jobs/{id}", get(job_status).delete(cancel))
-            .route("/v1/workers/{worker}/lease", post(cluster::lease))
-            .route("/v1/workers/{worker}/heartbeat", post(cluster::heartbeat))
             .route("/v1/stats", get(stats))
             .route("/v1/events", get(dashboard::dashboard_events))
-            .route("/metrics", get(metrics_endpoint))
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
+            .route("/metrics", get(metrics_endpoint));
 
-        let result_route = Router::new()
-            .route("/v1/jobs/{id}/result", post(cluster::result))
-            .layer(DefaultBodyLimit::max(MAX_RESULT_BYTES * 2 + MAX_REQUEST_BYTES));
+        let mut protected = Router::new();
+        // Worker cluster endpoints belong strictly to coordinators (`engine == None`); exposing
+        // them on a standalone `serve` instance would lease out jobs that it also runs locally.
+        if self.inner.engine.is_none() {
+            small = small
+                .route("/v1/workers/{worker}/lease", post(cluster::lease))
+                .route("/v1/workers/{worker}/heartbeat", post(cluster::heartbeat));
+            protected = protected
+                .route("/v1/jobs/{id}/result", post(cluster::result))
+                .layer(DefaultBodyLimit::max(MAX_RESULT_BYTES * 2 + MAX_REQUEST_BYTES));
+        }
 
         let protected = small
-            .merge(result_route)
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .merge(protected)
             .route_layer(middleware::from_fn_with_state(
                 self.inner.clone(),
                 authorize,
@@ -456,25 +460,16 @@ async fn submit(
     let trace_ctx = JobTraceContext::from_headers(traceparent);
     let outbound_tp = trace_ctx.to_traceparent();
 
-    let (job, expired) = {
-        let mut registry = inner.registry.lock().unwrap();
-        let expired = cluster::expire_leases(&mut registry, now_ms());
+    let job = match inner.with_registry(|registry, _| -> Result<Job, Response> {
         if !registry.accepting {
-            drop(registry);
-            for eid in expired {
-                inner.journal_done(eid);
-            }
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "shutting_down",
                 "the server is shutting down",
-            ));
+            )
+            .into_response());
         }
         if !registry.make_room(inner.max_jobs) {
-            drop(registry);
-            for eid in expired {
-                inner.journal_done(eid);
-            }
             let mut error = ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "capacity_exceeded",
@@ -484,7 +479,7 @@ async fn submit(
             error
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            return Ok(error);
+            return Err(error);
         }
 
         let id = Uuid::new_v4();
@@ -492,12 +487,11 @@ async fn submit(
         if let Some(journal) = &inner.journal {
             journal.submitted(id, &raw);
         }
-        let job = enqueue(&inner, &mut registry, id, request, trace_ctx);
-        (job, expired)
+        Ok(enqueue(&inner, registry, id, request, trace_ctx))
+    }) {
+        Ok(job) => job,
+        Err(error_response) => return Ok(error_response),
     };
-    for eid in expired {
-        inner.journal_done(eid);
-    }
     let id = job.id;
 
     let mut response = (StatusCode::ACCEPTED, Json(job)).into_response();
@@ -577,44 +571,45 @@ fn finish_job(
     id: Uuid,
     outcome: Result<fluxwright::Result<Vec<Value>>, tokio::task::JoinError>,
 ) {
-    let mut registry = inner.registry.lock().unwrap();
-    let Some(record) = registry.find_mut(id) else {
-        return;
-    };
-    record.abort = None;
-    if record.job.status.terminal() {
-        return; // Cancellation wins over a result arriving at the same instant.
-    }
-    record.job.finished_at = Some(now_ms());
-    match outcome {
-        Ok(Ok(results)) => {
-            record.job.status = JobStatus::Succeeded;
-            record.job.results = Some(results);
+    let finished_status = inner.with_registry(|registry, now| {
+        let record = registry.find_mut(id)?;
+        record.abort = None;
+        if record.job.status.terminal() {
+            return None; // Cancellation wins over a result arriving at the same instant.
         }
-        Ok(Err(error)) => {
-            record.job.status = JobStatus::Failed;
-            record.job.error = Some(bounded_error(&error.to_string()));
+        record.job.finished_at = Some(now);
+        match outcome {
+            Ok(Ok(results)) => {
+                record.job.status = JobStatus::Succeeded;
+                record.job.results = Some(results);
+            }
+            Ok(Err(error)) => {
+                record.job.status = JobStatus::Failed;
+                record.job.error = Some(bounded_error(&error.to_string()));
+            }
+            Err(error) => {
+                record.job.status = JobStatus::Failed;
+                record.job.error = Some(
+                    if error.is_panic() {
+                        "job worker panicked"
+                    } else {
+                        "job worker stopped"
+                    }
+                    .into(),
+                );
+            }
         }
-        Err(error) => {
-            record.job.status = JobStatus::Failed;
-            record.job.error = Some(
-                if error.is_panic() {
-                    "job worker panicked"
-                } else {
-                    "job worker stopped"
-                }
-                .into(),
-            );
+        let status = record.job.status;
+        match status {
+            JobStatus::Succeeded => registry.succeeded_jobs += 1,
+            _ => registry.failed_jobs += 1,
         }
+        Some(status)
+    });
+    if let Some(status) = finished_status {
+        inner.journal_done(id);
+        tracing::info!(job_id = %id, ?status, "HTTP job finished");
     }
-    let status = record.job.status;
-    match status {
-        JobStatus::Succeeded => registry.succeeded_jobs += 1,
-        _ => registry.failed_jobs += 1,
-    }
-    drop(registry);
-    inner.journal_done(id);
-    tracing::info!(job_id = %id, ?status, "HTTP job finished");
 }
 
 #[derive(Clone, Default)]
@@ -828,8 +823,8 @@ pub(crate) async fn execute_job(
     execution.instrument(job_span).await
 }
 
-/// Serialized length of a JSON value without materializing it.
-fn json_len(value: &Value) -> usize {
+/// Serialized byte length of a JSON-serializable value without materializing it.
+pub(crate) fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     struct Tally(usize);
     impl std::io::Write for Tally {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -841,7 +836,7 @@ fn json_len(value: &Value) -> usize {
         }
     }
     let mut tally = Tally(0);
-    serde_json::to_writer(&mut tally, value).expect("Value is JSON");
+    let _ = serde_json::to_writer(&mut tally, value);
     tally.0
 }
 
@@ -1014,20 +1009,16 @@ async fn job_status(
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
-    let (job, expired) = {
-        let mut registry = inner.registry.lock().unwrap();
-        let expired = cluster::expire_leases(&mut registry, now_ms());
-        let job = registry
-            .jobs
-            .iter()
-            .find(|r| r.job.id == id)
-            .map(|r| r.job.clone());
-        (job, expired)
-    };
-    for eid in expired {
-        inner.journal_done(eid);
-    }
-    job.map(Json).ok_or_else(not_found)
+    inner
+        .with_registry(|registry, _| {
+            registry
+                .jobs
+                .iter()
+                .find(|r| r.job.id == id)
+                .map(|r| r.job.clone())
+        })
+        .map(Json)
+        .ok_or_else(not_found)
 }
 
 async fn cancel(
@@ -1035,29 +1026,12 @@ async fn cancel(
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
-    let mut registry = inner.registry.lock().unwrap();
-    let expired = cluster::expire_leases(&mut registry, now_ms());
-    let (job_clone, abort) = {
-        let Some(record) = registry.find_mut(id) else {
-            drop(registry);
-            for eid in expired {
-                inner.journal_done(eid);
-            }
-            return Err(not_found());
-        };
+    let (job_clone, abort, finished) = inner.with_registry(|registry, now| -> Result<_, ApiError> {
+        let record = registry.find_mut(id).ok_or_else(not_found)?;
         if record.job.status == JobStatus::Cancelled {
-            let job = record.job.clone();
-            drop(registry);
-            for eid in expired {
-                inner.journal_done(eid);
-            }
-            return Ok(Json(job));
+            return Ok((record.job.clone(), None, false));
         }
         if record.job.status.terminal() {
-            drop(registry);
-            for eid in expired {
-                inner.journal_done(eid);
-            }
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "already_finished",
@@ -1065,21 +1039,21 @@ async fn cancel(
             ));
         }
         record.job.status = JobStatus::Cancelled;
-        record.job.finished_at = Some(now_ms());
+        record.job.finished_at = Some(now);
         record.worker = None;
         record.lease_until = None;
-        (record.job.clone(), record.abort.clone())
-    };
-    registry.cancelled_jobs += 1;
+        let job = record.job.clone();
+        let abort = record.abort.clone();
+        registry.cancelled_jobs += 1;
+        Ok((job, abort, true))
+    })?;
     if let Some(abort) = abort {
         abort.abort();
     }
-    drop(registry);
-    for eid in expired {
-        inner.journal_done(eid);
+    if finished {
+        // A job the client cancelled is over. One the shutdown cancels is not: it runs again.
+        inner.journal_done(id);
     }
-    // A job the client cancelled is over. One the shutdown cancels is not: it runs again.
-    inner.journal_done(id);
     Ok(Json(job_clone))
 }
 

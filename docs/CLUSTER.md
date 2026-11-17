@@ -1,6 +1,6 @@
-# Many machines (cluster mode)
+# Many machines (experimental cluster mode)
 
-Status: core coordinator and pulling worker loop implemented in `0.7.0`. Remaining later items: SQLite store, separate worker token, coordinator-wide per-host limits, and a worker table on the dashboard.
+Status: experimental in `0.7.0`. Core coordinator (`fluxwright coordinate`) and pulling worker loop (`fluxwright serve --join`) are implemented. Remaining hardening items: SQLite store, separate worker token, native worker TLS, coordinator-wide per-host limits, and a worker table on the dashboard.
 
 ## Goal
 
@@ -20,8 +20,8 @@ clients ──HTTP──▶ coordinator ◀──HTTP (pull)── worker (fluxw
 
 Two roles, one binary:
 
-- **Coordinator** (`fluxwright coordinate [--listen ADDR] [--max-jobs N] [--journal FILE]`): the public job API (`POST /v1/jobs`, `GET` and `DELETE /v1/jobs/{id}`), plus worker lease, heartbeat, and result endpoints, with no browsers of its own.
-- **Worker** (`fluxwright serve --join <http://coordinator-url> [--worker-id NAME]`): today's server (defaulting `--listen` to `127.0.0.1:0` when `--join` is passed), plus a pull loop that asks the coordinator for work, heartbeats every 10 seconds, aborts cancelled jobs, and posts outcomes (with failure evidence) back. Uses `FLUXWRIGHT_SERVER_TOKEN` for bearer authentication; place TLS termination on a reverse proxy when crossing untrusted networks.
+- **Coordinator** (`fluxwright coordinate [--listen ADDR] [--max-jobs N] [--journal FILE]`): the public job API (`POST /v1/jobs`, `GET` and `DELETE /v1/jobs/{id}`), plus worker lease, heartbeat, and result endpoints (not mounted on standalone `fluxwright serve`), with no browsers of its own. Bind a private network interface (for example `10.0.1.10:7331`) when workers run on other hosts.
+- **Worker** (`fluxwright serve --join <http://coordinator-url> [--worker-id NAME]`): today's server (defaulting `--listen` to `127.0.0.1:0` when `--join` is passed), plus a pull loop that asks the coordinator for work, heartbeats on a dedicated background task every 10 seconds, aborts cancelled jobs, drains in-flight work on clean shutdown, and posts outcomes (with failure evidence) back. `--join` speaks `http://` only (`https://` is rejected) and authenticates with `FLUXWRIGHT_SERVER_TOKEN`, so the worker-to-coordinator link **must** stay on a trusted private network or pass through a local TLS tunnel/WireGuard VPN.
 
 Workers pull; the coordinator never connects to a worker. So workers need no open port, sit
 behind NAT without trouble, and a new one joins by starting.
@@ -55,61 +55,20 @@ Side effects can repeat. A job that clicked "buy" and then lost its worker runs 
 first step on another one. This is the same rule as the single-server journal, and the docs say
 so: use the cluster for jobs that are safe to repeat, or set `retries: 0`.
 
-## What the coordinator stores
+## Current limits vs planned hardening
 
-The journal of today, extended: one line when a job is accepted, one when it is leased (worker,
-expiry), one when it ends, with the result. Compacted on start as now. Results are kept for a
-set time (default one hour) so a client can poll after the job ends, then dropped.
+Implemented in `0.7.0` (experimental):
+- One coordinator process with in-memory bounded job ring (`--max-jobs`) and optional `--journal` file replay for unfinished jobs.
+- Pull-based leases (`POST /v1/workers/{worker}/lease`), priority + FIFO ordering, 2 MiB batch size cap per lease response, 30 s lease expiration/requeue, dedicated 10 s heartbeat task (`POST /v1/workers/{worker}/heartbeat`), cancellation propagation, `409 Conflict` rejection on late worker results (`POST /v1/jobs/{id}/result`), and graceful worker drain on shutdown.
 
-This is the point where a database earns its place: results, leases and expiry are queries, not
-a log. The proposal is SQLite in one file on the coordinator, behind the same small interface
-the journal has now, so a single server keeps the plain file.
+Planned for later versions:
+- **SQLite store** behind the journal interface, retaining finished results for a configurable TTL across coordinator restarts.
+- **Per-host limits across the cluster** (`--max-per-host` / `--min-host-delay-ms` currently apply per worker).
+- **Separate worker auth token** and **native `https://` client support** on `--join` (currently `FLUXWRIGHT_SERVER_TOKEN` and unencrypted `http://` only, so keep worker-to-coordinator traffic on a trusted private network or local TLS tunnel).
+- **Coordinator worker metrics and dashboard table** (active workers, last heartbeat, lease expirations).
 
-## Limits across the fleet
+## Design choices
 
-- **Per-host limits** (`--max-per-host`, `--min-host-delay-ms`) are per worker today. Across a
-  cluster the coordinator has to enforce them, because it is the only place that sees every
-  job. It reads the host of each job's first `goto` and holds back a job whose host is full or
-  too recent. Jobs that visit several hosts are limited on the first one only.
-- **Priorities** work as now: the coordinator hands out high before normal before low.
-- **Capacity**: `max_jobs` moves to the coordinator, and can be far larger, since a queued job
-  there is a few hundred bytes and no browser.
-
-## Security
-
-- Workers authenticate to the coordinator with a worker token, separate from the client token,
-  so a leaked client token cannot take jobs or post results.
-- Job steps and results cross the network: run the coordinator behind TLS, as SERVER.md already
-  says for the single server.
-- A worker is trusted with every job it leases. Different trust levels need different clusters.
-
-## Observability
-
-The coordinator's `/metrics` adds: queued jobs, jobs per worker, lease expirations, worker count
-and each worker's last heartbeat. The dashboard gets a worker table. Trace ids pass through to
-the worker, so one trace covers the queue wait and the run.
-
-## What is deliberately left out
-
-- **A second coordinator.** One coordinator is one point of failure for accepting jobs.
-  Removing it means consensus or an external store (Postgres, Redis), which is a different
-  product size. If the coordinator is down, workers finish what they hold and report when it
-  returns.
-- **Pushing work to workers**, which would be faster by one poll interval but needs workers to
-  be reachable.
-- **Moving a running job** to another worker. A page's state lives in one Chrome.
-
-## Build order, if approved
-
-1. The store interface, with the journal behind it (no behaviour change).
-2. The coordinator with the lease, heartbeat and result calls, and SQLite behind the store.
-3. `serve --join`: the pull loop on the worker.
-4. Lease expiry and requeue, with a test that kills a worker mid-job.
-5. Per-host limits and metrics on the coordinator.
-
-## Questions for review
-
-1. Is one coordinator acceptable, or is a shared store (Postgres or Redis) required from the
-   start?
-2. Is at-least-once acceptable for your jobs, or do some need "never twice"?
-3. Should results be kept at all on the coordinator, or sent to a webhook when a job ends?
+- **Single coordinator:** High-availability consensus or an external Redis/Postgres queue is outside Fluxwright's scope. While the coordinator restarts, live workers continue running leased jobs and retry result posts with backoff.
+- **At-least-once delivery:** Crashed workers or expired leases can replay steps from the start, matching `--journal`. Use the cluster for repeatable jobs or set `retries: 0`.
+- **Bounded retained results:** Finished results remain in the coordinator's `--max-jobs` ring buffer for polling; webhooks and external object stores are out of scope.

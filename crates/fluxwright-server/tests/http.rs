@@ -583,7 +583,34 @@ async fn worker_pulls_and_executes_jobs_from_coordinator() {
         .expect("cluster failure evidence includes screenshot");
     assert!(shot.starts_with("iVBOR"));
 
-    worker.abort();
+    // Verify graceful worker shutdown lets an already-leased job finish before exiting.
+    let drain_sub = submit(
+        &coordinator,
+        json!({ "steps": [
+            { "action": "evaluate", "expression": "new Promise(r => setTimeout(() => r('drained-ok'), 250))" }
+        ] }),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, body) =
+                request(&coordinator, "GET", &format!("/v1/jobs/{}", drain_sub.id), Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            let j: Job = serde_json::from_value(body).unwrap();
+            if j.status != JobStatus::Queued {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker leased drain job");
+
+    worker.shutdown(Duration::from_secs(10)).await;
+    let drain_job = finish(&coordinator, drain_sub).await;
+    assert_eq!(drain_job.status, JobStatus::Succeeded, "{:?}", drain_job.error);
+    assert_eq!(drain_job.results.unwrap()[0], "drained-ok");
+
     coord_task.abort();
     let _ = engine.shutdown(Duration::from_secs(5)).await;
     coordinator.shutdown(Duration::ZERO).await.unwrap();

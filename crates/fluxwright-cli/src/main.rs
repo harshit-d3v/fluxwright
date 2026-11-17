@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use fluxwright::{BrowserEngine, QueueFullMode};
-use fluxwright_server::{HttpServer, ServerConfig};
+use fluxwright_server::{HttpServer, ServerConfig, WorkerHandle};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -251,7 +251,12 @@ async fn http_daemon(
                 worker_id,
                 slots,
             )?;
-            eprintln!("fluxwright worker joined coordinator {url} ({slots} slots)");
+            eprintln!("fluxwright worker joined coordinator {url} ({slots} slots, experimental)");
+            if !handle.coordinator_is_loopback() {
+                eprintln!(
+                    "warning: --join uses unencrypted HTTP; keep the coordinator link on a trusted private network or local TLS tunnel"
+                );
+            }
             Some(handle)
         }
         None => None,
@@ -268,7 +273,7 @@ async fn serve_http(
     listener: tokio::net::TcpListener,
     address: SocketAddr,
     server: HttpServer,
-    worker: Option<tokio::task::AbortHandle>,
+    worker: Option<WorkerHandle>,
 ) -> Result<()> {
     if !address.ip().is_loopback() {
         eprintln!("warning: remote access enabled; use a private network and a TLS reverse proxy; this is a trusted-operator API");
@@ -281,7 +286,7 @@ async fn serve_http(
                 tracing::error!(%error, "could not wait for the shutdown signal");
             }
             if let Some(w) = worker_on_shutdown {
-                w.abort();
+                w.shutdown(Duration::from_secs(10)).await;
             }
             let _ = shutdown.shutdown(Duration::from_secs(10)).await;
         })

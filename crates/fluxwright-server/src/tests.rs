@@ -1021,6 +1021,156 @@ async fn coordinator_expires_leases_requeues_retries_and_rejects_stale_worker_wi
         Err(ConfigError::InvalidCoordinator(_))
     ));
     assert!(cluster::CoordinatorEndpoint::parse("http://[::1]:7331/sub/").is_ok());
+    assert!(cluster::CoordinatorEndpoint::parse("http://127.0.0.1:7331").unwrap().is_loopback());
+    assert!(cluster::CoordinatorEndpoint::parse("http://[::1]:7331").unwrap().is_loopback());
+    assert!(!cluster::CoordinatorEndpoint::parse("http://10.0.1.10:7331").unwrap().is_loopback());
 
     server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_server_does_not_expose_worker_cluster_routes() {
+    let server = server(4).await;
+    let job = submit_job(&server).await;
+
+    for (path, payload) in [
+        ("/v1/workers/w1/lease", r#"{"max_jobs":1}"#),
+        ("/v1/workers/w1/heartbeat", r#"{"jobs":[]}"#),
+    ] {
+        assert_eq!(
+            call(&server, "POST", path, payload).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        call(
+            &server,
+            "POST",
+            &format!("/v1/jobs/{}/result", job.id),
+            r#"{"worker":"w1","status":"succeeded","attempts":1,"step_index":0,"results":[]}"#,
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_lease_caps_batch_bytes_without_burning_remaining_jobs() {
+    let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+    config.max_jobs = 64;
+    let server = HttpServer::coordinator(config).unwrap();
+
+    // 45 jobs at ~55 KiB each (~2.47 MiB total) exceed MAX_LEASE_RESPONSE_BYTES (2 MiB).
+    let pad = "a".repeat(55_000);
+    let expr = format!("/*{pad}*/'ok'");
+    let mut submitted = Vec::with_capacity(45);
+    for _ in 0..45 {
+        let payload = serde_json::json!({
+            "steps": [{ "action": "evaluate", "expression": expr }]
+        });
+        let res = call(&server, "POST", "/v1/jobs", payload.to_string()).await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        submitted.push(serde_json::from_value::<Job>(body(res).await).unwrap().id);
+    }
+
+    let res1 = call(&server, "POST", "/v1/workers/w1/lease", r#"{"max_jobs":64}"#).await;
+    assert_eq!(res1.status(), StatusCode::OK);
+    let b1 = body(res1).await;
+    let jobs1 = b1["jobs"].as_array().unwrap();
+    assert!(
+        jobs1.len() > 1 && jobs1.len() < 45,
+        "expected first lease batch to split cleanly at byte limit, got {}",
+        jobs1.len()
+    );
+
+    // Remaining jobs stayed Queued (never marked Running or burned).
+    let next_id = submitted[jobs1.len()];
+    let state = body(call(&server, "GET", &format!("/v1/jobs/{next_id}"), Body::empty()).await).await;
+    assert_eq!(state["status"], "queued");
+    assert_eq!(state["attempts"], 0);
+
+    let res2 = call(&server, "POST", "/v1/workers/w2/lease", r#"{"max_jobs":64}"#).await;
+    assert_eq!(res2.status(), StatusCode::OK);
+    let jobs2 = body(res2).await["jobs"].as_array().unwrap().len();
+    assert_eq!(jobs1.len() + jobs2, 45);
+
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_heartbeats_independently_and_stops_cleanly_when_cancelled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let heartbeats = Arc::new(AtomicUsize::new(0));
+    let hb_count = heartbeats.clone();
+    let job_id = Uuid::new_v4();
+
+    let server_task = tokio::spawn(async move {
+        let mut leased = false;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let resp_body = if req.contains("/lease") && !leased {
+                leased = true;
+                serde_json::json!({
+                    "jobs": [{
+                        "id": job_id,
+                        "request": { "steps": [{ "action": "title" }] },
+                        "attempts": 1,
+                        "trace_id": null
+                    }]
+                })
+                .to_string()
+            } else if req.contains("/lease") {
+                r#"{"jobs":[]}"#.to_string()
+            } else if req.contains("/heartbeat") {
+                let c = hb_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if c >= 2 {
+                    serde_json::json!({ "cancelled": [job_id] }).to_string()
+                } else {
+                    r#"{"cancelled":[]}"#.to_string()
+                }
+            } else {
+                r#"{"error":"unexpected"}"#.to_string()
+            };
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+
+    let engine = idle_engine().await;
+    let worker = cluster::spawn_worker_with(
+        engine.clone(),
+        format!("http://{addr}"),
+        TOKEN.into(),
+        Some("w-hb".into()),
+        1,
+        Duration::from_millis(20),
+        Duration::from_millis(30),
+    )
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while heartbeats.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("heartbeat task ran at least twice");
+
+    // Once cancelled via heartbeat, shutdown drains and finishes promptly.
+    worker.shutdown(Duration::from_secs(2)).await;
+    server_task.abort();
+    engine.shutdown(Duration::ZERO).await.unwrap();
 }
