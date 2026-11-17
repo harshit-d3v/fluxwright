@@ -30,6 +30,12 @@ const MAX_LEASE_BATCH: usize = 64;
 const MAX_LEASE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024 + 65_536;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long shutdown waits for aborted job tasks to stop before deciding which jobs to release.
+const TASK_STOP_WAIT: Duration = Duration::from_secs(1);
+/// Time a draining worker may spend after its grace deadline: one in-flight result call, the
+/// release call, and one pending-result call, plus task stop time and slack.
+const SHUTDOWN_REPORT_BUDGET: Duration =
+    Duration::from_secs(3 * HTTP_REQUEST_TIMEOUT.as_secs() + TASK_STOP_WAIT.as_secs() + 2);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -482,9 +488,7 @@ impl WorkerHandle {
         });
         if !*self.finished_rx.borrow() {
             let mut rx = self.finished_rx.clone();
-            let wait = grace
-                .saturating_add(HTTP_REQUEST_TIMEOUT)
-                .saturating_add(Duration::from_secs(2));
+            let wait = grace.saturating_add(SHUTDOWN_REPORT_BUDGET);
             let _ = tokio::time::timeout(wait, async move {
                 while !*rx.borrow() {
                     if rx.changed().await.is_err() {
@@ -859,26 +863,47 @@ async fn release_remaining(
     worker_id: &str,
 ) {
     hb_abort.abort();
+    let unfinished = stop_active_tasks(active, done_rx, pending_results).await;
+    // Release first: it is one call, and without it a `retries: 0` job fails as "worker lost".
+    if !unfinished.is_empty() {
+        if let Err(error) = post_release(endpoint, token, worker_id, &unfinished).await {
+            tracing::warn!(%error, worker = %worker_id, count = unfinished.len(), "failed to release unfinished jobs on shutdown");
+        }
+    }
+    let _ = flush_pending_results(endpoint, token, pending_results).await;
+}
+
+/// Aborts every leased task, waits for them to stop, and moves results that arrived meanwhile to
+/// `pending_results`. Returns the jobs that never finished. A task can be mid-poll when aborted
+/// and still send its result, so collecting results before every task has stopped would release
+/// (and rerun) a job that had already completed. A task still running after `TASK_STOP_WAIT` is
+/// released anyway, and a result it sends later is dropped.
+async fn stop_active_tasks(
+    active: &Mutex<HashMap<Uuid, RunningTask>>,
+    done_rx: &mut mpsc::UnboundedReceiver<(Uuid, ResultRequest)>,
+    pending_results: &mut VecDeque<(Uuid, ResultRequest)>,
+) -> Vec<Uuid> {
+    let handles: Vec<AbortHandle> = active
+        .lock()
+        .unwrap()
+        .values()
+        .map(|task| {
+            task.abort.abort();
+            task.abort.clone()
+        })
+        .collect();
+    let _ = tokio::time::timeout(TASK_STOP_WAIT, async {
+        while handles.iter().any(|h| !h.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
     while let Ok((id, req)) = done_rx.try_recv() {
         if active.lock().unwrap().remove(&id).is_some() {
             pending_results.push_back((id, req));
         }
     }
-    let _ = flush_pending_results(endpoint, token, pending_results).await;
-    let remaining_ids: Vec<Uuid> = {
-        let mut guard = active.lock().unwrap();
-        let mut ids = Vec::with_capacity(guard.len());
-        for (id, task) in guard.drain() {
-            task.abort.abort();
-            ids.push(id);
-        }
-        ids
-    };
-    if !remaining_ids.is_empty() {
-        if let Err(error) = post_release(endpoint, token, worker_id, &remaining_ids).await {
-            tracing::warn!(%error, worker = %worker_id, count = remaining_ids.len(), "failed to release unfinished jobs on shutdown");
-        }
-    }
+    active.lock().unwrap().drain().map(|(id, _)| id).collect()
 }
 
 fn spawn_leased_job(
@@ -1127,5 +1152,72 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, String> {
         }
         out.extend_from_slice(&data[..size]);
         data = &data[size + 2..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn running(abort: AbortHandle) -> RunningTask {
+        RunningTask {
+            abort,
+            progress: Arc::new(Mutex::new(ExecutionProgress {
+                attempts: 1,
+                step_index: None,
+                failure_evidence: None,
+            })),
+        }
+    }
+
+    fn succeeded() -> ResultRequest {
+        ResultRequest {
+            worker: "w".into(),
+            status: JobStatus::Succeeded,
+            attempts: 1,
+            step_index: None,
+            results: Some(Vec::new()),
+            error: None,
+            failure_evidence: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_tasks_keeps_a_result_sent_after_abort() {
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        let active = Mutex::new(HashMap::new());
+        let finishing = Uuid::new_v4();
+        let stuck = Uuid::new_v4();
+
+        // Mid-poll when aborted: it cannot be interrupted and sends its result afterwards.
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = started.clone();
+        let tx = done_tx.clone();
+        let task = tokio::spawn(async move {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = tx.send((finishing, succeeded()));
+        });
+        active
+            .lock()
+            .unwrap()
+            .insert(finishing, running(task.abort_handle()));
+        let task = tokio::spawn(std::future::pending::<()>());
+        active
+            .lock()
+            .unwrap()
+            .insert(stuck, running(task.abort_handle()));
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        let mut pending = VecDeque::new();
+        let unfinished = stop_active_tasks(&active, &mut done_rx, &mut pending).await;
+
+        assert_eq!(unfinished, vec![stuck]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, finishing);
+        assert!(active.lock().unwrap().is_empty());
     }
 }
