@@ -611,6 +611,60 @@ async fn worker_pulls_and_executes_jobs_from_coordinator() {
     assert_eq!(drain_job.status, JobStatus::Succeeded, "{:?}", drain_job.error);
     assert_eq!(drain_job.results.unwrap()[0], "drained-ok");
 
+    // Verify a job still running past shutdown grace is released back cleanly without losing its
+    // only attempt, then picked up and finished by a replacement worker.
+    let worker2 = fluxwright_server::spawn_worker(
+        engine.clone(),
+        format!("http://{coord_addr}"),
+        TOKEN.into(),
+        Some("http-test-worker-2".into()),
+        1,
+    )
+    .unwrap();
+    let long_sub = submit(
+        &coordinator,
+        json!({
+            "retries": 0,
+            "steps": [
+                { "action": "evaluate", "expression": "new Promise(r => setTimeout(() => r('released-ok'), 800))" }
+            ]
+        }),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, body) =
+                request(&coordinator, "GET", &format!("/v1/jobs/{}", long_sub.id), Value::Null).await;
+            assert_eq!(status, StatusCode::OK);
+            let j: Job = serde_json::from_value(body).unwrap();
+            if j.status == JobStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker2 leased long job");
+
+    worker2.shutdown(Duration::from_millis(40)).await;
+    let (_, after_rel) =
+        request(&coordinator, "GET", &format!("/v1/jobs/{}", long_sub.id), Value::Null).await;
+    assert_eq!(after_rel["status"], "queued", "{after_rel}");
+    assert_eq!(after_rel["attempts"], 0, "{after_rel}");
+
+    let worker3 = fluxwright_server::spawn_worker(
+        engine.clone(),
+        format!("http://{coord_addr}"),
+        TOKEN.into(),
+        Some("http-test-worker-3".into()),
+        1,
+    )
+    .unwrap();
+    let rel_job = finish(&coordinator, long_sub).await;
+    assert_eq!(rel_job.status, JobStatus::Succeeded, "{:?}", rel_job.error);
+    assert_eq!(rel_job.results.unwrap()[0], "released-ok");
+    worker3.abort();
+
     coord_task.abort();
     let _ = engine.shutdown(Duration::from_secs(5)).await;
     coordinator.shutdown(Duration::ZERO).await.unwrap();

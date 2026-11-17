@@ -1036,6 +1036,7 @@ async fn standalone_server_does_not_expose_worker_cluster_routes() {
     for (path, payload) in [
         ("/v1/workers/w1/lease", r#"{"max_jobs":1}"#),
         ("/v1/workers/w1/heartbeat", r#"{"jobs":[]}"#),
+        ("/v1/workers/w1/release", r#"{"jobs":[]}"#),
     ] {
         assert_eq!(
             call(&server, "POST", path, payload).await.status(),
@@ -1173,4 +1174,38 @@ async fn worker_heartbeats_independently_and_stops_cleanly_when_cancelled() {
     worker.shutdown(Duration::from_secs(2)).await;
     server_task.abort();
     engine.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_release_requeues_without_counting_attempt() {
+    let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+    config.max_jobs = 8;
+    let server = HttpServer::coordinator(config).unwrap();
+
+    // Even with retries: 0, releasing returns the job cleanly with attempts == 0.
+    let job_a = submit_priority(&server, "normal", 0).await;
+    let job_b = submit_priority(&server, "normal", 0).await;
+
+    let l1 = body(call(&server, "POST", "/v1/workers/w1/lease", r#"{"max_jobs":1}"#).await).await;
+    assert_eq!(l1["jobs"][0]["id"], job_a.id.to_string());
+    let l2 = body(call(&server, "POST", "/v1/workers/w2/lease", r#"{"max_jobs":1}"#).await).await;
+    assert_eq!(l2["jobs"][0]["id"], job_b.id.to_string());
+
+    // Passing another worker's job ID only releases w1's own job.
+    let rel_payload = serde_json::json!({ "jobs": [job_a.id, job_b.id] });
+    let rel = call(&server, "POST", "/v1/workers/w1/release", rel_payload.to_string()).await;
+    assert_eq!(rel.status(), StatusCode::OK);
+    assert_eq!(body(rel).await["released"], serde_json::json!([job_a.id]));
+
+    let state_a = body(call(&server, "GET", &format!("/v1/jobs/{}", job_a.id), Body::empty()).await).await;
+    assert_eq!(state_a["status"], "queued");
+    assert_eq!(state_a["attempts"], 0);
+    assert_eq!(state_a["started_at"], serde_json::Value::Null);
+
+    // w2's job stays running under w2.
+    let state_b = body(call(&server, "GET", &format!("/v1/jobs/{}", job_b.id), Body::empty()).await).await;
+    assert_eq!(state_b["status"], "running");
+    assert_eq!(state_b["attempts"], 1);
+
+    server.shutdown(Duration::ZERO).await.unwrap();
 }
