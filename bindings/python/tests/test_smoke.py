@@ -85,7 +85,7 @@ def base():
 
 RICH_HTML = (
     '<body style="margin:0;height:2000px">'
-    '<button id="btn" style="position:relative;width:80px;height:40px" '
+    '<button id="btn" style="border:0;padding:0;position:relative;width:80px;height:40px" '
     'oncontextmenu="event.preventDefault();window.__ctx=[event.button,event.shiftKey,Math.round(event.offsetX),Math.round(event.offsetY)]" '
     'onclick="window.__clicks=(window.__clicks||0)+1" '
     'ondblclick="window.__dbl=(window.__dbl||0)+1" '

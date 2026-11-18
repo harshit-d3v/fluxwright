@@ -396,12 +396,15 @@ mod tests {
             browser_pid: 0,
             browser_id: BrowserId(uuid::Uuid::new_v4()),
             headless: false,
+            is_remote: false,
             context_id: ContextId("ctx".into()),
             target_id: TargetId("tgt".into()),
             session_id: SessionId("sid".into()),
             targets: Default::default(),
             worlds: Default::default(),
             setups: Default::default(),
+            mouse: Default::default(),
+            keyboard: Default::default(),
         };
 
         let err = page
