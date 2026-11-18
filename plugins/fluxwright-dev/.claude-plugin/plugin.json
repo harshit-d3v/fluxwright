@@ -1,0 +1,7 @@
+{
+  "name": "fluxwright-dev",
+  "version": "0.1.0",
+  "description": "Guardrails for working on Fluxwright with Claude Code: no npm publishing or release tags from Claude, no timeouts around Chrome runs, cargo found when it is not on PATH, tokens hidden from tool output, and /release-check for the five npm packages",
+  "author": { "name": "Harshit Prakash" },
+  "license": "Apache-2.0"
+}

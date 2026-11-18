@@ -1,0 +1,4 @@
+{
+  "description": "The fluxwright-dev hooks module",
+  "modules": ["./register.ts"]
+}
