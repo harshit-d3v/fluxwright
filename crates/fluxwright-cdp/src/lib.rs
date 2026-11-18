@@ -3,6 +3,7 @@ mod connection;
 mod context;
 mod error;
 mod events;
+mod input;
 mod launch;
 mod log;
 mod page;
@@ -13,7 +14,11 @@ pub use browser::{BrowserId, CdpBrowser, ContextId, Proxy, SessionId, TargetId};
 pub use connection::{CdpEvent, Connection};
 pub use context::{ColorScheme, Cookie, Emulation, Geolocation, OriginStorage, StorageItem, StorageState};
 pub use error::{Error, LaunchOptions, Result};
-pub use events::{Dialog, NetEvent, NetRequest, NetResponse};
+pub use events::{Dialog, FileChooser, NetEvent, NetRequest, NetResponse};
+pub use input::{
+    parse_modifiers, CheckOptions, ClickOptions, FileInput, FilePayload, HoverOptions, MouseButton,
+    SelectEntry,
+};
 pub use launch::{find_browser, find_chrome, sweep_stale_profiles};
 pub use log::{ConsoleMessage, Download, DownloadResult, LogEntry, PageError, PageLog};
 pub use page::{BoundingBox, CdpPage, DownloadQueue, ResourceType, Selector, WaitState, WaitUntil};

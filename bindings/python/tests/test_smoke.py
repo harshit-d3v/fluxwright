@@ -83,6 +83,30 @@ def base():
     server.shutdown()
 
 
+RICH_HTML = (
+    '<body style="margin:0;height:2000px">'
+    '<button id="btn" style="position:relative;width:80px;height:40px" '
+    'oncontextmenu="event.preventDefault();window.__ctx=[event.button,event.shiftKey,Math.round(event.offsetX),Math.round(event.offsetY)]" '
+    'onclick="window.__clicks=(window.__clicks||0)+1" '
+    'ondblclick="window.__dbl=(window.__dbl||0)+1" '
+    'onmouseenter="window.__hover=true" '
+    'onmousedown="window.__down=(window.__down||0)+1" '
+    'onmouseup="window.__up=(window.__up||0)+1" '
+    'ontouchstart="window.__tap=(window.__tap||0)+1">Btn</button>'
+    '<div id="covered" onclick="window.__forced=true" style="position:relative;width:40px;height:20px">C</div>'
+    '<div style="position:relative;top:-20px;width:40px;height:20px;background:rgba(0,0,0,0.2)"></div>'
+    '<div id="dragsrc" style="position:absolute;left:120px;top:20px;width:20px;height:20px" onmousedown="window.__dragStart=true"></div>'
+    '<div id="dragdst" style="position:absolute;left:220px;top:20px;width:20px;height:20px" onmouseup="window.__dragEnd=true"></div>'
+    '<input id="inp" value="old" onfocus="window.__foc=true" onblur="window.__foc=false" onkeydown="window.__keys=(window.__keys||[]);window.__keys.push(event.key)">'
+    '<input id="chk" type="checkbox"><input id="rad" type="radio" name="r">'
+    '<div id="sw" role="switch" tabindex="0" aria-checked="false" onclick="this.setAttribute(\'aria-checked\', String(this.getAttribute(\'aria-checked\')!==\'true\'))">Sw</div>'
+    '<select id="sel" multiple><option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option></select>'
+    '<input id="file" type="file" multiple>'
+    '<div id="below" style="margin-top:1400px">End</div>'
+    '<script>window.addEventListener("wheel", e => { window.__wheel = e.deltaY; }, { passive: true });</script></body>'
+)
+
+
 def test_async_api(base, tmp_path):
     asyncio.run(async_smoke(base, tmp_path))
 
@@ -351,6 +375,91 @@ async def async_smoke(base: str, tmp: Path) -> None:
         assert await race.evaluate(FETCH_API) == "first"
         await race.close()
 
+        # Rich pointer, keyboard, form, upload, filechooser, and touch APIs.
+        rich = await browser.new_page(has_touch=True)
+        await rich.route("**/rich", lambda route: route.fulfill(content_type="text/html", body=RICH_HTML))
+        await rich.goto(f"{base}/rich")
+        await rich.click("#btn", button="right", trial=True)
+        assert await rich.evaluate("() => window.__ctx") is None
+        await rich.click("#btn", button="right", modifiers=["Shift"], position={"x": 10, "y": 12})
+        assert await rich.evaluate("() => window.__ctx") == [2, True, 10, 12]
+        await rich.dblclick("#btn")
+        assert await rich.evaluate("() => window.__dbl") == 1
+        await rich.hover("#btn")
+        assert await rich.evaluate("() => window.__hover") is True
+        await rich.locator("#covered").click(force=True)
+        assert await rich.evaluate("() => window.__forced") is True
+        await rich.drag_and_drop("#dragsrc", "#dragdst")
+        assert await rich.evaluate("() => [window.__dragStart, window.__dragEnd]") == [True, True]
+        await rich.evaluate("() => { window.__dragStart = false; window.__dragEnd = false; }")
+        await rich.locator("#dragsrc").drag_to(rich.locator("#dragdst"))
+        assert await rich.evaluate("() => [window.__dragStart, window.__dragEnd]") == [True, True]
+        await rich.locator("#below").scroll_into_view_if_needed()
+        assert await rich.evaluate("() => window.scrollY") > 500
+        await rich.evaluate("() => window.scrollTo(0, 0)")
+        await rich.mouse.move(15, 15, steps=2)
+        await rich.mouse.down()
+        await rich.mouse.up()
+        await rich.mouse.click(15, 15, delay=5)
+        await rich.mouse.dblclick(15, 15)
+        assert await rich.evaluate("() => window.__dbl") == 2
+        assert await rich.evaluate("() => [window.__down >= 3, window.__up >= 3]") == [True, True]
+        await rich.mouse.wheel(0, 120)
+        assert await rich.evaluate("() => window.__wheel") == 120
+
+        await rich.focus("#inp")
+        assert await rich.evaluate("() => window.__foc") is True
+        await rich.locator("#inp").clear()
+        assert await rich.evaluate("() => inp.value") == ""
+        await rich.locator("#inp").press_sequentially("hello")
+        await rich.press("#inp", "ControlOrMeta+a")
+        await rich.press("#inp", "Backspace")
+        await rich.locator("#inp").type("hi")
+        await rich.keyboard.down("Shift")
+        await rich.keyboard.press("KeyA")
+        await rich.keyboard.up("Shift")
+        await rich.keyboard.type("z")
+        await rich.keyboard.insert_text("世")
+        await rich.press("#inp", "Enter")
+        assert await rich.evaluate("() => inp.value") == "hiAz世"
+        assert "Enter" in await rich.evaluate("() => window.__keys")
+        await rich.locator("#inp").blur()
+        assert await rich.evaluate("() => window.__foc") is False
+
+        await rich.check("#chk")
+        assert await rich.evaluate("() => chk.checked") is True
+        await rich.uncheck("#chk")
+        assert await rich.evaluate("() => chk.checked") is False
+        await rich.locator("#sw").set_checked(True)
+        assert await rich.evaluate("() => sw.getAttribute('aria-checked')") == "true"
+        with pytest.raises(Error, match="cannot uncheck a radio"):
+            await rich.locator("#rad").uncheck()
+        assert await rich.select_option("#sel", label="Beta") == ["b"]
+        assert await rich.locator("#sel").select_option([{"label": "Beta"}, {"index": 2}]) == ["b", "c"]
+        with pytest.raises(ValueError, match="element"):
+            await rich.select_option("#sel", element="unsupported")
+
+        upload_file = tmp / "py-async-upload.txt"
+        upload_file.write_text("async-upload")
+        await rich.set_input_files("#file", upload_file)
+        assert await rich.evaluate("() => file.files[0]?.name") == "py-async-upload.txt"
+        await rich.set_input_files("#file", [])
+        assert await rich.evaluate("() => file.files.length") == 0
+        await rich.set_input_files("#file", {"name": "mem.txt", "mimeType": "text/plain", "buffer": b"mem"})
+        assert await rich.evaluate("() => file.files[0]?.name") == "mem.txt"
+
+        async with rich.expect_file_chooser() as fc_info:
+            await rich.click("#file")
+        fc = await fc_info.value
+        assert fc.is_multiple() is True
+        await fc.set_files({"name": "chosen.txt", "mimeType": "text/plain", "buffer": b"ok"})
+        assert await rich.evaluate("() => file.files[0]?.name") == "chosen.txt"
+
+        await rich.tap("#btn")
+        await rich.touchscreen.tap(15, 15)
+        assert await rich.evaluate("() => window.__tap") == 2
+        await rich.close()
+
         # A page with listeners and routes that nobody holds is collected, so its slot comes back.
         forgotten = await browser.new_page()
         forgotten.on("console", lambda m: None)
@@ -367,6 +476,7 @@ async def async_smoke(base: str, tmp: Path) -> None:
         forgotten.on("console", uses(forgotten))
         forgotten.on("request", uses(forgotten))
         forgotten.on("dialog", uses(forgotten))
+        forgotten.on("filechooser", uses(forgotten))
         await forgotten.route("**/api", uses(forgotten))
         gone = weakref.ref(forgotten)
         del forgotten
@@ -701,6 +811,64 @@ def test_sync_api(base, tmp_path):
         assert page.locator("#box").screenshot(type="jpeg")[:3] == b"\xff\xd8\xff"
         assert page.pdf(format="Letter", margin={"top": "10mm"})[:5] == b"%PDF-"
         page.close()
+
+        rich = browser.new_page(has_touch=True)
+        rich.route("**/rich", lambda route: route.fulfill(content_type="text/html", body=RICH_HTML))
+        rich.goto(f"{base}/rich")
+        rich.click("#btn", button="right", trial=True)
+        assert rich.evaluate("() => window.__ctx") is None
+        rich.click("#btn", button="right", modifiers=["Shift"], position={"x": 10, "y": 12})
+        assert rich.evaluate("() => window.__ctx") == [2, True, 10, 12]
+        rich.dblclick("#btn")
+        assert rich.evaluate("() => window.__dbl") == 1
+        rich.hover("#btn")
+        assert rich.evaluate("() => window.__hover") is True
+        rich.locator("#covered").click(force=True)
+        assert rich.evaluate("() => window.__forced") is True
+        rich.drag_and_drop("#dragsrc", "#dragdst")
+        assert rich.evaluate("() => [window.__dragStart, window.__dragEnd]") == [True, True]
+        rich.locator("#below").scroll_into_view_if_needed()
+        assert rich.evaluate("() => window.scrollY") > 500
+        rich.evaluate("() => window.scrollTo(0, 0)")
+        rich.mouse.move(15, 15, steps=2)
+        rich.mouse.wheel(0, 120)
+        assert rich.evaluate("() => window.__wheel") == 120
+
+        rich.focus("#inp")
+        assert rich.evaluate("() => window.__foc") is True
+        rich.locator("#inp").clear()
+        rich.locator("#inp").press_sequentially("hello")
+        rich.press("#inp", "ControlOrMeta+a")
+        rich.press("#inp", "Backspace")
+        rich.keyboard.insert_text("世")
+        rich.press("#inp", "Enter")
+        assert rich.evaluate("() => inp.value") == "世"
+        rich.locator("#inp").blur()
+        assert rich.evaluate("() => window.__foc") is False
+
+        rich.check("#chk")
+        assert rich.evaluate("() => chk.checked") is True
+        rich.uncheck("#chk")
+        assert rich.evaluate("() => chk.checked") is False
+        rich.set_checked("#sw", True)
+        assert rich.evaluate("() => sw.getAttribute('aria-checked')") == "true"
+        assert rich.select_option("#sel", [{"label": "Beta"}, {"index": 2}]) == ["b", "c"]
+
+        upload_file = tmp_path / "py-sync-upload.txt"
+        upload_file.write_text("sync-upload")
+        rich.set_input_files("#file", upload_file)
+        assert rich.evaluate("() => file.files[0]?.name") == "py-sync-upload.txt"
+        rich.set_input_files("#file", [])
+        assert rich.evaluate("() => file.files.length") == 0
+        with rich.expect_file_chooser(lambda fc: fc.is_multiple()) as fc_info:
+            rich.click("#file")
+        fc_info.value.set_files({"name": "sync.txt", "mimeType": "text/plain", "buffer": b"ok"})
+        assert rich.evaluate("() => file.files[0]?.name") == "sync.txt"
+
+        rich.tap("#btn")
+        rich.touchscreen.tap(15, 15)
+        assert rich.evaluate("() => window.__tap") == 2
+        rich.close()
 
         # One browser shared by a pool of threads.
         def job(n):

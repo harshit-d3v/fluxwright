@@ -24,17 +24,19 @@ from contextlib import contextmanager, suppress
 from os import PathLike
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 
 from . import _native
 from . import async_api as _a
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage
 from ._types import (
+    FilePayload,
     FloatRect,
     Geolocation,
     HttpCredentials,
     PdfMargins,
+    Position,
     ProxySettings,
     StorageState,
     URLMatch,
@@ -50,21 +52,27 @@ __all__ = [
     "Download",
     "Error",
     "EventInfo",
+    "FileChooser",
+    "FilePayload",
     "FloatRect",
     "FrameLocator",
     "Geolocation",
     "HttpCredentials",
+    "Keyboard",
     "Locator",
+    "Mouse",
     "Page",
     "PdfMargins",
     "Playwright",
     "PlaywrightContextManager",
+    "Position",
     "ProxySettings",
     "Request",
     "Response",
     "Route",
     "StorageState",
     "TimeoutError",
+    "Touchscreen",
     "ViewportSize",
     "chromium",
     "sync_playwright",
@@ -131,6 +139,8 @@ def _to_sync(arg: Any) -> Any:
         return Request(arg)
     if isinstance(arg, _a.Dialog):
         return Dialog(arg)
+    if isinstance(arg, _a.FileChooser):
+        return FileChooser(arg)
     return arg
 
 
@@ -183,12 +193,174 @@ class Locator(_Finders):
     def __repr__(self) -> str:
         return repr(self._impl)
 
-    def click(self, *, timeout: float | None = None) -> None:
+    def click(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
         """``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
-        _run(self._impl.click, timeout=timeout)
+        _run(
+            self._impl.click,
+            button=button,
+            click_count=click_count,
+            delay=delay,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def dblclick(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(
+            self._impl.dblclick,
+            button=button,
+            delay=delay,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def hover(
+        self,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(
+            self._impl.hover,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def tap(
+        self,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(
+            self._impl.tap,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def focus(self, *, timeout: float | None = None) -> None:
+        _run(self._impl.focus, timeout=timeout)
+
+    def blur(self, *, timeout: float | None = None) -> None:
+        _run(self._impl.blur, timeout=timeout)
+
+    def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:
+        _run(self._impl.scroll_into_view_if_needed, timeout=timeout)
+
+    def drag_to(self, target: Locator, *, force: bool | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.drag_to, target._impl, force=force, timeout=timeout)
 
     def fill(self, value: str, *, timeout: float | None = None) -> None:
         _run(self._impl.fill, value, timeout=timeout)
+
+    def clear(self, *, force: bool | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.clear, force=force, timeout=timeout)
+
+    def press(self, key: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.press, key, delay=delay, timeout=timeout)
+
+    def press_sequentially(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.press_sequentially, text, delay=delay, timeout=timeout)
+
+    def type(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.type, text, delay=delay, timeout=timeout)
+
+    def check(
+        self,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.check, position=position, force=force, trial=trial, timeout=timeout)
+
+    def uncheck(
+        self,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.uncheck, position=position, force=force, trial=trial, timeout=timeout)
+
+    def set_checked(
+        self,
+        checked: bool,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.set_checked, checked, position=position, force=force, trial=trial, timeout=timeout)
+
+    def select_option(
+        self,
+        value: str | Sequence[str] | Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+        *,
+        index: int | Sequence[int] | None = None,
+        label: str | Sequence[str] | None = None,
+        element: Any = None,
+        force: bool | None = None,
+        timeout: float | None = None,
+    ) -> list[str]:
+        return _run(
+            self._impl.select_option,
+            value,
+            index=index,
+            label=label,
+            element=element,
+            force=force,
+            timeout=timeout,
+        )
+
+    def set_input_files(
+        self,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.set_input_files, files, timeout=timeout)
 
     def wait_for(
         self,
@@ -400,6 +572,110 @@ class Dialog:
         _run(self._impl.dismiss)
 
 
+class FileChooser:
+    """A native file chooser dialog, intercepted via ``page.on("filechooser")`` or
+    ``page.expect_file_chooser()``."""
+
+    def __init__(self, impl: _a.FileChooser) -> None:
+        self._impl = impl
+
+    def __repr__(self) -> str:
+        return repr(self._impl)
+
+    def is_multiple(self) -> bool:
+        return self._impl.is_multiple()
+
+    def set_files(
+        self,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.set_files, files, timeout=timeout)
+
+
+class Mouse:
+    """Low-level pointer controls in viewport CSS pixels, accessed via ``page.mouse``."""
+
+    def __init__(self, impl: _a.Mouse) -> None:
+        self._impl = impl
+
+    def move(self, x: float, y: float, *, steps: int | None = None) -> None:
+        _run(self._impl.move, x, y, steps=steps)
+
+    def down(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+    ) -> None:
+        _run(self._impl.down, button=button, click_count=click_count)
+
+    def up(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+    ) -> None:
+        _run(self._impl.up, button=button, click_count=click_count)
+
+    def click(
+        self,
+        x: float,
+        y: float,
+        *,
+        delay: float | None = None,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+    ) -> None:
+        _run(self._impl.click, x, y, delay=delay, button=button, click_count=click_count)
+
+    def dblclick(
+        self,
+        x: float,
+        y: float,
+        *,
+        delay: float | None = None,
+        button: Literal["left", "right", "middle"] | None = None,
+    ) -> None:
+        _run(self._impl.dblclick, x, y, delay=delay, button=button)
+
+    def wheel(self, delta_x: float, delta_y: float) -> None:
+        _run(self._impl.wheel, delta_x, delta_y)
+
+
+class Keyboard:
+    """Low-level keyboard controls, accessed via ``page.keyboard``."""
+
+    def __init__(self, impl: _a.Keyboard) -> None:
+        self._impl = impl
+
+    def down(self, key: str) -> None:
+        _run(self._impl.down, key)
+
+    def up(self, key: str) -> None:
+        _run(self._impl.up, key)
+
+    def press(self, key: str, *, delay: float | None = None) -> None:
+        _run(self._impl.press, key, delay=delay)
+
+    def type(self, text: str, *, delay: float | None = None) -> None:
+        _run(self._impl.type, text, delay=delay)
+
+    def insert_text(self, text: str) -> None:
+        _run(self._impl.insert_text, text)
+
+
+class Touchscreen:
+    """Low-level touchscreen controls in viewport CSS pixels, accessed via ``page.touchscreen``."""
+
+    def __init__(self, impl: _a.Touchscreen) -> None:
+        self._impl = impl
+
+    def tap(self, x: float, y: float) -> None:
+        _run(self._impl.tap, x, y)
+
+
 class Route:
     """How a route handler answers a request, as Playwright's ``Route``. Each request takes one
     answer."""
@@ -502,12 +778,209 @@ class Page(_Finders):
     def content(self) -> str:
         return _run(self._impl.content)
 
-    def click(self, selector: str, *, timeout: float | None = None) -> None:
+    @property
+    def mouse(self) -> Mouse:
+        return Mouse(self._impl.mouse)
+
+    @property
+    def keyboard(self) -> Keyboard:
+        return Keyboard(self._impl.keyboard)
+
+    @property
+    def touchscreen(self) -> Touchscreen:
+        return Touchscreen(self._impl.touchscreen)
+
+    def click(
+        self,
+        selector: str,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
         """Scrolls into view and waits until the element is enabled, stable and not covered."""
-        _run(self._impl.click, selector, timeout=timeout)
+        _run(
+            self._impl.click,
+            selector,
+            button=button,
+            click_count=click_count,
+            delay=delay,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def dblclick(
+        self,
+        selector: str,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(
+            self._impl.dblclick,
+            selector,
+            button=button,
+            delay=delay,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def hover(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(
+            self._impl.hover,
+            selector,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def tap(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(
+            self._impl.tap,
+            selector,
+            position=position,
+            modifiers=list(modifiers) if modifiers is not None else None,
+            force=force,
+            trial=trial,
+            timeout=timeout,
+        )
+
+    def focus(self, selector: str, *, timeout: float | None = None) -> None:
+        _run(self._impl.focus, selector, timeout=timeout)
+
+    def blur(self, selector: str, *, timeout: float | None = None) -> None:
+        _run(self._impl.blur, selector, timeout=timeout)
+
+    def scroll_into_view_if_needed(self, selector: str, *, timeout: float | None = None) -> None:
+        _run(self._impl.scroll_into_view_if_needed, selector, timeout=timeout)
+
+    def drag_and_drop(
+        self,
+        source: str,
+        target: str,
+        *,
+        force: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.drag_and_drop, source, target, force=force, timeout=timeout)
 
     def fill(self, selector: str, value: str, *, timeout: float | None = None) -> None:
         _run(self._impl.fill, selector, value, timeout=timeout)
+
+    def clear(self, selector: str, *, force: bool | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.clear, selector, force=force, timeout=timeout)
+
+    def press(self, selector: str, key: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.press, selector, key, delay=delay, timeout=timeout)
+
+    def press_sequentially(
+        self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None
+    ) -> None:
+        _run(self._impl.press_sequentially, selector, text, delay=delay, timeout=timeout)
+
+    def type(self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.type, selector, text, delay=delay, timeout=timeout)
+
+    def check(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.check, selector, position=position, force=force, trial=trial, timeout=timeout)
+
+    def uncheck(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.uncheck, selector, position=position, force=force, trial=trial, timeout=timeout)
+
+    def set_checked(
+        self,
+        selector: str,
+        checked: bool,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.set_checked, selector, checked, position=position, force=force, trial=trial, timeout=timeout)
+
+    def select_option(
+        self,
+        selector: str,
+        value: str | Sequence[str] | Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+        *,
+        index: int | Sequence[int] | None = None,
+        label: str | Sequence[str] | None = None,
+        element: Any = None,
+        force: bool | None = None,
+        timeout: float | None = None,
+    ) -> list[str]:
+        return _run(
+            self._impl.select_option,
+            selector,
+            value,
+            index=index,
+            label=label,
+            element=element,
+            force=force,
+            timeout=timeout,
+        )
+
+    def set_input_files(
+        self,
+        selector: str,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.set_input_files, selector, files, timeout=timeout)
 
     def wait_for_selector(
         self,
@@ -656,6 +1129,17 @@ class Page(_Finders):
                 return
 
     off = remove_listener
+
+    @contextmanager
+    def expect_file_chooser(
+        self,
+        predicate: Callable[[FileChooser], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Iterator[EventInfo[FileChooser]]:
+        """Waits for the native file chooser opened by the code in the ``with`` block."""
+        with self._expect(self._impl.expect_file_chooser, predicate, timeout, FileChooser) as info:
+            yield info
 
     @contextmanager
     def expect_download(self, timeout: float | None = None) -> Iterator[EventInfo[Download]]:

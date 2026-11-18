@@ -97,6 +97,86 @@ export interface Download {
   failure(): Promise<string | null>
 }
 
+export type KeyModifier = 'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'
+export type MouseButton = 'left' | 'right' | 'middle'
+
+export interface FilePayload {
+  name: string
+  mimeType: string
+  buffer: Buffer
+}
+
+export type InputFiles = string | Array<string> | FilePayload | Array<FilePayload>
+
+export interface SelectOptionFilter {
+  value?: string
+  label?: string
+  index?: number
+}
+
+export interface ClickOptions {
+  button?: MouseButton
+  clickCount?: number
+  delay?: number
+  position?: { x: number; y: number }
+  modifiers?: Array<KeyModifier>
+  force?: boolean
+  trial?: boolean
+  timeout?: number
+}
+
+export interface DblclickOptions {
+  button?: MouseButton
+  delay?: number
+  position?: { x: number; y: number }
+  modifiers?: Array<KeyModifier>
+  force?: boolean
+  trial?: boolean
+  timeout?: number
+}
+
+export interface HoverOptions {
+  position?: { x: number; y: number }
+  modifiers?: Array<KeyModifier>
+  force?: boolean
+  trial?: boolean
+  timeout?: number
+}
+
+export interface CheckOptions {
+  position?: { x: number; y: number }
+  force?: boolean
+  trial?: boolean
+  timeout?: number
+}
+
+export interface FileChooser {
+  page(): Page
+  isMultiple(): boolean
+  setFiles(files: InputFiles, options?: { timeout?: number }): Promise<void>
+}
+
+export interface Mouse {
+  move(x: number, y: number, options?: { steps?: number }): Promise<void>
+  down(options?: { button?: MouseButton; clickCount?: number }): Promise<void>
+  up(options?: { button?: MouseButton; clickCount?: number }): Promise<void>
+  click(x: number, y: number, options?: { button?: MouseButton; clickCount?: number; delay?: number }): Promise<void>
+  dblclick(x: number, y: number, options?: { button?: MouseButton; delay?: number }): Promise<void>
+  wheel(deltaX: number, deltaY: number): Promise<void>
+}
+
+export interface Keyboard {
+  down(key: string): Promise<void>
+  up(key: string): Promise<void>
+  press(key: string, options?: { delay?: number }): Promise<void>
+  type(text: string, options?: { delay?: number }): Promise<void>
+  insertText(text: string): Promise<void>
+}
+
+export interface Touchscreen {
+  tap(x: number, y: number): Promise<void>
+}
+
 /**
  * A browser context, as Playwright's: the options its page opens with. Each context holds one page,
  * so one job's cookies and storage never reach another: `newPage()` opens it and a second call
@@ -176,13 +256,15 @@ declare module './index' {
     on(event: 'request' | 'requestfinished' | 'requestfailed', handler: (request: Request) => void): this
     on(event: 'response', handler: (response: Response) => void): this
     on(event: 'dialog', handler: (dialog: Dialog) => unknown): this
+    on(event: 'filechooser', handler: (fileChooser: FileChooser) => unknown): this
     once(event: 'console', handler: (message: ConsoleMessage) => void): this
     once(event: 'pageerror', handler: (error: Error) => void): this
     once(event: 'request' | 'requestfinished' | 'requestfailed', handler: (request: Request) => void): this
     once(event: 'response', handler: (response: Response) => void): this
     once(event: 'dialog', handler: (dialog: Dialog) => unknown): this
+    once(event: 'filechooser', handler: (fileChooser: FileChooser) => unknown): this
     off(
-      event: 'console' | 'pageerror' | 'request' | 'response' | 'requestfinished' | 'requestfailed' | 'dialog',
+      event: 'console' | 'pageerror' | 'request' | 'response' | 'requestfinished' | 'requestfailed' | 'dialog' | 'filechooser',
       handler: (...args: any[]) => unknown,
     ): this
     /**
@@ -198,11 +280,34 @@ declare module './index' {
       urlOrPredicate: string | RegExp | ((request: Request) => boolean | Promise<boolean>),
       options?: { timeout?: number },
     ): Promise<Request>
+    waitForFileChooser(options?: {
+      predicate?: (fileChooser: FileChooser) => boolean | Promise<boolean>
+      timeout?: number
+    }): Promise<FileChooser>
     /** The next download this page finished; ones that finished earlier queue up. Default timeout 30 s. */
     waitForDownload(options?: { timeout?: number }): Promise<Download>
+    readonly mouse: Mouse
+    readonly keyboard: Keyboard
+    readonly touchscreen: Touchscreen
     /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
-    click(selector: string, options?: { timeout?: number }): Promise<void>
+    click(selector: string, options?: ClickOptions): Promise<void>
+    dblclick(selector: string, options?: DblclickOptions): Promise<void>
+    hover(selector: string, options?: HoverOptions): Promise<void>
+    focus(selector: string, options?: { timeout?: number }): Promise<void>
+    dragAndDrop(source: string, target: string, options?: { force?: boolean; timeout?: number }): Promise<void>
     fill(selector: string, value: string, options?: { timeout?: number }): Promise<void>
+    press(selector: string, key: string, options?: { delay?: number; timeout?: number }): Promise<void>
+    type(selector: string, text: string, options?: { delay?: number; timeout?: number }): Promise<void>
+    check(selector: string, options?: CheckOptions): Promise<void>
+    uncheck(selector: string, options?: CheckOptions): Promise<void>
+    setChecked(selector: string, checked: boolean, options?: CheckOptions): Promise<void>
+    selectOption(
+      selector: string,
+      values: string | SelectOptionFilter | Array<string | SelectOptionFilter> | null,
+      options?: { force?: boolean; timeout?: number },
+    ): Promise<Array<string>>
+    setInputFiles(selector: string, files: InputFiles, options?: { timeout?: number }): Promise<void>
+    tap(selector: string, options?: HoverOptions): Promise<void>
     waitForSelector(
       selector: string,
       options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; timeout?: number },
@@ -210,8 +315,27 @@ declare module './index' {
   }
   interface Locator {
     /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
-    click(options?: { timeout?: number }): Promise<void>
+    click(options?: ClickOptions): Promise<void>
+    dblclick(options?: DblclickOptions): Promise<void>
+    hover(options?: HoverOptions): Promise<void>
+    focus(options?: { timeout?: number }): Promise<void>
+    blur(options?: { timeout?: number }): Promise<void>
+    scrollIntoViewIfNeeded(options?: { timeout?: number }): Promise<void>
+    dragTo(target: Locator, options?: { force?: boolean; timeout?: number }): Promise<void>
     fill(value: string, options?: { timeout?: number }): Promise<void>
+    press(key: string, options?: { delay?: number; timeout?: number }): Promise<void>
+    pressSequentially(text: string, options?: { delay?: number; timeout?: number }): Promise<void>
+    type(text: string, options?: { delay?: number; timeout?: number }): Promise<void>
+    clear(options?: { force?: boolean; timeout?: number }): Promise<void>
+    check(options?: CheckOptions): Promise<void>
+    uncheck(options?: CheckOptions): Promise<void>
+    setChecked(checked: boolean, options?: CheckOptions): Promise<void>
+    selectOption(
+      values: string | SelectOptionFilter | Array<string | SelectOptionFilter> | null,
+      options?: { force?: boolean; timeout?: number },
+    ): Promise<Array<string>>
+    setInputFiles(files: InputFiles, options?: { timeout?: number }): Promise<void>
+    tap(options?: HoverOptions): Promise<void>
     waitFor(options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; timeout?: number }): Promise<void>
     textContent(options?: { timeout?: number }): Promise<string | null>
     boundingBox(options?: { timeout?: number }): Promise<{ x: number; y: number; width: number; height: number } | null>

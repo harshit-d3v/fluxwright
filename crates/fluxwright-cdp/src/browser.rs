@@ -543,6 +543,22 @@ impl CdpBrowser {
                         .await;
                 });
             }
+            "Page.fileChooserOpened" => {
+                if let Some(sid) = ev.session_id.clone() {
+                    if let Some(tx) = self
+                        .setup_for_session(&sid)
+                        .await
+                        .and_then(|s| s.file_choosers)
+                    {
+                        let _ = tx.send(crate::events::FileChooser::new(
+                            &ev.params,
+                            self.conn.clone(),
+                            sid,
+                            self.is_remote(),
+                        ));
+                    }
+                }
+            }
             "Target.targetCrashed" => {
                 warn!(params = %ev.params, "target crashed");
             }
@@ -641,12 +657,15 @@ impl CdpBrowser {
             browser_pid: self.pid,
             browser_id: self.id,
             headless: self.headless,
+            is_remote: self.is_remote(),
             context_id: ctx.clone(),
             target_id: TargetId(target_id),
             session_id: SessionId(session_id),
             targets: self.targets.clone(),
             worlds: Default::default(),
             setups: self.setups.clone(),
+            mouse: Default::default(),
+            keyboard: Default::default(),
         })
     }
 
@@ -938,6 +957,9 @@ async fn prepare_session(
         calls.push(("Network.enable", json!({})));
         calls.push(("Page.setLifecycleEventsEnabled", json!({ "enabled": true })));
     }
+    if ty == "page" {
+        calls.push(("Page.setInterceptFileChooserDialog", json!({ "enabled": true })));
+    }
     if let Some(setup) = setup.filter(|_| ty == "page" || ty == "iframe") {
         if let Some(e) = &setup.emulation {
             calls.extend(e.calls(ty == "page"));
@@ -987,6 +1009,8 @@ fn check_prepare_results(
             // debugger release.
             let fatal = if e.is_timeout() {
                 matches!(method, "Fetch.enable" | "Runtime.runIfWaitingForDebugger")
+            } else if method == "Page.setInterceptFileChooserDialog" && matches!(e, Error::Command { .. }) {
+                false
             } else {
                 !method.starts_with("Emulation.") || !matches!(e, Error::Command { .. })
             };
