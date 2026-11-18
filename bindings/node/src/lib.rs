@@ -453,10 +453,12 @@ pub struct ActionPoint {
 
 #[napi(object)]
 pub struct ClickActionOptions {
+    #[napi(ts_type = "'left' | 'right' | 'middle'")]
     pub button: Option<String>,
     pub click_count: Option<u32>,
     pub delay: Option<f64>,
     pub position: Option<ActionPoint>,
+    #[napi(ts_type = "Array<'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'>")]
     pub modifiers: Option<Vec<String>>,
     pub force: Option<bool>,
     pub trial: Option<bool>,
@@ -466,6 +468,7 @@ pub struct ClickActionOptions {
 #[napi(object)]
 pub struct HoverActionOptions {
     pub position: Option<ActionPoint>,
+    #[napi(ts_type = "Array<'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'>")]
     pub modifiers: Option<Vec<String>>,
     pub force: Option<bool>,
     pub trial: Option<bool>,

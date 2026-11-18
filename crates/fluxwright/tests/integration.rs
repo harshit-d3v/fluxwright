@@ -1746,7 +1746,7 @@ async fn rich_input_and_form_controls() {
         "<select id=\"sel\" multiple><option value=\"a\">Alpha</option><option value=\"b\">Beta</option><option value=\"c\">Gamma</option></select>",
         "<input id=\"file\" type=\"file\" multiple>",
         "<div id=\"below\" style=\"margin-top:1400px\">End</div>",
-        "<script>window.addEventListener('wheel',e=>{window.__wheel=e.deltaY;},{passive:true});</script></body>",
+        "<script>window.addEventListener('wheel',e=>{window.__wheel=e.deltaY;if(window.__resolveWheel)window.__resolveWheel(e.deltaY);},{passive:false});</script></body>",
     );
     page.goto(&format!("data:text/html,{html}")).await.unwrap();
 
@@ -1828,7 +1828,14 @@ async fn rich_input_and_form_controls() {
     page.evaluate("window.scrollTo(0, 0)").await.unwrap();
     page.mouse_move(10.0, 10.0, 2).await.unwrap();
     page.mouse_wheel(0.0, 120.0).await.unwrap();
-    assert_eq!(page.evaluate("window.__wheel").await.unwrap(), json!(120));
+    assert_eq!(
+        page.evaluate(
+            "window.__wheel ?? new Promise((res, rej) => { window.__resolveWheel = res; setTimeout(() => rej(new Error('wheel timeout')), 3000); })"
+        )
+        .await
+        .unwrap(),
+        json!(120)
+    );
 
     // Focus/blur, keyboard chords, clear, press_sequentially, low-level keyboard, and iframe locator.
     page.focus("#inp").await.unwrap();
