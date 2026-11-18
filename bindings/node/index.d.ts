@@ -259,11 +259,11 @@ export interface CheckActionOptions {
 }
 
 export interface ClickActionOptions {
-  button?: string
+  button?: 'left' | 'right' | 'middle'
   clickCount?: number
   delay?: number
   position?: ActionPoint
-  modifiers?: Array<string>
+  modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'>
   force?: boolean
   trial?: boolean
   timeout?: number
@@ -350,7 +350,7 @@ export interface GotoOptions {
 
 export interface HoverActionOptions {
   position?: ActionPoint
-  modifiers?: Array<string>
+  modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'>
   force?: boolean
   trial?: boolean
   timeout?: number

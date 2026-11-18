@@ -496,7 +496,7 @@ try {
       '<select id="sel" multiple><option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option></select>' +
       '<input id="file" type="file" multiple>' +
       '<div id="below" style="margin-top:1400px">End</div>' +
-      '<script>window.addEventListener("wheel", e => { window.__wheel = e.deltaY; }, { passive: true });</script></body>',
+      '<script>window.addEventListener("wheel", e => { window.__wheel = e.deltaY; if (window.__resolveWheel) window.__resolveWheel(e.deltaY); }, { passive: false });</script></body>',
   )
   await rich.click('#btn', { trial: true, button: 'right' })
   assert.equal(await rich.evaluate(() => window.__ctx), undefined)
@@ -516,7 +516,17 @@ try {
   await rich.evaluate(() => window.scrollTo(0, 0))
   await rich.mouse.move(10, 10)
   await rich.mouse.wheel(0, 120)
-  assert.equal(await rich.evaluate(() => window.__wheel), 120)
+  assert.equal(
+    await rich.evaluate(
+      () =>
+        window.__wheel ??
+        new Promise((res, rej) => {
+          window.__resolveWheel = res
+          setTimeout(() => rej(new Error('wheel timeout')), 3000)
+        }),
+    ),
+    120,
+  )
 
   await rich.focus('#inp')
   assert.equal(await rich.evaluate(() => window.__foc), true)

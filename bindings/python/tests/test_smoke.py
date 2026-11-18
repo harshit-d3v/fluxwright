@@ -102,7 +102,7 @@ RICH_HTML = (
     '<select id="sel" multiple><option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option></select>'
     '<input id="file" type="file" multiple>'
     '<div id="below" style="margin-top:1400px">End</div>'
-    '<script>window.addEventListener("wheel", e => { window.__wheel = e.deltaY; }, { passive: true });</script></body>'
+    '<script>window.addEventListener("wheel", e => { window.__wheel = e.deltaY; if (window.__resolveWheel) window.__resolveWheel(e.deltaY); }, { passive: false });</script></body>'
 )
 
 
@@ -404,7 +404,12 @@ async def async_smoke(base: str, tmp: Path) -> None:
         assert await rich.evaluate("() => window.__dbl") == 2
         assert await rich.evaluate("() => [window.__down >= 3, window.__up >= 3]") == [True, True]
         await rich.mouse.wheel(0, 120)
-        assert await rich.evaluate("() => window.__wheel") == 120
+        assert (
+            await rich.evaluate(
+                "() => window.__wheel ?? new Promise((res, rej) => { window.__resolveWheel = res; setTimeout(() => rej(new Error('wheel timeout')), 3000); })"
+            )
+            == 120
+        )
 
         await rich.focus("#inp")
         assert await rich.evaluate("() => window.__foc") is True
@@ -831,7 +836,12 @@ def test_sync_api(base, tmp_path):
         rich.evaluate("() => window.scrollTo(0, 0)")
         rich.mouse.move(15, 15, steps=2)
         rich.mouse.wheel(0, 120)
-        assert rich.evaluate("() => window.__wheel") == 120
+        assert (
+            rich.evaluate(
+                "() => window.__wheel ?? new Promise((res, rej) => { window.__resolveWheel = res; setTimeout(() => rej(new Error('wheel timeout')), 3000); })"
+            )
+            == 120
+        )
 
         rich.focus("#inp")
         assert rich.evaluate("() => window.__foc") is True
