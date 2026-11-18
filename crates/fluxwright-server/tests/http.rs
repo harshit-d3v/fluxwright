@@ -670,3 +670,42 @@ async fn worker_pulls_and_executes_jobs_from_coordinator() {
     coordinator.shutdown(Duration::ZERO).await.unwrap();
     fixture.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn executes_rich_input_and_form_steps() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let html = r#"<!doctype html>
+        <input id="inp" value="old" onkeydown="if(event.key==='Enter') window.__enter=true">
+        <button id="dbl" ondblclick="this.dataset.dbl='1'">Dbl</button>
+        <input id="chk" type="checkbox">
+        <select id="sel">
+          <option value="a">Alpha</option>
+          <option value="b">Beta</option>
+        </select>"#;
+    let app = axum::Router::new().route("/", axum::routing::get(move || async move { axum::response::Html(html) }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let server = server().await;
+    let sub = submit(
+        &server,
+        json!({ "steps": [
+            { "action": "goto", "url": format!("http://127.0.0.1:{port}/") },
+            { "action": "clear", "selector": "#inp" },
+            { "action": "type", "selector": "#inp", "text": "new", "delay_ms": 2 },
+            { "action": "press", "selector": "#inp", "key": "Enter" },
+            { "action": "dblclick", "selector": "#dbl" },
+            { "action": "check", "selector": "#chk" },
+            { "action": "select_option", "selector": "#sel", "values": { "label": "Beta" } },
+            { "action": "evaluate", "expression": "[inp.value, !!window.__enter, dbl.dataset.dbl, chk.checked, sel.value]" }
+        ] }),
+    )
+    .await;
+
+    let job = finish(&server, sub).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+    let results = job.results.unwrap();
+    assert_eq!(results[6], json!(["b"]));
+    assert_eq!(results[7], json!(["new", true, "1", true, "b"]));
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+}

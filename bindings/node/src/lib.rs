@@ -326,6 +326,53 @@ impl PendingDialog {
     }
 }
 
+#[napi]
+pub struct PendingFileChooser {
+    inner: fluxwright::FileChooser,
+}
+
+#[napi]
+impl PendingFileChooser {
+    #[napi(getter)]
+    pub fn is_multiple(&self) -> bool {
+        self.inner.is_multiple
+    }
+
+    #[napi]
+    pub async fn set_files_paths(&self, paths: Vec<String>) -> Result<()> {
+        let fc = self.inner.clone();
+        let input = fluxwright::FileInput::Paths(paths.into_iter().map(Into::into).collect());
+        RT.spawn(async move {
+            fc.set_files(&input, std::time::Duration::from_secs(30))
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Error::from_reason(e.to_string()))?
+        .map_err(Error::from_reason)
+    }
+
+    #[napi]
+    pub async fn set_files_payloads(&self, files: Vec<FilePayloadInput>) -> Result<()> {
+        let fc = self.inner.clone();
+        let input = fluxwright::FileInput::Payloads(to_file_payloads(files));
+        RT.spawn(async move {
+            fc.set_files(&input, std::time::Duration::from_secs(30))
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Error::from_reason(e.to_string()))?
+        .map_err(Error::from_reason)
+    }
+}
+
+impl PendingFileChooser {
+    fn new(inner: fluxwright::FileChooser) -> Self {
+        Self { inner }
+    }
+}
+
 /// One console message or uncaught error, for `page.on`.
 #[napi(object)]
 pub struct LogEvent {
@@ -399,6 +446,155 @@ where
 }
 
 #[napi(object)]
+pub struct ActionPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[napi(object)]
+pub struct ClickActionOptions {
+    pub button: Option<String>,
+    pub click_count: Option<u32>,
+    pub delay: Option<f64>,
+    pub position: Option<ActionPoint>,
+    pub modifiers: Option<Vec<String>>,
+    pub force: Option<bool>,
+    pub trial: Option<bool>,
+    pub timeout: Option<f64>,
+}
+
+#[napi(object)]
+pub struct HoverActionOptions {
+    pub position: Option<ActionPoint>,
+    pub modifiers: Option<Vec<String>>,
+    pub force: Option<bool>,
+    pub trial: Option<bool>,
+    pub timeout: Option<f64>,
+}
+
+#[napi(object)]
+pub struct CheckActionOptions {
+    pub position: Option<ActionPoint>,
+    pub force: Option<bool>,
+    pub trial: Option<bool>,
+    pub timeout: Option<f64>,
+}
+
+#[napi(object)]
+pub struct SelectOptionItem {
+    pub value: Option<String>,
+    pub label: Option<String>,
+    pub index: Option<u32>,
+}
+
+#[napi(object)]
+pub struct FilePayloadInput {
+    pub name: String,
+    pub mime_type: String,
+    pub buffer: Buffer,
+}
+
+fn opt_delay(ms: Option<f64>) -> Option<std::time::Duration> {
+    ms.filter(|v| *v > 0.0 && v.is_finite())
+        .map(|v| std::time::Duration::from_secs_f64(v / 1000.0))
+}
+
+fn parse_button(button: Option<&str>) -> Result<fluxwright::MouseButton> {
+    match button {
+        None => Ok(fluxwright::MouseButton::Left),
+        Some(b) => b
+            .parse::<fluxwright::MouseButton>()
+            .map_err(|e| Error::from_reason(e.to_string())),
+    }
+}
+
+fn to_modifiers(mods: Option<Vec<String>>) -> Result<u8> {
+    match mods {
+        None => Ok(0),
+        Some(m) => fluxwright::parse_modifiers(&m).map_err(|e| Error::from_reason(e.to_string())),
+    }
+}
+
+fn to_click_options(o: Option<ClickActionOptions>) -> Result<(fluxwright::ClickOptions, Option<std::time::Duration>)> {
+    let Some(o) = o else {
+        return Ok((Default::default(), None));
+    };
+    let timeout = call_timeout(o.timeout);
+    Ok((
+        fluxwright::ClickOptions {
+            button: parse_button(o.button.as_deref())?,
+            click_count: o.click_count.unwrap_or(1),
+            delay: opt_delay(o.delay),
+            position: o.position.map(|p| (p.x, p.y)),
+            modifiers: to_modifiers(o.modifiers)?,
+            force: o.force.unwrap_or(false),
+            trial: o.trial.unwrap_or(false),
+        },
+        timeout,
+    ))
+}
+
+fn to_hover_options(o: Option<HoverActionOptions>) -> Result<(fluxwright::HoverOptions, Option<std::time::Duration>)> {
+    let Some(o) = o else {
+        return Ok((Default::default(), None));
+    };
+    let timeout = call_timeout(o.timeout);
+    Ok((
+        fluxwright::HoverOptions {
+            position: o.position.map(|p| (p.x, p.y)),
+            modifiers: to_modifiers(o.modifiers)?,
+            force: o.force.unwrap_or(false),
+            trial: o.trial.unwrap_or(false),
+        },
+        timeout,
+    ))
+}
+
+fn to_check_options(o: Option<CheckActionOptions>) -> (fluxwright::CheckOptions, Option<std::time::Duration>) {
+    let Some(o) = o else {
+        return (Default::default(), None);
+    };
+    (
+        fluxwright::CheckOptions {
+            position: o.position.map(|p| (p.x, p.y)),
+            force: o.force.unwrap_or(false),
+            trial: o.trial.unwrap_or(false),
+        },
+        call_timeout(o.timeout),
+    )
+}
+
+fn to_file_payloads(files: Vec<FilePayloadInput>) -> Vec<fluxwright::FilePayload> {
+    files
+        .into_iter()
+        .map(|f| fluxwright::FilePayload {
+            name: f.name,
+            mime_type: f.mime_type,
+            buffer: f.buffer.to_vec(),
+        })
+        .collect()
+}
+
+fn to_select_entries(items: Vec<SelectOptionItem>) -> Result<Vec<fluxwright::SelectEntry>> {
+    items
+        .into_iter()
+        .map(|item| {
+            if let Some(v) = item.value {
+                Ok(fluxwright::SelectEntry::Value(v))
+            } else if let Some(l) = item.label {
+                Ok(fluxwright::SelectEntry::Label(l))
+            } else if let Some(i) = item.index {
+                Ok(fluxwright::SelectEntry::Index(i as usize))
+            } else {
+                Err(Error::from_reason(
+                    "selectOption item must specify value, label or index",
+                ))
+            }
+        })
+        .collect()
+}
+
+#[napi(object)]
 pub struct GetByTextOptions {
     /// Default false: case-insensitive substring.
     pub exact: Option<bool>,
@@ -429,15 +625,188 @@ impl Locator {
     }
 
     #[napi]
-    pub async fn click(&self) -> Result<()> {
+    pub async fn click(&self, options: Option<ClickActionOptions>) -> Result<()> {
         let sel = self.selector.clone();
-        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.click(&sel).await })).await
+        let (opts, timeout) = to_click_options(options)?;
+        with_page_in(self.lease.clone(), timeout.or(self.timeout), move |p| {
+            Box::pin(async move { p.click_with(&sel, &opts).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn dblclick(&self, options: Option<ClickActionOptions>) -> Result<()> {
+        let sel = self.selector.clone();
+        let (opts, timeout) = to_click_options(options)?;
+        with_page_in(self.lease.clone(), timeout.or(self.timeout), move |p| {
+            Box::pin(async move { p.dblclick(&sel, &opts).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn hover(&self, options: Option<HoverActionOptions>) -> Result<()> {
+        let sel = self.selector.clone();
+        let (opts, timeout) = to_hover_options(options)?;
+        with_page_in(self.lease.clone(), timeout.or(self.timeout), move |p| {
+            Box::pin(async move { p.hover(&sel, &opts).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn focus(&self) -> Result<()> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.focus(&sel).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn blur(&self) -> Result<()> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.blur(&sel).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn scroll_into_view_if_needed(&self) -> Result<()> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.scroll_into_view_if_needed(&sel).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_frames")]
+    pub fn frames(&self) -> Vec<String> {
+        self.selector.frames.clone()
+    }
+
+    #[napi(js_name = "_query")]
+    pub fn query(&self) -> String {
+        self.selector.query.clone()
+    }
+
+    #[napi(js_name = "_dragTo")]
+    pub async fn drag_to(&self, frames: Vec<String>, query: String, force: Option<bool>) -> Result<()> {
+        let src = self.selector.clone();
+        let dst = fluxwright::Selector { frames, query };
+        let force = force.unwrap_or(false);
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.drag_and_drop(&src, &dst, force).await })
+        })
+        .await
     }
 
     #[napi]
     pub async fn fill(&self, value: String) -> Result<()> {
         let sel = self.selector.clone();
         with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.fill(&sel, &value).await })).await
+    }
+
+    #[napi]
+    pub async fn press(&self, key: String, delay: Option<f64>) -> Result<()> {
+        let sel = self.selector.clone();
+        let delay = opt_delay(delay);
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.press(&sel, &key, delay).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn press_sequentially(&self, text: String, delay: Option<f64>) -> Result<()> {
+        let sel = self.selector.clone();
+        let delay = opt_delay(delay);
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.press_sequentially(&sel, &text, delay).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn clear(&self, force: Option<bool>) -> Result<()> {
+        let sel = self.selector.clone();
+        let force = force.unwrap_or(false);
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.clear(&sel, force).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn check(&self, options: Option<CheckActionOptions>) -> Result<()> {
+        let sel = self.selector.clone();
+        let (opts, timeout) = to_check_options(options);
+        with_page_in(self.lease.clone(), timeout.or(self.timeout), move |p| {
+            Box::pin(async move { p.check(&sel, &opts).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn uncheck(&self, options: Option<CheckActionOptions>) -> Result<()> {
+        let sel = self.selector.clone();
+        let (opts, timeout) = to_check_options(options);
+        with_page_in(self.lease.clone(), timeout.or(self.timeout), move |p| {
+            Box::pin(async move { p.uncheck(&sel, &opts).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn set_checked(&self, checked: bool, options: Option<CheckActionOptions>) -> Result<()> {
+        let sel = self.selector.clone();
+        let (opts, timeout) = to_check_options(options);
+        with_page_in(self.lease.clone(), timeout.or(self.timeout), move |p| {
+            Box::pin(async move { p.set_checked(&sel, checked, &opts).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn select_option(&self, items: Vec<SelectOptionItem>, force: Option<bool>) -> Result<Vec<String>> {
+        let sel = self.selector.clone();
+        let entries = to_select_entries(items)?;
+        let force = force.unwrap_or(false);
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.select_option(&sel, &entries, force).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_setInputPaths")]
+    pub async fn set_input_paths(&self, paths: Vec<String>) -> Result<()> {
+        let sel = self.selector.clone();
+        let input = fluxwright::FileInput::Paths(paths.into_iter().map(Into::into).collect());
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.set_input_files(&sel, &input).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_setInputPayloads")]
+    pub async fn set_input_payloads(&self, files: Vec<FilePayloadInput>) -> Result<()> {
+        let sel = self.selector.clone();
+        let input = fluxwright::FileInput::Payloads(to_file_payloads(files));
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.set_input_files(&sel, &input).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn tap(&self, options: Option<HoverActionOptions>) -> Result<()> {
+        let sel = self.selector.clone();
+        let (opts, timeout) = to_hover_options(options)?;
+        with_page_in(self.lease.clone(), timeout.or(self.timeout), move |p| {
+            Box::pin(async move { p.tap(&sel, &opts).await })
+        })
+        .await
     }
 
     /// Waits until `state`: attached, detached, visible (the default) or hidden.
@@ -1426,6 +1795,139 @@ impl Page {
     pub async fn emulate_media(&self, media: Option<String>, color_scheme: Option<String>) -> Result<()> {
         with_page(self.lease.clone(), move |p| {
             Box::pin(async move { p.emulate_media(media.as_deref(), color_scheme.as_deref()).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_onFileChooser")]
+    pub fn on_file_chooser(&self, handler: Function<PendingFileChooser, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
+        let mut choosers = self.now(|p| p.subscribe_file_choosers())?;
+        RT.spawn(async move {
+            while let Some(fc) = choosers.recv().await {
+                tsfn.call(PendingFileChooser::new(fc), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    #[napi(js_name = "_mouseMove")]
+    pub async fn mouse_move(&self, x: f64, y: f64, steps: Option<u32>) -> Result<()> {
+        let steps = steps.unwrap_or(1);
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.mouse_move(x, y, steps).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_mouseDown")]
+    pub async fn mouse_down(&self, button: Option<String>, click_count: Option<u32>) -> Result<()> {
+        let button = parse_button(button.as_deref())?;
+        let click_count = click_count.unwrap_or(1);
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.mouse_down(button, click_count).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_mouseUp")]
+    pub async fn mouse_up(&self, button: Option<String>, click_count: Option<u32>) -> Result<()> {
+        let button = parse_button(button.as_deref())?;
+        let click_count = click_count.unwrap_or(1);
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.mouse_up(button, click_count).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_mouseClick")]
+    pub async fn mouse_click(
+        &self,
+        x: f64,
+        y: f64,
+        button: Option<String>,
+        click_count: Option<u32>,
+        delay: Option<f64>,
+    ) -> Result<()> {
+        let button = parse_button(button.as_deref())?;
+        let click_count = click_count.unwrap_or(1);
+        let delay = opt_delay(delay);
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.mouse_click(x, y, button, click_count, delay).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_mouseDblclick")]
+    pub async fn mouse_dblclick(
+        &self,
+        x: f64,
+        y: f64,
+        button: Option<String>,
+        delay: Option<f64>,
+    ) -> Result<()> {
+        let button = parse_button(button.as_deref())?;
+        let delay = opt_delay(delay);
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.mouse_dblclick(x, y, button, delay).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_mouseWheel")]
+    pub async fn mouse_wheel(&self, delta_x: f64, delta_y: f64) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.mouse_wheel(delta_x, delta_y).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_keyboardDown")]
+    pub async fn keyboard_down(&self, key: String) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.keyboard_down(&key).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_keyboardUp")]
+    pub async fn keyboard_up(&self, key: String) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.keyboard_up(&key).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_keyboardPress")]
+    pub async fn keyboard_press(&self, key: String, delay: Option<f64>) -> Result<()> {
+        let delay = opt_delay(delay);
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.keyboard_press(&key, delay).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_keyboardType")]
+    pub async fn keyboard_type(&self, text: String, delay: Option<f64>) -> Result<()> {
+        let delay = opt_delay(delay);
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.keyboard_type(&text, delay).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_keyboardInsertText")]
+    pub async fn keyboard_insert_text(&self, text: String) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.keyboard_insert_text(&text).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_touchscreenTap")]
+    pub async fn touchscreen_tap(&self, x: f64, y: f64) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.touchscreen_tap(x, y).await })
         })
         .await
     }

@@ -83,6 +83,46 @@ const PAGE = {
 }
 const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true }
 const CONTINUE = { url: true, method: true, headers: true, postData: true }
+const BUTTON = ['left', 'right', 'middle']
+const MODIFIER_NAMES = ['Alt', 'Control', 'Meta', 'Shift', 'ControlOrMeta']
+const MODIFIERS = (v, m) => {
+  if (!Array.isArray(v) || v.some((x) => !MODIFIER_NAMES.includes(x))) {
+    throw new TypeError(`${m}: modifiers must be ${MODIFIER_NAMES.join(', ')}`)
+  }
+}
+const POINT = (v, m) => {
+  checkOptions(m, v, { x: true, y: true })
+  if (typeof v?.x !== 'number' || typeof v?.y !== 'number') {
+    throw new TypeError(`${m}: x and y must be numbers`)
+  }
+}
+const CLICK = {
+  button: BUTTON,
+  clickCount: true,
+  delay: true,
+  position: POINT,
+  modifiers: MODIFIERS,
+  force: true,
+  trial: true,
+  timeout: true,
+}
+const DBLCLICK = {
+  button: BUTTON,
+  delay: true,
+  position: POINT,
+  modifiers: MODIFIERS,
+  force: true,
+  trial: true,
+  timeout: true,
+}
+const HOVER = { position: POINT, modifiers: MODIFIERS, force: true, trial: true, timeout: true }
+const CHECK = { position: POINT, force: true, trial: true, timeout: true }
+const PRESS = { delay: true, timeout: true }
+const FORCE_TIMEOUT = { force: true, timeout: true }
+const MOUSE_MOVE = { steps: true }
+const MOUSE_BUTTON = { button: BUTTON, clickCount: true }
+const MOUSE_CLICK = { button: BUTTON, clickCount: true, delay: true }
+const MOUSE_DBLCLICK = { button: BUTTON, delay: true }
 
 function checkOptions(method, options, allowed) {
   if (options == null) return
@@ -93,11 +133,12 @@ function checkOptions(method, options, allowed) {
     if (!ok) throw new TypeError(`${method}: option '${key}' is not supported (see MISSING.md)`)
     // NaN reaches napi as 0: an unset env var would make `maxBrowsers: 0` or no memory budget.
     if (Number.isNaN(value)) throw new TypeError(`${method}: option '${key}' is NaN`)
-    if (Array.isArray(ok) && !ok.includes(value)) {
+    if (typeof ok === 'function') {
+      ok(value, `${method} ${key}`)
+    } else if (Array.isArray(ok) && !ok.includes(value)) {
       const supported = ok.map((v) => JSON.stringify(v)).join(', ')
       throw new TypeError(`${method}: ${key} ${JSON.stringify(value)} is not supported, only ${supported} (see MISSING.md)`)
-    }
-    if (typeof ok === 'object' && !Array.isArray(ok)) {
+    } else if (typeof ok === 'object' && !Array.isArray(ok)) {
       checkOptions(`${method} ${key}`, value, ok)
     }
   }
@@ -247,6 +288,7 @@ function installEvents(Page) {
     requestfinished: 'network',
     requestfailed: 'network',
     dialog: 'dialog',
+    filechooser: 'filechooser',
   }
   const events = Object.keys(sources)
   // Pages whose close() was called: the native flag goes up only once napi runs the call.
@@ -276,6 +318,20 @@ function installEvents(Page) {
         if (e.event === 'requestfinished' || e.event === 'requestfailed') requests.delete(e.request.id)
         if (e.event === 'requestfailed') failures.set(request, e.failure)
         emitSafely(em(), e.event, e.event === 'response' ? toResponse(e.response, request) : request)
+      })
+    } else if (source === 'filechooser') {
+      page._onFileChooser((native) => {
+        const p = ref.deref()
+        if (!p) return
+        const fc = {
+          page: () => p,
+          isMultiple: () => native.isMultiple,
+          setFiles: async (files, options) => {
+            checkOptions('fileChooser.setFiles', options, TIMEOUT)
+            await applyFiles(native, 'setFilesPaths', 'setFilesPayloads', files)
+          },
+        }
+        emitSafely(em(), 'filechooser', fc)
       })
     } else {
       page._onDialog((native) => answerDialog(em()?.rawListeners('dialog') ?? [], native))
@@ -310,51 +366,61 @@ function installEvents(Page) {
       return this
     }
   }
-  // page.waitForResponse / waitForRequest: the first match from now on, within `timeout` ms
-  // (default 30 s, 0 for none). A string or RegExp matches the URL as page.route does; a function
-  // gets the Response or Request and may return a promise. Closing the page rejects it.
+  function waitForEvent(page, method, event, allowed, options, makeMatch) {
+    return new Promise((resolve, reject) => {
+      checkOptions(`page.${method}`, options, allowed)
+      const matches = makeMatch()
+      if (closing.has(page) || page.isClosed()) throw new Error(`page.${method}: the page is closed`)
+      const timeout = options?.timeout ?? 30000
+      const { em, waits } = stateOf(page, event)
+      let timer = null
+      const fail = (err) => {
+        done()
+        reject(err)
+      }
+      const closed = () => fail(new Error(`page.${method}: the page closed`))
+      const done = () => {
+        em.off(event, listener)
+        clearTimeout(timer)
+        waits.delete(closed)
+      }
+      const listener = async (r) => {
+        try {
+          if (!(await matches(r))) return
+        } catch (err) {
+          return fail(err)
+        }
+        done()
+        resolve(r)
+      }
+      em.on(event, listener)
+      waits.add(closed)
+      if (timeout > 0) {
+        timer = setTimeout(() => fail(new Error(`page.${method}: timeout ${timeout}ms exceeded`)), timeout)
+      }
+    })
+  }
+  // page.waitForResponse / waitForRequest / waitForFileChooser: the first match from now on, within
+  // `timeout` ms (default 30 s, 0 for none). Closing the page rejects it.
   for (const [method, event] of [
     ['waitForResponse', 'response'],
     ['waitForRequest', 'request'],
   ]) {
     Page.prototype[method] = function (urlOrPredicate, options) {
-      return new Promise((resolve, reject) => {
-        checkOptions(`page.${method}`, options, TIMEOUT)
-        if (closing.has(this) || this.isClosed()) throw new Error(`page.${method}: the page is closed`)
-        const timeout = options?.timeout ?? 30000
-        let matches = urlOrPredicate
-        if (typeof urlOrPredicate !== 'function') {
-          const url = urlMatcher(urlOrPredicate)
-          matches = (r) => url(r.url())
-        }
-        const { em, waits } = stateOf(this, event)
-        let timer = null
-        const fail = (err) => {
-          done()
-          reject(err)
-        }
-        const closed = () => fail(new Error(`page.${method}: the page closed`))
-        const done = () => {
-          em.off(event, listener)
-          clearTimeout(timer)
-          waits.delete(closed)
-        }
-        const listener = async (r) => {
-          try {
-            if (!(await matches(r))) return
-          } catch (err) {
-            return fail(err)
-          }
-          done()
-          resolve(r)
-        }
-        em.on(event, listener)
-        waits.add(closed)
-        if (timeout > 0) {
-          timer = setTimeout(() => fail(new Error(`page.${method}: timeout ${timeout}ms exceeded`)), timeout)
-        }
+      return waitForEvent(this, method, event, TIMEOUT, options, () => {
+        if (typeof urlOrPredicate === 'function') return urlOrPredicate
+        const url = urlMatcher(urlOrPredicate)
+        return (r) => url(r.url())
       })
     }
+  }
+  Page.prototype.waitForFileChooser = function (options) {
+    return waitForEvent(this, 'waitForFileChooser', 'filechooser', { timeout: true, predicate: true }, options, () => {
+      if (options?.predicate != null && typeof options.predicate !== 'function') {
+        throw new TypeError('page.waitForFileChooser: predicate must be a function')
+      }
+      return options?.predicate ?? (() => true)
+    })
   }
   // As in Playwright, closing the page rejects its pending waits at once; calls still running on
   // the page reject on the native side.
@@ -664,6 +730,38 @@ function parses(source) {
   }
 }
 
+function normalizeSelectValues(values) {
+  if (values == null) return []
+  const list = Array.isArray(values) ? values : [values]
+  return list.map((item) => {
+    if (typeof item === 'string') return { value: item }
+    if (item && typeof item === 'object') {
+      checkOptions('selectOption', item, { value: true, label: true, index: true })
+      const count = (item.value !== undefined) + (item.label !== undefined) + (item.index !== undefined)
+      if (count === 1) return item
+    }
+    throw new TypeError('selectOption: each entry must be a string or { value | label | index }')
+  })
+}
+
+function applyFiles(target, pathsMethod, payloadsMethod, files) {
+  if (files == null) throw new TypeError('setInputFiles: files must not be null or undefined')
+  const list = Array.isArray(files) ? files : [files]
+  if (list.length === 0) return target[pathsMethod]([])
+  if (list.every((f) => typeof f === 'string')) return target[pathsMethod](list)
+  const payloads = list.map((f) => {
+    if (!f || typeof f !== 'object') {
+      throw new TypeError('setInputFiles: files must be path strings or { name, mimeType, buffer } objects')
+    }
+    checkOptions('setInputFiles file', f, { name: true, mimeType: true, buffer: true })
+    if (typeof f.name !== 'string' || typeof f.mimeType !== 'string' || !Buffer.isBuffer(f.buffer)) {
+      throw new TypeError('setInputFiles: file payload needs string name, string mimeType, and Buffer buffer')
+    }
+    return { name: f.name, mimeType: f.mimeType, buffer: f.buffer }
+  })
+  return target[payloadsMethod](payloads)
+}
+
 try {
   const native = require('./index.js')
   const evaluate = native.Page.prototype.evaluate
@@ -757,22 +855,135 @@ try {
   native.Locator.prototype.waitFor = function (options) {
     return waitFor.call(this, options?.state)
   }
+  const press = native.Locator.prototype.press
+  native.Locator.prototype.press = function (key, options) {
+    return press.call(this, key, options?.delay)
+  }
+  const pressSeq = native.Locator.prototype.pressSequentially
+  native.Locator.prototype.pressSequentially = function (text, options) {
+    return pressSeq.call(this, text, options?.delay)
+  }
+  const clear = native.Locator.prototype.clear
+  native.Locator.prototype.clear = function (options) {
+    return clear.call(this, options?.force)
+  }
+  const selectOption = native.Locator.prototype.selectOption
+  native.Locator.prototype.selectOption = function (values, options) {
+    return selectOption.call(this, normalizeSelectValues(values), options?.force)
+  }
+  native.Locator.prototype.setInputFiles = function (files) {
+    return applyFiles(this, '_setInputPaths', '_setInputPayloads', files)
+  }
+  native.Locator.prototype.dragTo = function (target, options) {
+    if (!target || typeof target._frames !== 'function' || typeof target._query !== 'function') {
+      throw new TypeError('locator.dragTo: target must be a Locator')
+    }
+    return this._dragTo(target._frames(), target._query(), options?.force)
+  }
   guard(native.Page, 'page', true, builders)
   guard(native.FrameLocator, 'frameLocator', true, builders)
   guard(native.Locator, 'locator', true, [...builders, ['filter', 0, { hasText: true }]])
   guard(native.Page, 'page', false, [
     ['goto', 1, { waitUntil: true, timeout: true }],
-    ['click', 1, TIMEOUT, 'click'],
+    ['click', 1, CLICK, 'click'],
+    ['dblclick', 1, DBLCLICK, 'dblclick'],
+    ['hover', 1, HOVER, 'hover'],
+    ['focus', 1, TIMEOUT, 'focus'],
     ['fill', 2, TIMEOUT, 'fill'],
+    ['press', 2, PRESS, 'press'],
+    ['type', 2, PRESS, 'pressSequentially'],
+    ['check', 1, CHECK, 'check'],
+    ['uncheck', 1, CHECK, 'uncheck'],
+    ['setChecked', 2, CHECK, 'setChecked'],
+    ['selectOption', 2, FORCE_TIMEOUT, 'selectOption'],
+    ['setInputFiles', 2, TIMEOUT, 'setInputFiles'],
+    ['tap', 1, HOVER, 'tap'],
     ['waitForSelector', 1, { ...STATE, ...TIMEOUT }, 'waitFor'],
   ])
   guard(native.Locator, 'locator', false, [
-    ['click', 0, TIMEOUT],
-    ['fill', 1, TIMEOUT],
+    ['click', 0, CLICK],
+    ['dblclick', 0, DBLCLICK],
+    ['hover', 0, HOVER],
+    ['focus', 0, TIMEOUT],
+    ['blur', 0, TIMEOUT],
+    ['scrollIntoViewIfNeeded', 0, TIMEOUT],
+    ['dragTo', 1, FORCE_TIMEOUT],
+    ['press', 1, PRESS],
+    ['pressSequentially', 1, PRESS],
+    ['clear', 0, FORCE_TIMEOUT],
+    ['check', 0, CHECK],
+    ['uncheck', 0, CHECK],
+    ['setChecked', 1, CHECK],
+    ['selectOption', 1, FORCE_TIMEOUT],
+    ['setInputFiles', 1, TIMEOUT],
+    ['tap', 0, HOVER],
     ['waitFor', 0, { ...STATE, ...TIMEOUT }],
     ['textContent', 0, TIMEOUT],
     ['boundingBox', 0, TIMEOUT],
   ])
+  native.Locator.prototype.type = native.Locator.prototype.pressSequentially
+  native.Page.prototype.dragAndDrop = async function (source, target, options) {
+    checkOptions('page.dragAndDrop', options, FORCE_TIMEOUT)
+    return this.locator(source).dragTo(this.locator(target), options)
+  }
+  const devices = new WeakMap()
+  const deviceState = (page) => {
+    let d = devices.get(page)
+    if (!d) {
+      d = {
+        mouse: {
+          move: async (x, y, options) => {
+            checkOptions('mouse.move', options, MOUSE_MOVE)
+            return page._mouseMove(x, y, options?.steps)
+          },
+          down: async (options) => {
+            checkOptions('mouse.down', options, MOUSE_BUTTON)
+            return page._mouseDown(options?.button, options?.clickCount)
+          },
+          up: async (options) => {
+            checkOptions('mouse.up', options, MOUSE_BUTTON)
+            return page._mouseUp(options?.button, options?.clickCount)
+          },
+          click: async (x, y, options) => {
+            checkOptions('mouse.click', options, MOUSE_CLICK)
+            return page._mouseClick(x, y, options?.button, options?.clickCount, options?.delay)
+          },
+          dblclick: async (x, y, options) => {
+            checkOptions('mouse.dblclick', options, MOUSE_DBLCLICK)
+            return page._mouseDblclick(x, y, options?.button, options?.delay)
+          },
+          wheel: async (deltaX, deltaY) => page._mouseWheel(deltaX, deltaY),
+        },
+        keyboard: {
+          down: async (key) => page._keyboardDown(key),
+          up: async (key) => page._keyboardUp(key),
+          press: async (key, options) => {
+            checkOptions('keyboard.press', options, { delay: true })
+            return page._keyboardPress(key, options?.delay)
+          },
+          type: async (text, options) => {
+            checkOptions('keyboard.type', options, { delay: true })
+            return page._keyboardType(text, options?.delay)
+          },
+          insertText: async (text) => page._keyboardInsertText(text),
+        },
+        touchscreen: {
+          tap: async (x, y) => page._touchscreenTap(x, y),
+        },
+      }
+      devices.set(page, d)
+    }
+    return d
+  }
+  for (const name of ['mouse', 'keyboard', 'touchscreen']) {
+    Object.defineProperty(native.Page.prototype, name, {
+      get() {
+        return deviceState(this)[name]
+      },
+      enumerable: true,
+      configurable: true,
+    })
+  }
   native.Browser.prototype.newContext = async function (options) {
     checkOptions('browser.newContext', options, PAGE)
     return new BrowserContext(this, options)

@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use fluxwright::{
-    netguard, Clip, ImageFormat, JobOptions, PageLease, PdfMargin, PdfOptions, Priority,
-    ScreenshotOptions, WaitUntil,
+    netguard, parse_modifiers, CheckOptions, ClickOptions, Clip, HoverOptions, ImageFormat,
+    JobOptions, MouseButton, PageLease, PdfMargin, PdfOptions, Priority, ScreenshotOptions,
+    SelectEntry, WaitUntil,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,13 +72,84 @@ impl JobRequest {
                         "goto url is not allowed (link-local and non-web URLs are blocked)".into(),
                     );
                 }
-                Step::Click { selector }
-                | Step::Fill { selector, .. }
+                Step::Click {
+                    selector,
+                    delay_ms,
+                    position,
+                    modifiers,
+                    ..
+                }
+                | Step::Dblclick {
+                    selector,
+                    delay_ms,
+                    position,
+                    modifiers,
+                    ..
+                } => {
+                    validate_selector(selector)?;
+                    validate_delay(*delay_ms)?;
+                    validate_point(*position)?;
+                    validate_modifiers(modifiers)?;
+                }
+                Step::Hover {
+                    selector,
+                    position,
+                    modifiers,
+                    ..
+                }
+                | Step::Tap {
+                    selector,
+                    position,
+                    modifiers,
+                    ..
+                } => {
+                    validate_selector(selector)?;
+                    validate_point(*position)?;
+                    validate_modifiers(modifiers)?;
+                }
+                Step::Check {
+                    selector,
+                    position,
+                    ..
+                }
+                | Step::Uncheck {
+                    selector,
+                    position,
+                    ..
+                } => {
+                    validate_selector(selector)?;
+                    validate_point(*position)?;
+                }
+                Step::Press {
+                    selector,
+                    key,
+                    delay_ms,
+                } => {
+                    validate_selector(selector)?;
+                    if key.is_empty() {
+                        return Err("press key must not be empty".into());
+                    }
+                    validate_delay(*delay_ms)?;
+                }
+                Step::Type {
+                    selector, delay_ms, ..
+                } => {
+                    validate_selector(selector)?;
+                    validate_delay(*delay_ms)?;
+                }
+                Step::SelectOption {
+                    selector, values, ..
+                } => {
+                    validate_selector(selector)?;
+                    values.validate()?;
+                }
+                Step::Fill { selector, .. }
+                | Step::Focus { selector }
+                | Step::Blur { selector }
+                | Step::Clear { selector, .. }
                 | Step::WaitForSelector { selector }
-                | Step::TextContent { selector }
-                    if selector.trim().is_empty() =>
-                {
-                    return Err("selectors must not be empty".into());
+                | Step::TextContent { selector } => {
+                    validate_selector(selector)?;
                 }
                 Step::Evaluate { expression } if expression.trim().is_empty() => {
                     return Err("evaluate expression must not be empty".into());
@@ -130,6 +202,104 @@ pub enum Step {
     },
     Click {
         selector: String,
+        #[serde(default)]
+        button: Option<ServerMouseButton>,
+        #[serde(default)]
+        click_count: Option<u32>,
+        #[serde(default)]
+        delay_ms: Option<u64>,
+        #[serde(default)]
+        position: Option<ServerPoint>,
+        #[serde(default)]
+        modifiers: Vec<String>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        trial: bool,
+    },
+    Dblclick {
+        selector: String,
+        #[serde(default)]
+        button: Option<ServerMouseButton>,
+        #[serde(default)]
+        delay_ms: Option<u64>,
+        #[serde(default)]
+        position: Option<ServerPoint>,
+        #[serde(default)]
+        modifiers: Vec<String>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        trial: bool,
+    },
+    Hover {
+        selector: String,
+        #[serde(default)]
+        position: Option<ServerPoint>,
+        #[serde(default)]
+        modifiers: Vec<String>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        trial: bool,
+    },
+    Focus {
+        selector: String,
+    },
+    Blur {
+        selector: String,
+    },
+    Press {
+        selector: String,
+        key: String,
+        #[serde(default)]
+        delay_ms: Option<u64>,
+    },
+    Type {
+        selector: String,
+        text: String,
+        #[serde(default)]
+        delay_ms: Option<u64>,
+    },
+    Clear {
+        selector: String,
+        #[serde(default)]
+        force: bool,
+    },
+    Check {
+        selector: String,
+        #[serde(default)]
+        position: Option<ServerPoint>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        trial: bool,
+    },
+    Uncheck {
+        selector: String,
+        #[serde(default)]
+        position: Option<ServerPoint>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        trial: bool,
+    },
+    SelectOption {
+        selector: String,
+        values: ServerSelectValues,
+        #[serde(default)]
+        force: bool,
+    },
+    Tap {
+        selector: String,
+        #[serde(default)]
+        position: Option<ServerPoint>,
+        #[serde(default)]
+        modifiers: Vec<String>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        trial: bool,
     },
     Fill {
         selector: String,
@@ -180,6 +350,136 @@ pub enum Step {
         #[serde(default)]
         tagged: bool,
     },
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerMouseButton {
+    #[default]
+    Left,
+    Right,
+    Middle,
+}
+
+impl ServerMouseButton {
+    fn into_core(self) -> MouseButton {
+        match self {
+            Self::Left => MouseButton::Left,
+            Self::Right => MouseButton::Right,
+            Self::Middle => MouseButton::Middle,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServerSelectValues {
+    Single(ServerSelectValue),
+    Many(Vec<ServerSelectValue>),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServerSelectValue {
+    Str(String),
+    Obj(ServerSelectObj),
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSelectObj {
+    pub value: Option<String>,
+    pub label: Option<String>,
+    pub index: Option<usize>,
+}
+
+impl ServerSelectValue {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Str(_) => Ok(()),
+            Self::Obj(o) => {
+                let count = usize::from(o.value.is_some())
+                    + usize::from(o.label.is_some())
+                    + usize::from(o.index.is_some());
+                if count != 1 {
+                    Err("select_option entries must specify exactly one of value, label, or index".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn to_core(&self) -> SelectEntry {
+        match self {
+            Self::Str(s) => SelectEntry::Value(s.clone()),
+            Self::Obj(o) => {
+                if let Some(v) = &o.value {
+                    SelectEntry::Value(v.clone())
+                } else if let Some(l) = &o.label {
+                    SelectEntry::Label(l.clone())
+                } else {
+                    SelectEntry::Index(o.index.expect("validated"))
+                }
+            }
+        }
+    }
+}
+
+impl ServerSelectValues {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Single(v) => v.validate(),
+            Self::Many(list) => {
+                for v in list {
+                    v.validate()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn to_core(&self) -> Vec<SelectEntry> {
+        match self {
+            Self::Single(v) => vec![v.to_core()],
+            Self::Many(list) => list.iter().map(ServerSelectValue::to_core).collect(),
+        }
+    }
+}
+
+fn validate_selector(selector: &str) -> Result<(), String> {
+    if selector.trim().is_empty() {
+        Err("selectors must not be empty".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_delay(delay_ms: Option<u64>) -> Result<(), String> {
+    if delay_ms.is_some_and(|ms| ms > 10_000) {
+        Err("delay_ms must be between 0 and 10000".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_point(pt: Option<ServerPoint>) -> Result<(), String> {
+    if pt.is_some_and(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        Err("position x and y must be finite numbers".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_modifiers(modifiers: &[String]) -> Result<u8, String> {
+    parse_modifiers(modifiers).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -340,8 +640,167 @@ impl Step {
                 page.goto_with(url, wait).await?;
                 Ok(Value::Null)
             }
-            Step::Click { selector } => {
-                page.click(selector).await?;
+            Step::Click {
+                selector,
+                button,
+                click_count,
+                delay_ms,
+                position,
+                modifiers,
+                force,
+                trial,
+            } => {
+                let mods = parse_modifiers(modifiers)?;
+                page.click_with(
+                    selector,
+                    &ClickOptions {
+                        button: button.unwrap_or_default().into_core(),
+                        click_count: click_count.unwrap_or(1),
+                        delay: delay_ms.map(Duration::from_millis),
+                        position: position.map(|p| (p.x, p.y)),
+                        modifiers: mods,
+                        force: *force,
+                        trial: *trial,
+                    },
+                )
+                .await?;
+                Ok(Value::Null)
+            }
+            Step::Dblclick {
+                selector,
+                button,
+                delay_ms,
+                position,
+                modifiers,
+                force,
+                trial,
+            } => {
+                let mods = parse_modifiers(modifiers)?;
+                page.dblclick(
+                    selector,
+                    &ClickOptions {
+                        button: button.unwrap_or_default().into_core(),
+                        click_count: 2,
+                        delay: delay_ms.map(Duration::from_millis),
+                        position: position.map(|p| (p.x, p.y)),
+                        modifiers: mods,
+                        force: *force,
+                        trial: *trial,
+                    },
+                )
+                .await?;
+                Ok(Value::Null)
+            }
+            Step::Hover {
+                selector,
+                position,
+                modifiers,
+                force,
+                trial,
+            } => {
+                let mods = parse_modifiers(modifiers)?;
+                page.hover(
+                    selector,
+                    &HoverOptions {
+                        position: position.map(|p| (p.x, p.y)),
+                        modifiers: mods,
+                        force: *force,
+                        trial: *trial,
+                    },
+                )
+                .await?;
+                Ok(Value::Null)
+            }
+            Step::Focus { selector } => {
+                page.focus(selector).await?;
+                Ok(Value::Null)
+            }
+            Step::Blur { selector } => {
+                page.blur(selector).await?;
+                Ok(Value::Null)
+            }
+            Step::Press {
+                selector,
+                key,
+                delay_ms,
+            } => {
+                page.press(selector, key, delay_ms.map(Duration::from_millis))
+                    .await?;
+                Ok(Value::Null)
+            }
+            Step::Type {
+                selector,
+                text,
+                delay_ms,
+            } => {
+                page.press_sequentially(selector, text, delay_ms.map(Duration::from_millis))
+                    .await?;
+                Ok(Value::Null)
+            }
+            Step::Clear { selector, force } => {
+                page.clear(selector, *force).await?;
+                Ok(Value::Null)
+            }
+            Step::Check {
+                selector,
+                position,
+                force,
+                trial,
+            } => {
+                page.check(
+                    selector,
+                    &CheckOptions {
+                        position: position.map(|p| (p.x, p.y)),
+                        force: *force,
+                        trial: *trial,
+                    },
+                )
+                .await?;
+                Ok(Value::Null)
+            }
+            Step::Uncheck {
+                selector,
+                position,
+                force,
+                trial,
+            } => {
+                page.uncheck(
+                    selector,
+                    &CheckOptions {
+                        position: position.map(|p| (p.x, p.y)),
+                        force: *force,
+                        trial: *trial,
+                    },
+                )
+                .await?;
+                Ok(Value::Null)
+            }
+            Step::SelectOption {
+                selector,
+                values,
+                force,
+            } => {
+                let selected = page.select_option(selector, &values.to_core(), *force).await?;
+                Ok(serde_json::to_value(selected).expect("Vec<String> is JSON"))
+            }
+            Step::Tap {
+                selector,
+                position,
+                modifiers,
+                force,
+                trial,
+            } => {
+                let mods = parse_modifiers(modifiers)?;
+                page.tap(
+                    selector,
+                    &HoverOptions {
+                        position: position.map(|p| (p.x, p.y)),
+                        modifiers: mods,
+                        force: *force,
+                        trial: *trial,
+                    },
+                )
+                .await?;
                 Ok(Value::Null)
             }
             Step::Fill { selector, value } => {
@@ -375,6 +834,17 @@ impl Step {
         match self {
             Step::Goto { .. } => "goto",
             Step::Click { .. } => "click",
+            Step::Dblclick { .. } => "dblclick",
+            Step::Hover { .. } => "hover",
+            Step::Focus { .. } => "focus",
+            Step::Blur { .. } => "blur",
+            Step::Press { .. } => "press",
+            Step::Type { .. } => "type",
+            Step::Clear { .. } => "clear",
+            Step::Check { .. } => "check",
+            Step::Uncheck { .. } => "uncheck",
+            Step::SelectOption { .. } => "select_option",
+            Step::Tap { .. } => "tap",
             Step::Fill { .. } => "fill",
             Step::WaitForSelector { .. } => "wait_for_selector",
             Step::TextContent { .. } => "text_content",
@@ -609,10 +1079,37 @@ mod tests {
             json!({ "steps": [{ "action": "pdf", "format": "A9" }] }),
             json!({ "steps": [{ "action": "pdf", "scale": 3.0 }] }),
             json!({ "steps": [{ "action": "pdf", "margin": { "top": "10pt" } }] }),
+            json!({ "steps": [{ "action": "click", "selector": "a", "modifiers": ["Bogus"] }] }),
+            json!({ "steps": [{ "action": "press", "selector": "input", "key": "" }] }),
+            json!({ "steps": [{ "action": "press", "selector": "input", "key": "a", "delay_ms": 20000 }] }),
+            json!({ "steps": [{ "action": "select_option", "selector": "select", "values": {} }] }),
+            json!({ "steps": [{ "action": "select_option", "selector": "select", "values": { "value": "a", "label": "b" } }] }),
         ] {
             let job: JobRequest = serde_json::from_value(value).unwrap();
             assert!(job.validate().is_err());
         }
+        assert!(serde_json::from_value::<Step>(json!({
+            "action": "click", "selector": "#b", "button": "right", "modifiers": ["Shift"], "position": { "x": 2, "y": 3 }, "force": true
+        }))
+        .is_ok());
+        assert!(serde_json::from_value::<JobRequest>(json!({
+            "steps": [
+                { "action": "dblclick", "selector": "#d" },
+                { "action": "hover", "selector": "#h" },
+                { "action": "focus", "selector": "#f" },
+                { "action": "blur", "selector": "#f" },
+                { "action": "press", "selector": "#i", "key": "Enter" },
+                { "action": "type", "selector": "#i", "text": "hi", "delay_ms": 5 },
+                { "action": "clear", "selector": "#i" },
+                { "action": "check", "selector": "#c" },
+                { "action": "uncheck", "selector": "#c" },
+                { "action": "select_option", "selector": "select", "values": [{ "label": "Two" }, { "index": 2 }] },
+                { "action": "tap", "selector": "#t" }
+            ]
+        }))
+        .unwrap()
+        .validate()
+        .is_ok());
         assert!(serde_json::from_value::<JobRequest>(json!({
             "steps": [{ "action": "title" }], "script": "host code"
         }))
