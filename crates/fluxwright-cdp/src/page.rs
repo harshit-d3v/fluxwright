@@ -54,13 +54,49 @@ const QUERY_JS: &str = include_str!("query.js");
 pub struct Selector {
     pub frames: Vec<String>,
     pub query: String,
+    /// Reject matching more than one element (Playwright's strict mode).
+    pub strict: bool,
+}
+
+/// Filter options for [`Selector::role_with`] / `get_by_role_with`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleOptions {
+    pub name: Option<String>,
+    pub exact: bool,
+    /// Pattern and JS RegExp flags for regex `name` matching (takes precedence over `name`).
+    pub name_regex: Option<(String, String)>,
+    pub checked: Option<bool>,
+    pub disabled: Option<bool>,
+    pub expanded: Option<bool>,
+    pub include_hidden: bool,
+    pub level: Option<u32>,
+    pub pressed: Option<bool>,
+    pub selected: Option<bool>,
 }
 
 impl Selector {
+    pub fn new(query: impl Into<String>) -> Self {
+        Self { frames: Vec::new(), query: query.into(), strict: false }
+    }
+
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+
     /// `engine="text"` (exact) or `engine="text"i` (case-insensitive substring). Quoted either
     /// way, so a `>>` inside the text does not split the selector.
     fn matching(engine: &str, text: &str, exact: bool) -> String {
         format!("{engine}={}{}", serde_json::to_string(text).unwrap(), if exact { "" } else { "i" })
+    }
+
+    /// Serializes a JS RegExp as `re:"pattern","flags"` so `>>` inside it never splits the selector.
+    pub fn regex(pattern: &str, flags: &str) -> String {
+        format!(
+            "re:{},{}",
+            serde_json::to_string(pattern).unwrap(),
+            serde_json::to_string(flags).unwrap()
+        )
     }
 
     /// The `text=` query behind `get_by_text`.
@@ -98,34 +134,105 @@ impl Selector {
         Self::matching("has-text", text, false)
     }
 
+    pub fn has_text_regex(pattern: &str, flags: &str) -> String {
+        format!("has-text={}", Self::regex(pattern, flags))
+    }
+
+    pub fn has_not_text(text: &str) -> String {
+        Self::matching("has-not-text", text, false)
+    }
+
+    pub fn has_not_text_regex(pattern: &str, flags: &str) -> String {
+        format!("has-not-text={}", Self::regex(pattern, flags))
+    }
+
     /// This selector narrowed by `part`: another selector searched inside each match,
-    /// `nth=N`, or `has-text="..."i`.
+    /// `nth=N`, `has-text="..."i`, or a combinator part.
     pub fn then(&self, part: &str) -> Selector {
-        Selector { frames: self.frames.clone(), query: format!("{} >> {part}", self.query) }
+        Selector {
+            frames: self.frames.clone(),
+            query: format!("{} >> {part}", self.query),
+            strict: self.strict,
+        }
+    }
+
+    fn combine(&self, op: &str, other: &Selector) -> Selector {
+        if self.frames != other.frames {
+            return Selector {
+                frames: self.frames.clone(),
+                query: "role=[frame-mismatch]".to_string(),
+                strict: self.strict,
+            };
+        }
+        self.then(&format!("{op}={}", serde_json::to_string(&other.query).unwrap()))
+    }
+
+    pub fn has(&self, inner: &Selector) -> Selector {
+        self.combine("has", inner)
+    }
+
+    pub fn has_not(&self, inner: &Selector) -> Selector {
+        self.combine("has-not", inner)
+    }
+
+    pub fn and(&self, other: &Selector) -> Selector {
+        self.combine("and", other)
+    }
+
+    pub fn or(&self, other: &Selector) -> Selector {
+        self.combine("or", other)
+    }
+
+    /// The `role=` query behind `get_by_role_with`.
+    pub fn role_with(role: &str, opts: &RoleOptions) -> String {
+        let mut q = format!("role={role}");
+        if let Some((ref pat, ref flags)) = opts.name_regex {
+            q.push_str(&format!("[name={}]", Self::regex(pat, flags)));
+        } else if let Some(ref n) = opts.name {
+            q.push_str(&format!(
+                "[name={}{}]",
+                serde_json::to_string(n).unwrap(),
+                if opts.exact { "s" } else { "" }
+            ));
+        }
+        for (k, v) in [
+            ("checked", opts.checked),
+            ("disabled", opts.disabled),
+            ("expanded", opts.expanded),
+            ("pressed", opts.pressed),
+            ("selected", opts.selected),
+        ] {
+            if let Some(b) = v {
+                q.push_str(&format!("[{k}={b}]"));
+            }
+        }
+        if opts.include_hidden {
+            q.push_str("[include-hidden=true]");
+        }
+        if let Some(level) = opts.level {
+            q.push_str(&format!("[level={level}]"));
+        }
+        q
     }
 
     /// The `role=` query behind `get_by_role`.
     pub fn role(role: &str, name: Option<&str>, exact: bool) -> String {
-        match name {
-            None => format!("role={role}"),
-            Some(n) => format!(
-                "role={role}[name={}{}]",
-                serde_json::to_string(n).unwrap(),
-                if exact { "s" } else { "" }
-            ),
-        }
+        Self::role_with(
+            role,
+            &RoleOptions { name: name.map(String::from), exact, ..Default::default() },
+        )
     }
 }
 
 impl From<&str> for Selector {
     fn from(query: &str) -> Self {
-        Self { frames: Vec::new(), query: query.into() }
+        Self::new(query)
     }
 }
 
 impl From<String> for Selector {
     fn from(query: String) -> Self {
-        Self { frames: Vec::new(), query }
+        Self::new(query)
     }
 }
 
@@ -253,17 +360,32 @@ impl Affine {
     }
 }
 
-fn engine_call(query: &str, mode: &str) -> String {
-    engine_call_with(query, mode, &Value::Null)
+fn engine_call(sel: &Selector, mode: &str) -> String {
+    engine_call_with(sel, mode, &Value::Null)
 }
 
-fn engine_call_with(query: &str, mode: &str, arg: &Value) -> String {
+fn engine_call_with(sel: &Selector, mode: &str, arg: &Value) -> String {
+    let effective = if sel.strict {
+        let mut obj = arg.as_object().cloned().unwrap_or_default();
+        obj.insert("strict".into(), Value::Bool(true));
+        Value::Object(obj)
+    } else {
+        arg.clone()
+    };
     format!(
         "({QUERY_JS})({}, {}, {})",
-        serde_json::to_string(query).unwrap(),
+        serde_json::to_string(&sel.query).unwrap(),
         serde_json::to_string(mode).unwrap(),
-        serde_json::to_string(arg).unwrap(),
+        serde_json::to_string(&effective).unwrap(),
     )
+}
+
+fn json_texts(v: Option<Value>) -> Vec<String> {
+    v.and_then(|v| v["texts"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.as_str().unwrap_or("").to_string())
+        .collect()
 }
 
 /// Maps `exceptionDetails` to a JS-style error. `description` carries
@@ -763,7 +885,7 @@ impl CdpPage {
     /// and `arg`, in the page's own world as Playwright does, and returns its JSON result.
     pub async fn evaluate_on(&self, sel: &Selector, function: &str, arg: Option<Value>, timeout: Duration) -> Result<Value> {
         let (_, scope) = self.wait_element(sel, Wait::Query { mode: "attached", scroll: false }, timeout).await?;
-        let found = self.eval_in(&scope, &engine_call(&sel.query, "element"), false, timeout).await?;
+        let found = self.eval_in(&scope, &engine_call(sel, "element"), false, timeout).await?;
         let Some(isolated) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
             return Err(Error::NotActionable { selector: sel.to_string(), reason: "element went away".into() });
         };
@@ -918,7 +1040,7 @@ impl CdpPage {
                 .map(|_| ());
         }
         // Waiting for it to go: poll until the check that `mode` makes fails.
-        let expr = engine_call(&sel.query, mode);
+        let expr = engine_call(sel, mode);
         let start = Instant::now();
         loop {
             if self.browser.is_dead() {
@@ -953,6 +1075,102 @@ impl CdpPage {
         Ok(v["text"].as_str().map(String::from))
     }
 
+    pub async fn inner_text(&self, sel: &Selector, timeout: Duration) -> Result<String> {
+        let (v, _) = self.wait_element(sel, Wait::Query { mode: "inner_text", scroll: false }, timeout).await?;
+        Ok(v["text"].as_str().unwrap_or("").to_string())
+    }
+
+    pub async fn inner_html(&self, sel: &Selector, timeout: Duration) -> Result<String> {
+        let (v, _) = self.wait_element(sel, Wait::Query { mode: "inner_html", scroll: false }, timeout).await?;
+        Ok(v["html"].as_str().unwrap_or("").to_string())
+    }
+
+    pub async fn input_value(&self, sel: &Selector, timeout: Duration) -> Result<String> {
+        let (v, _) = self.wait_element(sel, Wait::Query { mode: "input_value", scroll: false }, timeout).await?;
+        Ok(v["value"].as_str().unwrap_or("").to_string())
+    }
+
+    pub async fn get_attribute(&self, sel: &Selector, name: &str, timeout: Duration) -> Result<Option<String>> {
+        let (v, _) = self
+            .wait_element_with(
+                sel,
+                Wait::Query { mode: "get_attribute", scroll: false },
+                &json!({ "name": name }),
+                timeout,
+            )
+            .await?;
+        Ok(v["value"].as_str().map(String::from))
+    }
+
+    pub async fn is_enabled(&self, sel: &Selector, timeout: Duration) -> Result<bool> {
+        let (v, _) = self.wait_element(sel, Wait::Query { mode: "is_enabled", scroll: false }, timeout).await?;
+        Ok(v["enabled"].as_bool().unwrap_or(false))
+    }
+
+    pub async fn is_disabled(&self, sel: &Selector, timeout: Duration) -> Result<bool> {
+        Ok(!self.is_enabled(sel, timeout).await?)
+    }
+
+    pub async fn is_checked(&self, sel: &Selector, timeout: Duration) -> Result<bool> {
+        let (v, _) = self.wait_element(sel, Wait::Query { mode: "is_checked", scroll: false }, timeout).await?;
+        Ok(v["checked"].as_bool().unwrap_or(false))
+    }
+
+    pub async fn is_editable(&self, sel: &Selector, timeout: Duration) -> Result<bool> {
+        let (v, _) = self.wait_element(sel, Wait::Query { mode: "is_editable", scroll: false }, timeout).await?;
+        Ok(v["editable"].as_bool().unwrap_or(false))
+    }
+
+    /// Single-shot evaluation without waiting; returns `None` when the frame does not exist yet.
+    async fn query_once(&self, sel: &Selector, mode: &str, arg: &Value, timeout: Duration) -> Result<Option<Value>> {
+        if self.browser.is_dead() {
+            return Err(Error::BrowserDead { pid: self.browser_pid });
+        }
+        let Ok((scope, _)) = self.scope(&sel.frames, false, timeout).await? else {
+            return Ok(None);
+        };
+        let v = match self.eval_in(&scope, &engine_call_with(sel, mode, arg), true, timeout).await {
+            Ok(r) => r["value"].clone(),
+            Err(e) => return Err(e),
+        };
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(Some(v));
+        }
+        if v["fatal"].as_bool() == Some(true) {
+            let reason = v["reason"].as_str().unwrap_or("unknown").to_string();
+            return Err(Error::NotActionable { selector: sel.to_string(), reason });
+        }
+        Ok(None)
+    }
+
+    pub async fn count(&self, sel: &Selector, timeout: Duration) -> Result<usize> {
+        Ok(self
+            .query_once(sel, "count", &Value::Null, timeout)
+            .await?
+            .and_then(|v| v["count"].as_u64())
+            .unwrap_or(0) as usize)
+    }
+
+    pub async fn all_text_contents(&self, sel: &Selector, timeout: Duration) -> Result<Vec<String>> {
+        Ok(json_texts(self.query_once(sel, "all_text_contents", &Value::Null, timeout).await?))
+    }
+
+    pub async fn all_inner_texts(&self, sel: &Selector, timeout: Duration) -> Result<Vec<String>> {
+        Ok(json_texts(self.query_once(sel, "all_inner_texts", &Value::Null, timeout).await?))
+    }
+
+    pub async fn is_visible(&self, sel: &Selector, timeout: Duration) -> Result<bool> {
+        Ok(self
+            .query_once(sel, "is_visible", &Value::Null, timeout)
+            .await?
+            .and_then(|v| v["visible"].as_bool())
+            .unwrap_or(false))
+    }
+
+    pub async fn is_hidden(&self, sel: &Selector, timeout: Duration) -> Result<bool> {
+        Ok(!self.is_visible(sel, timeout).await?)
+    }
+
     async fn wait_element(&self, sel: &Selector, wait: Wait, timeout: Duration) -> Result<(Value, Scope)> {
         self.wait_element_with(sel, wait, &Value::Null, timeout).await
     }
@@ -969,7 +1187,7 @@ impl CdpPage {
             Wait::Click { force } => ("point", true, force),
             Wait::Box => ("box", true, false),
         };
-        let expr = engine_call_with(&sel.query, mode, arg);
+        let expr = engine_call_with(sel, mode, arg);
         loop {
             if start.elapsed() > timeout {
                 // A timeout like any other, so callers (Python's `except TimeoutError`) see one.
@@ -1120,7 +1338,7 @@ impl CdpPage {
         let step = |mode: &'static str| {
             let scope = &scope;
             async move {
-                let r = self.eval_in(scope, &engine_call(&sel.query, mode), true, timeout).await?;
+                let r = self.eval_in(scope, &engine_call(sel, mode), true, timeout).await?;
                 match r["value"]["ok"].as_bool() {
                     Some(true) => Ok(()),
                     _ => Err(Error::NotActionable {
@@ -1186,7 +1404,7 @@ impl CdpPage {
         let r = self
             .eval_in(
                 &scope,
-                &engine_call_with(&sel.query, "check_state", &json!({ "want": checked })),
+                &engine_call_with(sel, "check_state", &json!({ "want": checked })),
                 true,
                 timeout,
             )
@@ -1235,7 +1453,7 @@ impl CdpPage {
                         timeout,
                     )
                     .await?;
-                let found = self.eval_in(&scope, &engine_call(&sel.query, "element"), false, timeout).await?;
+                let found = self.eval_in(&scope, &engine_call(sel, "element"), false, timeout).await?;
                 let Some(isolated) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
                     return Err(Error::NotActionable {
                         selector: sel.to_string(),

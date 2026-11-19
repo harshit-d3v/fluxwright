@@ -1,3 +1,4 @@
+import re
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal
@@ -72,6 +73,7 @@ class Page:
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]:
         """Scrolls into view and waits until the element is enabled, stable and not covered.
@@ -86,6 +88,7 @@ class Page:
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]: ...
     def hover(
@@ -96,6 +99,7 @@ class Page:
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]: ...
     def tap(
@@ -106,24 +110,37 @@ class Page:
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]: ...
-    def focus(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]: ...
-    def blur(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]: ...
-    def scroll_into_view_if_needed(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]: ...
-    def drag_and_drop(
-        self, source: str, target: str, *, force: bool | None = None, timeout: float | None = None
+    def focus(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> Awaitable[None]: ...
+    def blur(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> Awaitable[None]: ...
+    def scroll_into_view_if_needed(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
     ) -> Awaitable[None]: ...
-    def fill(self, selector: str, value: str, *, timeout: float | None = None) -> Awaitable[None]: ...
-    def clear(self, selector: str, *, force: bool | None = None, timeout: float | None = None) -> Awaitable[None]: ...
+    def drag_and_drop(
+        self,
+        source: str,
+        target: str,
+        *,
+        force: bool | None = None,
+        strict: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def fill(
+        self, selector: str, value: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[None]: ...
+    def clear(
+        self, selector: str, *, force: bool | None = None, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[None]: ...
     def press(
-        self, selector: str, key: str, *, delay: float | None = None, timeout: float | None = None
+        self, selector: str, key: str, *, delay: float | None = None, strict: bool | None = None, timeout: float | None = None
     ) -> Awaitable[None]: ...
     def press_sequentially(
-        self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None
+        self, selector: str, text: str, *, delay: float | None = None, strict: bool | None = None, timeout: float | None = None
     ) -> Awaitable[None]: ...
     def type(
-        self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None
+        self, selector: str, text: str, *, delay: float | None = None, strict: bool | None = None, timeout: float | None = None
     ) -> Awaitable[None]: ...
     def check(
         self,
@@ -132,6 +149,7 @@ class Page:
         position: Position | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]: ...
     def uncheck(
@@ -141,6 +159,7 @@ class Page:
         position: Position | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]: ...
     def set_checked(
@@ -151,6 +170,7 @@ class Page:
         position: Position | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]: ...
     def select_option(
@@ -162,6 +182,7 @@ class Page:
         label: str | Sequence[str] | None = None,
         element: Any = None,
         force: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[list[str]]: ...
     def set_input_files(
@@ -169,6 +190,7 @@ class Page:
         selector: str,
         files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
         *,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]: ...
     def wait_for_selector(
@@ -176,9 +198,43 @@ class Page:
         selector: str,
         *,
         state: Literal["attached", "detached", "visible", "hidden"] | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> Awaitable[None]:
         """Waits until ``state``: visible by default."""
+    def text_content(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[str | None]: ...
+    def inner_text(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[str]: ...
+    def inner_html(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[str]: ...
+    def input_value(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[str]: ...
+    def get_attribute(
+        self, selector: str, name: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[str | None]: ...
+    def is_visible(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[bool]: ...
+    def is_hidden(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[bool]: ...
+    def is_enabled(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[bool]: ...
+    def is_disabled(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[bool]: ...
+    def is_checked(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[bool]: ...
+    def is_editable(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[bool]: ...
     def evaluate(self, expression: str, arg: Any = None) -> Awaitable[Any]:
         """Runs JavaScript in the page and returns its JSON result, awaiting promises. A function
         (``"(x) => x * 2"``) is called with ``arg``; anything else is evaluated as is."""
@@ -229,10 +285,31 @@ class Page:
     def close(self) -> Awaitable[None]: ...
     def is_closed(self) -> bool:
         """Whether ``close()`` was called (or is under way)."""
-    def locator(self, selector: str) -> Locator:
-        """CSS, ``text=``, or ``role=`` selector."""
+    def locator(
+        self,
+        selector: str,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        """CSS, ``text=``, ``xpath=``, or ``role=`` selector."""
     def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator: ...
-    def get_by_role(self, role: str, *, name: str | None = None, exact: bool | None = None) -> Locator: ...
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        checked: bool | None = None,
+        disabled: bool | None = None,
+        exact: bool | None = None,
+        expanded: bool | None = None,
+        include_hidden: bool | None = None,
+        level: int | None = None,
+        name: str | re.Pattern[str] | None = None,
+        pressed: bool | None = None,
+        selected: bool | None = None,
+    ) -> Locator: ...
     def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator: ...
     def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator: ...
     def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator: ...
@@ -384,6 +461,20 @@ class Locator:
     ) -> Awaitable[None]:
         """Waits until ``state``: visible by default."""
     def text_content(self, *, timeout: float | None = None) -> Awaitable[str | None]: ...
+    def inner_text(self, *, timeout: float | None = None) -> Awaitable[str]: ...
+    def inner_html(self, *, timeout: float | None = None) -> Awaitable[str]: ...
+    def input_value(self, *, timeout: float | None = None) -> Awaitable[str]: ...
+    def get_attribute(self, name: str, *, timeout: float | None = None) -> Awaitable[str | None]: ...
+    def count(self) -> Awaitable[int]: ...
+    def all(self) -> Awaitable[list[Locator]]: ...
+    def all_text_contents(self) -> Awaitable[list[str]]: ...
+    def all_inner_texts(self) -> Awaitable[list[str]]: ...
+    def is_visible(self, *, timeout: float | None = None) -> Awaitable[bool]: ...
+    def is_hidden(self, *, timeout: float | None = None) -> Awaitable[bool]: ...
+    def is_enabled(self, *, timeout: float | None = None) -> Awaitable[bool]: ...
+    def is_disabled(self, *, timeout: float | None = None) -> Awaitable[bool]: ...
+    def is_checked(self, *, timeout: float | None = None) -> Awaitable[bool]: ...
+    def is_editable(self, *, timeout: float | None = None) -> Awaitable[bool]: ...
     def screenshot(
         self,
         *,
@@ -405,12 +496,42 @@ class Locator:
     def first(self) -> Locator: ...
     @property
     def last(self) -> Locator: ...
-    def filter(self, *, has_text: str | None = None) -> Locator:
-        """Keeps matches containing ``has_text`` (case-insensitive substring)."""
-    def locator(self, selector: str) -> Locator:
+    def filter(
+        self,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        """Narrow matching elements."""
+    def and_(self, locator: Locator) -> Locator: ...
+    def or_(self, locator: Locator) -> Locator: ...
+    def locator(
+        self,
+        selector: str,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
         """Searches inside this locator's matches."""
     def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator: ...
-    def get_by_role(self, role: str, *, name: str | None = None, exact: bool | None = None) -> Locator: ...
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        checked: bool | None = None,
+        disabled: bool | None = None,
+        exact: bool | None = None,
+        expanded: bool | None = None,
+        include_hidden: bool | None = None,
+        level: int | None = None,
+        name: str | re.Pattern[str] | None = None,
+        pressed: bool | None = None,
+        selected: bool | None = None,
+    ) -> Locator: ...
     def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator: ...
     def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator: ...
     def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator: ...
@@ -420,9 +541,30 @@ class Locator:
 class FrameLocator:
     """An iframe, same- or cross-origin, to find elements in."""
 
-    def locator(self, selector: str) -> Locator: ...
+    def locator(
+        self,
+        selector: str,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator: ...
     def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator: ...
-    def get_by_role(self, role: str, *, name: str | None = None, exact: bool | None = None) -> Locator: ...
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        checked: bool | None = None,
+        disabled: bool | None = None,
+        exact: bool | None = None,
+        expanded: bool | None = None,
+        include_hidden: bool | None = None,
+        level: int | None = None,
+        name: str | re.Pattern[str] | None = None,
+        pressed: bool | None = None,
+        selected: bool | None = None,
+    ) -> Locator: ...
     def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator: ...
     def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator: ...
     def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator: ...

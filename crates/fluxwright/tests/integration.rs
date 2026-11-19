@@ -1000,8 +1000,11 @@ async fn selectors_and_frames() {
     let page = eng.acquire().await.unwrap();
     page.goto(&format!("http://127.0.0.1:{port}/")).await.unwrap();
 
-    // Name is a case-insensitive substring by default, so "Save" finds "Save draft" first.
-    page.get_by_role("button", Some("save"), false).click().await.unwrap();
+    // Strict mode on Locator rejects ambiguous substring match ("Save draft" and "Save");
+    // `.first()` narrows to a single match.
+    let err = page.get_by_role("button", Some("save"), false).click().await.unwrap_err().to_string();
+    assert!(err.contains("strict mode violation"), "got {err}");
+    page.get_by_role("button", Some("save"), false).first().click().await.unwrap();
     assert_eq!(page.title().await.unwrap(), "draft");
     page.get_by_role("button", Some("Save"), true).click().await.unwrap();
     assert_eq!(page.title().await.unwrap(), "saved");
@@ -1934,6 +1937,157 @@ async fn rich_input_and_form_controls() {
     page.tap("#btn", &HoverOptions::default()).await.unwrap();
     page.touchscreen_tap(15.0, 15.0).await.unwrap();
     assert_eq!(page.evaluate("window.__tap").await.unwrap(), json!(2));
+
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn locator_reading_filtering_and_strictness() {
+    let eng = engine(1, 1).await;
+    let page = eng.new_page(JobOptions::default()).await.unwrap();
+    page.set_content(
+        "<!doctype html><html><body>\
+        <h1>Top</h1>\
+        <h2 aria-level=\"2\">Sub Section</h2>\
+        <ul id=\"items\">\
+          <li class=\"row\"><b>Apple</b> <span class=\"tag\">fresh</span></li>\
+          <li class=\"row\"><span class=\"name\">Banana</span> <span class=\"tag\">ripe</span></li>\
+          <li class=\"row\" style=\"display:none\">HiddenFruit</li>\
+        </ul>\
+        <input id=\"ro\" readonly value=\"locked\" data-kind=\"text\">\
+        <input id=\"ed\" value=\"hello\">\
+        <input id=\"dis\" disabled value=\"nope\">\
+        <input id=\"cb\" type=\"checkbox\" checked>\
+        <div id=\"ce\" contenteditable=\"true\">Edit <em>me</em></div>\
+        <button id=\"tog\" aria-pressed=\"true\" aria-expanded=\"false\">Toggle</button>\
+        <button id=\"disbtn\" aria-disabled=\"true\">Blocked</button>\
+        <button id=\"hidbtn\" style=\"display:none\">Secret</button>\
+        <div role=\"tab\" aria-selected=\"true\">SelectedTab</div>\
+        <div role=\"tab\" aria-selected=\"false\">OtherTab</div>\
+        <div id=\"parent\"><span id=\"child\">Leaf</span></div>\
+        <span class=\"multi\">One</span><span class=\"multi\">Two</span>\
+        </body></html>",
+    )
+    .await
+    .unwrap();
+
+    // Bulk & list methods never throw strict-mode errors.
+    let items = page.locator("#items li");
+    assert_eq!(items.count().await.unwrap(), 3);
+    assert_eq!(items.all().await.unwrap().len(), 3);
+    assert_eq!(
+        items.all_text_contents().await.unwrap(),
+        vec!["Apple fresh", "Banana ripe", "HiddenFruit"]
+    );
+    assert_eq!(items.all_inner_texts().await.unwrap().len(), 3);
+
+    // Non-existent iframe / elements degrade to empty without waiting.
+    assert_eq!(page.frame_locator("#missing-iframe").locator("div").count().await.unwrap(), 0);
+    assert!(page.locator("#does-not-exist").is_hidden().await.unwrap());
+    assert!(!page.locator("#does-not-exist").is_visible().await.unwrap());
+
+    // Readers & immediate predicates on single matches.
+    assert_eq!(items.first().inner_text().await.unwrap(), "Apple fresh");
+    assert_eq!(items.first().inner_html().await.unwrap(), "<b>Apple</b> <span class=\"tag\">fresh</span>");
+    assert_eq!(page.locator("#ed").input_value().await.unwrap(), "hello");
+    assert_eq!(page.locator("#ro").get_attribute("data-kind").await.unwrap().as_deref(), Some("text"));
+    assert_eq!(page.locator("#ro").get_attribute("data-missing").await.unwrap(), None);
+
+    assert!(page.locator("#ed").is_visible().await.unwrap());
+    assert!(page.locator("#hidbtn").is_hidden().await.unwrap());
+    assert!(page.locator("#ed").is_enabled().await.unwrap());
+    assert!(page.locator("#dis").is_disabled().await.unwrap());
+    assert!(page.locator("#disbtn").is_disabled().await.unwrap());
+    assert!(page.locator("#cb").is_checked().await.unwrap());
+    assert!(page.locator("#ed").is_editable().await.unwrap());
+    assert!(!page.locator("#ro").is_editable().await.unwrap());
+    assert!(!page.locator("#dis").is_editable().await.unwrap());
+    assert!(page.locator("#ce").is_editable().await.unwrap());
+
+    // Strict mode: Page shortcuts pick first; Locator rejects multiple matches cleanly (including is_visible).
+    assert_eq!(page.inner_text(".multi").await.unwrap(), "One");
+    let strict_err = page.locator(".multi").inner_text().await.unwrap_err().to_string();
+    assert!(strict_err.contains("strict mode violation"), "got {strict_err}");
+    let vis_err = page.locator(".multi").is_visible().await.unwrap_err().to_string();
+    assert!(vis_err.contains("strict mode violation"), "got {vis_err}");
+
+    // Filters (has, has_not, has_not_text, regex) & combinators (and, or).
+    let with_b = items.filter_has(&page.locator("b"));
+    assert_eq!(with_b.inner_text().await.unwrap(), "Apple fresh");
+    let without_b = items.filter_has_not(&page.locator("b")).filter_has_not_text("Hidden");
+    assert_eq!(without_b.inner_text().await.unwrap(), "Banana ripe");
+    let re_match = items.filter_has_text_regex("^Ban", "");
+    assert_eq!(re_match.inner_text().await.unwrap(), "Banana ripe");
+    let and_match = page.locator("input").and(&page.locator("#ed"));
+    assert_eq!(and_match.input_value().await.unwrap(), "hello");
+    let or_match = page.locator("#cb").or(&page.locator("#ed"));
+    assert_eq!(or_match.count().await.unwrap(), 2);
+
+    // XPath + parent `..`.
+    assert_eq!(page.locator("//button[@id='tog']").inner_text().await.unwrap(), "Toggle");
+    assert_eq!(page.locator("xpath=//div[@id='ce']/em").inner_text().await.unwrap(), "me");
+    assert_eq!(page.locator("#child").locator("..").get_attribute("id").await.unwrap().as_deref(), Some("parent"));
+
+    // Extended getByRole options + regex name.
+    let h2 = page.get_by_role_with(
+        "heading",
+        &fluxwright::RoleOptions { level: Some(2), name_regex: Some(("^Sub".into(), "".into())), ..Default::default() },
+    );
+    assert_eq!(h2.inner_text().await.unwrap(), "Sub Section");
+    assert_eq!(
+        page.get_by_role_with(
+            "button",
+            &fluxwright::RoleOptions { pressed: Some(true), expanded: Some(false), ..Default::default() }
+        )
+        .get_attribute("id")
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("tog")
+    );
+    assert_eq!(
+        page.get_by_role_with(
+            "button",
+            &fluxwright::RoleOptions { disabled: Some(true), ..Default::default() }
+        )
+        .inner_text()
+        .await
+        .unwrap(),
+        "Blocked"
+    );
+    assert_eq!(
+        page.get_by_role_with(
+            "button",
+            &fluxwright::RoleOptions { name: Some("Secret".into()), include_hidden: true, ..Default::default() }
+        )
+        .get_attribute("id")
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("hidbtn")
+    );
+    assert_eq!(
+        page.get_by_role_with(
+            "checkbox",
+            &fluxwright::RoleOptions { checked: Some(true), ..Default::default() }
+        )
+        .get_attribute("id")
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("cb")
+    );
+    assert_eq!(
+        page.get_by_role_with(
+            "tab",
+            &fluxwright::RoleOptions { selected: Some(true), ..Default::default() }
+        )
+        .inner_text()
+        .await
+        .unwrap(),
+        "SelectedTab"
+    );
 
     page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();

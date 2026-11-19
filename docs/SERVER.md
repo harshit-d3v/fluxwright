@@ -181,14 +181,19 @@ failed job returns **409**.
 | `select_option` | `selector`, `values` (string, `{ value \| label \| index }`, or array), optional `force` | Array of selected option values |
 | `tap` | `selector`, optional `position`, `modifiers`, `force`, `trial` | `null` |
 | `wait_for_selector` | `selector` | `null` |
-| `text_content` | `selector` | String or `null` |
+| `text_content` | `selector`, optional `strict` | String or `null` |
+| `inner_text` / `inner_html` / `input_value` | `selector`, optional `strict` | String |
+| `get_attribute` | `selector`, `name`, optional `strict` | String or `null` |
+| `count` | `selector` | Non-negative integer |
+| `all_text_contents` / `all_inner_texts` | `selector` | Array of strings |
+| `is_visible` / `is_hidden` / `is_enabled` / `is_disabled` / `is_checked` / `is_editable` | `selector`, optional `strict` | Boolean |
 | `evaluate` | `expression` | JSON value, evaluated in the page, **not** on the host |
 | `title` | None | String |
 | `content` | None | HTML string |
 | `screenshot` | Optional `full_page` (default `false`), `type` (`"png"` \| `"jpeg"` \| `"webp"`), `quality` (0–100, JPEG/WebP only), `clip` (`{ x, y, width, height }`), `omit_background` | `{ "mime_type": "image/png" \| "image/jpeg" \| "image/webp", "base64": "…" }` |
 | `pdf` | Optional `format`, `width`, `height`, `margin` (`{ top, right, bottom, left }`), `landscape`, `print_background`, `scale` (0.1–2), `page_ranges`, `prefer_css_page_size`, `display_header_footer`, `header_template`, `footer_template`, `outline`, `tagged` | `{ "mime_type": "application/pdf", "base64": "…" }` |
 
-Selectors support the engine's CSS, `text=…`, `role=…`, and chained `>>` syntax. `wait_until`
+Selectors support the engine's CSS, `xpath=…` (plus bare `//…` and `..`), `text=…`, `role=…`, and chained `>>` syntax. `wait_until`
 accepts `load`, `domcontentloaded`, `networkidle`, or `commit`. Explicit `goto` URLs must use
 HTTP/HTTPS or be `about:blank`; this validation is **not** a network isolation policy.
 Unknown request/step fields are rejected instead of silently ignored. Filesystem output paths

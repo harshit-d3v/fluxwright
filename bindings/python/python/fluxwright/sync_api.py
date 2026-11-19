@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import re
 import threading
 from contextlib import contextmanager, suppress
 from os import PathLike
@@ -151,20 +152,66 @@ def _listen(handler: Callable[[Any], Any], arg: Any) -> None:
         _log.exception("a page.on listener failed")
 
 
+def _native_loc(loc: Locator | Any) -> Any:
+    return loc._impl if isinstance(loc, Locator) else loc
+
+
 class _Finders:
     """The ways to find elements that pages, locators and frames share."""
 
     _impl: Any
 
-    def locator(self, selector: str) -> Locator:
-        """CSS, ``text=``, or ``role=`` selector."""
-        return Locator(self._impl.locator(selector))
+    def locator(
+        self,
+        selector: str,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        """CSS, ``text=``, ``xpath=``, or ``role=`` selector."""
+        return Locator(
+            self._impl.locator(
+                selector,
+                has=_native_loc(has) if has is not None else None,
+                has_not=_native_loc(has_not) if has_not is not None else None,
+                has_text=has_text,
+                has_not_text=has_not_text,
+            )
+        )
 
     def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator:
         return Locator(self._impl.get_by_text(text, exact=exact))
 
-    def get_by_role(self, role: str, *, name: str | None = None, exact: bool | None = None) -> Locator:
-        return Locator(self._impl.get_by_role(role, name=name, exact=exact))
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        checked: bool | None = None,
+        disabled: bool | None = None,
+        exact: bool | None = None,
+        expanded: bool | None = None,
+        include_hidden: bool | None = None,
+        level: int | None = None,
+        name: str | re.Pattern[str] | None = None,
+        pressed: bool | None = None,
+        selected: bool | None = None,
+    ) -> Locator:
+        return Locator(
+            self._impl.get_by_role(
+                role,
+                checked=checked,
+                disabled=disabled,
+                exact=exact,
+                expanded=expanded,
+                include_hidden=include_hidden,
+                level=level,
+                name=name,
+                pressed=pressed,
+                selected=selected,
+            )
+        )
 
     def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator:
         return Locator(self._impl.get_by_label(text, exact=exact))
@@ -374,6 +421,48 @@ class Locator(_Finders):
     def text_content(self, *, timeout: float | None = None) -> str | None:
         return _run(self._impl.text_content, timeout=timeout)
 
+    def inner_text(self, *, timeout: float | None = None) -> str:
+        return _run(self._impl.inner_text, timeout=timeout)
+
+    def inner_html(self, *, timeout: float | None = None) -> str:
+        return _run(self._impl.inner_html, timeout=timeout)
+
+    def input_value(self, *, timeout: float | None = None) -> str:
+        return _run(self._impl.input_value, timeout=timeout)
+
+    def get_attribute(self, name: str, *, timeout: float | None = None) -> str | None:
+        return _run(self._impl.get_attribute, name, timeout=timeout)
+
+    def count(self) -> int:
+        return _run(self._impl.count)
+
+    def all(self) -> list[Locator]:
+        return [Locator(item) for item in _run(self._impl.all)]
+
+    def all_text_contents(self) -> list[str]:
+        return _run(self._impl.all_text_contents)
+
+    def all_inner_texts(self) -> list[str]:
+        return _run(self._impl.all_inner_texts)
+
+    def is_visible(self, *, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_visible, timeout=timeout)
+
+    def is_hidden(self, *, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_hidden, timeout=timeout)
+
+    def is_enabled(self, *, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_enabled, timeout=timeout)
+
+    def is_disabled(self, *, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_disabled, timeout=timeout)
+
+    def is_checked(self, *, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_checked, timeout=timeout)
+
+    def is_editable(self, *, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_editable, timeout=timeout)
+
     def bounding_box(self, *, timeout: float | None = None) -> FloatRect | None:
         """Relative to the viewport, without scrolling; ``None`` when the element is not visible."""
         return _run(self._impl.bounding_box, timeout=timeout)
@@ -413,9 +502,29 @@ class Locator(_Finders):
     def last(self) -> Locator:
         return Locator(self._impl.last)
 
-    def filter(self, *, has_text: str | None = None) -> Locator:
-        """Keeps matches containing ``has_text`` (case-insensitive substring)."""
-        return Locator(self._impl.filter(has_text=has_text))
+    def filter(
+        self,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        """Narrow matching elements."""
+        return Locator(
+            self._impl.filter(
+                has=_native_loc(has) if has is not None else None,
+                has_not=_native_loc(has_not) if has_not is not None else None,
+                has_text=has_text,
+                has_not_text=has_not_text,
+            )
+        )
+
+    def and_(self, locator: Locator) -> Locator:
+        return Locator(self._impl.and_(_native_loc(locator)))
+
+    def or_(self, locator: Locator) -> Locator:
+        return Locator(self._impl.or_(_native_loc(locator)))
 
 
 class FrameLocator(_Finders):
@@ -801,6 +910,7 @@ class Page(_Finders):
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
         """Scrolls into view and waits until the element is enabled, stable and not covered."""
@@ -814,6 +924,7 @@ class Page(_Finders):
             modifiers=list(modifiers) if modifiers is not None else None,
             force=force,
             trial=trial,
+            strict=strict,
             timeout=timeout,
         )
 
@@ -827,6 +938,7 @@ class Page(_Finders):
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
         _run(
@@ -838,6 +950,7 @@ class Page(_Finders):
             modifiers=list(modifiers) if modifiers is not None else None,
             force=force,
             trial=trial,
+            strict=strict,
             timeout=timeout,
         )
 
@@ -849,6 +962,7 @@ class Page(_Finders):
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
         _run(
@@ -858,6 +972,7 @@ class Page(_Finders):
             modifiers=list(modifiers) if modifiers is not None else None,
             force=force,
             trial=trial,
+            strict=strict,
             timeout=timeout,
         )
 
@@ -869,6 +984,7 @@ class Page(_Finders):
         modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
         _run(
@@ -878,17 +994,20 @@ class Page(_Finders):
             modifiers=list(modifiers) if modifiers is not None else None,
             force=force,
             trial=trial,
+            strict=strict,
             timeout=timeout,
         )
 
-    def focus(self, selector: str, *, timeout: float | None = None) -> None:
-        _run(self._impl.focus, selector, timeout=timeout)
+    def focus(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.focus, selector, strict=strict, timeout=timeout)
 
-    def blur(self, selector: str, *, timeout: float | None = None) -> None:
-        _run(self._impl.blur, selector, timeout=timeout)
+    def blur(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.blur, selector, strict=strict, timeout=timeout)
 
-    def scroll_into_view_if_needed(self, selector: str, *, timeout: float | None = None) -> None:
-        _run(self._impl.scroll_into_view_if_needed, selector, timeout=timeout)
+    def scroll_into_view_if_needed(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> None:
+        _run(self._impl.scroll_into_view_if_needed, selector, strict=strict, timeout=timeout)
 
     def drag_and_drop(
         self,
@@ -896,26 +1015,51 @@ class Page(_Finders):
         target: str,
         *,
         force: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.drag_and_drop, source, target, force=force, timeout=timeout)
+        _run(self._impl.drag_and_drop, source, target, force=force, strict=strict, timeout=timeout)
 
-    def fill(self, selector: str, value: str, *, timeout: float | None = None) -> None:
-        _run(self._impl.fill, selector, value, timeout=timeout)
+    def fill(self, selector: str, value: str, *, strict: bool | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.fill, selector, value, strict=strict, timeout=timeout)
 
-    def clear(self, selector: str, *, force: bool | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.clear, selector, force=force, timeout=timeout)
+    def clear(
+        self, selector: str, *, force: bool | None = None, strict: bool | None = None, timeout: float | None = None
+    ) -> None:
+        _run(self._impl.clear, selector, force=force, strict=strict, timeout=timeout)
 
-    def press(self, selector: str, key: str, *, delay: float | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.press, selector, key, delay=delay, timeout=timeout)
+    def press(
+        self,
+        selector: str,
+        key: str,
+        *,
+        delay: float | None = None,
+        strict: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.press, selector, key, delay=delay, strict=strict, timeout=timeout)
 
     def press_sequentially(
-        self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None
+        self,
+        selector: str,
+        text: str,
+        *,
+        delay: float | None = None,
+        strict: bool | None = None,
+        timeout: float | None = None,
     ) -> None:
-        _run(self._impl.press_sequentially, selector, text, delay=delay, timeout=timeout)
+        _run(self._impl.press_sequentially, selector, text, delay=delay, strict=strict, timeout=timeout)
 
-    def type(self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.type, selector, text, delay=delay, timeout=timeout)
+    def type(
+        self,
+        selector: str,
+        text: str,
+        *,
+        delay: float | None = None,
+        strict: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.type, selector, text, delay=delay, strict=strict, timeout=timeout)
 
     def check(
         self,
@@ -924,9 +1068,10 @@ class Page(_Finders):
         position: Position | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.check, selector, position=position, force=force, trial=trial, timeout=timeout)
+        _run(self._impl.check, selector, position=position, force=force, trial=trial, strict=strict, timeout=timeout)
 
     def uncheck(
         self,
@@ -935,9 +1080,10 @@ class Page(_Finders):
         position: Position | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.uncheck, selector, position=position, force=force, trial=trial, timeout=timeout)
+        _run(self._impl.uncheck, selector, position=position, force=force, trial=trial, strict=strict, timeout=timeout)
 
     def set_checked(
         self,
@@ -947,9 +1093,19 @@ class Page(_Finders):
         position: Position | None = None,
         force: bool | None = None,
         trial: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.set_checked, selector, checked, position=position, force=force, trial=trial, timeout=timeout)
+        _run(
+            self._impl.set_checked,
+            selector,
+            checked,
+            position=position,
+            force=force,
+            trial=trial,
+            strict=strict,
+            timeout=timeout,
+        )
 
     def select_option(
         self,
@@ -960,6 +1116,7 @@ class Page(_Finders):
         label: str | Sequence[str] | None = None,
         element: Any = None,
         force: bool | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> list[str]:
         return _run(
@@ -970,6 +1127,7 @@ class Page(_Finders):
             label=label,
             element=element,
             force=force,
+            strict=strict,
             timeout=timeout,
         )
 
@@ -978,19 +1136,58 @@ class Page(_Finders):
         selector: str,
         files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
         *,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.set_input_files, selector, files, timeout=timeout)
+        _run(self._impl.set_input_files, selector, files, strict=strict, timeout=timeout)
 
     def wait_for_selector(
         self,
         selector: str,
         *,
         state: Literal["attached", "detached", "visible", "hidden"] | None = None,
+        strict: bool | None = None,
         timeout: float | None = None,
     ) -> None:
         """Waits until ``state``: visible by default."""
-        _run(self._impl.wait_for_selector, selector, state=state, timeout=timeout)
+        _run(self._impl.wait_for_selector, selector, state=state, strict=strict, timeout=timeout)
+
+    def text_content(
+        self, selector: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> str | None:
+        return _run(self._impl.text_content, selector, strict=strict, timeout=timeout)
+
+    def inner_text(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> str:
+        return _run(self._impl.inner_text, selector, strict=strict, timeout=timeout)
+
+    def inner_html(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> str:
+        return _run(self._impl.inner_html, selector, strict=strict, timeout=timeout)
+
+    def input_value(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> str:
+        return _run(self._impl.input_value, selector, strict=strict, timeout=timeout)
+
+    def get_attribute(
+        self, selector: str, name: str, *, strict: bool | None = None, timeout: float | None = None
+    ) -> str | None:
+        return _run(self._impl.get_attribute, selector, name, strict=strict, timeout=timeout)
+
+    def is_visible(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_visible, selector, strict=strict, timeout=timeout)
+
+    def is_hidden(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_hidden, selector, strict=strict, timeout=timeout)
+
+    def is_enabled(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_enabled, selector, strict=strict, timeout=timeout)
+
+    def is_disabled(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_disabled, selector, strict=strict, timeout=timeout)
+
+    def is_checked(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_checked, selector, strict=strict, timeout=timeout)
+
+    def is_editable(self, selector: str, *, strict: bool | None = None, timeout: float | None = None) -> bool:
+        return _run(self._impl.is_editable, selector, strict=strict, timeout=timeout)
 
     def evaluate(self, expression: str, arg: Any = None) -> Any:
         """Runs JavaScript in the page and returns its JSON result, awaiting promises. A function
