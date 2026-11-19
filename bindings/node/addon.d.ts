@@ -1,5 +1,19 @@
 export * from './index'
-import { Chromium, ConsoleMessage, Locator, NewPageOptions, Page, PdfOptions, ScreenshotOptions, StorageState, Browser } from './index'
+import {
+  Browser,
+  Chromium,
+  ConsoleMessage,
+  FrameLocator,
+  GetByRoleOptions,
+  GetByTextOptions,
+  GotoOptions,
+  Locator,
+  NewPageOptions,
+  Page,
+  PdfOptions,
+  ScreenshotOptions,
+  StorageState,
+} from './index'
 
 export interface FilterOptions {
   has?: Locator
@@ -185,22 +199,21 @@ export interface Touchscreen {
 }
 
 /**
- * A browser context, as Playwright's: the options its page opens with. Each context holds one page,
- * so one job's cookies and storage never reach another: `newPage()` opens it and a second call
- * rejects. To share a login across pages, pass one page's `storageState()` to the next `newContext`.
+ * A browser context, as Playwright's: holds multiple pages and popups sharing cookies, storage,
+ * init scripts, exposed functions and routes.
  */
 export interface BrowserContext {
   browser(): Browser
-  /** The context's page while it is open. */
+  /** The context's open pages, including popups. */
   pages(): Page[]
   newPage(): Promise<Page>
-  /** `page.route` for this context's page; added before `newPage()`, it applies from the first request. */
+  /** `page.route` for all pages and popups in this context; added before `newPage()`, it applies from the first request. */
   route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
   unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
   addInitScript<Arg>(script: (arg: Arg) => unknown, arg: Arg): Promise<void>
   addInitScript(script: (() => unknown) | string | { path?: string; content?: string }): Promise<void>
   exposeFunction(name: string, callback: (...args: any[]) => unknown): Promise<void>
-  /** The cookies and localStorage of this context's page, as `page.storageState`. */
+  /** The cookies and localStorage of this context, usable before or after `newPage()`. */
   storageState(options?: { path?: string }): Promise<StorageState>
   /** Every cookie in this context. */
   cookies(): Promise<StorageState['cookies']>
@@ -220,8 +233,32 @@ export interface BrowserContext {
     }>,
   ): Promise<void>
   clearCookies(): Promise<void>
-  /** Closes the context's page; the context opens no other. */
+  /** Closes this context and all of its pages and popups. */
   close(): Promise<void>
+}
+
+/** An imperative handle to a main frame or iframe on a page. */
+export interface Frame {
+  page(): Page
+  url(): string
+  name(): string
+  isDetached(): boolean
+  parentFrame(): Frame | null
+  childFrames(): Frame[]
+  goto(url: string, options?: GotoOptions): Promise<void>
+  evaluate<R, Arg = undefined>(pageFunction: (arg: Arg) => R, arg?: Arg): Promise<Awaited<R>>
+  evaluate(pageFunction: string, arg?: unknown): Promise<any>
+  title(): Promise<string>
+  content(): Promise<string>
+  locator(selector: string, options?: FilterOptions): Locator
+  getByText(text: string, options?: GetByTextOptions): Locator
+  getByRole(role: string, options?: GetByRoleOptions): Locator
+  getByLabel(text: string, options?: GetByTextOptions): Locator
+  getByPlaceholder(text: string, options?: GetByTextOptions): Locator
+  getByAltText(text: string, options?: GetByTextOptions): Locator
+  getByTitle(text: string, options?: GetByTextOptions): Locator
+  getByTestId(testId: string): Locator
+  frameLocator(selector: string): FrameLocator
 }
 
 declare module './index' {
@@ -271,14 +308,25 @@ declare module './index' {
     on(event: 'response', handler: (response: Response) => void): this
     on(event: 'dialog', handler: (dialog: Dialog) => unknown): this
     on(event: 'filechooser', handler: (fileChooser: FileChooser) => unknown): this
+    on(event: 'popup', handler: (popup: Page) => unknown): this
     once(event: 'console', handler: (message: ConsoleMessage) => void): this
     once(event: 'pageerror', handler: (error: Error) => void): this
     once(event: 'request' | 'requestfinished' | 'requestfailed', handler: (request: Request) => void): this
     once(event: 'response', handler: (response: Response) => void): this
     once(event: 'dialog', handler: (dialog: Dialog) => unknown): this
     once(event: 'filechooser', handler: (fileChooser: FileChooser) => unknown): this
+    once(event: 'popup', handler: (popup: Page) => unknown): this
     off(
-      event: 'console' | 'pageerror' | 'request' | 'response' | 'requestfinished' | 'requestfailed' | 'dialog' | 'filechooser',
+      event:
+        | 'console'
+        | 'pageerror'
+        | 'request'
+        | 'response'
+        | 'requestfinished'
+        | 'requestfailed'
+        | 'dialog'
+        | 'filechooser'
+        | 'popup',
       handler: (...args: any[]) => unknown,
     ): this
     /**
@@ -298,6 +346,14 @@ declare module './index' {
       predicate?: (fileChooser: FileChooser) => boolean | Promise<boolean>
       timeout?: number
     }): Promise<FileChooser>
+    waitForPopup(options?: {
+      predicate?: (popup: Page) => boolean | Promise<boolean>
+      timeout?: number
+    }): Promise<Page>
+    opener(): Promise<Page | null>
+    frames(): Frame[]
+    mainFrame(): Frame
+    frame(frameSelector: string | { name?: string; url?: URLMatch }): Frame | null
     /** The next download this page finished; ones that finished earlier queue up. Default timeout 30 s. */
     waitForDownload(options?: { timeout?: number }): Promise<Download>
     readonly mouse: Mouse

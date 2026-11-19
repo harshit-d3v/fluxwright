@@ -99,6 +99,29 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/csp":
             headers = {"Content-Type": "text/html", "Content-Security-Policy": "script-src 'none'"}
             body = b'<p id="n">0</p><script>document.getElementById("n").textContent="1"</script>'
+        elif self.path == "/opener-page":
+            body = (
+                b"<title>Opener</title>"
+                b"<button id=\"open-btn\" onclick=\"window.open('/popup-one', '_blank')\">Open</button>"
+                b'<a id="blank-link" href="/popup-two" target="_blank">Link</a>'
+            )
+        elif self.path == "/popup-one":
+            body = b"<title>Popup1</title><p id='pop'>popup-one</p>"
+        elif self.path == "/popup-two":
+            body = b"<title>Popup2</title><p id='pop2'>popup-two</p>"
+        elif self.path == "/frames-host":
+            port = self.server.server_port
+            body = (
+                f"<title>FramesHost</title>"
+                f'<iframe id="same" name="same-fr" src="http://127.0.0.1:{port}/same-child"></iframe>'
+                f'<iframe id="cross" name="cross-fr" src="http://localhost:{port}/cross-child"></iframe>'
+            ).encode()
+        elif self.path == "/same-child":
+            body = b'<title>SameTitle</title><button id="sb" onclick="this.textContent=\'clicked-same\'">SameBtn</button>'
+        elif self.path == "/same-next":
+            body = b"<title>SameNext</title><p id='sn'>navigated-same</p>"
+        elif self.path == "/cross-child":
+            body = b'<title>CrossTitle</title><button id="cb" onclick="this.textContent=\'clicked-cross\'">CrossBtn</button>'
         else:
             if self.path == "/login":
                 headers["Set-Cookie"] = "sid=s3cret; Path=/"
@@ -917,10 +940,15 @@ async def context_smoke(base: str) -> None:
         await page.emulate_media(media=None, color_scheme=None)
         with pytest.raises(Error):
             await p.chromium.connect_over_cdp("ws://127.0.0.1:1/invalid")
-        with pytest.raises(Error, match="holds one page"):
-            await context.new_page()
+        page2 = await context.new_page()
+        assert len(context.pages) == 2
+        await context.add_cookies([{"name": "shared", "value": "v2", "url": base}])
+        await page2.goto("/")
+        assert await page2.evaluate("() => document.cookie") == "shared=v2"
+        await page.bring_to_front()
         await context.close()
         assert page.is_closed()
+        assert page2.is_closed()
         assert context.pages == []
         with pytest.raises(Error, match="context is closed"):
             await context.new_page()
@@ -1245,3 +1273,121 @@ def test_call_from_a_late_exit_handler_fails_instead_of_hanging(tmp_path):
         done = subprocess.run([sys.executable, "-c", script], stdout=stdout, stderr=stderr, timeout=60)
     assert done.returncode == 0, err.read_text()
     assert "stopped at interpreter exit" in out.read_text()
+
+
+def test_multi_tab_popups_and_frames(base):
+    async def run_async():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(max_browsers=1)
+            try:
+                async with await browser.new_context(base_url=base, locale="fr-FR") as ctx:
+                    await ctx.add_cookies([{"name": "pre", "value": "yes", "url": base}])
+                    pre_state = await ctx.storage_state()
+                    assert any(c["name"] == "pre" for c in pre_state["cookies"])
+                    assert any(c["name"] == "pre" for c in await ctx.cookies())
+                    await ctx.add_init_script('window.__ctxInit = "shared";')
+                    await ctx.expose_function("ctxMul", lambda a, b: a * b)
+                    await ctx.route("**/api", lambda r: r.fulfill(body="from-ctx-route"))
+
+                    opener = await ctx.new_page()
+                    await opener.goto("/opener-page")
+                    seen_popups = []
+                    opener.on("popup", seen_popups.append)
+
+                    async with opener.expect_popup() as pop_info:
+                        await opener.click("#open-btn")
+                    pop1 = await pop_info.value
+                    await pop1.wait_for_load_state("load")
+                    assert await pop1.opener() is opener
+                    assert pop1 in ctx.pages
+                    assert await pop1.locator("#pop").inner_text() == "popup-one"
+                    assert await pop1.evaluate(
+                        "async () => [window.__ctxInit, navigator.language, await ctxMul(3, 5)]"
+                    ) == ["shared", "fr-FR", 15]
+                    assert await pop1.evaluate("() => fetch('/api').then((r) => r.text())") == "from-ctx-route"
+                    await pop1.close()
+                    assert pop1 not in ctx.pages
+
+                    async with opener.expect_popup(lambda p2: not p2.is_closed()) as pop2_info:
+                        await opener.click("#blank-link")
+                    pop2 = await pop2_info.value
+                    await pop2.wait_for_load_state("load")
+                    assert await pop2.locator("#pop2").inner_text() == "popup-two"
+                    assert len(seen_popups) == 2
+                    await pop2.close()
+
+                    await opener.goto("/frames-host")
+                    for _ in range(100):
+                        fs = opener.frames
+                        if any(f.name == "same-fr" and f.url.endswith("/same-child") for f in fs) and any(
+                            f.name == "cross-fr" and f.url.endswith("/cross-child") for f in fs
+                        ):
+                            break
+                        await asyncio.sleep(0.03)
+                    else:
+                        raise AssertionError("frames did not load")
+
+                    main = opener.main_frame
+                    assert len(opener.frames) == 3
+                    assert len(main.child_frames) == 2
+                    same = opener.frame("same-fr")
+                    cross = opener.frame(url=re.compile(r"cross-child"))
+                    assert same is not None and cross is not None
+                    assert same.parent_frame is main
+                    assert cross.parent_frame is main
+                    assert not same.is_detached()
+                    assert not cross.is_detached()
+
+                    await same.locator("#sb").click()
+                    assert await same.locator("#sb").inner_text() == "clicked-same"
+                    assert await same.title() == "SameTitle"
+                    await cross.locator("#cb").click()
+                    assert await cross.locator("#cb").inner_text() == "clicked-cross"
+                    assert await cross.title() == "CrossTitle"
+                    assert "clicked-cross" in await cross.content()
+                    assert await cross.evaluate("(x) => x + 10", 5) == 15
+
+                    await same.goto("/same-next")
+                    assert await same.locator("#sn").inner_text() == "navigated-same"
+
+                    await opener.evaluate("() => document.getElementById('same').remove()")
+                    for _ in range(50):
+                        if same.is_detached():
+                            break
+                        await asyncio.sleep(0.02)
+                    assert same.is_detached()
+            finally:
+                await browser.close()
+
+    asyncio.run(run_async())
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(max_browsers=1)
+        try:
+            with browser.new_context(base_url=base) as ctx:
+                ctx.add_cookies([{"name": "sync_pre", "value": "ok", "url": base}])
+                assert any(c["name"] == "sync_pre" for c in ctx.storage_state()["cookies"])
+                opener = ctx.new_page()
+                opener.goto("/opener-page")
+                with opener.expect_popup() as info:
+                    opener.click("#open-btn")
+                pop = info.value
+                pop.wait_for_load_state("load")
+                assert pop.opener() is opener
+                assert pop in ctx.pages
+                pop.close()
+
+                opener.goto("/frames-host")
+                for _ in range(100):
+                    if any(f.name == "cross-fr" and f.url.endswith("/cross-child") for f in opener.frames):
+                        break
+                    time.sleep(0.03)
+                else:
+                    raise AssertionError("sync frames did not load")
+                cross = opener.frame("cross-fr")
+                assert cross is not None
+                cross.locator("#cb").click()
+                assert cross.locator("#cb").inner_text() == "clicked-cross"
+                assert cross.evaluate("(x) => x * 2", 7) == 14
+        finally:
+            browser.close()
