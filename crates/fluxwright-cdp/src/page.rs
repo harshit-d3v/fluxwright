@@ -1434,18 +1434,6 @@ impl CdpPage {
             return self.evaluate(expression, timeout).await;
         }
         let deadline = tokio::time::Instant::now() + timeout;
-        let eval_once = |session: &str, ctx_id: Option<i64>, step_timeout: Duration| {
-            let mut params = json!({
-                "expression": expression,
-                "returnByValue": true,
-                "awaitPromise": true,
-            });
-            if let Some(id) = ctx_id {
-                params["contextId"] = json!(id);
-            }
-            self.session_call(session, "Runtime.evaluate", params, step_timeout)
-        };
-
         for attempt in 0..2 {
             let mut entry = self
                 .frames
@@ -1487,7 +1475,15 @@ impl CdpPage {
             } else {
                 entry.default_context_id
             };
-            match eval_once(&entry.session_id, ctx_opt, rem).await {
+            let mut params = json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            });
+            if let Some(id) = ctx_opt {
+                params["contextId"] = json!(id);
+            }
+            match self.session_call(&entry.session_id, "Runtime.evaluate", params, rem).await {
                 Ok(res) => {
                     return match js_error(&res) {
                         Some(e) => Err(e),
