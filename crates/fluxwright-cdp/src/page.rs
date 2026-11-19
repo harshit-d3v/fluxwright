@@ -13,6 +13,7 @@ use crate::browser::{
     install_binding_on_sessions, BrowserId, CdpBrowser, ContextId, FrameInfo, FrameTree,
     NetActivity, PageSetup, SessionId, TargetId, TargetState,
 };
+use crate::cdp_session::CdpSession;
 use crate::connection::Connection;
 use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
 use crate::input::{
@@ -655,6 +656,54 @@ impl CdpPage {
             .or_default()
             .popups = Some(tx);
         rx
+    }
+
+    async fn attach_cdp_session(&self, target_id: &str, timeout: Duration) -> Result<CdpSession> {
+        if self.is_closed() {
+            return Err(Error::Other("page is closed".into()));
+        }
+        if self.browser.is_dead() {
+            return Err(Error::BrowserDead {
+                pid: self.browser_pid,
+            });
+        }
+        let res = self
+            .browser
+            .call(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+                None,
+                timeout,
+            )
+            .await?;
+        let sid = res["sessionId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::Other("Target.attachToTarget returned no sessionId".into()))?;
+        Ok(CdpSession::new(
+            self.browser.clone(),
+            self.browser_pid,
+            SessionId(sid.to_owned()),
+            TargetId(target_id.to_owned()),
+        ))
+    }
+
+    pub async fn new_cdp_session(&self, timeout: Duration) -> Result<CdpSession> {
+        self.attach_cdp_session(&self.target_id.0, timeout).await
+    }
+
+    pub async fn new_frame_cdp_session(&self, frame_id: &str, timeout: Duration) -> Result<CdpSession> {
+        if frame_id == self.target_id.0
+            || CdpBrowser::session_for_target(&self.targets, frame_id)
+                .await
+                .is_some()
+        {
+            self.attach_cdp_session(frame_id, timeout).await
+        } else {
+            Err(Error::Other(
+                "This frame does not have a separate CDP session, it is a part of the parent frame's session".into(),
+            ))
+        }
     }
 
     pub fn url(&self) -> String {

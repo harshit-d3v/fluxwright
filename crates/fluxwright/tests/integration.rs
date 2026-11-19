@@ -2608,3 +2608,112 @@ async fn multi_tab_popups_and_frames() {
     assert!(tab2.is_closed());
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cdp_session_send_events_and_oopif() {
+    use axum::{response::Html, routing::get, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            "/host",
+            get(move || async move {
+                Html(format!(
+                    r#"<!doctype html><title>CdpHost</title>
+                    <iframe id="same" name="same-fr" src="http://127.0.0.1:{port}/same"></iframe>
+                    <iframe id="cross" name="cross-fr" src="http://localhost:{port}/cross"></iframe>"#
+                ))
+            }),
+        )
+        .route("/same", get(|| async { Html("<p id='s'>same</p>") }))
+        .route("/cross", get(|| async { Html("<p id='c'>cross</p>") }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let eng = engine(1, 2).await;
+    let mut opts = JobOptions::default();
+    opts.base_url = Some(base);
+    let ctx = eng.acquire_context_with(&opts).await.unwrap();
+    let other_ctx = eng.acquire_context().await.unwrap();
+    let page = ctx.new_page().await.unwrap();
+
+    // Wrong context rejects.
+    let wrong = other_ctx.new_cdp_session(&page).await;
+    assert!(wrong.is_err());
+
+    let cdp = ctx.new_cdp_session(&page).await.unwrap();
+    let mut events = cdp.subscribe_events();
+    cdp.send("Runtime.enable", json!({}), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let eval = cdp
+        .send(
+            "Runtime.evaluate",
+            json!({ "expression": "console.log('cdp-hi', 42); 6 * 7", "returnByValue": true }),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(eval["result"]["value"], json!(42));
+
+    let saw_console = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = events.recv().await {
+            if ev.method == "Runtime.consoleAPICalled"
+                && ev.params["args"][0]["value"] == json!("cdp-hi")
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap();
+    assert!(saw_console, "expected Runtime.consoleAPICalled event");
+
+    cdp.detach(Duration::from_secs(5)).await.unwrap();
+    assert!(cdp.is_detached());
+    assert!(cdp
+        .send("Runtime.evaluate", json!({ "expression": "1" }), Duration::from_secs(5))
+        .await
+        .is_err());
+    // Page itself remains healthy after session detach.
+    assert_eq!(page.evaluate("10 + 5").await.unwrap(), json!(15));
+
+    // OOPIF vs same-origin frame CDPSession.
+    page.goto("/host").await.unwrap();
+    let mut loaded = false;
+    for _ in 0..100 {
+        let fs = page.frames();
+        if fs.iter().any(|f| f.name() == "same-fr" && f.url().ends_with("/same"))
+            && fs.iter().any(|f| f.name() == "cross-fr" && f.url().ends_with("/cross"))
+        {
+            loaded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(loaded, "frames did not load");
+
+    let frames = page.frames();
+    let same = frames.iter().find(|f| f.name() == "same-fr").unwrap();
+    let cross = frames.iter().find(|f| f.name() == "cross-fr").unwrap();
+    let err = same.new_cdp_session().await.err().expect("same-origin frame should reject");
+    assert!(err.to_string().contains("separate CDP session"), "{err}");
+
+    let cross_cdp = cross.new_cdp_session().await.unwrap();
+    let cross_res = cross_cdp
+        .send(
+            "Runtime.evaluate",
+            json!({ "expression": "document.getElementById('c').textContent", "returnByValue": true }),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_res["result"]["value"], json!("cross"));
+    cross_cdp.detach(Duration::from_secs(5)).await.unwrap();
+
+    other_ctx.close().await.unwrap();
+    ctx.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}

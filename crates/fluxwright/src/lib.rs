@@ -12,11 +12,11 @@ pub use fluxwright_core::{
 
 pub use fluxwright_cdp::{
     find_browser, find_chrome, parse_modifiers, sweep_stale_profiles, url_glob_matches,
-    BindingCall, BoundingBox, CheckOptions, ClickOptions, Clip, ColorScheme, ConsoleMessage,
-    Cookie, Dialog, Download, Emulation, FileChooser, FileInput, FilePayload, FrameInfo, Fulfill,
-    Geolocation, HoverOptions, ImageFormat, InterceptedRequest, LaunchOptions, LogEntry,
-    MouseButton, NetEvent, NetRequest, NetResponse, OriginStorage, Overrides, PageError,
-    PdfMargin, PdfOptions, Proxy, ResourceType, RoleOptions, ScreenshotOptions, ScriptTagOptions,
-    SelectEntry, Selector, StorageItem, StorageState, StyleTagOptions, WaitPolling, WaitState,
-    WaitUntil,
+    BindingCall, BoundingBox, CdpSession, CdpSessionEvent, CheckOptions, ClickOptions, Clip,
+    ColorScheme, ConsoleMessage, Cookie, Dialog, Download, Emulation, FileChooser, FileInput,
+    FilePayload, FrameInfo, Fulfill, Geolocation, HoverOptions, ImageFormat, InterceptedRequest,
+    LaunchOptions, LogEntry, MouseButton, NetEvent, NetRequest, NetResponse, OriginStorage,
+    Overrides, PageError, PdfMargin, PdfOptions, Proxy, ResourceType, RoleOptions,
+    ScreenshotOptions, ScriptTagOptions, SelectEntry, Selector, StorageItem, StorageState,
+    StyleTagOptions, WaitPolling, WaitState, WaitUntil,
 };

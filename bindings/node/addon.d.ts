@@ -233,8 +233,19 @@ export interface BrowserContext {
     }>,
   ): Promise<void>
   clearCookies(): Promise<void>
+  newCDPSession(page: Page | Frame): Promise<CDPSession>
   /** Closes this context and all of its pages and popups. */
   close(): Promise<void>
+}
+
+export interface CDPSession {
+  send(method: string, params?: Record<string, any>): Promise<any>
+  on(event: string, handler: (params: any) => void): this
+  once(event: string, handler: (params: any) => void): this
+  addListener(event: string, handler: (params: any) => void): this
+  off(event: string, handler: (params: any) => void): this
+  removeListener(event: string, handler: (params: any) => void): this
+  detach(): Promise<void>
 }
 
 /** An imperative handle to a main frame or iframe on a page. */
