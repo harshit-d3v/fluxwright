@@ -1031,80 +1031,82 @@ async fn apply_context_blocking(guard: &ContextGuard, opts: &JobOptions) -> Resu
     Ok(())
 }
 
-async fn build_page_lease(
+fn build_page_lease(
     engine: Arc<Inner>,
     context: Arc<ContextGuard>,
     owns_context: bool,
     page: CdpPage,
     base_url: Option<String>,
     default_timeouts: (Option<Duration>, Option<Duration>),
-) -> PageLease {
-    let (log, downloads, log_task) = page.collect_logs(&context.download_dir);
-    let dialog_listeners = Listeners::default();
-    route_newest(page.dialogs().await, dialog_listeners.clone());
-    let file_chooser_listeners = Listeners::default();
-    route_newest(page.file_choosers().await, file_chooser_listeners.clone());
-    let binding_listeners = Listeners::default();
-    route_newest(page.bindings().await, binding_listeners.clone());
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = PageLease> + Send>> {
+    Box::pin(async move {
+        let (log, downloads, log_task) = page.collect_logs(&context.download_dir);
+        let dialog_listeners = Listeners::default();
+        route_newest(page.dialogs().await, dialog_listeners.clone());
+        let file_chooser_listeners = Listeners::default();
+        route_newest(page.file_choosers().await, file_chooser_listeners.clone());
+        let binding_listeners = Listeners::default();
+        route_newest(page.bindings().await, binding_listeners.clone());
 
-    let popup_listeners: Listeners<PageLease> = Listeners::default();
-    let mut popups_rx = page.popups().await;
-    let popup_task = tokio::spawn({
-        let popup_listeners = popup_listeners.clone();
-        let context = context.clone();
-        let engine = engine.clone();
-        let base_url = base_url.clone();
-        async move {
-            while let Some(raw_popup) = popups_rx.recv().await {
-                let has_listener = {
+        let popup_listeners: Listeners<PageLease> = Listeners::default();
+        let mut popups_rx = page.popups().await;
+        let popup_task = tokio::spawn({
+            let popup_listeners = popup_listeners.clone();
+            let context = context.clone();
+            let engine = engine.clone();
+            let base_url = base_url.clone();
+            async move {
+                while let Some(raw_popup) = popups_rx.recv().await {
+                    let has_listener = {
+                        let mut g = popup_listeners.lock().unwrap();
+                        g.retain(|tx| !tx.is_closed());
+                        !g.is_empty()
+                    };
+                    if !has_listener {
+                        drop(raw_popup);
+                        continue;
+                    }
+                    let lease = build_page_lease(
+                        engine.clone(),
+                        context.clone(),
+                        false,
+                        raw_popup,
+                        base_url.clone(),
+                        default_timeouts,
+                    )
+                    .await;
                     let mut g = popup_listeners.lock().unwrap();
                     g.retain(|tx| !tx.is_closed());
-                    !g.is_empty()
-                };
-                if !has_listener {
-                    drop(raw_popup);
-                    continue;
-                }
-                let lease = Box::pin(build_page_lease(
-                    engine.clone(),
-                    context.clone(),
-                    false,
-                    raw_popup,
-                    base_url.clone(),
-                    default_timeouts,
-                ))
-                .await;
-                let mut g = popup_listeners.lock().unwrap();
-                g.retain(|tx| !tx.is_closed());
-                if let Some(tx) = g.last() {
-                    let _ = tx.send(lease);
+                    if let Some(tx) = g.last() {
+                        let _ = tx.send(lease);
+                    }
                 }
             }
-        }
-    });
+        });
 
-    PageLease {
-        engine,
-        context,
-        owns_context,
-        page,
-        lease_id: Uuid::new_v4(),
-        released: false,
-        runtime: tokio::runtime::Handle::current(),
-        log,
-        log_task,
-        popup_task,
-        downloads: Downloads(Arc::new(Mutex::new(downloads))),
-        dialog_listeners,
-        file_chooser_listeners,
-        binding_listeners,
-        binding_handlers: Default::default(),
-        binding_dispatch_started: AtomicBool::new(false),
-        popup_listeners,
-        default_timeouts: std::sync::Mutex::new(default_timeouts),
-        host_slot: HostSlot::default(),
-        base_url: std::sync::Mutex::new(base_url),
-    }
+        PageLease {
+            engine,
+            context,
+            owns_context,
+            page,
+            lease_id: Uuid::new_v4(),
+            released: false,
+            runtime: tokio::runtime::Handle::current(),
+            log,
+            log_task,
+            popup_task,
+            downloads: Downloads(Arc::new(Mutex::new(downloads))),
+            dialog_listeners,
+            file_chooser_listeners,
+            binding_listeners,
+            binding_handlers: Default::default(),
+            binding_dispatch_started: AtomicBool::new(false),
+            popup_listeners,
+            default_timeouts: std::sync::Mutex::new(default_timeouts),
+            host_slot: HostSlot::default(),
+            base_url: std::sync::Mutex::new(base_url),
+        }
+    })
 }
 
 fn spawn_binding_dispatcher(
