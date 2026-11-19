@@ -10,7 +10,7 @@ mod page;
 mod render;
 mod route;
 
-pub use browser::{BrowserId, CdpBrowser, ContextId, Proxy, SessionId, TargetId};
+pub use browser::{BrowserId, CdpBrowser, ContextId, FrameInfo, Proxy, SessionId, TargetId};
 pub use connection::{CdpEvent, Connection};
 pub use context::{ColorScheme, Cookie, Emulation, Geolocation, OriginStorage, StorageItem, StorageState};
 pub use error::{Error, LaunchOptions, Result};
@@ -23,7 +23,7 @@ pub use launch::{find_browser, find_chrome, sweep_stale_profiles};
 pub use log::{ConsoleMessage, Download, DownloadResult, LogEntry, PageError, PageLog};
 pub use page::{
     url_glob_matches, BoundingBox, CdpPage, DownloadQueue, ResourceType, RoleOptions,
-    ScriptTagOptions, Selector, StyleTagOptions, WaitPolling, WaitState, WaitUntil,
+    ScriptTagOptions, Selector, StyleTagOptions, WaitPolling, WaitState, WaitUntil, FRAME_ID_PREFIX,
 };
 pub use render::{MAX_PDF_BYTES, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotOptions};
 pub use route::{Fulfill, InterceptedRequest, Overrides};

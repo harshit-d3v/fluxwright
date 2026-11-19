@@ -87,6 +87,43 @@ const server = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'text/html')
     return res.end('<p id="n">0</p><script>document.getElementById("n").textContent="1"</script>')
   }
+  if (req.url === '/opener-page') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end(
+      '<title>Opener</title>' +
+        '<button id="open-btn" onclick="window.open(\'/popup-one\', \'_blank\')">Open</button>' +
+        '<a id="blank-link" href="/popup-two" target="_blank">Link</a>',
+    )
+  }
+  if (req.url === '/popup-one') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<title>Popup1</title><p id="pop">popup-one</p>')
+  }
+  if (req.url === '/popup-two') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<title>Popup2</title><p id="pop2">popup-two</p>')
+  }
+  if (req.url === '/frames-host') {
+    const port = server.address().port
+    res.setHeader('Content-Type', 'text/html')
+    return res.end(
+      `<title>FramesHost</title>` +
+        `<iframe id="same" name="same-fr" src="http://127.0.0.1:${port}/same-child"></iframe>` +
+        `<iframe id="cross" name="cross-fr" src="http://localhost:${port}/cross-child"></iframe>`,
+    )
+  }
+  if (req.url === '/same-child') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<title>SameTitle</title><button id="sb" onclick="this.textContent=\'clicked-same\'">SameBtn</button>')
+  }
+  if (req.url === '/same-next') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<title>SameNext</title><p id="sn">navigated-same</p>')
+  }
+  if (req.url === '/cross-child') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<title>CrossTitle</title><button id="cb" onclick="this.textContent=\'clicked-cross\'">CrossBtn</button>')
+  }
   if (req.url === '/login') res.setHeader('Set-Cookie', 'sid=s3cret; Path=/')
   res.setHeader('Content-Type', 'text/html')
   res.end(`<title>${req.headers['user-agent']}|${req.headers['accept-language']}</title>`)
@@ -521,9 +558,15 @@ try {
   await inContext.emulateMedia({ media: null, colorScheme: null })
   await assert.rejects(fluxwright.chromium.connectOverCDP('ws://127.0.0.1:1', { slowMo: 1 }), TypeError)
   await assert.rejects(fluxwright.chromium.connectOverCDP('ws://127.0.0.1:1'))
-  await assert.rejects(context.newPage(), /holds one page/)
+  const inContext2 = await context.newPage()
+  assert.equal(context.pages().length, 2)
+  await context.addCookies([{ name: 'shared', value: 'v2', url: base }])
+  await inContext2.goto('/')
+  assert.equal(await inContext2.evaluate(() => document.cookie), 'shared=v2')
+  await inContext.bringToFront()
   await context.close()
   assert.ok(inContext.isClosed())
+  assert.ok(inContext2.isClosed())
   assert.deepEqual(context.pages(), [])
   await assert.rejects(context.newPage(), /context is closed/)
 
@@ -882,6 +925,91 @@ try {
     } finally {
       await ctx.close()
       await Promise.all([rm(initPath, { force: true }), rm(tagJsPath, { force: true }), rm(tagCssPath, { force: true })])
+    }
+  }
+
+  // Multi-tab contexts, popups, and imperative Frame handles (same-origin + cross-origin OOPIF).
+  {
+    const ctx = await browser.newContext({ baseURL: base, locale: 'fr-FR' })
+    try {
+      await ctx.addCookies([{ name: 'pre', value: 'yes', url: base }])
+      const preState = await ctx.storageState()
+      assert.ok(preState.cookies.some((c) => c.name === 'pre'))
+      assert.ok((await ctx.cookies()).some((c) => c.name === 'pre'))
+      await ctx.addInitScript('window.__ctxInit = "shared";')
+      await ctx.exposeFunction('ctxMul', (a, b) => a * b)
+      await ctx.route('**/api', (r) => r.fulfill({ body: 'from-ctx-route' }))
+
+      const opener = await ctx.newPage()
+      await opener.goto('/opener-page')
+      const seenPopups = []
+      opener.on('popup', (p) => seenPopups.push(p))
+      const [pop1] = await Promise.all([opener.waitForPopup(), opener.click('#open-btn')])
+      await pop1.waitForLoadState('load')
+      assert.equal(await pop1.opener(), opener)
+      assert.ok(ctx.pages().includes(pop1))
+      assert.equal(await pop1.locator('#pop').innerText(), 'popup-one')
+      assert.deepEqual(
+        await pop1.evaluate(async () => [window.__ctxInit, navigator.language, await ctxMul(3, 5)]),
+        ['shared', 'fr-FR', 15],
+      )
+      assert.equal(await pop1.evaluate(() => fetch('/api').then((r) => r.text())), 'from-ctx-route')
+      await pop1.close()
+      assert.ok(!ctx.pages().includes(pop1))
+
+      const [pop2] = await Promise.all([
+        opener.waitForPopup({ predicate: (p) => !p.isClosed() }),
+        opener.click('#blank-link'),
+      ])
+      await pop2.waitForLoadState('load')
+      assert.equal(await pop2.locator('#pop2').innerText(), 'popup-two')
+      assert.equal(seenPopups.length, 2)
+      await pop2.close()
+
+      await opener.goto('/frames-host')
+      let loaded = false
+      for (let i = 0; i < 100; i++) {
+        const fs = opener.frames()
+        if (
+          fs.some((f) => f.name() === 'same-fr' && f.url().endsWith('/same-child')) &&
+          fs.some((f) => f.name() === 'cross-fr' && f.url().endsWith('/cross-child'))
+        ) {
+          loaded = true
+          break
+        }
+        await new Promise((r) => setTimeout(r, 30))
+      }
+      assert.ok(loaded, 'frames loaded')
+      const main = opener.mainFrame()
+      assert.equal(opener.frames().length, 3)
+      assert.equal(main.childFrames().length, 2)
+      const same = opener.frame('same-fr')
+      const cross = opener.frame({ url: /cross-child/ })
+      assert.ok(same && cross)
+      assert.equal(same.parentFrame(), main)
+      assert.equal(cross.parentFrame(), main)
+      assert.equal(same.isDetached(), false)
+      assert.equal(cross.isDetached(), false)
+
+      await same.locator('#sb').click()
+      assert.equal(await same.locator('#sb').innerText(), 'clicked-same')
+      assert.equal(await same.title(), 'SameTitle')
+      await cross.locator('#cb').click()
+      assert.equal(await cross.locator('#cb').innerText(), 'clicked-cross')
+      assert.equal(await cross.title(), 'CrossTitle')
+      assert.match(await cross.content(), /clicked-cross/)
+      assert.equal(await cross.evaluate((x) => x + 10, 5), 15)
+
+      await same.goto('/same-next')
+      assert.equal(await same.locator('#sn').innerText(), 'navigated-same')
+
+      await opener.evaluate(() => document.getElementById('same').remove())
+      for (let i = 0; i < 50 && !same.isDetached(); i++) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      assert.equal(same.isDetached(), true)
+    } finally {
+      await ctx.close()
     }
   }
 

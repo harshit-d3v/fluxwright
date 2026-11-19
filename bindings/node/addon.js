@@ -300,8 +300,22 @@ async function answerDialog(listeners, native) {
   if (!answered) await (native.type === 'beforeunload' ? native.accept() : native.dismiss()).catch(() => {})
 }
 
-// page.on / once / off as in Playwright, for console messages, page errors, network events and
-// dialogs. Each source starts with its first listener.
+const popupWired = new WeakSet()
+const pageContext = new WeakMap()
+const contextRouteGetters = new WeakMap()
+const pagesByTarget = new Map()
+const contextRegistry = new FinalizationRegistry(({ browser, id }) => {
+  browser._dropContext(id)
+})
+
+function trackTarget(page) {
+  const tid = page._targetId()
+  pagesByTarget.set(tid, new WeakRef(page))
+  return tid
+}
+
+// page.on / once / off as in Playwright, for console messages, page errors, network events,
+// dialogs, file choosers and popups. Each source starts with its first listener.
 function installEvents(Page) {
   const emitters = new WeakMap()
   const sources = {
@@ -313,10 +327,26 @@ function installEvents(Page) {
     requestfailed: 'network',
     dialog: 'dialog',
     filechooser: 'filechooser',
+    popup: 'popup',
   }
   const events = Object.keys(sources)
   // Pages whose close() was called: the native flag goes up only once napi runs the call.
   const closing = new WeakSet()
+
+  function ensurePopupSubscription(page) {
+    trackTarget(page)
+    if (popupWired.has(page)) return
+    popupWired.add(page)
+    const ref = new WeakRef(page)
+    page._onPopup((popup) => {
+      const opener = ref.deref()
+      trackTarget(popup)
+      const ctx = opener ? pageContext.get(opener)?.deref() : undefined
+      if (ctx) ctx._adoptPopup(popup)
+      if (opener) emitSafely(emitters.get(opener)?.em, 'popup', popup)
+    })
+  }
+
   // The native side keeps these callbacks as long as the page's lease. They reach the emitter only
   // through a WeakRef and the WeakMap, so listeners that use the page don't keep a forgotten page,
   // and its browser slot, alive. Made apart from `stateOf`, whose scope holds the page.
@@ -365,6 +395,8 @@ function installEvents(Page) {
         }
         emitSafely(em(), 'filechooser', fc)
       })
+    } else if (source === 'popup') {
+      ensurePopupSubscription(page)
     } else {
       page._onDialog((native) => answerDialog(em()?.rawListeners('dialog') ?? [], native))
     }
@@ -454,15 +486,36 @@ function installEvents(Page) {
       return options?.predicate ?? (() => true)
     })
   }
+  Page.prototype.waitForPopup = function (options) {
+    return waitForEvent(this, 'waitForPopup', 'popup', { timeout: true, predicate: true }, options, () => {
+      if (options?.predicate != null && typeof options.predicate !== 'function') {
+        throw new TypeError('page.waitForPopup: predicate must be a function')
+      }
+      return options?.predicate ?? (() => true)
+    })
+  }
+  Page.prototype.opener = async function () {
+    const id = this._openerTargetId()
+    if (!id) return null
+    const p = pagesByTarget.get(id)?.deref()
+    return p && !p.isClosed() ? p : null
+  }
+  const origIsClosed = Page.prototype.isClosed
+  Page.prototype.isClosed = function () {
+    return closing.has(this) || origIsClosed.call(this)
+  }
   // As in Playwright, closing the page rejects its pending waits at once; calls still running on
   // the page reject on the native side.
   const close = Page.prototype.close
   Page.prototype.close = async function (options) {
     checkOptions('page.close', options, NONE)
     closing.add(this)
+    pagesByTarget.delete(this._targetId())
+    pageContext.get(this)?.deref()?._removePage(this)
     for (const closed of emitters.get(this)?.waits ?? []) closed()
     return close.call(this)
   }
+  return ensurePopupSubscription
 }
 
 // Playwright's URL patterns: a glob string (** any characters, * any but /, {a,b} either), a
@@ -501,17 +554,16 @@ function urlMatcher(pattern) {
 
 // page.route / unroute with Playwright's Route and Request. The handler added last runs first;
 // route.fallback() passes the request to the next matching one, and unmatched requests continue.
-function installRoutes(Page) {
-  const routes = new WeakMap()
-  const dispatch = async (list, native) => {
-    const request = toRequest(native)
-    let answered = false
-    try {
-      for (let i = list.length - 1; i >= 0; i--) {
+async function dispatchRoutes(list, extra, native) {
+  const request = toRequest(native)
+  let answered = false
+  try {
+    for (const handlers of [list, extra]) {
+      for (let i = handlers.length - 1; i >= 0; i--) {
         // A URL function is user code: one that throws counts as no match.
         let matched = false
         try {
-          matched = list[i].matches(native.url)
+          matched = handlers[i].matches(native.url)
         } catch (err) {
           console.error('[fluxwright] a page.route URL matcher failed:', err)
         }
@@ -557,7 +609,7 @@ function installRoutes(Page) {
           },
         }
         try {
-          await list[i].handler(route, request)
+          await handlers[i].handler(route, request)
           returned = true
           if (fellBack && !answer) continue
           if (answer) {
@@ -571,17 +623,26 @@ function installRoutes(Page) {
         }
         return
       }
-    } finally {
-      // No answer, or one that failed: let the request through rather than hang the page.
-      if (!answered) await native.continue().catch(() => {})
     }
+  } finally {
+    // No answer, or one that failed: let the request through rather than hang the page.
+    if (!answered) await native.continue().catch(() => {})
   }
+}
+
+function installRoutes(Page) {
+  const routes = new WeakMap()
   // The native side keeps the dispatcher as long as the page's lease. It reaches the route list
   // through a WeakRef, so handlers that use the page don't keep a forgotten page alive. Made apart
   // from route(), whose scope holds the page.
   const dispatcher = (page) => {
     const ref = new WeakRef(page)
-    return (native) => dispatch(routes.get(ref.deref()) ?? [], native)
+    return (native) => {
+      const p = ref.deref()
+      const list = p ? routes.get(p) ?? [] : []
+      const extra = p ? contextRouteGetters.get(p)?.() ?? [] : []
+      return dispatchRoutes(list, extra, native)
+    }
   }
   // One interception start per page. Every route() call waits for it, so none returns before
   // requests are handed over, and a call adds its handler only once the start succeeded (a
@@ -612,26 +673,27 @@ function installRoutes(Page) {
   }
 }
 
-const ONE_PAGE =
-  'a Fluxwright context holds one page, so jobs never share cookies: open another context, ' +
-  'and pass it storageState() from this one to share a login'
-
-// browser.newContext() and context.newPage(), as in Playwright. Each context holds one page, so
-// one job's cookies and storage never reach another; a login is shared through storageState.
+// browser.newContext() and context.newPage(), as in Playwright. Each context can hold multiple
+// pages and popups sharing cookies, storage, init scripts, exposed functions and routes.
 class BrowserContext {
   #browser
-  #options
-  #page = null
-  #opening = false
+  #id
+  #ensurePopup
   #closed = false
+  #pages = new Set()
   #routes = []
-  #cookies = []
-  #initScripts = []
-  #exposed = []
+  #routeStart = null
+  #bindings = new Map()
+  #bindingStarted = false
+  #routeGetter
 
-  constructor(browser, options) {
+  constructor(browser, id, ensurePopup) {
     this.#browser = browser
-    this.#options = options
+    this.#id = id
+    this.#ensurePopup = ensurePopup
+    const ref = new WeakRef(this)
+    this.#routeGetter = () => ref.deref()?.#routes ?? []
+    contextRegistry.register(this, { browser, id }, this)
   }
 
   browser() {
@@ -639,84 +701,125 @@ class BrowserContext {
   }
 
   pages() {
-    return this.#page && !this.#page.isClosed() ? [this.#page] : []
+    for (const p of this.#pages) {
+      if (p.isClosed()) this.#pages.delete(p)
+    }
+    return [...this.#pages]
+  }
+
+  _adoptPage(page) {
+    this.#pages.add(page)
+    pageContext.set(page, new WeakRef(this))
+    contextRouteGetters.set(page, this.#routeGetter)
+    this.#ensurePopup(page)
+  }
+
+  _adoptPopup(popup) {
+    if (this.#closed) return
+    this._adoptPage(popup)
+  }
+
+  _removePage(page) {
+    this.#pages.delete(page)
   }
 
   async newPage() {
     if (this.#closed) throw new Error('browserContext.newPage: the context is closed')
-    if (this.#page || this.#opening) throw new Error(`browserContext.newPage: ${ONE_PAGE}`)
-    this.#opening = true
-    try {
-      const page = await this.#browser.newPage(this.#options)
-      try {
-        if (this.#cookies.length) await page._addCookies(this.#cookies)
-        for (const [name, callback] of this.#exposed) await page.exposeFunction(name, callback)
-        for (const source of this.#initScripts) await page._addInitScript(source)
-        for (const [url, handler] of this.#routes) await page.route(url, handler)
-        // close() ran while the page was coming: it would otherwise stay open on a closed context.
-        if (this.#closed) throw new Error('browserContext.newPage: the context is closed')
-      } catch (err) {
-        await page.close()
-        throw err
-      }
-      this.#page = page
-      return page
-    } finally {
-      this.#opening = false
+    const page = await this.#browser._newPageInContext(this.#id)
+    if (this.#closed) {
+      await page.close().catch(() => {})
+      throw new Error('browserContext.newPage: the context is closed')
     }
+    this._adoptPage(page)
+    return page
   }
 
-  // page.route for this context's page; added before newPage(), it applies from the first request.
+  // page.route for all pages and popups in this context; added before newPage(), it applies from the first request.
   async route(url, handler, options) {
     checkOptions('browserContext.route', options, NONE)
-    this.#routes.push([url, handler])
-    if (this.#page) await this.#page.route(url, handler)
+    if (this.#closed) throw new Error('browserContext.route: the context is closed')
+    if (!this.#routeStart) {
+      const ref = new WeakRef(this)
+      this.#browser._setContextRouteHandler(this.#id, (native) => {
+        const c = ref.deref()
+        return dispatchRoutes(c ? c.#routes : [], [], native)
+      })
+      this.#routeStart = this.#browser._contextIntercept(this.#id)
+      this.#routeStart.catch(() => {
+        this.#routeStart = null
+      })
+    }
+    await this.#routeStart
+    this.#routes.push({ url, handler, matches: urlMatcher(url) })
   }
 
   async unroute(url, handler) {
-    this.#routes = this.#routes.filter(([u, h]) => !(u === url && (!handler || h === handler)))
-    if (this.#page) await this.#page.unroute(url, handler)
+    for (let i = this.#routes.length - 1; i >= 0; i--) {
+      if (this.#routes[i].url === url && (!handler || this.#routes[i].handler === handler)) {
+        this.#routes.splice(i, 1)
+      }
+    }
   }
 
   async addInitScript(script, arg) {
+    if (this.#closed) throw new Error('browserContext.addInitScript: the context is closed')
     const source = await resolveInitScript('browserContext.addInitScript', script, arg)
-    this.#initScripts.push(source)
-    if (this.#page) await this.#page._addInitScript(source)
+    return this.#browser._contextAddInitScript(this.#id, source)
   }
 
   async exposeFunction(name, callback) {
+    if (this.#closed) throw new Error('browserContext.exposeFunction: the context is closed')
     if (typeof name !== 'string' || !name) {
       throw new TypeError('browserContext.exposeFunction: name must be a non-empty string')
     }
     if (typeof callback !== 'function') {
       throw new TypeError('browserContext.exposeFunction: callback must be a function')
     }
-    if (this.#exposed.some(([n]) => n === name)) {
+    if (this.#bindings.has(name)) {
       throw new Error(`Function "${name}" has been already registered`)
     }
-    this.#exposed.push([name, callback])
-    if (this.#page) {
-      try {
-        await this.#page.exposeFunction(name, callback)
-      } catch (err) {
-        this.#exposed = this.#exposed.filter(([n]) => n !== name)
-        throw err
-      }
+    if (!this.#bindingStarted) {
+      this.#bindingStarted = true
+      const browser = this.#browser
+      const ref = new WeakRef(this)
+      browser._contextOnBinding(this.#id, (ev) => {
+        const c = ref.deref()
+        if (!c) return
+        return handleBindingEvent(
+          (id, encoded) => browser._contextResolveBinding(id, encoded),
+          (id, msg) => browser._contextRejectBinding(id, msg),
+          c.#bindings,
+          ev,
+        )
+      })
+    }
+    this.#bindings.set(name, callback)
+    try {
+      await this.#browser._contextExposeBinding(this.#id, name)
+    } catch (err) {
+      if (this.#bindings.get(name) === callback) this.#bindings.delete(name)
+      throw err
     }
   }
 
   async storageState(options) {
-    if (!this.#page) throw new Error('browserContext.storageState: call newPage() first')
-    return this.#page.storageState(options)
+    checkOptions('browserContext.storageState', options, { path: true })
+    if (this.#closed) throw new Error('browserContext.storageState: the context is closed')
+    const [p] = this.pages()
+    const state = p ? await p.storageState() : { cookies: await this.#browser._contextCookies(this.#id), origins: [] }
+    if (options?.path) await savePrivate(options.path, JSON.stringify(state, null, 2))
+    return state
   }
 
   async cookies(urls) {
     if (urls !== undefined) throw new TypeError('browserContext.cookies: filtering by URL is not supported (see MISSING.md)')
-    return (await this.storageState()).cookies
+    if (this.#closed) throw new Error('browserContext.cookies: the context is closed')
+    return this.#browser._contextCookies(this.#id)
   }
 
   async addCookies(cookies) {
     if (!Array.isArray(cookies)) throw new TypeError('browserContext.addCookies: cookies must be an array')
+    if (this.#closed) throw new Error('browserContext.addCookies: the context is closed')
     const normalized = cookies.map((c) => {
       checkOptions('browserContext.addCookies cookie', c, {
         name: true,
@@ -747,20 +850,23 @@ class BrowserContext {
         _crHasCrossSiteAncestor: c._crHasCrossSiteAncestor,
       }
     })
-    if (this.#page) return this.#page._addCookies(normalized)
-    this.#cookies.push(...normalized)
+    return this.#browser._contextAddCookies(this.#id, normalized)
   }
 
   async clearCookies(options) {
     checkOptions('browserContext.clearCookies', options, NONE)
-    this.#cookies = []
-    if (this.#page) await this.#page._clearCookies()
+    if (this.#closed) throw new Error('browserContext.clearCookies: the context is closed')
+    return this.#browser._contextClearCookies(this.#id)
   }
 
   async close(options) {
     checkOptions('browserContext.close', options, NONE)
+    if (this.#closed) return
     this.#closed = true
-    if (this.#page) await this.#page.close()
+    contextRegistry.unregister(this)
+    await Promise.allSettled([...this.#pages].map((p) => (p.isClosed() ? Promise.resolve() : p.close())))
+    this.#pages.clear()
+    await this.#browser._closeContext(this.#id)
   }
 }
 
@@ -799,29 +905,38 @@ async function resolveInitScript(method, script, arg) {
   throw new TypeError(`${method}: script must be a function, string, or { path, content }`)
 }
 
+async function handleBindingEvent(resolveFn, rejectFn, map, ev) {
+  const cb = map?.get(ev.name)
+  if (!cb) {
+    await rejectFn(ev.id, `Function "${ev.name}" is not exposed`).catch(() => {})
+    return
+  }
+  try {
+    const args = JSON.parse(ev.argsJson)
+    const value = await cb(...args)
+    const encoded = value === undefined ? 'null' : (JSON.stringify(value) ?? 'null')
+    await resolveFn(ev.id, encoded).catch(() => {})
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await rejectFn(ev.id, msg).catch(() => {})
+  }
+}
+
 function installBindings(Page) {
   const pages = new WeakMap()
   const starts = new WeakSet()
 
   function subscribe(page) {
     const ref = new WeakRef(page)
-    page._onBinding(async (ev) => {
+    page._onBinding((ev) => {
       const p = ref.deref()
       if (!p) return
-      const cb = pages.get(p)?.get(ev.name)
-      if (!cb) {
-        await p._rejectBinding(ev.id, `Function "${ev.name}" is not exposed`).catch(() => {})
-        return
-      }
-      try {
-        const args = JSON.parse(ev.argsJson)
-        const value = await cb(...args)
-        const encoded = value === undefined ? 'null' : (JSON.stringify(value) ?? 'null')
-        await p._resolveBinding(ev.id, encoded).catch(() => {})
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        await p._rejectBinding(ev.id, msg).catch(() => {})
-      }
+      return handleBindingEvent(
+        (id, encoded) => p._resolveBinding(id, encoded),
+        (id, msg) => p._rejectBinding(id, msg),
+        pages.get(p),
+        ev,
+      )
     })
   }
 
@@ -885,6 +1000,189 @@ function installBindings(Page) {
   }
 }
 
+function installFrames(Page, applyFilter) {
+  const caches = new WeakMap()
+  const frameMap = (page) => {
+    let m = caches.get(page)
+    if (!m) {
+      m = new Map()
+      caches.set(page, m)
+    }
+    return m
+  }
+
+  class Frame {
+    #page
+    #id
+    #lastInfo = { parentId: null, name: '', url: 'about:blank' }
+
+    constructor(page, info) {
+      this.#page = page
+      this.#id = info.id
+      this.#update(info)
+    }
+
+    #update(info) {
+      this.#lastInfo = {
+        parentId: info.parentId ?? null,
+        name: info.name ?? '',
+        url: info.url ?? 'about:blank',
+      }
+    }
+
+    #info() {
+      const cur = this.#page._frames().find((f) => f.id === this.#id)
+      if (cur) this.#update(cur)
+      return cur
+    }
+
+    #root() {
+      return this.#page._frameById(this.#id)
+    }
+
+    page() {
+      return this.#page
+    }
+
+    url() {
+      this.#info()
+      return this.#lastInfo.url
+    }
+
+    name() {
+      this.#info()
+      return this.#lastInfo.name
+    }
+
+    isDetached() {
+      return this.#page.isClosed() || this.#info() == null
+    }
+
+    parentFrame() {
+      const info = this.#info()
+      const pid = info?.parentId ?? this.#lastInfo.parentId
+      if (!pid) return null
+      return getFrameById(this.#page, pid)
+    }
+
+    childFrames() {
+      return this.#page
+        ._frames()
+        .filter((f) => f.parentId === this.#id)
+        .map((info) => getFrame(this.#page, info))
+    }
+
+    async goto(url, options) {
+      checkOptions('frame.goto', options, NAV_OPTIONS)
+      return this.#page._frameGoto(this.#id, url, options)
+    }
+
+    async evaluate(pageFunction, arg) {
+      return this.#page._frameEvaluate(this.#id, toExpression(pageFunction, arg))
+    }
+
+    async title() {
+      return this.#page._frameEvaluate(this.#id, 'document.title')
+    }
+
+    async content() {
+      return this.#page._frameEvaluate(
+        this.#id,
+        "document.documentElement ? document.documentElement.outerHTML : ''",
+      )
+    }
+
+    locator(selector, options) {
+      let loc = this.#root().locator(selector)
+      if (options != null) loc = applyFilter(loc, options, 'frame.locator')
+      return loc
+    }
+
+    getByText(text, options) {
+      checkOptions('frame.getByText', options, EXACT)
+      return this.#root().getByText(text, options)
+    }
+
+    getByRole(role, options) {
+      return this.#root().getByRole(role, options)
+    }
+
+    getByLabel(text, options) {
+      checkOptions('frame.getByLabel', options, EXACT)
+      return this.#root().getByLabel(text, options)
+    }
+
+    getByPlaceholder(text, options) {
+      checkOptions('frame.getByPlaceholder', options, EXACT)
+      return this.#root().getByPlaceholder(text, options)
+    }
+
+    getByAltText(text, options) {
+      checkOptions('frame.getByAltText', options, EXACT)
+      return this.#root().getByAltText(text, options)
+    }
+
+    getByTitle(text, options) {
+      checkOptions('frame.getByTitle', options, EXACT)
+      return this.#root().getByTitle(text, options)
+    }
+
+    getByTestId(testId) {
+      return this.#root().getByTestId(testId)
+    }
+
+    frameLocator(selector) {
+      return this.#root().frameLocator(selector)
+    }
+  }
+
+  function getFrame(page, info) {
+    const cache = frameMap(page)
+    let f = cache.get(info.id)
+    if (!f) {
+      f = new Frame(page, info)
+      cache.set(info.id, f)
+    }
+    return f
+  }
+
+  function getFrameById(page, id) {
+    const info = page._frames().find((f) => f.id === id)
+    if (info) return getFrame(page, info)
+    return caches.get(page)?.get(id) ?? null
+  }
+
+  Page.prototype.frames = function () {
+    return this._frames().map((info) => getFrame(this, info))
+  }
+
+  Page.prototype.mainFrame = function () {
+    const id = this._mainFrameId()
+    return (
+      getFrameById(this, id) ??
+      getFrame(this, { id, parentId: null, name: '', url: this.url() })
+    )
+  }
+
+  Page.prototype.frame = function (frameSelector) {
+    if (typeof frameSelector === 'string') {
+      return this.frames().find((f) => f.name() === frameSelector) ?? null
+    }
+    if (frameSelector && typeof frameSelector === 'object') {
+      checkOptions('page.frame', frameSelector, { name: true, url: true })
+      if ((frameSelector.name == null) === (frameSelector.url == null)) {
+        throw new TypeError('page.frame: provide either name or url, not both')
+      }
+      if (frameSelector.name != null) {
+        return this.frames().find((f) => f.name() === frameSelector.name) ?? null
+      }
+      const matches = urlMatcher(frameSelector.url)
+      return this.frames().find((f) => matches(f.url())) ?? null
+    }
+    throw new TypeError('page.frame: frameSelector must be a string or { name | url }')
+  }
+}
+
 // Compiles only, nothing runs. Unlike `new Function`, this also works under
 // `--disallow-code-generation-from-strings`.
 function parses(source) {
@@ -935,13 +1233,19 @@ try {
     return evaluate.call(this, toExpression(pageFunction, arg))
   }
   // As in Playwright, saved storage can live in a JSON file.
+  async function normalizeContextOptions(method, options) {
+    checkOptions(method, options, PAGE)
+    if (typeof options?.storageState === 'string') {
+      return { ...options, storageState: JSON.parse(await fs.readFile(options.storageState, 'utf8')) }
+    }
+    return options
+  }
   const newPage = native.Browser.prototype.newPage
   native.Browser.prototype.newPage = async function (options) {
-    checkOptions('browser.newPage', options, PAGE)
-    if (typeof options?.storageState === 'string') {
-      options = { ...options, storageState: JSON.parse(await fs.readFile(options.storageState, 'utf8')) }
-    }
-    return newPage.call(this, options)
+    const opts = await normalizeContextOptions('browser.newPage', options)
+    const page = await newPage.call(this, opts)
+    trackTarget(page)
+    return page
   }
   const storageState = native.Page.prototype.storageState
   native.Page.prototype.storageState = async function (options) {
@@ -1314,14 +1618,16 @@ function applyFilter(loc, options, label) {
       configurable: true,
     })
   }
+  const ensurePopup = installEvents(native.Page)
   native.Browser.prototype.newContext = async function (options) {
-    checkOptions('browser.newContext', options, PAGE)
-    return new BrowserContext(this, options)
+    const opts = await normalizeContextOptions('browser.newContext', options)
+    const id = await this._newContext(opts)
+    return new BrowserContext(this, id, ensurePopup)
   }
-  installEvents(native.Page)
   installRoutes(native.Page)
   installDownloads(native.Page)
   installBindings(native.Page)
+  installFrames(native.Page, applyFilter)
   module.exports = native
   // Chromium.launch is read-only on the native class, so `chromium` is a checked stand-in.
   module.exports.chromium = {

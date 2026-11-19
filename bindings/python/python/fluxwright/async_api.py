@@ -66,6 +66,7 @@ __all__ = [
     "FileChooser",
     "FilePayload",
     "FloatRect",
+    "Frame",
     "FrameLocator",
     "Geolocation",
     "HttpCredentials",
@@ -484,6 +485,157 @@ class EventInfo(Generic[T]):
 
 Listener = Callable[[Any], Any]
 _UNSET: Any = object()
+_pages_by_target: weakref.WeakValueDictionary[str, Page] = weakref.WeakValueDictionary()
+
+
+class Frame:
+    """An imperative handle to a main frame or iframe on a page."""
+
+    def __init__(
+        self,
+        page: Page,
+        frame_id: str,
+        parent_id: str | None,
+        name: str,
+        url: str,
+    ) -> None:
+        self._page = page
+        self._id = frame_id
+        self._parent_id = parent_id
+        self._name = name
+        self._url = url
+
+    def _update(self, info: _native.FrameInfo) -> None:
+        self._parent_id = info.parent_id
+        self._name = info.name
+        self._url = info.url
+
+    def _info(self) -> _native.FrameInfo | None:
+        for f in self._page._frames():
+            if f.id == self._id:
+                self._update(f)
+                return f
+        return None
+
+    def _root(self) -> FrameLocator:
+        return self._page._frame_by_id(self._id)
+
+    @property
+    def page(self) -> Page:
+        return self._page
+
+    @property
+    def url(self) -> str:
+        self._info()
+        return self._url
+
+    @property
+    def name(self) -> str:
+        self._info()
+        return self._name
+
+    def is_detached(self) -> bool:
+        return self._page.is_closed() or self._info() is None
+
+    @property
+    def parent_frame(self) -> Frame | None:
+        info = self._info()
+        pid = info.parent_id if info is not None else self._parent_id
+        if pid is None:
+            return None
+        return self._page._get_frame_by_id(pid)
+
+    @property
+    def child_frames(self) -> list[Frame]:
+        return [self._page._get_frame(f) for f in self._page._frames() if f.parent_id == self._id]
+
+    async def goto(
+        self,
+        url: str,
+        *,
+        wait_until: Literal["load", "domcontentloaded", "networkidle", "commit"] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        await self._page._frame_goto(self._id, url, wait_until=wait_until, timeout=timeout)
+
+    async def evaluate(self, expression: str, arg: Any = None) -> Any:
+        return await self._page._frame_evaluate(self._id, expression, arg)
+
+    async def title(self) -> str:
+        return str(await self._page._frame_evaluate(self._id, "document.title"))
+
+    async def content(self) -> str:
+        return str(
+            await self._page._frame_evaluate(
+                self._id,
+                "document.documentElement ? document.documentElement.outerHTML : ''",
+            )
+        )
+
+    def locator(
+        self,
+        selector: str,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        return self._root().locator(
+            selector,
+            has=has,
+            has_not=has_not,
+            has_text=has_text,
+            has_not_text=has_not_text,
+        )
+
+    def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator:
+        return self._root().get_by_text(text, exact=exact)
+
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        checked: bool | None = None,
+        disabled: bool | None = None,
+        exact: bool | None = None,
+        expanded: bool | None = None,
+        include_hidden: bool | None = None,
+        level: int | None = None,
+        name: str | re.Pattern[str] | None = None,
+        pressed: bool | None = None,
+        selected: bool | None = None,
+    ) -> Locator:
+        return self._root().get_by_role(
+            role,
+            checked=checked,
+            disabled=disabled,
+            exact=exact,
+            expanded=expanded,
+            include_hidden=include_hidden,
+            level=level,
+            name=name,
+            pressed=pressed,
+            selected=selected,
+        )
+
+    def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator:
+        return self._root().get_by_label(text, exact=exact)
+
+    def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator:
+        return self._root().get_by_placeholder(text, exact=exact)
+
+    def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator:
+        return self._root().get_by_alt_text(text, exact=exact)
+
+    def get_by_title(self, text: str, *, exact: bool | None = None) -> Locator:
+        return self._root().get_by_title(text, exact=exact)
+
+    def get_by_test_id(self, test_id: str) -> Locator:
+        return self._root().get_by_test_id(test_id)
+
+    def frame_locator(self, selector: str) -> FrameLocator:
+        return self._root().frame_locator(selector)
 
 
 class Page(_native.Page):
@@ -503,10 +655,14 @@ class Page(_native.Page):
         self._network_task: asyncio.Future[Any] | None = None
         self._answering_dialogs = False
         self._serving_file_choosers = False
+        self._serving_popups = False
         self._bindings: dict[str, Callable[..., Any]] = {}
         self._serving_bindings = False
         self._tasks: set[asyncio.Future[Any]] = set()
         self._expects: set[asyncio.Future[Any]] = set()
+        self._context_ref: weakref.ref[BrowserContext] | None = None
+        self._frame_cache: weakref.WeakValueDictionary[str, Frame] = weakref.WeakValueDictionary()
+        _pages_by_target[self._target_id()] = self
 
     @property
     def mouse(self) -> Mouse:
@@ -579,7 +735,8 @@ class Page(_native.Page):
         async with self._route_lock:
             if not self._routing:
                 stream = await self._intercept()
-                _keep(self._tasks, asyncio.ensure_future(_serve_routes(stream, weakref.ref(self), self._tasks)))
+                ref = weakref.ref(self)
+                _keep(self._tasks, asyncio.ensure_future(_serve_routes(stream, lambda: _routes_of(ref), self._tasks)))
                 self._routing = True
             self._routes.append(_RouteEntry(url, handler))
 
@@ -668,6 +825,69 @@ class Page(_native.Page):
     off = remove_listener
 
     @asynccontextmanager
+    async def expect_popup(
+        self,
+        predicate: Callable[[Page], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[EventInfo[Page]]:
+        """Waits for a popup page opened by the code in the ``async with`` block."""
+        async with self._expect(
+            "popup",
+            predicate if predicate is not None else (lambda _: True),
+            timeout,
+            label="popup",
+        ) as info:
+            yield info
+
+    async def opener(self) -> Page | None:
+        tid = self._opener_target_id()
+        if tid is None:
+            return None
+        p = _pages_by_target.get(tid)
+        return p if p is not None and not p.is_closed() else None
+
+    def _get_frame(self, info: _native.FrameInfo) -> Frame:
+        f = self._frame_cache.get(info.id)
+        if f is None:
+            f = Frame(self, info.id, info.parent_id, info.name, info.url)
+            self._frame_cache[info.id] = f
+        else:
+            f._update(info)
+        return f
+
+    def _get_frame_by_id(self, frame_id: str) -> Frame | None:
+        for f in self._frames():
+            if f.id == frame_id:
+                return self._get_frame(f)
+        return self._frame_cache.get(frame_id)
+
+    @property
+    def frames(self) -> list[Frame]:
+        return [self._get_frame(f) for f in self._frames()]
+
+    @property
+    def main_frame(self) -> Frame:
+        mid = self._main_frame_id()
+        found = self._get_frame_by_id(mid)
+        if found is not None:
+            return found
+        f = self._frame_cache.get(mid)
+        if f is None:
+            f = Frame(self, mid, None, "", self.url)
+            self._frame_cache[mid] = f
+        return f
+
+    def frame(self, name: str | None = None, *, url: URLMatch | None = None) -> Frame | None:
+        if (name is not None) == (url is not None):
+            raise TypeError("page.frame: provide either name or url, not both")
+        if name is not None:
+            return next((f for f in self.frames if f.name == name), None)
+        assert url is not None
+        matches = _url_matcher(url)
+        return next((f for f in self.frames if matches(f.url)), None)
+
+    @asynccontextmanager
     async def expect_file_chooser(
         self,
         predicate: Callable[[FileChooser], bool] | None = None,
@@ -730,6 +950,10 @@ class Page(_native.Page):
         for future in list(self._expects):
             if not future.done():
                 future.set_exception(Error("page closed"))
+        _pages_by_target.pop(self._target_id(), None)
+        ctx = self._context_ref() if self._context_ref is not None else None
+        if ctx is not None:
+            ctx._remove_page(self)
         self._routes.clear()
         self._listeners.clear()
         self._bindings.clear()
@@ -788,6 +1012,11 @@ class Page(_native.Page):
             self._expects.discard(future)
             self.remove_listener(event, listener)
 
+    def _ensure_popup_subscription(self) -> None:
+        if not self._serving_popups:
+            _keep(self._tasks, asyncio.ensure_future(_serve_popups(self._popups(), weakref.ref(self), self._tasks)))
+            self._serving_popups = True
+
     def _add_listener(self, method: str, event: str, added: Listener, call: Listener) -> None:
         if event not in _EVENTS:
             raise ValueError(f"page.{method}: {event!r} is not supported ({', '.join(_EVENTS)})")
@@ -804,6 +1033,8 @@ class Page(_native.Page):
                 asyncio.ensure_future(_serve_file_choosers(self._file_choosers(), weakref.ref(self), self._tasks)),
             )
             self._serving_file_choosers = True
+        elif event == "popup":
+            self._ensure_popup_subscription()
         elif event in _NETWORK_EVENTS and (self._network_task is None or self._network_task.done()):
             self._network_task = asyncio.ensure_future(_serve_network(self._network(), weakref.ref(self), self._tasks))
             _keep(self._tasks, self._network_task)
@@ -811,7 +1042,7 @@ class Page(_native.Page):
 
 
 _NETWORK_EVENTS = ("request", "response", "requestfinished", "requestfailed")
-_EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog", "filechooser")
+_EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog", "filechooser", "popup")
 
 
 # The loops below run until the page closes (the network one also once nobody listens). They reach
@@ -922,18 +1153,29 @@ def _resolve_init_script(method: str, script: str | None, path: str | PathLike[s
     return script
 
 
+async def _serve_popups(stream: _native.PopupStream, page: PageRef, tasks: set[asyncio.Future[Any]]) -> None:
+    while (lease := await stream.next()) is not None:
+        popup = Page(lease)
+        opener = page()
+        if opener is not None:
+            ctx = opener._context_ref() if opener._context_ref is not None else None
+            if ctx is not None:
+                ctx._adopt_popup(popup)
+            _emit(opener._listeners, "popup", popup, tasks)
+
+
 async def _serve_bindings(
     stream: _native.BindingStream,
-    page: PageRef,
+    owner: Callable[[], Any],
     tasks: set[asyncio.Future[Any]],
 ) -> None:
     while (call := await stream.next()) is not None:
-        _keep(tasks, asyncio.ensure_future(_invoke_binding(call, page)))
+        _keep(tasks, asyncio.ensure_future(_invoke_binding(call, owner)))
 
 
-async def _invoke_binding(call: _native.BindingCall, page: PageRef) -> None:
-    p = page()
-    cb = p._bindings.get(call.name) if p is not None else None
+async def _invoke_binding(call: _native.BindingCall, owner: Callable[[], Any]) -> None:
+    obj = owner()
+    cb = obj._bindings.get(call.name) if obj is not None else None
     if cb is None:
         with suppress(Error):
             await call.reject(f'Function "{call.name}" is not exposed')
@@ -973,14 +1215,25 @@ async def _answer_dialog(listeners: list[tuple[Listener, Listener]], dialog: Dia
             await (dialog.accept() if dialog.type == "beforeunload" else dialog.dismiss())
 
 
+def _ctx_routes_of(ctx: weakref.ref[BrowserContext]) -> list[_RouteEntry]:
+    c = ctx()
+    return list(c._routes) if c is not None else []
+
+
 def _routes_of(page: PageRef) -> list[_RouteEntry]:
     p = page()
-    return list(p._routes) if p is not None else []
+    if p is None:
+        return []
+    ctx = p._context_ref() if p._context_ref is not None else None
+    ctx_routes = list(ctx._routes) if ctx is not None else []
+    return ctx_routes + list(p._routes)
 
 
-async def _serve_routes(stream: _native.RouteStream, page: PageRef, tasks: set[asyncio.Future[Any]]) -> None:
+async def _serve_routes(
+    stream: _native.RouteStream, routes_of: Callable[[], list[_RouteEntry]], tasks: set[asyncio.Future[Any]]
+) -> None:
     while (native := await stream.next()) is not None:
-        _keep(tasks, asyncio.ensure_future(_dispatch(native, _routes_of(page))))
+        _keep(tasks, asyncio.ensure_future(_dispatch(native, routes_of())))
 
 
 async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
@@ -1100,9 +1353,8 @@ class Browser:
         bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
     ) -> BrowserContext:
-        """A browser context with ``new_page``'s options, as Playwright's ``new_context``. Each
-        context holds one page; see ``BrowserContext``."""
-        options = dict(
+        """A browser context with ``new_page``'s options, as Playwright's ``new_context``; see ``BrowserContext``."""
+        ctx = await self._engine.new_context(
             proxy=proxy,
             user_agent=user_agent,
             locale=locale,
@@ -1123,7 +1375,7 @@ class Browser:
             bypass_csp=bypass_csp,
             storage_state=storage_state,
         )
-        return BrowserContext(self, options)
+        return BrowserContext(self, ctx)
 
     async def close(self) -> None:
         """Shuts the engine down, and with it every page and Chrome process it started."""
@@ -1138,30 +1390,22 @@ class Browser:
         await self.close()
 
 
-ONE_PAGE = (
-    "a Fluxwright context holds one page, so jobs never share cookies: open another context, "
-    "and pass it storage_state() from this one to share a login"
-)
-
-
 class BrowserContext:
-    """A browser context, as Playwright's: the options its page opens with.
-
-    Each context holds one page, so one job's cookies and storage never reach another:
-    ``new_page()`` opens it and a second call raises ``Error``. To share a login across pages,
-    pass one page's ``storage_state()`` to the next ``new_context``.
+    """A browser context, as Playwright's: holds multiple pages and popups sharing cookies,
+    storage, init scripts, exposed functions and routes.
     """
 
-    def __init__(self, browser: Browser, options: dict[str, Any]) -> None:
+    def __init__(self, browser: Browser, ctx: _native.Context) -> None:
         self._browser = browser
-        self._options = options
-        self._page: Page | None = None
-        self._opening = False
+        self._ctx = ctx
         self._closed = False
-        self._routes: list[tuple[URLMatch, Callable[..., Any]]] = []
-        self._cookies: list[dict[str, Any]] = []
-        self._init_scripts: list[str] = []
-        self._exposed: list[tuple[str, Callable[..., Any]]] = []
+        self._pages: list[Page] = []
+        self._routes: list[_RouteEntry] = []
+        self._routing = False
+        self._route_lock = asyncio.Lock()
+        self._bindings: dict[str, Callable[..., Any]] = {}
+        self._serving_bindings = False
+        self._tasks: set[asyncio.Future[Any]] = set()
 
     @property
     def browser(self) -> Browser:
@@ -1169,104 +1413,127 @@ class BrowserContext:
 
     @property
     def pages(self) -> list[Page]:
-        return [self._page] if self._page is not None and not self._page.is_closed() else []
+        self._pages = [p for p in self._pages if not p.is_closed()]
+        return list(self._pages)
+
+    def _adopt_page(self, page: Page) -> None:
+        if page not in self._pages:
+            self._pages.append(page)
+        page._context_ref = weakref.ref(self)
+        if not page.is_closed():
+            page._ensure_popup_subscription()
+
+    def _adopt_popup(self, popup: Page) -> None:
+        if self._closed:
+            return
+        self._adopt_page(popup)
+
+    def _remove_page(self, page: Page) -> None:
+        with suppress(ValueError):
+            self._pages.remove(page)
 
     async def new_page(self) -> Page:
         if self._closed:
             raise Error("browser_context.new_page: the context is closed")
-        if self._page is not None or self._opening:
-            raise Error(f"browser_context.new_page: {ONE_PAGE}")
-        self._opening = True
-        try:
-            page = await self._browser.new_page(**self._options)
-            try:
-                if self._cookies:
-                    await page._add_cookies(self._cookies)
-                for name, callback in self._exposed:
-                    await page.expose_function(name, callback)
-                for source in self._init_scripts:
-                    await page._add_init_script(source)
-                for url, handler in self._routes:
-                    await page.route(url, handler)
-                # close() ran while the page was coming: it would otherwise stay open on a closed
-                # context.
-                if self._closed:
-                    raise Error("browser_context.new_page: the context is closed")
-            except BaseException:
-                await page.close()
-                raise
-            self._page = page
-            return page
-        finally:
-            self._opening = False
+        lease = await self._ctx.new_page()
+        page = Page(lease)
+        if self._closed:
+            await page.close()
+            raise Error("browser_context.new_page: the context is closed")
+        self._adopt_page(page)
+        return page
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
-        """``page.route`` for this context's page; added before ``new_page()``, it applies from
-        the page's first request."""
-        self._routes.append((url, handler))
-        if self._page is not None:
-            await self._page.route(url, handler)
+        """``page.route`` for all pages and popups in this context; added before ``new_page()``, it
+        applies from the first request."""
+        if self._closed:
+            raise Error("browser_context.route: the context is closed")
+        async with self._route_lock:
+            if not self._routing:
+                stream = await self._ctx.intercept()
+                ref = weakref.ref(self)
+                _keep(
+                    self._tasks,
+                    asyncio.ensure_future(_serve_routes(stream, lambda: _ctx_routes_of(ref), self._tasks)),
+                )
+                self._routing = True
+            self._routes.append(_RouteEntry(url, handler))
 
     async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
-        self._routes = [r for r in self._routes if not (r[0] == url and (handler is None or r[1] == handler))]
-        if self._page is not None:
-            await self._page.unroute(url, handler)
+        self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
 
     async def add_init_script(
         self, script: str | None = None, *, path: str | PathLike[str] | None = None
     ) -> None:
-        """``page.add_init_script`` for this context's page; added before ``new_page()``, it runs from the first navigation."""
+        """``page.add_init_script`` for all pages and popups in this context."""
+        if self._closed:
+            raise Error("browser_context.add_init_script: the context is closed")
         source = _resolve_init_script("browser_context.add_init_script", script, path)
-        self._init_scripts.append(source)
-        if self._page is not None:
-            await self._page._add_init_script(source)
+        await self._ctx.add_init_script(source)
 
     async def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
-        """``page.expose_function`` for this context's page."""
+        """``page.expose_function`` for all pages and popups in this context."""
+        if self._closed:
+            raise Error("browser_context.expose_function: the context is closed")
         if not isinstance(name, str) or not name:
             raise TypeError("browser_context.expose_function: name must be a non-empty str")
         if not callable(callback):
             raise TypeError("browser_context.expose_function: callback must be callable")
-        if any(n == name for n, _ in self._exposed):
+        if name in self._bindings:
             raise Error(f'Function "{name}" has been already registered')
-        self._exposed.append((name, callback))
-        if self._page is not None:
-            try:
-                await self._page.expose_function(name, callback)
-            except BaseException:
-                self._exposed = [(n, c) for n, c in self._exposed if n != name]
-                raise
+        if not self._serving_bindings:
+            _keep(
+                self._tasks,
+                asyncio.ensure_future(_serve_bindings(self._ctx.binding_calls(), weakref.ref(self), self._tasks)),
+            )
+            self._serving_bindings = True
+        self._bindings[name] = callback
+        try:
+            await self._ctx.expose_binding(name)
+        except BaseException:
+            if self._bindings.get(name) is callback:
+                del self._bindings[name]
+            raise
 
     async def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
-        """The cookies and localStorage of this context's page, as ``page.storage_state``."""
-        if self._page is None:
-            raise Error("browser_context.storage_state: call new_page() first")
-        return await self._page.storage_state(path=path)
+        """The cookies and localStorage of this context, usable before or after ``new_page()``."""
+        if self._closed:
+            raise Error("browser_context.storage_state: the context is closed")
+        pages = self.pages
+        if pages:
+            return await pages[0].storage_state(path=path)
+        return await self._ctx.storage_state(path=path)
 
     async def cookies(self) -> list[dict[str, Any]]:
         """Every cookie in this context."""
-        state = await self.storage_state()
-        cookies: list[dict[str, Any]] = state["cookies"]
-        return cookies
+        if self._closed:
+            raise Error("browser_context.cookies: the context is closed")
+        return await self._ctx.cookies()
 
     async def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
         """Adds cookies to this context."""
-        if self._page is not None:
-            await self._page._add_cookies(cookies)
-        else:
-            self._cookies.extend(cookies)
+        if self._closed:
+            raise Error("browser_context.add_cookies: the context is closed")
+        await self._ctx.add_cookies(cookies)
 
     async def clear_cookies(self) -> None:
         """Clears every cookie in this context."""
-        self._cookies.clear()
-        if self._page is not None:
-            await self._page._clear_cookies()
+        if self._closed:
+            raise Error("browser_context.clear_cookies: the context is closed")
+        await self._ctx.clear_cookies()
 
     async def close(self) -> None:
-        """Closes the context's page; the context opens no other."""
+        """Closes this context and all of its pages and popups."""
+        if self._closed:
+            return
         self._closed = True
-        if self._page is not None:
-            await self._page.close()
+        for p in list(self._pages):
+            if not p.is_closed():
+                with suppress(Error):
+                    await p.close()
+        self._pages.clear()
+        with suppress(Error):
+            await self._ctx.close()
 
     async def __aenter__(self) -> BrowserContext:
         return self

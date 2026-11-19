@@ -2393,3 +2393,218 @@ async fn init_scripts_bindings_and_tags() {
     page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_tab_popups_and_frames() {
+    use axum::{http::header, response::Html, routing::get, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            "/set-cookie",
+            get(|| async {
+                ([(header::SET_COOKIE, "shared=1; Path=/")], Html("<title>CookieSet</title>"))
+            }),
+        )
+        .route(
+            "/check-cookie",
+            get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get(header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            }),
+        )
+        .route("/api", get(|| async { "real" }))
+        .route(
+            "/opener",
+            get(|| async {
+                Html(
+                    r#"<!doctype html><title>Opener</title>
+                    <button id="open-btn" onclick="window.open('/popup', '_blank')">Open</button>
+                    <a id="blank-link" href="/popup2" target="_blank">Link</a>"#,
+                )
+            }),
+        )
+        .route(
+            "/popup",
+            get(|| async { Html("<title>Popup1</title><p id='p'>from-popup</p>") }),
+        )
+        .route(
+            "/popup2",
+            get(|| async { Html("<title>Popup2</title><p id='p2'>link-popup</p>") }),
+        )
+        .route(
+            "/frames-host",
+            get(move || async move {
+                Html(format!(
+                    r#"<!doctype html><title>Host</title>
+                    <iframe id="same" name="same-fr" src="http://127.0.0.1:{port}/same-child"></iframe>
+                    <iframe id="cross" name="cross-fr" src="http://localhost:{port}/cross-child"></iframe>"#
+                ))
+            }),
+        )
+        .route(
+            "/same-child",
+            get(|| async {
+                Html(
+                    r#"<!doctype html><title>SameTitle</title>
+                    <button id="sb" onclick="this.textContent='clicked-same'">SameBtn</button>"#,
+                )
+            }),
+        )
+        .route(
+            "/same-next",
+            get(|| async { Html("<p id='sn'>navigated-same</p>") }),
+        )
+        .route(
+            "/cross-child",
+            get(|| async {
+                Html(
+                    r#"<!doctype html><title>CrossTitle</title>
+                    <button id="cb" onclick="this.textContent='clicked-cross'">CrossBtn</button>"#,
+                )
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let eng = engine(1, 2).await;
+    let mut opts = JobOptions::default().locale("fr-FR");
+    opts.base_url = Some(base.clone());
+    let ctx = eng.acquire_context_with(&opts).await.unwrap();
+
+    // Context-wide init script and exposed function reach all tabs and popups.
+    ctx.add_init_script("window.__ctxInit = 'shared-init';")
+        .await
+        .unwrap();
+    ctx.expose_function("ctxMul", |args| async move {
+        let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        Ok(json!(a * b))
+    })
+    .await
+    .unwrap();
+
+    // 1. Multi-tab context: shared cookies, independent per-page routes & dialogs.
+    let tab1 = ctx.new_page().await.unwrap();
+    let tab2 = ctx.new_page().await.unwrap();
+    tab1.goto("/set-cookie").await.unwrap();
+    tab2.goto("/check-cookie").await.unwrap();
+    let cookie_body = tab2.inner_text("body").await.unwrap();
+    assert!(cookie_body.contains("shared=1"), "{cookie_body}");
+    assert_eq!(tab2.evaluate("ctxMul(6, 7)").await.unwrap(), json!(42));
+
+    let mut r1 = tab1.intercept().await.unwrap();
+    tokio::spawn(async move {
+        while let Some(req) = r1.recv().await {
+            if req.url.ends_with("/api") {
+                let _ = req
+                    .fulfill(fluxwright::Fulfill {
+                        body: b"from-tab1".to_vec(),
+                        ..Default::default()
+                    })
+                    .await;
+            } else {
+                let _ = req.continue_with(fluxwright::Overrides::default()).await;
+            }
+        }
+    });
+    assert_eq!(
+        tab1.evaluate("fetch('/api').then(r => r.text())").await.unwrap(),
+        json!("from-tab1")
+    );
+    assert_eq!(
+        tab2.evaluate("fetch('/api').then(r => r.text())").await.unwrap(),
+        json!("real")
+    );
+    tab1.bring_to_front().await.unwrap();
+    tab1.close().await.unwrap();
+    assert!(!tab2.is_closed());
+    assert_eq!(tab2.evaluate("window.__ctxInit").await.unwrap(), json!("shared-init"));
+
+    // 2. Popup capture via window.open and target=_blank, preserving opener_target_id.
+    let mut popups = tab2.subscribe_popups();
+    tab2.goto("/opener").await.unwrap();
+    tab2.locator("#open-btn").click().await.unwrap();
+    let pop1 = tokio::time::timeout(Duration::from_secs(10), popups.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pop1.opener_target_id(), Some(tab2.target_id()));
+    for _ in 0..50 {
+        if pop1.url().ends_with("/popup") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(pop1.inner_text("#p").await.unwrap(), "from-popup");
+    assert_eq!(pop1.evaluate("window.__ctxInit").await.unwrap(), json!("shared-init"));
+    assert_eq!(
+        pop1.evaluate("(async () => [navigator.language, await ctxMul(3, 5)])()")
+            .await
+            .unwrap(),
+        json!(["fr-FR", 15])
+    );
+    pop1.close().await.unwrap();
+    assert!(!tab2.is_closed());
+
+    tab2.locator("#blank-link").click().await.unwrap();
+    let pop2 = tokio::time::timeout(Duration::from_secs(10), popups.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pop2.inner_text("#p2").await.unwrap(), "link-popup");
+    pop2.close().await.unwrap();
+
+    // 3. Imperative Frame API for same-origin and cross-origin OOPIF iframes.
+    tab2.goto("/frames-host").await.unwrap();
+    let mut found = None;
+    for _ in 0..100 {
+        let frames = tab2.frames();
+        if frames.iter().any(|f| f.name() == "same-fr" && f.url().ends_with("/same-child"))
+            && frames.iter().any(|f| f.name() == "cross-fr" && f.url().ends_with("/cross-child"))
+        {
+            found = Some((frames.len(), tab2.main_frame().id().to_string()));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let (count, main_id) = found.expect("frames loaded");
+    assert_eq!(count, 3);
+    assert_eq!(tab2.main_frame().child_frames().len(), 2);
+
+    let frames = tab2.frames();
+    let same = frames.iter().find(|f| f.name() == "same-fr").unwrap();
+    let cross = frames.iter().find(|f| f.name() == "cross-fr").unwrap();
+    assert_eq!(same.parent_frame().unwrap().id(), main_id);
+    assert_eq!(cross.parent_frame().unwrap().id(), main_id);
+    assert!(!same.is_detached());
+    assert!(!cross.is_detached());
+
+    same.locator("#sb").click().await.unwrap();
+    assert_eq!(same.locator("#sb").inner_text().await.unwrap(), "clicked-same");
+    assert_eq!(same.title().await.unwrap(), "SameTitle");
+
+    cross.locator("#cb").click().await.unwrap();
+    assert_eq!(cross.locator("#cb").inner_text().await.unwrap(), "clicked-cross");
+    assert_eq!(cross.title().await.unwrap(), "CrossTitle");
+
+    same.goto(&format!("{base}/same-next")).await.unwrap();
+    assert_eq!(same.locator("#sn").inner_text().await.unwrap(), "navigated-same");
+
+    tab2.evaluate("document.getElementById('same').remove()").await.unwrap();
+    for _ in 0..50 {
+        if same.is_detached() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(same.is_detached());
+
+    ctx.close().await.unwrap();
+    assert!(tab2.is_closed());
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}
