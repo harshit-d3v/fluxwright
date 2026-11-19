@@ -15,9 +15,11 @@ export declare class Browser {
   close(): Promise<void>
   _newContext(options?: NewPageOptions | undefined | null): Promise<number>
   _newPageInContext(ctxId: number): Promise<Page>
-  _contextCookies(ctxId: number): Promise<Array<Cookie>>
+  _contextCookies(ctxId: number, urls?: Array<string> | undefined | null): Promise<Array<Cookie>>
   _contextAddCookies(ctxId: number, cookies: Array<Cookie>): Promise<void>
   _contextClearCookies(ctxId: number): Promise<void>
+  _contextReplaceCookies(ctxId: number, cookies: Array<Cookie>): Promise<void>
+  _contextApiFetch(ctxId: number, url: string, options?: ApiFetchOptions | undefined | null): Promise<ApiResponseData>
   _contextAddInitScript(ctxId: number, source: string): Promise<void>
   _contextExposeBinding(ctxId: number, name: string): Promise<void>
   _contextOnBinding(ctxId: number, handler: (arg: BindingCallEvent) => void): void
@@ -62,6 +64,7 @@ export declare class InterceptedRoute {
   get headers(): Record<string, string>
   get postData(): string | null
   get resourceType(): string
+  fetch(options?: RouteFetchOptions | undefined | null): Promise<ApiResponseData>
   fulfill(options?: FulfillOptions | undefined | null): Promise<void>
   continue(options?: ContinueOptions | undefined | null): Promise<void>
   /** `errorCode` as in Playwright: `failed` (default), `aborted`, `blockedbyclient`, ... */
@@ -161,7 +164,7 @@ export declare class Page {
    * Every cookie in this page's context, plus localStorage of the current origin. Pass it
    * (or a file it was saved to) as `newPage({ storageState })` to skip logging in again.
    */
-  storageState(): Promise<StorageState>
+  storageState(indexedDb?: boolean | undefined | null): Promise<StorageState>
   goto(url: string, options?: GotoOptions | undefined | null): Promise<void>
   url(): string
   reload(options?: GotoOptions | undefined | null): Promise<void>
@@ -238,6 +241,7 @@ export declare class Page {
   setDefaultNavigationTimeout(timeout: number): void
   _addCookies(cookies: Array<Cookie>): Promise<void>
   _clearCookies(): Promise<void>
+  _apiFetch(url: string, options?: ApiFetchOptions | undefined | null): Promise<ApiResponseData>
   _emulateMedia(media?: string | undefined | null, colorScheme?: string | undefined | null): Promise<void>
   _onFileChooser(handler: (arg: FileChooserEvent) => void): void
   _setFileChooserPaths(id: number, paths: Array<string>, timeout?: number | undefined | null): Promise<void>
@@ -294,6 +298,24 @@ export declare class PendingDialog {
 export interface ActionPoint {
   x: number
   y: number
+}
+
+export interface ApiFetchOptions {
+  method?: string
+  headers?: Record<string, string>
+  params?: Array<HeaderEntry>
+  data?: string | Buffer
+  failOnStatusCode?: boolean
+  maxRedirects?: number
+  timeoutMs?: number
+}
+
+export interface ApiResponseData {
+  url: string
+  status: number
+  statusText: string
+  headers: Array<HeaderEntry>
+  body: Buffer
 }
 
 export interface BindingCallEvent {
@@ -426,6 +448,11 @@ export interface GotoOptions {
   timeout?: number
 }
 
+export interface HeaderEntry {
+  name: string
+  value: string
+}
+
 export interface HoverActionOptions {
   position?: ActionPoint
   modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'>
@@ -541,6 +568,7 @@ export interface NewPageOptions {
 export interface OriginStorage {
   origin: string
   localStorage: Array<StorageItem>
+  indexedDB?: Array<{ name: string; version: number; stores: Array<{ name: string; autoIncrement: boolean; keyPath?: string; keyPathArray?: Array<string>; records: Array<{ key?: any; keyEncoded?: any; value?: any; valueEncoded?: any }>; indexes: Array<{ name: string; keyPath?: string; keyPathArray?: Array<string>; multiEntry: boolean; unique: boolean }> }> }>
 }
 
 /** An exception nothing caught; `page.pageErrors()` turns these into `Error` objects. */
@@ -585,6 +613,15 @@ export interface ProxyOptions {
   bypass?: string
   username?: string
   password?: string
+}
+
+export interface RouteFetchOptions {
+  url?: string
+  method?: string
+  headers?: Record<string, string>
+  postData?: string | Buffer
+  maxRedirects?: number
+  timeoutMs?: number
 }
 
 export interface ScreenshotOptions {

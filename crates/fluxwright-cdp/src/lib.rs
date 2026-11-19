@@ -4,6 +4,7 @@ mod connection;
 mod context;
 mod error;
 mod events;
+pub mod http_client;
 mod input;
 mod launch;
 mod log;
@@ -14,9 +15,13 @@ mod route;
 pub use browser::{BrowserId, CdpBrowser, ContextId, FrameInfo, Proxy, SessionId, TargetId};
 pub use cdp_session::{CdpSession, CdpSessionEvent};
 pub use connection::{CdpEvent, Connection};
-pub use context::{ColorScheme, Cookie, Emulation, Geolocation, OriginStorage, StorageItem, StorageState};
+pub use context::{
+    filter_cookies, ColorScheme, Cookie, CookieFilter, Emulation, Geolocation, IndexedDbDatabase,
+    IndexedDbIndex, IndexedDbRecord, IndexedDbStore, OriginStorage, StorageItem, StorageState,
+};
 pub use error::{Error, LaunchOptions, Result};
 pub use events::{BindingCall, Dialog, FileChooser, NetEvent, NetRequest, NetResponse};
+pub use http_client::{ApiRequestOptions, ApiResponse, RouteFetchOptions};
 pub use input::{
     parse_modifiers, CheckOptions, ClickOptions, FileInput, FilePayload, HoverOptions, MouseButton,
     SelectEntry,
@@ -28,4 +33,4 @@ pub use page::{
     ScriptTagOptions, Selector, StyleTagOptions, WaitPolling, WaitState, WaitUntil, FRAME_ID_PREFIX,
 };
 pub use render::{MAX_PDF_BYTES, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotOptions};
-pub use route::{Fulfill, InterceptedRequest, Overrides};
+pub use route::{Fulfill, InterceptedRequest, Overrides, RouteFetchHandle};

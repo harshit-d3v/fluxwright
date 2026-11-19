@@ -169,8 +169,17 @@ export async function typed(): Promise<void> {
   await only.exposeFunction('pageEcho', async (x: string) => x)
   await only.addScriptTag({ content: 'window.__tag = 1', type: 'module' })
   await only.addStyleTag({ content: 'body { color: red; }' })
-  const cookies: { name: string }[] = await context.cookies()
-  void [closed, currentUrl, wf1, wf2, wf3, cookies, cdpEval, context.pages().length, context.browser()]
+  const cookies: { name: string }[] = await context.cookies(['https://example.com'])
+  await context.clearCookies({ name: 'c', domain: /example\.com/, path: '/' })
+  const idbState = await context.storageState({ indexedDB: true })
+  const apiRes = await context.request.get('/v1', { params: { a: '1' } })
+  const apiBody: unknown = await apiRes.json()
+  const pageReq = await only.request.post('/v1', { data: { ok: true }, multipart: { f: { name: 'a.txt', mimeType: 'text/plain', buffer: Buffer.from('hi') } } })
+  await page.route('**/proxy/*', async (r) => {
+    const upstream = await r.fetch()
+    await r.fulfill({ response: upstream, json: { patched: true } })
+  })
+  void [closed, currentUrl, wf1, wf2, wf3, cookies, idbState, apiBody, pageReq.headersArray(), cdpEval, context.pages().length, context.browser()]
   await context.close()
   await browser.close()
 }
