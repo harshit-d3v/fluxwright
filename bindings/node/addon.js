@@ -320,15 +320,23 @@ function installEvents(Page) {
         emitSafely(em(), e.event, e.event === 'response' ? toResponse(e.response, request) : request)
       })
     } else if (source === 'filechooser') {
-      page._onFileChooser((native) => {
+      page._onFileChooser((ev) => {
         const p = ref.deref()
         if (!p) return
         const fc = {
           page: () => p,
-          isMultiple: () => native.isMultiple,
+          isMultiple: () => ev.isMultiple,
           setFiles: async (files, options) => {
             checkOptions('fileChooser.setFiles', options, TIMEOUT)
-            await applyFiles(native, 'setFilesPaths', 'setFilesPayloads', files)
+            await applyFiles(
+              {
+                paths: (ps) => p._setFileChooserPaths(ev.id, ps, options?.timeout),
+                payloads: (fs) => p._setFileChooserPayloads(ev.id, fs, options?.timeout),
+              },
+              'paths',
+              'payloads',
+              files,
+            )
           },
         }
         emitSafely(em(), 'filechooser', fc)

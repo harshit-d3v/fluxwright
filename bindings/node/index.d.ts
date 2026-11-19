@@ -192,7 +192,9 @@ export declare class Page {
   _addCookies(cookies: Array<Cookie>): Promise<void>
   _clearCookies(): Promise<void>
   _emulateMedia(media?: string | undefined | null, colorScheme?: string | undefined | null): Promise<void>
-  _onFileChooser(handler: (arg: PendingFileChooser) => void): void
+  _onFileChooser(handler: (arg: FileChooserEvent) => void): void
+  _setFileChooserPaths(id: number, paths: Array<string>, timeout?: number | undefined | null): Promise<void>
+  _setFileChooserPayloads(id: number, files: Array<FilePayloadInput>, timeout?: number | undefined | null): Promise<void>
   _mouseMove(x: number, y: number, steps?: number | undefined | null): Promise<void>
   _mouseDown(button?: string | undefined | null, clickCount?: number | undefined | null): Promise<void>
   _mouseUp(button?: string | undefined | null, clickCount?: number | undefined | null): Promise<void>
@@ -219,12 +221,6 @@ export declare class PendingDialog {
   /** `promptText` is what a `prompt` returns. */
   accept(promptText?: string | undefined | null): Promise<void>
   dismiss(): Promise<void>
-}
-
-export declare class PendingFileChooser {
-  get isMultiple(): boolean
-  setFilesPaths(paths: Array<string>): Promise<void>
-  setFilesPayloads(files: Array<FilePayloadInput>): Promise<void>
 }
 
 export interface ActionPoint {
@@ -293,6 +289,11 @@ export interface DownloadInfo {
   suggestedFilename: string
   /** Deleted when the page closes. */
   path: string
+}
+
+export interface FileChooserEvent {
+  id: number
+  isMultiple: boolean
 }
 
 export interface FilePayloadInput {

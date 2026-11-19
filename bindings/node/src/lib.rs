@@ -29,6 +29,7 @@ pub struct Page {
     lease: LeaseSlot,
     /// The JavaScript route dispatcher, once `page.route` was called.
     routes: Arc<std::sync::Mutex<Option<Arc<Callback<InterceptedRoute>>>>>,
+    file_choosers: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::FileChooser>)>>,
 }
 
 /// A thread-safe JavaScript callback (errors are not passed to it) that does not keep Node
@@ -326,51 +327,10 @@ impl PendingDialog {
     }
 }
 
-#[napi]
-pub struct PendingFileChooser {
-    inner: fluxwright::FileChooser,
-}
-
-#[napi]
-impl PendingFileChooser {
-    #[napi(getter)]
-    pub fn is_multiple(&self) -> bool {
-        self.inner.is_multiple
-    }
-
-    #[napi]
-    pub async fn set_files_paths(&self, paths: Vec<String>) -> Result<()> {
-        let fc = self.inner.clone();
-        let input = fluxwright::FileInput::Paths(paths.into_iter().map(Into::into).collect());
-        RT.spawn(async move {
-            fc.set_files(&input, std::time::Duration::from_secs(30))
-                .await
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
-    }
-
-    #[napi]
-    pub async fn set_files_payloads(&self, files: Vec<FilePayloadInput>) -> Result<()> {
-        let fc = self.inner.clone();
-        let input = fluxwright::FileInput::Payloads(to_file_payloads(files));
-        RT.spawn(async move {
-            fc.set_files(&input, std::time::Duration::from_secs(30))
-                .await
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
-    }
-}
-
-impl PendingFileChooser {
-    fn new(inner: fluxwright::FileChooser) -> Self {
-        Self { inner }
-    }
+#[napi(object)]
+pub struct FileChooserEvent {
+    pub id: u32,
+    pub is_multiple: bool,
 }
 
 /// One console message or uncaught error, for `page.on`.
@@ -1493,6 +1453,7 @@ impl Browser {
         Ok(Page {
             lease: Arc::new(PageSlot { page: RwLock::new(Some(lease)), closing: tokio::sync::watch::Sender::new(false) }),
             routes: Default::default(),
+            file_choosers: Default::default(),
         })
     }
 
@@ -1739,6 +1700,7 @@ impl Page {
     pub async fn close(&self) -> Result<()> {
         // The route callback keeps the JS dispatcher and its handlers: free them now.
         self.routes.lock().unwrap().take();
+        self.file_choosers.lock().unwrap().1.clear();
         // Calls still running give up now (see `with_page`), so the write lock comes at once.
         self.lease.closing.send_replace(true);
         let slot = self.lease.clone();
@@ -1803,15 +1765,46 @@ impl Page {
     }
 
     #[napi(js_name = "_onFileChooser")]
-    pub fn on_file_chooser(&self, handler: Function<PendingFileChooser, ()>) -> Result<()> {
+    pub fn on_file_chooser(&self, handler: Function<FileChooserEvent, ()>) -> Result<()> {
         let tsfn = callback(handler)?;
         let mut choosers = self.now(|p| p.subscribe_file_choosers())?;
+        let store = self.file_choosers.clone();
         RT.spawn(async move {
             while let Some(fc) = choosers.recv().await {
-                tsfn.call(PendingFileChooser::new(fc), ThreadsafeFunctionCallMode::NonBlocking);
+                let is_multiple = fc.is_multiple;
+                let id = {
+                    let mut g = store.lock().unwrap();
+                    g.0 = g.0.wrapping_add(1);
+                    if g.1.len() >= 64 {
+                        if let Some(&oldest) = g.1.keys().min() {
+                            g.1.remove(&oldest);
+                        }
+                    }
+                    let id = g.0;
+                    g.1.insert(id, fc);
+                    id
+                };
+                tsfn.call(FileChooserEvent { id, is_multiple }, ThreadsafeFunctionCallMode::NonBlocking);
             }
         });
         Ok(())
+    }
+
+    #[napi(js_name = "_setFileChooserPaths")]
+    pub async fn set_file_chooser_paths(&self, id: u32, paths: Vec<String>, timeout: Option<f64>) -> Result<()> {
+        let input = fluxwright::FileInput::Paths(paths.into_iter().map(Into::into).collect());
+        self.apply_file_chooser(id, input, timeout).await
+    }
+
+    #[napi(js_name = "_setFileChooserPayloads")]
+    pub async fn set_file_chooser_payloads(
+        &self,
+        id: u32,
+        files: Vec<FilePayloadInput>,
+        timeout: Option<f64>,
+    ) -> Result<()> {
+        let input = fluxwright::FileInput::Payloads(to_file_payloads(files));
+        self.apply_file_chooser(id, input, timeout).await
     }
 
     #[napi(js_name = "_mouseMove")]
@@ -1953,6 +1946,22 @@ impl Page {
 
     fn top(&self) -> FrameLocator {
         FrameLocator { lease: self.lease.clone(), frames: Vec::new() }
+    }
+
+    async fn apply_file_chooser(&self, id: u32, input: fluxwright::FileInput, timeout: Option<f64>) -> Result<()> {
+        let fc = self
+            .file_choosers
+            .lock()
+            .unwrap()
+            .1
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::from_reason("file chooser is no longer available"))?;
+        let timeout = call_timeout(timeout).unwrap_or(std::time::Duration::from_secs(30));
+        RT.spawn(async move { fc.set_files(&input, timeout).await.map_err(|e| e.to_string()) })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(Error::from_reason)
     }
 
     /// Runs `f` on the page at once, for subscriptions, which must be in place when they return;
