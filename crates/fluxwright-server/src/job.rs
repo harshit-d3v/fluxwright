@@ -183,6 +183,15 @@ impl JobRequest {
                         return Err("polling_ms must be between 1 and 60000".into());
                     }
                 }
+                Step::AddInitScript { script } if script.trim().is_empty() => {
+                    return Err("add_init_script script must not be empty".into());
+                }
+                Step::AddScriptTag { url, content, .. } => {
+                    validate_tag_source("add_script_tag", url.as_deref(), content.as_deref())?;
+                }
+                Step::AddStyleTag { url, content } => {
+                    validate_tag_source("add_style_tag", url.as_deref(), content.as_deref())?;
+                }
                 Step::Screenshot { .. } => {
                     step.screenshot_options().and_then(|o| o.validate().map_err(|e| e.to_string()))?;
                 }
@@ -206,6 +215,25 @@ impl JobRequest {
             .retries(self.retries)
             .timeout(Duration::from_millis(self.timeout_ms))
     }
+}
+
+fn validate_tag_source(what: &str, url: Option<&str>, content: Option<&str>) -> Result<(), String> {
+    if url.is_some() == content.is_some() {
+        return Err(format!("{what} requires exactly one of url or content"));
+    }
+    if let Some(u) = url {
+        let trimmed = u.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{what} url must not be empty"));
+        }
+        if trimmed.starts_with("//") {
+            return Err(format!("{what} url is not allowed"));
+        }
+        if trimmed.contains(':') && (!web_url(trimmed) || netguard::url_allowed(trimmed).is_err()) {
+            return Err(format!("{what} url is not allowed"));
+        }
+    }
+    Ok(())
 }
 
 fn web_url(url: &str) -> bool {
@@ -438,6 +466,23 @@ pub enum Step {
         expression: String,
         #[serde(default)]
         polling_ms: Option<u64>,
+    },
+    AddInitScript {
+        script: String,
+    },
+    AddScriptTag {
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(rename = "type", default)]
+        script_type: Option<String>,
+    },
+    AddStyleTag {
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
     },
     Title {},
     Content {},
@@ -1037,6 +1082,27 @@ impl Step {
                     .unwrap_or_default();
                 page.wait_for_function_with(expression, polling).await
             }
+            Step::AddInitScript { script } => {
+                page.add_init_script(script).await?;
+                Ok(Value::Null)
+            }
+            Step::AddScriptTag { url, content, script_type } => {
+                page.add_script_tag(&fluxwright::ScriptTagOptions {
+                    url: url.clone(),
+                    content: content.clone(),
+                    script_type: script_type.clone(),
+                })
+                .await?;
+                Ok(Value::Null)
+            }
+            Step::AddStyleTag { url, content } => {
+                page.add_style_tag(&fluxwright::StyleTagOptions {
+                    url: url.clone(),
+                    content: content.clone(),
+                })
+                .await?;
+                Ok(Value::Null)
+            }
             Step::Title {} => Ok(Value::String(page.title().await?)),
             Step::Content {} => Ok(Value::String(page.content().await?)),
             Step::Screenshot { kind, .. } => {
@@ -1091,6 +1157,9 @@ impl Step {
             Step::WaitForLoadState { .. } => "wait_for_load_state",
             Step::WaitForUrl { .. } => "wait_for_url",
             Step::WaitForFunction { .. } => "wait_for_function",
+            Step::AddInitScript { .. } => "add_init_script",
+            Step::AddScriptTag { .. } => "add_script_tag",
+            Step::AddStyleTag { .. } => "add_style_tag",
             Step::Title {} => "title",
             Step::Content {} => "content",
             Step::Screenshot { .. } => "screenshot",

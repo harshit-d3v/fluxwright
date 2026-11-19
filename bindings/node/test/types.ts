@@ -131,6 +131,15 @@ export async function typed(): Promise<void> {
   const wf1: string = await only.waitForFunction(() => document.title)
   const wf2: number = await only.waitForFunction((n: number) => n + 1, 4, { polling: 50, timeout: 1000 })
   const wf3: unknown = await only.waitForFunction('1 + 1', undefined, { polling: 'raf' })
+  await context.addInitScript('window.__ctxStr = 1')
+  await context.addInitScript((n: number) => {
+    ;(window as any).__ctxArg = n
+  }, 7)
+  await context.exposeFunction('ctxAdd', (a: number, b: number) => a + b)
+  await only.addInitScript({ path: 'init.js' })
+  await only.exposeFunction('pageEcho', async (x: string) => x)
+  await only.addScriptTag({ content: 'window.__tag = 1', type: 'module' })
+  await only.addStyleTag({ content: 'body { color: red; }' })
   const cookies: { name: string }[] = await context.cookies()
   void [closed, currentUrl, wf1, wf2, wf3, cookies, context.pages().length, context.browser()]
   await context.close()

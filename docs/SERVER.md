@@ -176,6 +176,9 @@ failed job returns **409**.
 | `wait_for_load_state` | Optional `state` (`"load"` \| `"domcontentloaded"` \| `"networkidle"`) | `null` |
 | `wait_for_url` | `url` glob, optional `wait_until` | `null` |
 | `wait_for_function` | `expression`, optional `polling_ms` (`1–60000`) | JSON result of the truthy expression |
+| `add_init_script` | `script` | `null` |
+| `add_script_tag` | `url` or `content`, optional `type` | `null` |
+| `add_style_tag` | `url` or `content` | `null` |
 | `click` | `selector`, optional `button` (`"left"` \| `"right"` \| `"middle"`), `click_count`, `delay_ms`, `position` (`{ x, y }`), `modifiers` (`["Alt" \| "Control" \| "Meta" \| "Shift" \| "ControlOrMeta"]`), `force`, `trial` | `null` |
 | `dblclick` | `selector`, optional `button`, `delay_ms`, `position`, `modifiers`, `force`, `trial` | `null` |
 | `hover` | `selector`, optional `position`, `modifiers`, `force`, `trial` | `null` |

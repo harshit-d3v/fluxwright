@@ -63,6 +63,21 @@ class Handler(BaseHTTPRequestHandler):
             body = b'<script>setTimeout(() => { location.href = "/nav-done" }, 80)</script>'
         elif self.path == "/nav-done":
             body = b"<title>PyNavDone</title>"
+        elif self.path == "/init-page":
+            body = (
+                b'<title>PyInitPage</title>'
+                b'<script>window.__seenAtParse = { fromStr: window.__initStr, hasBound: typeof window.ctxFn === "function" }</script>'
+                b'<p id="tag-target">Hello</p>'
+            )
+        elif self.path == "/tag.js":
+            headers = {"Content-Type": "application/javascript"}
+            body = b"window.__urlScript = (window.__urlScript || 0) + 1;"
+        elif self.path == "/tag.css":
+            headers = {"Content-Type": "text/css"}
+            body = b"#tag-target { color: rgb(255, 0, 0); }"
+        elif self.path == "/missing-tag.js":
+            status = 404
+            body = b"missing"
         elif self.path.startswith("/report"):
             headers = {"Content-Disposition": f'attachment; filename="{self.path[1:]}.csv"'}
             body = b"a,b\n1,2\n"
@@ -925,6 +940,102 @@ async def context_smoke(base: str) -> None:
             page.emulate_media(media="print")
             page.emulate_media(media=None)
         assert page.is_closed()
+
+
+def test_init_scripts_and_bindings(base, tmp_path):
+    init_js = tmp_path / "py-init.js"
+    init_js.write_text("window.__initPath = true;", encoding="utf-8")
+    tag_js = tmp_path / "py-tag.js"
+    tag_js.write_text('window.__fileTag = "from-file";', encoding="utf-8")
+    tag_css = tmp_path / "py-tag.css"
+    tag_css.write_text("#tag-target { margin-left: 17px; }", encoding="utf-8")
+
+    async def run():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(max_browsers=1)
+            try:
+                ctx = await browser.new_context(base_url=base)
+                await ctx.expose_function("ctxFn", lambda n: n * 3)
+                await ctx.add_init_script('window.__initStr = "ok";')
+
+                page = await ctx.new_page()
+                await page.add_init_script(path=init_js)
+                await page.goto("/init-page")
+
+                assert await page.evaluate("() => window.__seenAtParse") == {"fromStr": "ok", "hasBound": True}
+                assert await page.evaluate("() => window.__initPath") is True
+                assert await page.evaluate("() => window.ctxFn(14)") == 42
+
+                async def with_title(suffix):
+                    return f"{await page.title()}:{suffix}"
+
+                await page.expose_function("withTitle", with_title)
+                assert await page.evaluate("() => window.withTitle('a')") == "PyInitPage:a"
+
+                await page.expose_function("noReturn", lambda: None)
+                await page.evaluate("() => window.noReturn()")
+
+                def boom():
+                    raise RuntimeError("py-cb-boom")
+
+                await page.expose_function("boomFn", boom)
+                with pytest.raises(Error, match="py-cb-boom"):
+                    await page.evaluate("() => window.boomFn()")
+                with pytest.raises(Error, match="already registered"):
+                    await page.expose_function("ctxFn", lambda n: n)
+                with pytest.raises(Error, match="already registered"):
+                    await ctx.expose_function("ctxFn", lambda n: n)
+
+                await page.reload()
+                assert await page.evaluate("() => [window.__initStr, window.__initPath]") == ["ok", True]
+                assert await page.evaluate("() => window.withTitle('r')") == "PyInitPage:r"
+
+                await page.add_script_tag(content="window.__inlineTag = 7;")
+                await page.add_script_tag(url=f"{base}/tag.js")
+                await page.add_script_tag(path=tag_js)
+                await page.add_script_tag(content="window.__modLoaded = true;", type="module")
+                await page.wait_for_function("() => window.__modLoaded === true")
+                assert await page.evaluate(
+                    "() => [window.__inlineTag, window.__urlScript, window.__fileTag, "
+                    "document.querySelector('script[type=\"module\"]') !== null]"
+                ) == [7, 1, "from-file", True]
+                with pytest.raises(Error):
+                    await page.add_script_tag(url=f"{base}/missing-tag.js")
+                with pytest.raises(ValueError):
+                    await page.add_script_tag()
+
+                await page.add_style_tag(content="body { background-color: rgb(1, 2, 3); }")
+                await page.add_style_tag(url=f"{base}/tag.css")
+                await page.add_style_tag(path=tag_css)
+                assert await page.evaluate(
+                    "() => [getComputedStyle(document.body).backgroundColor, "
+                    "getComputedStyle(document.querySelector('#tag-target')).color, "
+                    "getComputedStyle(document.querySelector('#tag-target')).marginLeft]"
+                ) == ["rgb(1, 2, 3)", "rgb(255, 0, 0)", "17px"]
+                await ctx.close()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(max_browsers=1)
+        try:
+            with browser.new_context(base_url=base) as ctx:
+                ctx.expose_function("syncMul", lambda a, b: a * b)
+                ctx.add_init_script('window.__syncInit = "yes";')
+                page = ctx.new_page()
+                page.goto("/init-page")
+                assert page.evaluate("async () => [window.__syncInit, await window.syncMul(6, 7)]") == ["yes", 42]
+                # Re-entrant sync callback: calls page.title() without deadlocking the event loop.
+                page.expose_function("syncTitle", lambda s: f"{page.title()}:{s}")
+                assert page.evaluate("() => window.syncTitle('s')") == "PyInitPage:s"
+                page.add_script_tag(content="window.__syncTag = 3;")
+                assert page.evaluate("() => window.__syncTag") == 3
+                page.add_style_tag(path=tag_css)
+                assert page.evaluate("() => getComputedStyle(document.querySelector('#tag-target')).marginLeft") == "17px"
+        finally:
+            browser.close()
 
 
 def test_sync_api(base, tmp_path):

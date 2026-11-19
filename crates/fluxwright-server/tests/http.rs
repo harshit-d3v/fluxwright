@@ -854,3 +854,54 @@ async fn executes_navigation_and_wait_steps() {
 
     server.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn executes_init_script_and_tag_steps() {
+    let app = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                axum::response::Html("<h1 id='h'></h1><script>document.getElementById('h').textContent = String(window.__early)</script>")
+            }),
+        )
+        .route(
+            "/u.js",
+            axum::routing::get(|| async {
+                ([(axum::http::header::CONTENT_TYPE, "application/javascript")], "window.__u = 'js-ok';")
+            }),
+        )
+        .route(
+            "/u.css",
+            axum::routing::get(|| async {
+                ([(axum::http::header::CONTENT_TYPE, "text/css")], "#h { padding-left: 19px; }")
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let server = server().await;
+    let sub = submit(
+        &server,
+        json!({ "steps": [
+            { "action": "add_init_script", "script": "window.__early = 99;" },
+            { "action": "goto", "url": format!("{base}/") },
+            { "action": "inner_text", "selector": "#h" },
+            { "action": "add_script_tag", "content": "window.__c = 5;" },
+            { "action": "add_script_tag", "url": "/u.js" },
+            { "action": "add_style_tag", "content": "#h { color: rgb(0, 128, 0); }" },
+            { "action": "add_style_tag", "url": "/u.css" },
+            { "action": "evaluate", "expression": "[window.__c, window.__u, getComputedStyle(document.getElementById('h')).color, getComputedStyle(document.getElementById('h')).paddingLeft]" }
+        ] }),
+    )
+    .await;
+
+    let job = finish(&server, sub).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+    let results = job.results.unwrap();
+    assert_eq!(results[2], json!("99"));
+    assert_eq!(results[7], json!([5, "js-ok", "rgb(0, 128, 0)", "19px"]));
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+}
