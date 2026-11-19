@@ -96,6 +96,28 @@ export async function typed(): Promise<void> {
   const only = await context.newPage()
   await only.emulateMedia({ media: 'print', colorScheme: 'dark' })
   void [only.getByAltText('Logo', { exact: true }), only.getByTitle('Tooltip')]
+  const filtered = only
+    .locator('li', { has: only.locator('b'), hasNotText: /skip/i })
+    .filter({ hasNot: only.locator('.bad'), hasText: 'ok' })
+    .and(only.locator('.row'))
+    .or(only.getByRole('button', { name: /^Save/, level: 2, pressed: true, checked: false, disabled: false, expanded: true, includeHidden: true, selected: false }))
+  const _n: number = await filtered.count()
+  const _items = await filtered.all()
+  const _texts: string[] = await filtered.allTextContents()
+  const _inners: string[] = await filtered.allInnerTexts()
+  const _it: string = await only.innerText('#a', { strict: true, timeout: 100 })
+  const _ih: string = await filtered.innerHTML({ timeout: 100 })
+  const _iv: string = await filtered.inputValue()
+  const _attr: string | null = await filtered.getAttribute('href')
+  const _flags: boolean[] = [
+    await only.isVisible('#a', { strict: false }),
+    await filtered.isHidden(),
+    await filtered.isEnabled(),
+    await filtered.isDisabled(),
+    await filtered.isChecked(),
+    await filtered.isEditable(),
+  ]
+  void [_n, _items, _texts, _inners, _it, _ih, _iv, _attr, _flags]
   if (false) await chromium.connectOverCDP('ws://127.0.0.1:9222')
   const closed: boolean = only.isClosed()
   const cookies: { name: string }[] = await context.cookies()
