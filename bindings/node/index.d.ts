@@ -196,19 +196,8 @@ export declare class Page {
   _mouseMove(x: number, y: number, steps?: number | undefined | null): Promise<void>
   _mouseDown(button?: string | undefined | null, clickCount?: number | undefined | null): Promise<void>
   _mouseUp(button?: string | undefined | null, clickCount?: number | undefined | null): Promise<void>
-  _mouseClick(
-    x: number,
-    y: number,
-    button?: string | undefined | null,
-    clickCount?: number | undefined | null,
-    delay?: number | undefined | null,
-  ): Promise<void>
-  _mouseDblclick(
-    x: number,
-    y: number,
-    button?: string | undefined | null,
-    delay?: number | undefined | null,
-  ): Promise<void>
+  _mouseClick(x: number, y: number, button?: string | undefined | null, clickCount?: number | undefined | null, delay?: number | undefined | null): Promise<void>
+  _mouseDblclick(x: number, y: number, button?: string | undefined | null, delay?: number | undefined | null): Promise<void>
   _mouseWheel(deltaX: number, deltaY: number): Promise<void>
   _keyboardDown(key: string): Promise<void>
   _keyboardUp(key: string): Promise<void>
