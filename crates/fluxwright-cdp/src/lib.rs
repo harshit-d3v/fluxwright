@@ -21,6 +21,9 @@ pub use input::{
 };
 pub use launch::{find_browser, find_chrome, sweep_stale_profiles};
 pub use log::{ConsoleMessage, Download, DownloadResult, LogEntry, PageError, PageLog};
-pub use page::{BoundingBox, CdpPage, DownloadQueue, ResourceType, RoleOptions, Selector, WaitState, WaitUntil};
+pub use page::{
+    url_glob_matches, BoundingBox, CdpPage, DownloadQueue, ResourceType, RoleOptions, Selector,
+    WaitPolling, WaitState, WaitUntil,
+};
 pub use render::{MAX_PDF_BYTES, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotOptions};
 pub use route::{Fulfill, InterceptedRequest, Overrides};
