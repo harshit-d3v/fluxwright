@@ -924,7 +924,7 @@ impl PageLease {
 
     /// For `goto`. As in Playwright, the page's default timeout covers navigation too unless
     /// a navigation default was set.
-    fn navigation_timeout(&self) -> Duration {
+    pub fn navigation_timeout(&self) -> Duration {
         let (action, navigation) = *self.default_timeouts.lock().unwrap();
         CALL_TIMEOUT
             .try_with(|t| *t)
@@ -998,6 +998,113 @@ impl PageLease {
             .goto(&url, wait_until, self.navigation_timeout())
             .await?;
         Ok(())
+    }
+
+    pub fn url(&self) -> String {
+        self.page.url()
+    }
+
+    pub fn subscribe_url(&self) -> tokio::sync::watch::Receiver<String> {
+        self.page.subscribe_url()
+    }
+
+    pub fn base_url(&self) -> Option<String> {
+        self.base_url.lock().unwrap().clone()
+    }
+
+    pub async fn reload(&self) -> Result<()> {
+        self.reload_with(fluxwright_cdp::WaitUntil::Load).await
+    }
+
+    pub async fn reload_with(&self, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
+        self.page.reload(wait_until, self.navigation_timeout()).await?;
+        Ok(())
+    }
+
+    pub async fn go_back(&self) -> Result<bool> {
+        self.go_back_with(fluxwright_cdp::WaitUntil::Load).await
+    }
+
+    pub async fn go_back_with(&self, wait_until: fluxwright_cdp::WaitUntil) -> Result<bool> {
+        Ok(self.page.go_back(wait_until, self.navigation_timeout()).await?)
+    }
+
+    pub async fn go_forward(&self) -> Result<bool> {
+        self.go_forward_with(fluxwright_cdp::WaitUntil::Load).await
+    }
+
+    pub async fn go_forward_with(&self, wait_until: fluxwright_cdp::WaitUntil) -> Result<bool> {
+        Ok(self.page.go_forward(wait_until, self.navigation_timeout()).await?)
+    }
+
+    pub async fn set_content(&self, html: &str) -> Result<()> {
+        self.set_content_with(html, fluxwright_cdp::WaitUntil::Load).await
+    }
+
+    pub async fn set_content_with(&self, html: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
+        self.page
+            .set_content(html, wait_until, self.navigation_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn wait_for_load_state(&self, state: fluxwright_cdp::WaitUntil) -> Result<()> {
+        self.page
+            .wait_for_load_state(state, self.navigation_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn wait_for_url(&self, pattern: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
+        let base = self.base_url();
+        let resolved = if pattern.starts_with('/')
+            || (!pattern.starts_with('*')
+                && !pattern.split(['/', '?', '#']).next().unwrap_or("").contains(':')
+                && !pattern.contains('{'))
+        {
+            resolve_url(base.as_deref(), pattern)
+        } else {
+            pattern.to_string()
+        };
+        self.wait_for_url_matching(|u| fluxwright_cdp::url_glob_matches(&resolved, u), wait_until)
+            .await
+    }
+
+    pub async fn wait_for_url_matching<F>(
+        &self,
+        predicate: F,
+        wait_until: fluxwright_cdp::WaitUntil,
+    ) -> Result<()>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.page
+            .wait_for_url(predicate, wait_until, self.navigation_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn wait_for_url_change(&self, after_url: &str) -> Result<String> {
+        Ok(self
+            .page
+            .wait_for_url_change(after_url, self.navigation_timeout())
+            .await?)
+    }
+
+    pub async fn wait_for_function(&self, expression: &str) -> Result<serde_json::Value> {
+        self.wait_for_function_with(expression, fluxwright_cdp::WaitPolling::Raf)
+            .await
+    }
+
+    pub async fn wait_for_function_with(
+        &self,
+        expression: &str,
+        polling: fluxwright_cdp::WaitPolling,
+    ) -> Result<serde_json::Value> {
+        Ok(self
+            .page
+            .wait_for_function(expression, polling, self.action_timeout())
+            .await?)
     }
 
     pub async fn title(&self) -> Result<String> {

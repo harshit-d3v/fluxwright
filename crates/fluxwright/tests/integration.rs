@@ -2093,3 +2093,138 @@ async fn locator_reading_filtering_and_strictness() {
     page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn navigation_and_wait_helpers() {
+    use std::sync::atomic::AtomicUsize;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_a = Arc::clone(&hits);
+    let app = axum::Router::new()
+        .route(
+            "/a",
+            axum::routing::get(move || {
+                let n = hits_a.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { axum::response::Html(format!("<title>A-{n}</title><h1 id='h'>A</h1>")) }
+            }),
+        )
+        .route(
+            "/redir",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/b") }),
+        )
+        .route(
+            "/b",
+            axum::routing::get(|| async { axum::response::Html("<title>B</title><div id='b'>B</div>") }),
+        )
+        .route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                "slow-ok"
+            }),
+        )
+        .route(
+            "/delayed-nav",
+            axum::routing::get(|| async {
+                axum::response::Html(
+                    "<script>setTimeout(() => { location.href = '/done'; }, 100);</script>",
+                )
+            }),
+        )
+        .route(
+            "/done",
+            axum::routing::get(|| async { axum::response::Html("<title>Done</title>") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+
+    let eng = engine(1, 1).await;
+    let page = eng.acquire_job(&JobOptions::default()).await.unwrap();
+    assert_eq!(page.url(), "about:blank");
+
+    // Empty history returns false cleanly.
+    assert!(!page.go_back().await.unwrap());
+    assert!(!page.go_forward().await.unwrap());
+
+    // Navigation, redirect URL tracking, reload, and history traversal.
+    page.goto(&format!("{base}/a")).await.unwrap();
+    assert_eq!(page.url(), format!("{base}/a"));
+    assert_eq!(page.title().await.unwrap(), "A-1");
+
+    page.reload().await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "A-2");
+
+    page.goto(&format!("{base}/redir")).await.unwrap();
+    assert_eq!(page.url(), format!("{base}/b"));
+    assert_eq!(page.title().await.unwrap(), "B");
+
+    assert!(page.go_back().await.unwrap());
+    assert_eq!(page.url(), format!("{base}/a"));
+    assert!(page.go_forward().await.unwrap());
+    assert_eq!(page.url(), format!("{base}/b"));
+    assert!(!page.go_forward().await.unwrap());
+
+    // Same-document history (pushState).
+    page.evaluate("history.pushState({}, '', '/b#sec')").await.unwrap();
+    assert_eq!(page.url(), format!("{base}/b#sec"));
+    assert!(page.go_back().await.unwrap());
+    assert_eq!(page.url(), format!("{base}/b"));
+    assert!(page.go_forward().await.unwrap());
+    assert_eq!(page.url(), format!("{base}/b#sec"));
+
+    // set_content writes DOM and runs inline scripts.
+    page.set_content("<h1 id='sc'>Written</h1><script>window.__sc = 7</script>")
+        .await
+        .unwrap();
+    assert_eq!(page.inner_text("#sc").await.unwrap(), "Written");
+    assert_eq!(page.evaluate("window.__sc").await.unwrap(), json!(7));
+
+    // wait_for_load_state: already loaded + networkidle waiting on in-flight fetch.
+    page.goto(&format!("{base}/a")).await.unwrap();
+    page.wait_for_load_state(WaitUntil::Load).await.unwrap();
+    page.wait_for_load_state(WaitUntil::NetworkIdle).await.unwrap();
+    page.evaluate("window.__slowDone = false; fetch('/slow').then(() => { window.__slowDone = true; })")
+        .await
+        .unwrap();
+    page.wait_for_load_state(WaitUntil::NetworkIdle).await.unwrap();
+    assert_eq!(page.evaluate("window.__slowDone").await.unwrap(), json!(true));
+
+    // wait_for_url across delayed client redirect + timeout.
+    page.goto(&format!("{base}/delayed-nav")).await.unwrap();
+    page.wait_for_url("**/done", WaitUntil::Load).await.unwrap();
+    assert_eq!(page.url(), format!("{base}/done"));
+    page.set_default_timeout(Duration::from_millis(400));
+    page.set_default_navigation_timeout(Duration::from_millis(400));
+    assert!(page.wait_for_url("**/never-matches", WaitUntil::Load).await.unwrap_err().is_timeout());
+
+    // wait_for_function: delayed truthy value, numeric interval, DOM node, JS throw, and timeout.
+    page.set_default_timeout(Duration::from_secs(5));
+    page.evaluate("setTimeout(() => { window.__ready = 42; }, 80)").await.unwrap();
+    assert_eq!(
+        page.wait_for_function("window.__ready && { v: window.__ready }")
+            .await
+            .unwrap(),
+        json!({ "v": 42 })
+    );
+    page.evaluate("setTimeout(() => { const d = document.createElement('span'); d.id = 'late'; document.body.append(d); }, 60)")
+        .await
+        .unwrap();
+    assert!(!page
+        .wait_for_function_with("document.querySelector('#late')", fluxwright::WaitPolling::Interval(Duration::from_millis(25)))
+        .await
+        .unwrap()
+        .is_null());
+    let js_err = page
+        .wait_for_function("(() => { throw new Error('wait-boom') })()")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(js_err.contains("wait-boom"), "got {js_err}");
+    page.set_default_timeout(Duration::from_millis(300));
+    assert!(page.wait_for_function("false").await.unwrap_err().is_timeout());
+
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}

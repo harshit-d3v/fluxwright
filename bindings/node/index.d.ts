@@ -149,6 +149,16 @@ export declare class Page {
    */
   storageState(): Promise<StorageState>
   goto(url: string, options?: GotoOptions | undefined | null): Promise<void>
+  url(): string
+  reload(options?: GotoOptions | undefined | null): Promise<void>
+  goBack(options?: GotoOptions | undefined | null): Promise<void>
+  goForward(options?: GotoOptions | undefined | null): Promise<void>
+  setContent(html: string, options?: GotoOptions | undefined | null): Promise<void>
+  _waitForLoadState(state?: string | undefined | null, timeout?: number | undefined | null): Promise<void>
+  _waitForUrlChange(afterUrl: string, timeout?: number | undefined | null): Promise<string>
+  _navigationTimeout(): number
+  _baseUrl(): string | null
+  _waitForFunction(expression: string, pollingMs?: number | undefined | null, timeout?: number | undefined | null): Promise<any>
   title(): Promise<string>
   content(): Promise<string>
   evaluate(expression: string): Promise<any>

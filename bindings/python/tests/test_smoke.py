@@ -31,15 +31,39 @@ FETCH_API = "() => fetch('/api').then((r) => r.text())"
 CLICK_REPORT = "() => { const a = document.createElement('a'); a.href = '/report'; document.body.append(a); a.click() }"
 
 
+_nav_lock = threading.Lock()
+_nav_hits = 0
+
+
 class Handler(BaseHTTPRequestHandler):
     """Echoes the user agent and languages; /login sets a cookie; /report and /report2 are
     downloads (report.csv, report2.csv); /hdr echoes x-test; /api is the real API that routes
     stand in for."""
 
     def do_GET(self):
+        global _nav_hits
         status = 200
         headers = {"Content-Type": "text/html"}
-        if self.path.startswith("/report"):
+        if self.path == "/nav-a":
+            with _nav_lock:
+                _nav_hits += 1
+                n = _nav_hits
+            body = f"<title>PyNavA-{n}</title><p id='p'>A</p>".encode()
+        elif self.path == "/nav-redir":
+            status = 302
+            headers = {"Location": "/nav-b"}
+            body = b""
+        elif self.path == "/nav-b":
+            body = b"<title>PyNavB</title><div id='b'>B</div>"
+        elif self.path == "/nav-slow":
+            time.sleep(0.25)
+            headers = {"Content-Type": "text/plain"}
+            body = b"slow-ok"
+        elif self.path == "/nav-delayed":
+            body = b'<script>setTimeout(() => { location.href = "/nav-done" }, 80)</script>'
+        elif self.path == "/nav-done":
+            body = b"<title>PyNavDone</title>"
+        elif self.path.startswith("/report"):
             headers = {"Content-Disposition": f'attachment; filename="{self.path[1:]}.csv"'}
             body = b"a,b\n1,2\n"
         elif self.path == "/hdr":
@@ -724,6 +748,58 @@ async def event_smoke(base: str) -> None:
             await page.wait_for_download(timeout=300)
         assert time.monotonic() - start < 3
 
+        # Navigation and wait helpers (url, reload, history, set_content, wait_for_load_state, wait_for_url, wait_for_function).
+        nav = await browser.new_page(base_url=base)
+        assert nav.url == "about:blank"
+        await nav.go_back()
+        await nav.go_forward()
+        await nav.goto("/nav-a")
+        assert nav.url == f"{base}/nav-a"
+        first_n = int((await nav.title()).split("-")[1])
+        await nav.reload()
+        assert await nav.title() == f"PyNavA-{first_n + 1}"
+        await nav.goto("/nav-redir")
+        assert nav.url == f"{base}/nav-b"
+        await nav.go_back()
+        assert nav.url == f"{base}/nav-a"
+        await nav.go_forward()
+        assert nav.url == f"{base}/nav-b"
+        await nav.evaluate("() => history.pushState({}, '', '/nav-b#s')")
+        assert nav.url == f"{base}/nav-b#s"
+        await nav.go_back()
+        assert nav.url == f"{base}/nav-b"
+
+        await nav.set_content('<h1 id="sc">Set</h1><script>window.__sc = 15</script>')
+        assert await nav.inner_text("#sc") == "Set"
+        assert await nav.evaluate("() => window.__sc") == 15
+
+        await nav.goto("/nav-a")
+        await nav.wait_for_load_state("load")
+        await nav.evaluate("() => { window.__slowDone = false; fetch('/nav-slow').then(() => { window.__slowDone = true }) }")
+        await nav.wait_for_load_state("networkidle")
+        assert await nav.evaluate("() => window.__slowDone") is True
+
+        await nav.goto("/nav-delayed")
+        await nav.wait_for_url("**/nav-done")
+        assert nav.url == f"{base}/nav-done"
+        await nav.goto("/nav-delayed")
+        await nav.wait_for_url(re.compile(r"/nav-done$"))
+        await nav.goto("/nav-delayed")
+        await nav.wait_for_url(lambda u: u.endswith("/nav-done"), wait_until="commit")
+        with pytest.raises(TimeoutError):
+            await nav.wait_for_url("/never", timeout=300)
+
+        await nav.evaluate("() => setTimeout(() => { window.__fn = { n: 5 } }, 60)")
+        assert await nav.wait_for_function("(w) => window.__fn && window.__fn.n + w", 3, polling=20) == 8
+        assert await nav.wait_for_function("window.__fn && window.__fn.n") == 5
+        with pytest.raises(Error, match="fn-boom"):
+            await nav.wait_for_function("() => { throw new Error('fn-boom') }")
+        with pytest.raises(TimeoutError):
+            await nav.wait_for_function("() => false", timeout=250)
+        with pytest.raises(ValueError):
+            await nav.wait_for_load_state("bogus")  # type: ignore[arg-type]
+        await nav.close()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(max_browsers=1)
         page = browser.new_page()
@@ -971,6 +1047,27 @@ def test_sync_api(base, tmp_path):
         with pytest.raises(Error, match="strict mode violation"):
             lr_sync.locator(".m").inner_text()
         lr_sync.close()
+
+        nav_sync = browser.new_page(base_url=base)
+        assert nav_sync.url == "about:blank"
+        nav_sync.goto("/nav-a")
+        first_sync = int(nav_sync.title().split("-")[1])
+        nav_sync.reload()
+        assert nav_sync.title() == f"PyNavA-{first_sync + 1}"
+        nav_sync.goto("/nav-redir")
+        assert nav_sync.url == f"{base}/nav-b"
+        nav_sync.go_back()
+        assert nav_sync.url == f"{base}/nav-a"
+        nav_sync.go_forward()
+        assert nav_sync.url == f"{base}/nav-b"
+        nav_sync.set_content('<p id="sync-sc">SyncContent</p>')
+        assert nav_sync.inner_text("#sync-sc") == "SyncContent"
+        nav_sync.goto("/nav-delayed")
+        nav_sync.wait_for_url("/nav-done")
+        assert nav_sync.url == f"{base}/nav-done"
+        nav_sync.evaluate("() => setTimeout(() => { window.__sfn = 21 }, 50)")
+        assert nav_sync.wait_for_function("(m) => window.__sfn && window.__sfn * m", 2, polling=20) == 42
+        nav_sync.close()
 
         # One browser shared by a pool of threads.
         def job(n):

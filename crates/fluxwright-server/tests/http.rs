@@ -778,3 +778,79 @@ async fn executes_locator_read_and_state_steps() {
 
     server.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn executes_navigation_and_wait_steps() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_a = Arc::clone(&hits);
+    let app = axum::Router::new()
+        .route(
+            "/a",
+            axum::routing::get(move || {
+                let n = hits_a.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { axum::response::Html(format!("<title>S-{n}</title><p id='p'>A</p>")) }
+            }),
+        )
+        .route(
+            "/b",
+            axum::routing::get(|| async {
+                axum::response::Html("<title>SB</title><script>setTimeout(() => { window.__ready = 9; }, 60);</script>")
+            }),
+        )
+        .route(
+            "/delayed",
+            axum::routing::get(|| async {
+                axum::response::Html("<script>setTimeout(() => { location.href = '/done'; }, 80);</script>")
+            }),
+        )
+        .route(
+            "/done",
+            axum::routing::get(|| async { axum::response::Html("<title>SDone</title>") }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let server = server().await;
+    let sub = submit(
+        &server,
+        json!({ "steps": [
+            { "action": "goto", "url": format!("{base}/a") },
+            { "action": "url" },
+            { "action": "reload" },
+            { "action": "title" },
+            { "action": "goto", "url": format!("{base}/b") },
+            { "action": "wait_for_function", "expression": "window.__ready", "polling_ms": 20 },
+            { "action": "go_back" },
+            { "action": "url" },
+            { "action": "go_forward" },
+            { "action": "url" },
+            { "action": "wait_for_load_state", "state": "load" },
+            { "action": "goto", "url": format!("{base}/delayed") },
+            { "action": "wait_for_url", "url": "**/done" },
+            { "action": "url" },
+            { "action": "set_content", "html": "<h1 id='sc'>Inline</h1>" },
+            { "action": "inner_text", "selector": "#sc" }
+        ] }),
+    )
+    .await;
+
+    let job = finish(&server, sub).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+    let results = job.results.unwrap();
+    assert_eq!(results[1], json!(format!("{base}/a")));
+    assert_eq!(results[3], json!("S-2"));
+    assert_eq!(results[5], json!(9));
+    assert_eq!(results[6], json!(true));
+    assert_eq!(results[7], json!(format!("{base}/a")));
+    assert_eq!(results[8], json!(true));
+    assert_eq!(results[9], json!(format!("{base}/b")));
+    assert_eq!(results[13], json!(format!("{base}/done")));
+    assert_eq!(results[15], json!("Inline"));
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+}

@@ -1139,6 +1139,30 @@ struct Lease(std::sync::Mutex<Option<fluxwright::PageLease>>);
 #[pyclass(frozen, subclass, module = "fluxwright._native")]
 struct Page {
     lease: LeaseSlot,
+    url: tokio::sync::watch::Receiver<String>,
+}
+
+fn parse_wait_until(wait_until: Option<&str>) -> PyResult<fluxwright::WaitUntil> {
+    match wait_until {
+        None | Some("load") => Ok(fluxwright::WaitUntil::Load),
+        Some("domcontentloaded") => Ok(fluxwright::WaitUntil::DomContentLoaded),
+        Some("networkidle") => Ok(fluxwright::WaitUntil::NetworkIdle),
+        Some("commit") => Ok(fluxwright::WaitUntil::Commit),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "wait_until must be load, domcontentloaded, networkidle or commit, not {other:?}"
+        ))),
+    }
+}
+
+fn parse_load_state(state: Option<&str>) -> PyResult<fluxwright::WaitUntil> {
+    match state {
+        None | Some("load") => Ok(fluxwright::WaitUntil::Load),
+        Some("domcontentloaded") => Ok(fluxwright::WaitUntil::DomContentLoaded),
+        Some("networkidle") => Ok(fluxwright::WaitUntil::NetworkIdle),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "state must be load, domcontentloaded or networkidle, not {other:?}"
+        ))),
+    }
 }
 
 #[pymethods]
@@ -1147,12 +1171,14 @@ impl Page {
     fn new(lease: &Bound<'_, Lease>) -> PyResult<Self> {
         let lease = lease.get().0.lock().unwrap().take();
         let lease = lease.ok_or_else(|| PyValueError::new_err("this lease already has a page"))?;
+        let url = lease.subscribe_url();
         let (closing, _) = tokio::sync::watch::channel(false);
         Ok(Page {
             lease: Arc::new(PageSlot {
                 page: RwLock::new(Some(lease)),
                 closing,
             }),
+            url,
         })
     }
 
@@ -1164,19 +1190,155 @@ impl Page {
         wait_until: Option<String>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let wait = match wait_until.as_deref() {
-            None | Some("load") => fluxwright::WaitUntil::Load,
-            Some("domcontentloaded") => fluxwright::WaitUntil::DomContentLoaded,
-            Some("networkidle") => fluxwright::WaitUntil::NetworkIdle,
-            Some("commit") => fluxwright::WaitUntil::Commit,
-            Some(other) => {
-                return Err(PyValueError::new_err(format!(
-                "wait_until must be load, domcontentloaded, networkidle or commit, not {other:?}"
-            )))
+        let wait = parse_wait_until(wait_until.as_deref())?;
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.goto_with(&url, wait).await.map(none) })
+        })
+    }
+
+    #[getter]
+    fn url(&self) -> String {
+        self.url.borrow().clone()
+    }
+
+    #[pyo3(signature = (*, wait_until=None, timeout=None))]
+    fn reload<'py>(
+        &self,
+        py: Python<'py>,
+        wait_until: Option<String>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait = parse_wait_until(wait_until.as_deref())?;
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.reload_with(wait).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (*, wait_until=None, timeout=None))]
+    fn go_back<'py>(
+        &self,
+        py: Python<'py>,
+        wait_until: Option<String>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait = parse_wait_until(wait_until.as_deref())?;
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move {
+                p.go_back_with(wait).await?;
+                Ok(None::<()>)
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, wait_until=None, timeout=None))]
+    fn go_forward<'py>(
+        &self,
+        py: Python<'py>,
+        wait_until: Option<String>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait = parse_wait_until(wait_until.as_deref())?;
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move {
+                p.go_forward_with(wait).await?;
+                Ok(None::<()>)
+            })
+        })
+    }
+
+    #[pyo3(signature = (html, *, wait_until=None, timeout=None))]
+    fn set_content<'py>(
+        &self,
+        py: Python<'py>,
+        html: String,
+        wait_until: Option<String>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait = parse_wait_until(wait_until.as_deref())?;
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.set_content_with(&html, wait).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (state=None, *, timeout=None))]
+    fn wait_for_load_state<'py>(
+        &self,
+        py: Python<'py>,
+        state: Option<String>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = parse_load_state(state.as_deref())?;
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.wait_for_load_state(state).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (expression, arg=None, *, timeout=None, polling=None))]
+    fn wait_for_function<'py>(
+        &self,
+        py: Python<'py>,
+        expression: String,
+        arg: Option<Bound<'py, PyAny>>,
+        timeout: Option<f64>,
+        polling: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let arg = arg.map(|a| to_json(&a)).transpose()?;
+        let script = page_function(&expression, arg.as_ref());
+        let polling = match polling {
+            None => fluxwright::WaitPolling::Raf,
+            Some(v) => {
+                if v.is_instance_of::<PyBool>() {
+                    return Err(PyValueError::new_err("polling must be 'raf' or a positive number"));
+                }
+                if let Ok(s) = v.extract::<String>() {
+                    if s == "raf" {
+                        fluxwright::WaitPolling::Raf
+                    } else {
+                        return Err(PyValueError::new_err(format!(
+                            "polling must be 'raf' or a positive number, not {s:?}"
+                        )));
+                    }
+                } else if let Ok(ms) = v.extract::<f64>() {
+                    if ms > 0.0 && ms.is_finite() {
+                        fluxwright::WaitPolling::Interval(Duration::from_secs_f64(ms / 1000.0))
+                    } else {
+                        return Err(PyValueError::new_err("polling must be 'raf' or a positive number"));
+                    }
+                } else {
+                    return Err(PyValueError::new_err("polling must be 'raf' or a positive number"));
+                }
             }
         };
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.goto_with(&url, wait).await.map(none) })
+            Box::pin(async move { p.wait_for_function_with(&script, polling).await.map(Json) })
+        })
+    }
+
+    fn _navigation_timeout(&self) -> f64 {
+        let Ok(page) = self.lease.page.try_read() else {
+            return 30_000.0;
+        };
+        page.as_ref()
+            .map(|p| p.navigation_timeout().as_millis() as f64)
+            .unwrap_or(30_000.0)
+    }
+
+    fn _base_url(&self) -> Option<String> {
+        let Ok(page) = self.lease.page.try_read() else {
+            return None;
+        };
+        page.as_ref().and_then(|p| p.base_url())
+    }
+
+    #[pyo3(signature = (after_url, *, timeout=None))]
+    fn _wait_for_url_change<'py>(
+        &self,
+        py: Python<'py>,
+        after_url: String,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.wait_for_url_change(&after_url).await })
         })
     }
 

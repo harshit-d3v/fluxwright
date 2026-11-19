@@ -30,6 +30,7 @@ pub struct Page {
     /// The JavaScript route dispatcher, once `page.route` was called.
     routes: Arc<std::sync::Mutex<Option<Arc<Callback<InterceptedRoute>>>>>,
     file_choosers: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::FileChooser>)>>,
+    url: tokio::sync::watch::Receiver<String>,
 }
 
 /// A thread-safe JavaScript callback (errors are not passed to it) that does not keep Node
@@ -1607,10 +1608,12 @@ impl Browser {
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
+        let url = lease.subscribe_url();
         Ok(Page {
             lease: Arc::new(PageSlot { page: RwLock::new(Some(lease)), closing: tokio::sync::watch::Sender::new(false) }),
             routes: Default::default(),
             file_choosers: Default::default(),
+            url,
         })
     }
 
@@ -1623,6 +1626,29 @@ impl Browser {
         .await
         .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(())
+    }
+}
+
+fn parse_wait_until(wait_until: Option<&str>) -> Result<fluxwright::WaitUntil> {
+    match wait_until {
+        None | Some("load") => Ok(fluxwright::WaitUntil::Load),
+        Some("domcontentloaded") => Ok(fluxwright::WaitUntil::DomContentLoaded),
+        Some("networkidle") => Ok(fluxwright::WaitUntil::NetworkIdle),
+        Some("commit") => Ok(fluxwright::WaitUntil::Commit),
+        Some(other) => Err(Error::from_reason(format!(
+            "waitUntil must be load, domcontentloaded, networkidle or commit, got {other}"
+        ))),
+    }
+}
+
+fn parse_load_state(state: Option<&str>) -> Result<fluxwright::WaitUntil> {
+    match state {
+        None | Some("load") => Ok(fluxwright::WaitUntil::Load),
+        Some("domcontentloaded") => Ok(fluxwright::WaitUntil::DomContentLoaded),
+        Some("networkidle") => Ok(fluxwright::WaitUntil::NetworkIdle),
+        Some(other) => Err(Error::from_reason(format!(
+            "state must be load, domcontentloaded or networkidle, got {other}"
+        ))),
     }
 }
 
@@ -1640,19 +1666,115 @@ impl Page {
     #[napi]
     pub async fn goto(&self, url: String, options: Option<GotoOptions>) -> Result<()> {
         let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
-        let wait_until = match options.and_then(|o| o.wait_until).as_deref() {
-            None | Some("load") => fluxwright::WaitUntil::Load,
-            Some("domcontentloaded") => fluxwright::WaitUntil::DomContentLoaded,
-            Some("networkidle") => fluxwright::WaitUntil::NetworkIdle,
-            Some("commit") => fluxwright::WaitUntil::Commit,
-            Some(other) => {
-                return Err(Error::from_reason(format!(
-                    "waitUntil must be load, domcontentloaded, networkidle or commit, got {other}"
-                )))
-            }
-        };
+        let wait_until = parse_wait_until(options.and_then(|o| o.wait_until).as_deref())?;
         with_page_in(self.lease.clone(), timeout, move |p| Box::pin(async move { p.goto_with(&url, wait_until).await }))
             .await
+    }
+
+    #[napi]
+    pub fn url(&self) -> String {
+        self.url.borrow().clone()
+    }
+
+    #[napi]
+    pub async fn reload(&self, options: Option<GotoOptions>) -> Result<()> {
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
+        let wait_until = parse_wait_until(options.and_then(|o| o.wait_until).as_deref())?;
+        with_page_in(self.lease.clone(), timeout, move |p| Box::pin(async move { p.reload_with(wait_until).await }))
+            .await
+    }
+
+    #[napi]
+    pub async fn go_back(&self, options: Option<GotoOptions>) -> Result<()> {
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
+        let wait_until = parse_wait_until(options.and_then(|o| o.wait_until).as_deref())?;
+        with_page_in(self.lease.clone(), timeout, move |p| {
+            Box::pin(async move {
+                p.go_back_with(wait_until).await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn go_forward(&self, options: Option<GotoOptions>) -> Result<()> {
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
+        let wait_until = parse_wait_until(options.and_then(|o| o.wait_until).as_deref())?;
+        with_page_in(self.lease.clone(), timeout, move |p| {
+            Box::pin(async move {
+                p.go_forward_with(wait_until).await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn set_content(&self, html: String, options: Option<GotoOptions>) -> Result<()> {
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
+        let wait_until = parse_wait_until(options.and_then(|o| o.wait_until).as_deref())?;
+        with_page_in(self.lease.clone(), timeout, move |p| {
+            Box::pin(async move { p.set_content_with(&html, wait_until).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_waitForLoadState")]
+    pub async fn wait_for_load_state(&self, state: Option<String>, timeout: Option<f64>) -> Result<()> {
+        let state = parse_load_state(state.as_deref())?;
+        let timeout = call_timeout(timeout);
+        with_page_in(self.lease.clone(), timeout, move |p| {
+            Box::pin(async move { p.wait_for_load_state(state).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_waitForUrlChange")]
+    pub async fn wait_for_url_change(&self, after_url: String, timeout: Option<f64>) -> Result<String> {
+        let timeout = call_timeout(timeout);
+        with_page_in(self.lease.clone(), timeout, move |p| {
+            Box::pin(async move { p.wait_for_url_change(&after_url).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_navigationTimeout")]
+    pub fn navigation_timeout(&self) -> f64 {
+        let Ok(page) = self.lease.page.try_read() else {
+            return 30_000.0;
+        };
+        page.as_ref()
+            .map(|p| p.navigation_timeout().as_millis() as f64)
+            .unwrap_or(30_000.0)
+    }
+
+    #[napi(js_name = "_baseUrl")]
+    pub fn base_url(&self) -> Option<String> {
+        let Ok(page) = self.lease.page.try_read() else {
+            return None;
+        };
+        page.as_ref().and_then(|p| p.base_url())
+    }
+
+    #[napi(js_name = "_waitForFunction")]
+    pub async fn wait_for_function(
+        &self,
+        expression: String,
+        polling_ms: Option<f64>,
+        timeout: Option<f64>,
+    ) -> Result<serde_json::Value> {
+        let timeout = call_timeout(timeout);
+        let polling = match polling_ms {
+            Some(ms) if ms > 0.0 && ms.is_finite() => {
+                fluxwright::WaitPolling::Interval(std::time::Duration::from_secs_f64(ms / 1000.0))
+            }
+            _ => fluxwright::WaitPolling::Raf,
+        };
+        with_page_in(self.lease.clone(), timeout, move |p| {
+            Box::pin(async move { p.wait_for_function_with(&expression, polling).await })
+        })
+        .await
     }
 
     #[napi]
