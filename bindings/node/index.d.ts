@@ -13,6 +13,20 @@ export declare class Browser {
   /** A fresh browser context. Every option applies to this page only. */
   newPage(options?: NewPageOptions | undefined | null): Promise<Page>
   close(): Promise<void>
+  _newContext(options?: NewPageOptions | undefined | null): Promise<number>
+  _newPageInContext(ctxId: number): Promise<Page>
+  _contextCookies(ctxId: number): Promise<Array<Cookie>>
+  _contextAddCookies(ctxId: number, cookies: Array<Cookie>): Promise<void>
+  _contextClearCookies(ctxId: number): Promise<void>
+  _contextAddInitScript(ctxId: number, source: string): Promise<void>
+  _contextExposeBinding(ctxId: number, name: string): Promise<void>
+  _contextOnBinding(ctxId: number, handler: (arg: BindingCallEvent) => void): void
+  _contextResolveBinding(id: number, valueJson: string): Promise<void>
+  _contextRejectBinding(id: number, message: string): Promise<void>
+  _setContextRouteHandler(ctxId: number, handler: (arg: InterceptedRoute) => void): void
+  _contextIntercept(ctxId: number): Promise<void>
+  _closeContext(ctxId: number): Promise<void>
+  _dropContext(ctxId: number): void
 }
 
 export declare class Chromium {
@@ -247,6 +261,15 @@ export declare class Page {
   _exposeBinding(name: string): Promise<void>
   _resolveBinding(id: number, valueJson: string): Promise<void>
   _rejectBinding(id: number, message: string): Promise<void>
+  bringToFront(): Promise<void>
+  _targetId(): string
+  _openerTargetId(): string | null
+  _onPopup(handler: (arg: Page) => void): void
+  _mainFrameId(): string
+  _frames(): Array<FrameInfo>
+  _frameGoto(frameId: string, url: string, options?: GotoOptions | undefined | null): Promise<void>
+  _frameEvaluate(frameId: string, expression: string): Promise<any>
+  _frameById(frameId: string): FrameLocator
 }
 
 /**
@@ -346,6 +369,13 @@ export interface FilePayloadInput {
   name: string
   mimeType: string
   buffer: Buffer
+}
+
+export interface FrameInfo {
+  id: string
+  parentId?: string
+  name: string
+  url: string
 }
 
 export interface FulfillOptions {

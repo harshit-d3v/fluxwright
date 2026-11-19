@@ -843,6 +843,48 @@ struct CookieInput {
     cross_site_ancestor: Option<bool>,
 }
 
+fn parse_cookies(cookies: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<fluxwright::Cookie>> {
+    let mut parsed = Vec::with_capacity(cookies.len());
+    for c in cookies {
+        let item: CookieInput = options(&c, "cookies")?;
+        if item.domain.is_some() == item.url.is_some() {
+            return Err(PyValueError::new_err(
+                "add_cookies: each cookie needs url or domain, not both",
+            ));
+        }
+        let domain = item.domain.or(item.url).expect("checked above");
+        parsed.push(fluxwright::Cookie {
+            name: item.name,
+            value: item.value,
+            domain,
+            path: item.path.unwrap_or_else(|| "/".into()),
+            expires: item.expires.unwrap_or(-1.0),
+            http_only: item.http_only.unwrap_or(false),
+            secure: item.secure.unwrap_or(false),
+            same_site: item.same_site.unwrap_or_else(|| "Lax".into()),
+            partition_key: item.partition_key,
+            cross_site_ancestor: item.cross_site_ancestor,
+        });
+    }
+    Ok(parsed)
+}
+
+fn eval_script(expression: &str, arg: Option<Bound<'_, PyAny>>) -> PyResult<String> {
+    let arg = arg.map(|a| to_json(&a)).transpose()?;
+    Ok(page_function(expression, arg.as_ref()))
+}
+
+async fn save_storage_json(json: serde_json::Value, path: Option<PathBuf>) -> PyResult<Json> {
+    if let Some(path) = path {
+        let bytes = serde_json::to_vec_pretty(&json)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        RT.spawn_blocking(move || save_private(&path, &bytes))
+            .await
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
+    }
+    Ok(Json(json))
+}
+
 #[derive(Deserialize)]
 struct ProxyOptions {
     server: String,
@@ -966,6 +1008,79 @@ fn queue_wait(ms: Option<f64>) -> Duration {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn parse_job_options<'py>(
+    proxy: Option<Bound<'py, PyAny>>,
+    user_agent: Option<String>,
+    locale: Option<String>,
+    timezone_id: Option<String>,
+    geolocation: Option<Bound<'py, PyAny>>,
+    permissions: Option<Vec<String>>,
+    viewport: Option<Bound<'py, PyAny>>,
+    device_scale_factor: Option<f64>,
+    color_scheme: Option<String>,
+    is_mobile: Option<bool>,
+    has_touch: Option<bool>,
+    extra_http_headers: Option<HashMap<String, String>>,
+    ignore_https_errors: Option<bool>,
+    java_script_enabled: Option<bool>,
+    offline: Option<bool>,
+    base_url: Option<String>,
+    http_credentials: Option<Bound<'py, PyAny>>,
+    bypass_csp: Option<bool>,
+    storage_state: Option<Bound<'py, PyAny>>,
+) -> PyResult<fluxwright::JobOptions> {
+    let color_scheme = match color_scheme {
+        None => None,
+        Some(s) => Some(fluxwright::ColorScheme::parse(&s).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "color_scheme must be light, dark or no-preference, not {s:?}"
+            ))
+        })?),
+    };
+    let proxy: Option<ProxyOptions> = proxy.map(|p| options(&p, "proxy")).transpose()?;
+    let geolocation: Option<GeolocationOptions> = geolocation
+        .map(|g| options(&g, "geolocation"))
+        .transpose()?;
+    let viewport: Option<Size> = viewport.map(|v| options(&v, "viewport")).transpose()?;
+    let http_credentials: Option<Credentials> = http_credentials
+        .map(|c| options(&c, "http_credentials"))
+        .transpose()?;
+    Ok(fluxwright::JobOptions {
+        proxy: proxy.map(|p| fluxwright::Proxy {
+            server: p.server,
+            bypass: p.bypass,
+            username: p.username,
+            password: p.password,
+        }),
+        emulation: fluxwright::Emulation {
+            user_agent,
+            locale,
+            timezone_id,
+            geolocation: geolocation.map(|g| fluxwright::Geolocation {
+                latitude: g.latitude,
+                longitude: g.longitude,
+                accuracy: g.accuracy,
+            }),
+            viewport: viewport.map(|v| (v.width, v.height)),
+            device_scale_factor,
+            color_scheme,
+            is_mobile: is_mobile.unwrap_or(false),
+            has_touch: has_touch.unwrap_or(false),
+            extra_http_headers: extra_http_headers.unwrap_or_default().into_iter().collect(),
+            ignore_https_errors: ignore_https_errors.unwrap_or(false),
+            javascript_enabled: java_script_enabled,
+            offline: offline.unwrap_or(false),
+            bypass_csp: bypass_csp.unwrap_or(false),
+        },
+        permissions: permissions.unwrap_or_default(),
+        storage_state: storage_state.map(|s| storage(&s)).transpose()?,
+        base_url,
+        http_credentials: http_credentials.map(|c| (c.username, c.password)),
+        ..Default::default()
+    })
+}
+
 /// The engine: a pool of Chrome processes that pages are leased from.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct Engine {
@@ -1066,59 +1181,90 @@ impl Engine {
         bypass_csp: Option<bool>,
         storage_state: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let color_scheme = match color_scheme {
-            None => None,
-            Some(s) => Some(fluxwright::ColorScheme::parse(&s).ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "color_scheme must be light, dark or no-preference, not {s:?}"
-                ))
-            })?),
-        };
-        let proxy: Option<ProxyOptions> = proxy.map(|p| options(&p, "proxy")).transpose()?;
-        let geolocation: Option<GeolocationOptions> = geolocation
-            .map(|g| options(&g, "geolocation"))
-            .transpose()?;
-        let viewport: Option<Size> = viewport.map(|v| options(&v, "viewport")).transpose()?;
-        let http_credentials: Option<Credentials> = http_credentials
-            .map(|c| options(&c, "http_credentials"))
-            .transpose()?;
-        let opts = fluxwright::JobOptions {
-            proxy: proxy.map(|p| fluxwright::Proxy {
-                server: p.server,
-                bypass: p.bypass,
-                username: p.username,
-                password: p.password,
-            }),
-            emulation: fluxwright::Emulation {
-                user_agent,
-                locale,
-                timezone_id,
-                geolocation: geolocation.map(|g| fluxwright::Geolocation {
-                    latitude: g.latitude,
-                    longitude: g.longitude,
-                    accuracy: g.accuracy,
-                }),
-                viewport: viewport.map(|v| (v.width, v.height)),
-                device_scale_factor,
-                color_scheme,
-                is_mobile: is_mobile.unwrap_or(false),
-                has_touch: has_touch.unwrap_or(false),
-                extra_http_headers: extra_http_headers.unwrap_or_default().into_iter().collect(),
-                ignore_https_errors: ignore_https_errors.unwrap_or(false),
-                javascript_enabled: java_script_enabled,
-                offline: offline.unwrap_or(false),
-                bypass_csp: bypass_csp.unwrap_or(false),
-            },
-            permissions: permissions.unwrap_or_default(),
-            storage_state: storage_state.map(|s| storage(&s)).transpose()?,
+        let opts = parse_job_options(
+            proxy,
+            user_agent,
+            locale,
+            timezone_id,
+            geolocation,
+            permissions,
+            viewport,
+            device_scale_factor,
+            color_scheme,
+            is_mobile,
+            has_touch,
+            extra_http_headers,
+            ignore_https_errors,
+            java_script_enabled,
+            offline,
             base_url,
-            http_credentials: http_credentials.map(|c| (c.username, c.password)),
-            ..Default::default()
-        };
+            http_credentials,
+            bypass_csp,
+            storage_state,
+        )?;
         let engine = self.inner.clone();
         future_into_py(py, async move {
             let lease = engine.acquire_job(&opts).await.map_err(error)?;
             Ok(Lease(std::sync::Mutex::new(Some(lease))))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, proxy=None, user_agent=None, locale=None, timezone_id=None, geolocation=None,
+                        permissions=None, viewport=None, device_scale_factor=None, color_scheme=None,
+                        is_mobile=None, has_touch=None, extra_http_headers=None, ignore_https_errors=None,
+                        java_script_enabled=None, offline=None, base_url=None, http_credentials=None,
+                        bypass_csp=None, storage_state=None))]
+    fn new_context<'py>(
+        &self,
+        py: Python<'py>,
+        proxy: Option<Bound<'py, PyAny>>,
+        user_agent: Option<String>,
+        locale: Option<String>,
+        timezone_id: Option<String>,
+        geolocation: Option<Bound<'py, PyAny>>,
+        permissions: Option<Vec<String>>,
+        viewport: Option<Bound<'py, PyAny>>,
+        device_scale_factor: Option<f64>,
+        color_scheme: Option<String>,
+        is_mobile: Option<bool>,
+        has_touch: Option<bool>,
+        extra_http_headers: Option<HashMap<String, String>>,
+        ignore_https_errors: Option<bool>,
+        java_script_enabled: Option<bool>,
+        offline: Option<bool>,
+        base_url: Option<String>,
+        http_credentials: Option<Bound<'py, PyAny>>,
+        bypass_csp: Option<bool>,
+        storage_state: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = parse_job_options(
+            proxy,
+            user_agent,
+            locale,
+            timezone_id,
+            geolocation,
+            permissions,
+            viewport,
+            device_scale_factor,
+            color_scheme,
+            is_mobile,
+            has_touch,
+            extra_http_headers,
+            ignore_https_errors,
+            java_script_enabled,
+            offline,
+            base_url,
+            http_credentials,
+            bypass_csp,
+            storage_state,
+        )?;
+        let engine = self.inner.clone();
+        future_into_py(py, async move {
+            let ctx = engine.acquire_context_with(&opts).await.map_err(error)?;
+            Ok(Context {
+                inner: Arc::new(ctx),
+            })
         })
     }
 
@@ -1131,6 +1277,123 @@ impl Engine {
     }
 }
 
+#[pyclass(frozen, module = "fluxwright._native")]
+struct Context {
+    inner: Arc<fluxwright::ContextLease>,
+}
+
+#[pymethods]
+impl Context {
+    fn new_page<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            let lease = ctx.new_page().await.map_err(error)?;
+            Ok(Lease(std::sync::Mutex::new(Some(lease))))
+        })
+    }
+
+    fn cookies<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            let cookies = ctx.cookies().await.map_err(error)?;
+            let json =
+                serde_json::to_value(&cookies).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok(Json(json))
+        })
+    }
+
+    fn add_cookies<'py>(
+        &self,
+        py: Python<'py>,
+        cookies: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let parsed = parse_cookies(cookies)?;
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            ctx.add_cookies(&parsed).await.map(none).map_err(error)
+        })
+    }
+
+    fn clear_cookies<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            ctx.clear_cookies().await.map(none).map_err(error)
+        })
+    }
+
+    fn add_init_script<'py>(&self, py: Python<'py>, source: String) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            ctx.add_init_script(&source).await.map(none).map_err(error)
+        })
+    }
+
+    fn expose_binding<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            ctx.expose_binding(&name).await.map(none).map_err(error)
+        })
+    }
+
+    fn binding_calls(&self) -> BindingStream {
+        BindingStream(Arc::new(Mutex::new(self.inner.subscribe_bindings())))
+    }
+
+    fn intercept<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            let rx = ctx.intercept().await.map_err(error)?;
+            Ok(RouteStream(Arc::new(Mutex::new(rx))))
+        })
+    }
+
+    #[pyo3(signature = (*, path=None))]
+    fn storage_state<'py>(
+        &self,
+        py: Python<'py>,
+        path: Option<PathBuf>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            let cookies = ctx.cookies().await.map_err(error)?;
+            let json = serde_json::json!({ "cookies": cookies, "origins": [] });
+            save_storage_json(json, path).await
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ctx = self.inner.clone();
+        future_into_py(py, async move { ctx.close().await.map(none).map_err(error) })
+    }
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct FrameInfo {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    parent_id: Option<String>,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    url: String,
+}
+
+impl From<fluxwright::FrameInfo> for FrameInfo {
+    fn from(f: fluxwright::FrameInfo) -> Self {
+        FrameInfo {
+            id: f.id,
+            parent_id: f.parent_id,
+            name: f.name,
+            url: f.url,
+        }
+    }
+}
+
 /// A leased page on its way to becoming a `Page`.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct Lease(std::sync::Mutex<Option<fluxwright::PageLease>>);
@@ -1140,6 +1403,8 @@ struct Lease(std::sync::Mutex<Option<fluxwright::PageLease>>);
 struct Page {
     lease: LeaseSlot,
     url: tokio::sync::watch::Receiver<String>,
+    target_id: String,
+    opener_target_id: Option<String>,
 }
 
 fn parse_wait_until(wait_until: Option<&str>) -> PyResult<fluxwright::WaitUntil> {
@@ -1171,6 +1436,8 @@ impl Page {
     fn new(lease: &Bound<'_, Lease>) -> PyResult<Self> {
         let lease = lease.get().0.lock().unwrap().take();
         let lease = lease.ok_or_else(|| PyValueError::new_err("this lease already has a page"))?;
+        let target_id = lease.target_id().to_owned();
+        let opener_target_id = lease.opener_target_id().map(str::to_owned);
         let url = lease.subscribe_url();
         let (closing, _) = tokio::sync::watch::channel(false);
         Ok(Page {
@@ -1179,6 +1446,8 @@ impl Page {
                 closing,
             }),
             url,
+            target_id,
+            opener_target_id,
         })
     }
 
@@ -1933,8 +2202,7 @@ impl Page {
         expression: String,
         arg: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let arg = arg.map(|a| to_json(&a)).transpose()?;
-        let script = page_function(&expression, arg.as_ref());
+        let script = eval_script(&expression, arg)?;
         run(py, &self.lease, move |p| {
             Box::pin(async move { p.evaluate(&script).await.map(Json) })
         })
@@ -2076,14 +2344,7 @@ impl Page {
             let state = with_page(&lease, |p| Box::pin(p.storage_state())).await?;
             let json =
                 serde_json::to_value(&state).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            if let Some(path) = path {
-                let bytes = serde_json::to_vec_pretty(&json)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                RT.spawn_blocking(move || save_private(&path, &bytes))
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))??;
-            }
-            Ok(Json(json))
+            save_storage_json(json, path).await
         })
     }
 
@@ -2165,6 +2426,11 @@ impl Page {
     /// Whether `close()` was called (or is under way).
     fn is_closed(&self) -> bool {
         *self.lease.closing.borrow()
+            || self
+                .lease
+                .page
+                .try_read()
+                .map_or(true, |g| g.as_ref().is_none_or(|p| p.is_closed()))
     }
 
     /// CSS, `text=`, `xpath=`, or `role=` selector.
@@ -2298,28 +2564,7 @@ impl Page {
         py: Python<'py>,
         cookies: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut parsed = Vec::with_capacity(cookies.len());
-        for c in cookies {
-            let item: CookieInput = options(&c, "cookies")?;
-            if item.domain.is_some() == item.url.is_some() {
-                return Err(PyValueError::new_err(
-                    "add_cookies: each cookie needs url or domain, not both",
-                ));
-            }
-            let domain = item.domain.or(item.url).expect("checked above");
-            parsed.push(fluxwright::Cookie {
-                name: item.name,
-                value: item.value,
-                domain,
-                path: item.path.unwrap_or_else(|| "/".into()),
-                expires: item.expires.unwrap_or(-1.0),
-                http_only: item.http_only.unwrap_or(false),
-                secure: item.secure.unwrap_or(false),
-                same_site: item.same_site.unwrap_or_else(|| "Lax".into()),
-                partition_key: item.partition_key,
-                cross_site_ancestor: item.cross_site_ancestor,
-            });
-        }
+        let parsed = parse_cookies(cookies)?;
         run(py, &self.lease, move |p| {
             Box::pin(async move { p.add_cookies(&parsed).await.map(none) })
         })
@@ -2386,6 +2631,83 @@ impl Page {
         run(py, &self.lease, move |p| {
             Box::pin(async move { p.expose_binding(&name).await.map(none) })
         })
+    }
+
+    fn bring_to_front<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, |p| {
+            Box::pin(async move { p.bring_to_front().await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_target_id")]
+    fn target_id(&self) -> String {
+        self.target_id.clone()
+    }
+
+    #[pyo3(name = "_opener_target_id")]
+    fn opener_target_id(&self) -> Option<String> {
+        self.opener_target_id.clone()
+    }
+
+    #[pyo3(name = "_popups")]
+    fn popups(&self) -> PyResult<PopupStream> {
+        self.now(|p| PopupStream(Arc::new(Mutex::new(p.subscribe_popups()))))
+    }
+
+    #[pyo3(name = "_main_frame_id")]
+    fn main_frame_id(&self) -> String {
+        self.target_id.clone()
+    }
+
+    #[pyo3(name = "_frames")]
+    fn frames(&self) -> Vec<FrameInfo> {
+        if *self.lease.closing.borrow() {
+            return Vec::new();
+        }
+        let Ok(page) = self.lease.page.try_read() else {
+            return Vec::new();
+        };
+        let Some(p) = page.as_ref().filter(|p| !p.is_closed()) else {
+            return Vec::new();
+        };
+        p.frame_infos().into_iter().map(FrameInfo::from).collect()
+    }
+
+    #[pyo3(name = "_frame_goto", signature = (frame_id, url, *, wait_until=None, timeout=None))]
+    fn frame_goto<'py>(
+        &self,
+        py: Python<'py>,
+        frame_id: String,
+        url: String,
+        wait_until: Option<String>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let wait = parse_wait_until(wait_until.as_deref())?;
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.frame_goto_with(&frame_id, &url, wait).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_frame_evaluate", signature = (frame_id, expression, arg=None))]
+    fn frame_evaluate<'py>(
+        &self,
+        py: Python<'py>,
+        frame_id: String,
+        expression: String,
+        arg: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let script = eval_script(&expression, arg)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.frame_evaluate(&frame_id, &script).await.map(Json) })
+        })
+    }
+
+    #[pyo3(name = "_frame_by_id")]
+    fn frame_by_id(&self, frame_id: String) -> FrameLocator {
+        FrameLocator {
+            lease: self.lease.clone(),
+            frames: vec![fluxwright::Selector::frame_id_hop(&frame_id)],
+        }
     }
 }
 
@@ -3621,6 +3943,26 @@ impl BindingStream {
     }
 }
 
+/// Popups opened from this page, in order.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct PopupStream(Arc<Mutex<UnboundedReceiver<fluxwright::PageLease>>>);
+
+#[pymethods]
+impl PopupStream {
+    /// The next popup lease, or `None` once the page closed.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .map(|lease| Lease(std::sync::Mutex::new(Some(lease)))))
+        })
+    }
+}
+
 /// Requests `page.route` intercepted, in order.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct RouteStream(Arc<Mutex<UnboundedReceiver<fluxwright::InterceptedRequest>>>);
@@ -3760,6 +4102,8 @@ impl Download {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
+    m.add_class::<Context>()?;
+    m.add_class::<FrameInfo>()?;
     m.add_class::<Lease>()?;
     m.add_class::<Page>()?;
     m.add_class::<Locator>()?;
@@ -3779,6 +4123,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FileChooserStream>()?;
     m.add_class::<BindingCall>()?;
     m.add_class::<BindingStream>()?;
+    m.add_class::<PopupStream>()?;
     m.py().import("atexit")?.call_method1("register", (wrap_pyfunction!(wait_for_hand_overs, m)?,))?;
     Ok(())
 }

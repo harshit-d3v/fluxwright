@@ -21,6 +21,7 @@ import concurrent.futures
 import logging
 import re
 import threading
+import weakref
 from contextlib import contextmanager, suppress
 from os import PathLike
 from pathlib import Path
@@ -56,6 +57,7 @@ __all__ = [
     "FileChooser",
     "FilePayload",
     "FloatRect",
+    "Frame",
     "FrameLocator",
     "Geolocation",
     "HttpCredentials",
@@ -132,8 +134,18 @@ async def _await(awaitable: Awaitable[T]) -> T:
     return await awaitable
 
 
+_sync_pages: weakref.WeakKeyDictionary[_a.Page, Page] = weakref.WeakKeyDictionary()
+
+
+def _wrap_page(impl: _a.Page) -> Page:
+    page = _sync_pages.get(impl)
+    return page if page is not None else Page(impl)
+
+
 def _to_sync(arg: Any) -> Any:
     """An async API object as its blocking counterpart, for a listener or predicate."""
+    if isinstance(arg, _a.Page):
+        return _wrap_page(arg)
     if isinstance(arg, _a.Response):
         return Response(arg)
     if isinstance(arg, _a.Request):
@@ -143,6 +155,47 @@ def _to_sync(arg: Any) -> Any:
     if isinstance(arg, _a.FileChooser):
         return FileChooser(arg)
     return arg
+
+
+def _bridge_route(
+    bridges: list[tuple[URLMatch, Callable[..., Any], Callable[..., Any]]],
+    async_target: Any,
+    url: URLMatch,
+    handler: Callable[..., Any],
+) -> None:
+    loop = _event_loop()
+    with_request = _a._takes_request(handler)
+
+    def bridge(route: _a.Route, request: _a.Request) -> Any:
+        args = (Route(route), Request(request)) if with_request else (Route(route),)
+        # The loop's default pool: a handler waiting on the page holds up no other request.
+        return loop.run_in_executor(None, lambda: handler(*args))
+
+    bridges.append((url, handler, bridge))
+    _run(async_target.route, url, bridge)
+
+
+def _unbridge_route(
+    bridges: list[tuple[URLMatch, Callable[..., Any], Callable[..., Any]]],
+    async_target: Any,
+    url: URLMatch,
+    handler: Callable[..., Any] | None = None,
+) -> None:
+    for entry in list(bridges):
+        if entry[0] == url and (handler is None or entry[1] == handler):
+            bridges.remove(entry)
+            _run(async_target.unroute, url, entry[2])
+
+
+def _bridge_expose(async_target: Any, label: str, name: str, callback: Callable[..., Any]) -> None:
+    if not callable(callback):
+        raise TypeError(f"{label}: callback must be callable")
+    loop = _event_loop()
+
+    def bridge(*args: Any) -> Any:
+        return loop.run_in_executor(None, lambda: callback(*args))
+
+    _run(async_target.expose_function, name, bridge)
 
 
 def _listen(handler: Callable[[Any], Any], arg: Any) -> None:
@@ -540,6 +593,54 @@ class FrameLocator(_Finders):
         return FrameLocator(self._impl.frame_locator(selector))
 
 
+class Frame(_Finders):
+    """An imperative handle to a main frame or iframe on a page."""
+
+    _impl: _a.Frame
+
+    def __init__(self, impl: _a.Frame) -> None:
+        self._impl = impl
+
+    @property
+    def page(self) -> Page:
+        return _wrap_page(self._impl.page)
+
+    @property
+    def url(self) -> str:
+        return self._impl.url
+
+    @property
+    def name(self) -> str:
+        return self._impl.name
+
+    def is_detached(self) -> bool:
+        return self._impl.is_detached()
+
+    @property
+    def parent_frame(self) -> Frame | None:
+        p = self._impl.parent_frame
+        return Frame(p) if p is not None else None
+
+    @property
+    def child_frames(self) -> list[Frame]:
+        return [Frame(f) for f in self._impl.child_frames]
+
+    def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.goto, url, wait_until=wait_until, timeout=timeout)
+
+    def evaluate(self, expression: str, arg: Any = None) -> Any:
+        return _run(self._impl.evaluate, expression, arg)
+
+    def title(self) -> str:
+        return _run(self._impl.title)
+
+    def content(self) -> str:
+        return _run(self._impl.content)
+
+    def frame_locator(self, selector: str) -> FrameLocator:
+        return FrameLocator(self._impl.frame_locator(selector))
+
+
 class Download:
     """A file the page downloaded; deleted when the page closes, so ``save_as`` it first."""
 
@@ -861,6 +962,7 @@ class Page(_Finders):
 
     def __init__(self, impl: _a.Page) -> None:
         self._impl = impl
+        _sync_pages[impl] = self
         self._route_bridges: list[tuple[URLMatch, Callable[..., Any], Callable[..., Any]]] = []
         self._listener_bridges: list[tuple[str, Callable[[Any], Any], Callable[[Any], Any]]] = []
         # This page's listeners run here, one at a time and in order, so a slow one on another
@@ -1327,27 +1429,45 @@ class Page(_Finders):
     def frame_locator(self, selector: str) -> FrameLocator:
         return FrameLocator(self._impl.frame_locator(selector))
 
+    @property
+    def frames(self) -> list[Frame]:
+        return [Frame(f) for f in self._impl.frames]
+
+    @property
+    def main_frame(self) -> Frame:
+        return Frame(self._impl.main_frame)
+
+    def frame(self, name: str | None = None, *, url: URLMatch | None = None) -> Frame | None:
+        f = self._impl.frame(name, url=url)
+        return Frame(f) if f is not None else None
+
+    def bring_to_front(self) -> None:
+        _run(self._impl.bring_to_front)
+
+    def opener(self) -> Page | None:
+        p = _run(self._impl.opener)
+        return _wrap_page(p) if p is not None else None
+
+    @contextmanager
+    def expect_popup(
+        self,
+        predicate: Callable[[Page], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Iterator[EventInfo[Page]]:
+        """Waits for a popup page opened by the code in the ``with`` block."""
+        with self._expect(self._impl.expect_popup, predicate, timeout, _wrap_page) as info:
+            yield info
+
     def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
         """Hands matching requests to ``handler(route)`` or ``handler(route, request)``, on a
         worker thread, as Playwright's ``page.route``. The handler added last runs first; an
         unanswered request continues. Call it before navigating."""
-        loop = _event_loop()
-        with_request = _a._takes_request(handler)
-
-        def bridge(route: _a.Route, request: _a.Request) -> Any:
-            args = (Route(route), Request(request)) if with_request else (Route(route),)
-            # The loop's default pool: a handler waiting on the page holds up no other request.
-            return loop.run_in_executor(None, lambda: handler(*args))
-
-        self._route_bridges.append((url, handler, bridge))
-        _run(self._impl.route, url, bridge)
+        _bridge_route(self._route_bridges, self._impl, url, handler)
 
     def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         """Removes the handlers added for ``url`` (only ``handler``, when given)."""
-        for entry in list(self._route_bridges):
-            if entry[0] == url and (handler is None or entry[1] == handler):
-                self._route_bridges.remove(entry)
-                _run(self._impl.unroute, url, entry[2])
+        _unbridge_route(self._route_bridges, self._impl, url, handler)
 
     def add_init_script(self, script: str | None = None, *, path: str | PathLike[str] | None = None) -> None:
         """Adds a script evaluated whenever the page navigates or reloads."""
@@ -1355,14 +1475,7 @@ class Page(_Finders):
 
     def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
         """Exposes ``callback`` on ``window.<name>``; runs on the worker pool so it can call the page."""
-        if not callable(callback):
-            raise TypeError("page.expose_function: callback must be callable")
-        loop = _event_loop()
-
-        def bridge(*args: Any) -> Any:
-            return loop.run_in_executor(None, lambda: callback(*args))
-
-        _run(self._impl.expose_function, name, bridge)
+        _bridge_expose(self._impl, "page.expose_function", name, callback)
 
     def add_script_tag(
         self,
@@ -1603,9 +1716,9 @@ class Browser:
         bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
     ) -> BrowserContext:
-        """A browser context with ``new_page``'s options, as Playwright's ``new_context``. Each
-        context holds one page; see ``BrowserContext``."""
-        options = dict(
+        """A browser context with ``new_page``'s options, as Playwright's ``new_context``; see ``BrowserContext``."""
+        impl = _run(
+            self._impl.new_context,
             proxy=proxy,
             user_agent=user_agent,
             locale=locale,
@@ -1626,7 +1739,7 @@ class Browser:
             bypass_csp=bypass_csp,
             storage_state=storage_state,
         )
-        return BrowserContext(self, options)
+        return BrowserContext(self, impl)
 
     def close(self) -> None:
         """Shuts the engine down, and with it every page and Chrome process it started."""
@@ -1640,24 +1753,14 @@ class Browser:
 
 
 class BrowserContext:
-    """A browser context, as Playwright's: the options its page opens with.
-
-    Each context holds one page, so one job's cookies and storage never reach another:
-    ``new_page()`` opens it and a second call raises ``Error``. To share a login across pages,
-    pass one page's ``storage_state()`` to the next ``new_context``.
+    """A browser context, as Playwright's: holds multiple pages and popups sharing cookies,
+    storage, init scripts, exposed functions and routes.
     """
 
-    def __init__(self, browser: Browser, options: dict[str, Any]) -> None:
+    def __init__(self, browser: Browser, impl: _a.BrowserContext) -> None:
         self._browser = browser
-        self._options = options
-        self._page: Page | None = None
-        self._lock = threading.Lock()
-        self._opening = False
-        self._closed = False
-        self._routes: list[tuple[URLMatch, Callable[..., Any]]] = []
-        self._cookies: list[dict[str, Any]] = []
-        self._init_scripts: list[str] = []
-        self._exposed: list[tuple[str, Callable[..., Any]]] = []
+        self._impl = impl
+        self._route_bridges: list[tuple[URLMatch, Callable[..., Any], Callable[..., Any]]] = []
 
     @property
     def browser(self) -> Browser:
@@ -1665,115 +1768,49 @@ class BrowserContext:
 
     @property
     def pages(self) -> list[Page]:
-        return [self._page] if self._page is not None and not self._page.is_closed() else []
+        return [_wrap_page(p) for p in self._impl.pages]
 
     def new_page(self) -> Page:
-        with self._lock:
-            if self._closed:
-                raise Error("browser_context.new_page: the context is closed")
-            if self._page is not None or self._opening:
-                raise Error(f"browser_context.new_page: {_a.ONE_PAGE}")
-            self._opening = True
-        try:
-            page = self._browser.new_page(**self._options)
-            try:
-                if self._cookies:
-                    _run(page._impl._add_cookies, list(self._cookies))
-                for name, callback in self._exposed:
-                    page.expose_function(name, callback)
-                for source in self._init_scripts:
-                    _run(page._impl._add_init_script, source)
-                for url, handler in self._routes:
-                    page.route(url, handler)
-                # close() from another thread while the page was coming: it would otherwise stay
-                # open on a closed context. Checked and stored under the lock close() takes.
-                with self._lock:
-                    if not self._closed:
-                        self._page = page
-                if self._page is not page:
-                    raise Error("browser_context.new_page: the context is closed")
-            except BaseException:
-                page.close()
-                raise
-            return page
-        finally:
-            self._opening = False
+        return _wrap_page(_run(self._impl.new_page))
 
     def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
-        """``page.route`` for this context's page; added before ``new_page()``, it applies from
-        the page's first request."""
-        self._routes.append((url, handler))
-        if self._page is not None:
-            self._page.route(url, handler)
+        """``page.route`` for all pages and popups in this context; added before ``new_page()``, it
+        applies from the first request."""
+        _bridge_route(self._route_bridges, self._impl, url, handler)
 
     def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
-        self._routes = [r for r in self._routes if not (r[0] == url and (handler is None or r[1] == handler))]
-        if self._page is not None:
-            self._page.unroute(url, handler)
+        _unbridge_route(self._route_bridges, self._impl, url, handler)
 
     def add_init_script(self, script: str | None = None, *, path: str | PathLike[str] | None = None) -> None:
-        """``page.add_init_script`` for this context's page."""
-        source = _a._resolve_init_script("browser_context.add_init_script", script, path)
-        with self._lock:
-            self._init_scripts.append(source)
-            page = self._page
-        if page is not None:
-            _run(page._impl._add_init_script, source)
+        """``page.add_init_script`` for all pages and popups in this context."""
+        _run(self._impl.add_init_script, script, path=path)
 
     def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
-        """``page.expose_function`` for this context's page."""
-        if not isinstance(name, str) or not name:
-            raise TypeError("browser_context.expose_function: name must be a non-empty str")
-        if not callable(callback):
-            raise TypeError("browser_context.expose_function: callback must be callable")
-        with self._lock:
-            if any(n == name for n, _ in self._exposed):
-                raise Error(f'Function "{name}" has been already registered')
-            self._exposed.append((name, callback))
-            page = self._page
-        if page is not None:
-            try:
-                page.expose_function(name, callback)
-            except BaseException:
-                with self._lock:
-                    self._exposed = [(n, c) for n, c in self._exposed if n != name]
-                raise
+        """``page.expose_function`` for all pages and popups in this context."""
+        _bridge_expose(self._impl, "browser_context.expose_function", name, callback)
 
     def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
-        """The cookies and localStorage of this context's page, as ``page.storage_state``."""
-        if self._page is None:
-            raise Error("browser_context.storage_state: call new_page() first")
-        return self._page.storage_state(path=path)
+        """The cookies and localStorage of this context, usable before or after ``new_page()``."""
+        return _run(self._impl.storage_state, path=path)
 
     def cookies(self) -> list[dict[str, Any]]:
         """Every cookie in this context."""
-        cookies: list[dict[str, Any]] = self.storage_state()["cookies"]
-        return cookies
+        return _run(self._impl.cookies)
 
     def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
         """Adds cookies to this context."""
-        with self._lock:
-            if self._page is None:
-                self._cookies.extend(cookies)
-                return
-            page = self._page
-        _run(page._impl._add_cookies, cookies)
+        _run(self._impl.add_cookies, cookies)
 
     def clear_cookies(self) -> None:
         """Clears every cookie in this context."""
-        with self._lock:
-            self._cookies.clear()
-            page = self._page
-        if page is not None:
-            _run(page._impl._clear_cookies)
+        _run(self._impl.clear_cookies)
 
     def close(self) -> None:
-        """Closes the context's page; the context opens no other."""
-        with self._lock:
-            self._closed = True
-            page = self._page
-        if page is not None:
-            page.close()
+        """Closes this context and all of its pages and popups."""
+        wrappers = [_sync_pages[p] for p in self._impl.pages if p in _sync_pages]
+        _run(self._impl.close)
+        for w in wrappers:
+            w._listener_thread.shutdown(wait=False)
 
     def __enter__(self) -> BrowserContext:
         return self

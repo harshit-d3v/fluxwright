@@ -12,6 +12,9 @@ static RT: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio"));
 #[napi]
 pub struct Browser {
     inner: fluxwright::BrowserEngine,
+    contexts: Arc<std::sync::Mutex<(u32, HashMap<u32, Arc<fluxwright::ContextLease>>)>>,
+    context_routes: Arc<std::sync::Mutex<HashMap<u32, Arc<Callback<InterceptedRoute>>>>>,
+    context_bindings: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::BindingCall>)>>,
 }
 
 /// The page's lease, read-locked by every page call, so calls run side by side (a download wait
@@ -32,6 +35,8 @@ pub struct Page {
     file_choosers: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::FileChooser>)>>,
     bindings: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::BindingCall>)>>,
     url: tokio::sync::watch::Receiver<String>,
+    target_id: String,
+    opener_target_id: Option<String>,
 }
 
 /// A thread-safe JavaScript callback (errors are not passed to it) that does not keep Node
@@ -464,6 +469,14 @@ pub struct FilePayloadInput {
     pub name: String,
     pub mime_type: String,
     pub buffer: Buffer,
+}
+
+#[napi(object)]
+pub struct FrameInfo {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub url: String,
 }
 
 fn opt_delay(ms: Option<f64>) -> Option<std::time::Duration> {
@@ -1305,25 +1318,44 @@ pub struct StorageItem {
     pub value: String,
 }
 
+impl From<Cookie> for fluxwright::Cookie {
+    fn from(c: Cookie) -> Self {
+        fluxwright::Cookie {
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path,
+            expires: c.expires,
+            http_only: c.http_only,
+            secure: c.secure,
+            same_site: c.same_site,
+            partition_key: c.partition_key,
+            cross_site_ancestor: c.cr_has_cross_site_ancestor,
+        }
+    }
+}
+
+impl From<fluxwright::Cookie> for Cookie {
+    fn from(c: fluxwright::Cookie) -> Self {
+        Cookie {
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path,
+            expires: c.expires,
+            http_only: c.http_only,
+            secure: c.secure,
+            same_site: c.same_site,
+            partition_key: c.partition_key,
+            cr_has_cross_site_ancestor: c.cross_site_ancestor,
+        }
+    }
+}
+
 impl From<StorageState> for fluxwright::StorageState {
     fn from(s: StorageState) -> Self {
         fluxwright::StorageState {
-            cookies: s
-                .cookies
-                .into_iter()
-                .map(|c| fluxwright::Cookie {
-                    name: c.name,
-                    value: c.value,
-                    domain: c.domain,
-                    path: c.path,
-                    expires: c.expires,
-                    http_only: c.http_only,
-                    secure: c.secure,
-                    same_site: c.same_site,
-                    partition_key: c.partition_key,
-                    cross_site_ancestor: c.cr_has_cross_site_ancestor,
-                })
-                .collect(),
+            cookies: s.cookies.into_iter().map(Into::into).collect(),
             origins: s
                 .origins
                 .into_iter()
@@ -1578,7 +1610,12 @@ impl Chromium {
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(Browser { inner: engine })
+        Ok(Browser {
+            inner: engine,
+            contexts: Default::default(),
+            context_routes: Default::default(),
+            context_bindings: Default::default(),
+        })
     }
 
     /// Connects to an existing browser over the Chrome DevTools Protocol (`ws://...` or `http://...`).
@@ -1597,8 +1634,62 @@ impl Chromium {
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(Browser { inner: engine })
+        Ok(Browser {
+            inner: engine,
+            contexts: Default::default(),
+            context_routes: Default::default(),
+            context_bindings: Default::default(),
+        })
     }
+}
+
+fn spawn_binding_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<fluxwright::BindingCall>,
+    store: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::BindingCall>)>>,
+    tsfn: Callback<BindingCallEvent>,
+) {
+    RT.spawn(async move {
+        while let Some(call) = rx.recv().await {
+            let name = call.name.clone();
+            let args_json = serde_json::to_string(&call.args).unwrap_or_else(|_| "[]".into());
+            let id = {
+                let mut g = store.lock().unwrap();
+                g.0 = g.0.wrapping_add(1);
+                if g.1.len() >= 256 {
+                    if let Some(&oldest) = g.1.keys().min() {
+                        g.1.remove(&oldest);
+                    }
+                }
+                let id = g.0;
+                g.1.insert(id, call);
+                id
+            };
+            tsfn.call(BindingCallEvent { id, name, args_json }, ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    });
+}
+
+async fn resolve_binding_call(
+    store: &std::sync::Mutex<(u32, HashMap<u32, fluxwright::BindingCall>)>,
+    id: u32,
+    outcome: std::result::Result<serde_json::Value, String>,
+) -> Result<()> {
+    let call = store
+        .lock()
+        .unwrap()
+        .1
+        .remove(&id)
+        .ok_or_else(|| Error::from_reason("binding call is no longer available"))?;
+    RT.spawn(async move {
+        let res = match outcome {
+            Ok(v) => call.resolve(&v).await,
+            Err(msg) => call.reject(&msg).await,
+        };
+        res.map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| Error::from_reason(e.to_string()))?
+    .map_err(Error::from_reason)
 }
 
 #[napi]
@@ -1616,25 +1707,183 @@ impl Browser {
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let url = lease.subscribe_url();
-        Ok(Page {
-            lease: Arc::new(PageSlot { page: RwLock::new(Some(lease)), closing: tokio::sync::watch::Sender::new(false) }),
-            routes: Default::default(),
-            file_choosers: Default::default(),
-            bindings: Default::default(),
-            url,
-        })
+        Ok(Page::from_lease(lease))
     }
 
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        self.context_routes.lock().unwrap().clear();
+        self.context_bindings.lock().unwrap().1.clear();
+        let ctxs: Vec<Arc<fluxwright::ContextLease>> =
+            self.contexts.lock().unwrap().1.drain().map(|(_, c)| c).collect();
         let eng = self.inner.clone();
         RT.spawn(async move {
+            for c in ctxs {
+                let _ = c.close().await;
+            }
             let _ = eng.shutdown(std::time::Duration::from_secs(5)).await;
         })
         .await
         .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(())
+    }
+
+    #[napi(js_name = "_newContext")]
+    pub async fn new_context(&self, options: Option<NewPageOptions>) -> Result<u32> {
+        let opts = match options {
+            Some(o) => job_options(o)?,
+            None => fluxwright::JobOptions::default(),
+        };
+        let eng = self.inner.clone();
+        let ctx = RT
+            .spawn(async move { eng.acquire_context_with(&opts).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let mut g = self.contexts.lock().unwrap();
+        g.0 = g.0.wrapping_add(1);
+        let id = g.0;
+        g.1.insert(id, Arc::new(ctx));
+        Ok(id)
+    }
+
+    #[napi(js_name = "_newPageInContext")]
+    pub async fn new_page_in_context(&self, ctx_id: u32) -> Result<Page> {
+        let ctx = self.get_context(ctx_id)?;
+        let lease = RT
+            .spawn(async move { ctx.new_page().await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(Page::from_lease(lease))
+    }
+
+    #[napi(js_name = "_contextCookies")]
+    pub async fn context_cookies(&self, ctx_id: u32) -> Result<Vec<Cookie>> {
+        let ctx = self.get_context(ctx_id)?;
+        let cookies = RT
+            .spawn(async move { ctx.cookies().await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(cookies.into_iter().map(Into::into).collect())
+    }
+
+    #[napi(js_name = "_contextAddCookies")]
+    pub async fn context_add_cookies(&self, ctx_id: u32, cookies: Vec<Cookie>) -> Result<()> {
+        let ctx = self.get_context(ctx_id)?;
+        let cookies: Vec<fluxwright::Cookie> = cookies.into_iter().map(Into::into).collect();
+        RT.spawn(async move { ctx.add_cookies(&cookies).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "_contextClearCookies")]
+    pub async fn context_clear_cookies(&self, ctx_id: u32) -> Result<()> {
+        let ctx = self.get_context(ctx_id)?;
+        RT.spawn(async move { ctx.clear_cookies().await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "_contextAddInitScript")]
+    pub async fn context_add_init_script(&self, ctx_id: u32, source: String) -> Result<()> {
+        let ctx = self.get_context(ctx_id)?;
+        RT.spawn(async move { ctx.add_init_script(&source).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "_contextExposeBinding")]
+    pub async fn context_expose_binding(&self, ctx_id: u32, name: String) -> Result<()> {
+        let ctx = self.get_context(ctx_id)?;
+        RT.spawn(async move { ctx.expose_binding(&name).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "_contextOnBinding")]
+    pub fn context_on_binding(&self, ctx_id: u32, handler: Function<BindingCallEvent, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
+        let ctx = self.get_context(ctx_id)?;
+        spawn_binding_forwarder(ctx.subscribe_bindings(), self.context_bindings.clone(), tsfn);
+        Ok(())
+    }
+
+    #[napi(js_name = "_contextResolveBinding")]
+    pub async fn context_resolve_binding(&self, id: u32, value_json: String) -> Result<()> {
+        let value: serde_json::Value = serde_json::from_str(&value_json)
+            .map_err(|e| Error::from_reason(format!("resolveBinding invalid JSON: {e}")))?;
+        resolve_binding_call(&self.context_bindings, id, Ok(value)).await
+    }
+
+    #[napi(js_name = "_contextRejectBinding")]
+    pub async fn context_reject_binding(&self, id: u32, message: String) -> Result<()> {
+        resolve_binding_call(&self.context_bindings, id, Err(message)).await
+    }
+
+    #[napi(js_name = "_setContextRouteHandler")]
+    pub fn set_context_route_handler(&self, ctx_id: u32, handler: Function<InterceptedRoute, ()>) -> Result<()> {
+        self.context_routes
+            .lock()
+            .unwrap()
+            .insert(ctx_id, Arc::new(callback(handler)?));
+        Ok(())
+    }
+
+    #[napi(js_name = "_contextIntercept")]
+    pub async fn context_intercept(&self, ctx_id: u32) -> Result<()> {
+        let Some(tsfn) = self.context_routes.lock().unwrap().get(&ctx_id).cloned() else {
+            return Err(Error::from_reason("set a context route handler first"));
+        };
+        let ctx = self.get_context(ctx_id)?;
+        let mut requests = RT
+            .spawn(async move { ctx.intercept().await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        RT.spawn(async move {
+            while let Some(req) = requests.recv().await {
+                tsfn.call(InterceptedRoute::new(req), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    #[napi(js_name = "_closeContext")]
+    pub async fn close_context(&self, ctx_id: u32) -> Result<()> {
+        self.context_routes.lock().unwrap().remove(&ctx_id);
+        let ctx = self.contexts.lock().unwrap().1.remove(&ctx_id);
+        if let Some(ctx) = ctx {
+            RT.spawn(async move { ctx.close().await })
+                .await
+                .map_err(|e| Error::from_reason(e.to_string()))?
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[napi(js_name = "_dropContext")]
+    pub fn drop_context(&self, ctx_id: u32) {
+        self.context_routes.lock().unwrap().remove(&ctx_id);
+        self.contexts.lock().unwrap().1.remove(&ctx_id);
+    }
+}
+
+impl Browser {
+    fn get_context(&self, ctx_id: u32) -> Result<Arc<fluxwright::ContextLease>> {
+        self.contexts
+            .lock()
+            .unwrap()
+            .1
+            .get(&ctx_id)
+            .cloned()
+            .filter(|c| !c.is_closed())
+            .ok_or_else(|| Error::from_reason("browserContext: the context is closed"))
     }
 }
 
@@ -2009,7 +2258,13 @@ impl Page {
     /// Whether `close()` was called (or is under way).
     #[napi]
     pub fn is_closed(&self) -> bool {
-        *self.lease.closing.borrow()
+        if *self.lease.closing.borrow() {
+            return true;
+        }
+        let Ok(page) = self.lease.page.try_read() else {
+            return true;
+        };
+        page.as_ref().is_none_or(|p| p.is_closed())
     }
 
     /// The timeout in milliseconds for this page's calls from now on, navigation included; 0
@@ -2027,21 +2282,7 @@ impl Page {
 
     #[napi(js_name = "_addCookies")]
     pub async fn add_cookies(&self, cookies: Vec<Cookie>) -> Result<()> {
-        let cookies: Vec<fluxwright::Cookie> = cookies
-            .into_iter()
-            .map(|c| fluxwright::Cookie {
-                name: c.name,
-                value: c.value,
-                domain: c.domain,
-                path: c.path,
-                expires: c.expires,
-                http_only: c.http_only,
-                secure: c.secure,
-                same_site: c.same_site,
-                partition_key: c.partition_key,
-                cross_site_ancestor: c.cr_has_cross_site_ancestor,
-            })
-            .collect();
+        let cookies: Vec<fluxwright::Cookie> = cookies.into_iter().map(Into::into).collect();
         with_page(self.lease.clone(), move |p| Box::pin(async move { p.add_cookies(&cookies).await })).await
     }
 
@@ -2256,27 +2497,8 @@ impl Page {
     #[napi(js_name = "_onBinding")]
     pub fn on_binding(&self, handler: Function<BindingCallEvent, ()>) -> Result<()> {
         let tsfn = callback(handler)?;
-        let mut rx = self.now(|p| p.subscribe_bindings())?;
-        let store = self.bindings.clone();
-        RT.spawn(async move {
-            while let Some(call) = rx.recv().await {
-                let name = call.name.clone();
-                let args_json = serde_json::to_string(&call.args).unwrap_or_else(|_| "[]".into());
-                let id = {
-                    let mut g = store.lock().unwrap();
-                    g.0 = g.0.wrapping_add(1);
-                    if g.1.len() >= 256 {
-                        if let Some(&oldest) = g.1.keys().min() {
-                            g.1.remove(&oldest);
-                        }
-                    }
-                    let id = g.0;
-                    g.1.insert(id, call);
-                    id
-                };
-                tsfn.call(BindingCallEvent { id, name, args_json }, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
+        let rx = self.now(|p| p.subscribe_bindings())?;
+        spawn_binding_forwarder(rx, self.bindings.clone(), tsfn);
         Ok(())
     }
 
@@ -2299,9 +2521,99 @@ impl Page {
     pub async fn reject_binding(&self, id: u32, message: String) -> Result<()> {
         self.finish_binding(id, Err(message)).await
     }
+
+    #[napi]
+    pub async fn bring_to_front(&self) -> Result<()> {
+        with_page(self.lease.clone(), |p| Box::pin(async move { p.bring_to_front().await })).await
+    }
+
+    #[napi(js_name = "_targetId")]
+    pub fn target_id(&self) -> String {
+        self.target_id.clone()
+    }
+
+    #[napi(js_name = "_openerTargetId")]
+    pub fn opener_target_id(&self) -> Option<String> {
+        self.opener_target_id.clone()
+    }
+
+    #[napi(js_name = "_onPopup")]
+    pub fn on_popup(&self, handler: Function<Page, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
+        let mut rx = self.now(|p| p.subscribe_popups())?;
+        RT.spawn(async move {
+            while let Some(popup) = rx.recv().await {
+                tsfn.call(Page::from_lease(popup), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    #[napi(js_name = "_mainFrameId")]
+    pub fn main_frame_id(&self) -> String {
+        self.target_id.clone()
+    }
+
+    #[napi(js_name = "_frames")]
+    pub fn frames(&self) -> Vec<FrameInfo> {
+        let Ok(page) = self.lease.page.try_read() else {
+            return Vec::new();
+        };
+        let Some(p) = page.as_ref().filter(|p| !*self.lease.closing.borrow() && !p.is_closed()) else {
+            return Vec::new();
+        };
+        p.frame_infos()
+            .into_iter()
+            .map(|f| FrameInfo { id: f.id, parent_id: f.parent_id, name: f.name, url: f.url })
+            .collect()
+    }
+
+    #[napi(js_name = "_frameGoto")]
+    pub async fn frame_goto(&self, frame_id: String, url: String, options: Option<GotoOptions>) -> Result<()> {
+        let timeout = call_timeout(options.as_ref().and_then(|o| o.timeout));
+        let wait_until = parse_wait_until(options.and_then(|o| o.wait_until).as_deref())?;
+        with_page_in(self.lease.clone(), timeout, move |p| {
+            Box::pin(async move { p.frame_goto_with(&frame_id, &url, wait_until).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_frameEvaluate")]
+    pub async fn frame_evaluate(&self, frame_id: String, expression: String) -> Result<serde_json::Value> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.frame_evaluate(&frame_id, &expression).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_frameById")]
+    pub fn frame_by_id(&self, frame_id: String) -> FrameLocator {
+        FrameLocator {
+            lease: self.lease.clone(),
+            frames: vec![fluxwright::Selector::frame_id_hop(&frame_id)],
+        }
+    }
 }
 
 impl Page {
+    fn from_lease(lease: fluxwright::PageLease) -> Self {
+        let target_id = lease.target_id().to_owned();
+        let opener_target_id = lease.opener_target_id().map(str::to_owned);
+        let url = lease.subscribe_url();
+        Page {
+            lease: Arc::new(PageSlot {
+                page: RwLock::new(Some(lease)),
+                closing: tokio::sync::watch::Sender::new(false),
+            }),
+            routes: Default::default(),
+            file_choosers: Default::default(),
+            bindings: Default::default(),
+            url,
+            target_id,
+            opener_target_id,
+        }
+    }
+
     fn set_timeouts(&self, ms: f64, navigation: bool) {
         // Only close() holds the page for writing, and a closed page needs no timeout.
         let Ok(page) = self.lease.page.try_read() else {
@@ -2337,23 +2649,7 @@ impl Page {
     }
 
     async fn finish_binding(&self, id: u32, outcome: std::result::Result<serde_json::Value, String>) -> Result<()> {
-        let call = self
-            .bindings
-            .lock()
-            .unwrap()
-            .1
-            .remove(&id)
-            .ok_or_else(|| Error::from_reason("binding call is no longer available"))?;
-        RT.spawn(async move {
-            let res = match outcome {
-                Ok(v) => call.resolve(&v).await,
-                Err(msg) => call.reject(&msg).await,
-            };
-            res.map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Error::from_reason(e.to_string()))?
-        .map_err(Error::from_reason)
+        resolve_binding_call(&self.bindings, id, outcome).await
     }
 
     /// Runs `f` on the page at once, for subscriptions, which must be in place when they return;
