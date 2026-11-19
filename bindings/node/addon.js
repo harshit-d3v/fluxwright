@@ -847,7 +847,7 @@ function installBindings(Page) {
     }
     if (!starts.has(this)) {
       subscribe(this)
-      starts.set(this, true)
+      starts.add(this)
     }
     map.set(name, callback)
     try {
