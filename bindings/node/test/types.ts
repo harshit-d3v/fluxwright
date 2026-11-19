@@ -120,8 +120,19 @@ export async function typed(): Promise<void> {
   void [_n, _items, _texts, _inners, _it, _ih, _iv, _attr, _flags]
   if (false) await chromium.connectOverCDP('ws://127.0.0.1:9222')
   const closed: boolean = only.isClosed()
+  const currentUrl: string = only.url()
+  await only.reload({ waitUntil: 'load', timeout: 5000 })
+  await only.goBack({ waitUntil: 'domcontentloaded' })
+  await only.goForward()
+  await only.setContent('<p>ok</p>', { waitUntil: 'networkidle' })
+  await only.waitForLoadState('networkidle', { timeout: 5000 })
+  await only.waitForURL('**/done', { waitUntil: 'commit', timeout: 2000 })
+  await only.waitForURL((u: URL) => u.pathname === '/done')
+  const wf1: string = await only.waitForFunction(() => document.title)
+  const wf2: number = await only.waitForFunction((n: number) => n + 1, 4, { polling: 50, timeout: 1000 })
+  const wf3: unknown = await only.waitForFunction('1 + 1', undefined, { polling: 'raf' })
   const cookies: { name: string }[] = await context.cookies()
-  void [closed, cookies, context.pages().length, context.browser()]
+  void [closed, currentUrl, wf1, wf2, wf3, cookies, context.pages().length, context.browser()]
   await context.close()
   await browser.close()
 }

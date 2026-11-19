@@ -405,6 +405,8 @@ mod tests {
             setups: Default::default(),
             mouse: Default::default(),
             keyboard: Default::default(),
+            url: Arc::new(tokio::sync::watch::Sender::new("about:blank".into())),
+            net: Default::default(),
         };
 
         let err = page

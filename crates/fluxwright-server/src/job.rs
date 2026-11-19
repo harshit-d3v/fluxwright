@@ -172,6 +172,17 @@ impl JobRequest {
                 Step::Evaluate { expression } if expression.trim().is_empty() => {
                     return Err("evaluate expression must not be empty".into());
                 }
+                Step::WaitForUrl { url, .. } if url.trim().is_empty() => {
+                    return Err("wait_for_url url must not be empty".into());
+                }
+                Step::WaitForFunction { expression, polling_ms } => {
+                    if expression.trim().is_empty() {
+                        return Err("wait_for_function expression must not be empty".into());
+                    }
+                    if polling_ms.is_some_and(|ms| ms == 0 || ms > 60_000) {
+                        return Err("polling_ms must be between 1 and 60000".into());
+                    }
+                }
                 Step::Screenshot { .. } => {
                     step.screenshot_options().and_then(|o| o.validate().map_err(|e| e.to_string()))?;
                 }
@@ -396,6 +407,38 @@ pub enum Step {
     },
     // Empty struct variants (rather than unit variants) make serde enforce unknown-field
     // rejection for these actions too.
+    Url {},
+    Reload {
+        #[serde(default)]
+        wait_until: NavigationWait,
+    },
+    GoBack {
+        #[serde(default)]
+        wait_until: NavigationWait,
+    },
+    GoForward {
+        #[serde(default)]
+        wait_until: NavigationWait,
+    },
+    SetContent {
+        html: String,
+        #[serde(default)]
+        wait_until: NavigationWait,
+    },
+    WaitForLoadState {
+        #[serde(default)]
+        state: LoadStateWait,
+    },
+    WaitForUrl {
+        url: String,
+        #[serde(default)]
+        wait_until: NavigationWait,
+    },
+    WaitForFunction {
+        expression: String,
+        #[serde(default)]
+        polling_ms: Option<u64>,
+    },
     Title {},
     Content {},
     Screenshot {
@@ -634,6 +677,36 @@ pub enum NavigationWait {
     Commit,
 }
 
+impl NavigationWait {
+    fn into_core(self) -> WaitUntil {
+        match self {
+            Self::Load => WaitUntil::Load,
+            Self::DomContentLoaded => WaitUntil::DomContentLoaded,
+            Self::NetworkIdle => WaitUntil::NetworkIdle,
+            Self::Commit => WaitUntil::Commit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoadStateWait {
+    #[default]
+    Load,
+    DomContentLoaded,
+    NetworkIdle,
+}
+
+impl LoadStateWait {
+    fn into_core(self) -> WaitUntil {
+        match self {
+            Self::Load => WaitUntil::Load,
+            Self::DomContentLoaded => WaitUntil::DomContentLoaded,
+            Self::NetworkIdle => WaitUntil::NetworkIdle,
+        }
+    }
+}
+
 impl Step {
     fn screenshot_options(&self) -> Result<ScreenshotOptions, String> {
         let Step::Screenshot {
@@ -711,13 +784,7 @@ impl Step {
     pub(crate) async fn execute(&self, page: &PageLease) -> fluxwright::Result<Value> {
         match self {
             Step::Goto { url, wait_until } => {
-                let wait = match wait_until {
-                    NavigationWait::Load => WaitUntil::Load,
-                    NavigationWait::DomContentLoaded => WaitUntil::DomContentLoaded,
-                    NavigationWait::NetworkIdle => WaitUntil::NetworkIdle,
-                    NavigationWait::Commit => WaitUntil::Commit,
-                };
-                page.goto_with(url, wait).await?;
+                page.goto_with(url, wait_until.into_core()).await?;
                 Ok(Value::Null)
             }
             Step::Click {
@@ -945,6 +1012,31 @@ impl Step {
                 Ok(Value::Bool(page.is_editable(s).await?))
             }
             Step::Evaluate { expression } => page.evaluate(expression).await,
+            Step::Url {} => Ok(Value::String(page.url())),
+            Step::Reload { wait_until } => {
+                page.reload_with(wait_until.into_core()).await?;
+                Ok(Value::Null)
+            }
+            Step::GoBack { wait_until } => Ok(Value::Bool(page.go_back_with(wait_until.into_core()).await?)),
+            Step::GoForward { wait_until } => Ok(Value::Bool(page.go_forward_with(wait_until.into_core()).await?)),
+            Step::SetContent { html, wait_until } => {
+                page.set_content_with(html, wait_until.into_core()).await?;
+                Ok(Value::Null)
+            }
+            Step::WaitForLoadState { state } => {
+                page.wait_for_load_state(state.into_core()).await?;
+                Ok(Value::Null)
+            }
+            Step::WaitForUrl { url, wait_until } => {
+                page.wait_for_url(url, wait_until.into_core()).await?;
+                Ok(Value::Null)
+            }
+            Step::WaitForFunction { expression, polling_ms } => {
+                let polling = polling_ms
+                    .map(|ms| fluxwright::WaitPolling::Interval(Duration::from_millis(ms)))
+                    .unwrap_or_default();
+                page.wait_for_function_with(expression, polling).await
+            }
             Step::Title {} => Ok(Value::String(page.title().await?)),
             Step::Content {} => Ok(Value::String(page.content().await?)),
             Step::Screenshot { kind, .. } => {
@@ -991,6 +1083,14 @@ impl Step {
             Step::IsChecked { .. } => "is_checked",
             Step::IsEditable { .. } => "is_editable",
             Step::Evaluate { .. } => "evaluate",
+            Step::Url {} => "url",
+            Step::Reload { .. } => "reload",
+            Step::GoBack { .. } => "go_back",
+            Step::GoForward { .. } => "go_forward",
+            Step::SetContent { .. } => "set_content",
+            Step::WaitForLoadState { .. } => "wait_for_load_state",
+            Step::WaitForUrl { .. } => "wait_for_url",
+            Step::WaitForFunction { .. } => "wait_for_function",
             Step::Title {} => "title",
             Step::Content {} => "content",
             Step::Screenshot { .. } => "screenshot",

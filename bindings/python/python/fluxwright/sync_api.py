@@ -867,10 +867,53 @@ class Page(_Finders):
         # page never holds them up. The thread starts with the first event.
         self._listener_thread = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="fluxwright-listeners")
 
+    @property
+    def url(self) -> str:
+        return self._impl.url
+
     def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None) -> None:
         """Navigates; ``wait_until`` is ``load`` (the default), ``domcontentloaded``,
         ``networkidle`` or ``commit``. ``timeout`` is in milliseconds; 0 for none."""
         _run(self._impl.goto, url, wait_until=wait_until, timeout=timeout)
+
+    def reload(self, *, wait_until: str | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.reload, wait_until=wait_until, timeout=timeout)
+
+    def go_back(self, *, wait_until: str | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.go_back, wait_until=wait_until, timeout=timeout)
+
+    def go_forward(self, *, wait_until: str | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.go_forward, wait_until=wait_until, timeout=timeout)
+
+    def set_content(self, html: str, *, wait_until: str | None = None, timeout: float | None = None) -> None:
+        _run(self._impl.set_content, html, wait_until=wait_until, timeout=timeout)
+
+    def wait_for_load_state(
+        self,
+        state: Literal["load", "domcontentloaded", "networkidle"] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        _run(self._impl.wait_for_load_state, state, timeout=timeout)
+
+    def wait_for_url(
+        self,
+        url: URLMatch,
+        *,
+        timeout: float | None = None,
+        wait_until: Literal["load", "domcontentloaded", "networkidle", "commit"] | None = None,
+    ) -> None:
+        _run(self._impl.wait_for_url, url, timeout=timeout, wait_until=wait_until)
+
+    def wait_for_function(
+        self,
+        expression: str,
+        arg: Any = None,
+        *,
+        timeout: float | None = None,
+        polling: float | Literal["raf"] | None = None,
+    ) -> Any:
+        return _run(self._impl.wait_for_function, expression, arg, timeout=timeout, polling=polling)
 
     def set_default_timeout(self, timeout: float) -> None:
         """The timeout in milliseconds for this page's calls from now on, navigation included;

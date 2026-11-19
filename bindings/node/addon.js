@@ -137,6 +137,7 @@ const ROLE = {
   selected: true,
 }
 const STRICT_TIMEOUT = { ...TIMEOUT, strict: true }
+const NAV_OPTIONS = { waitUntil: true, timeout: true }
 
 function checkOptions(method, options, allowed) {
   if (options == null) return
@@ -986,8 +987,71 @@ function applyFilter(loc, options, label) {
   guard(native.Page, 'page', true, builders)
   guard(native.FrameLocator, 'frameLocator', true, builders)
   guard(native.Locator, 'locator', true, builders)
+  native.Page.prototype.waitForLoadState = async function (state, options) {
+    if (state != null && !['load', 'domcontentloaded', 'networkidle'].includes(state)) {
+      throw new TypeError(`page.waitForLoadState: state ${JSON.stringify(state)} is not supported`)
+    }
+    checkOptions('page.waitForLoadState', options, TIMEOUT)
+    return this._waitForLoadState(state ?? 'load', options?.timeout)
+  }
+  native.Page.prototype.waitForURL = async function (url, options) {
+    checkOptions('page.waitForURL', options, {
+      waitUntil: ['load', 'domcontentloaded', 'networkidle', 'commit'],
+      timeout: true,
+    })
+    let target = url
+    if (typeof target === 'string') {
+      const baseUrl = this._baseUrl()
+      if (baseUrl != null && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(target)) {
+        if (target.startsWith('/')) {
+          target = new URL(baseUrl).origin + target
+        } else if (!target.startsWith('*') && !target.includes('{')) {
+          target = new URL(target, baseUrl).href
+        }
+      }
+    } else if (!(target instanceof RegExp) && typeof target !== 'function') {
+      throw new TypeError('page.waitForURL: url must be a string, RegExp or function')
+    }
+    const matches = urlMatcher(target)
+    const waitUntil = options?.waitUntil ?? 'load'
+    const rawTimeout = options?.timeout
+    if (rawTimeout != null && (typeof rawTimeout !== 'number' || rawTimeout < 0)) {
+      throw new TypeError('page.waitForURL: timeout must be a non-negative number')
+    }
+    const navTimeout = rawTimeout ?? this._navigationTimeout()
+    const unlimited = navTimeout === 0 || navTimeout >= 365 * 24 * 3600 * 1000
+    const deadline = unlimited ? Infinity : Date.now() + navTimeout
+    while (true) {
+      const current = this.url()
+      if (matches(current)) {
+        if (waitUntil === 'commit') return
+        const remaining = unlimited ? 0 : Math.max(1, deadline - Date.now())
+        return this._waitForLoadState(waitUntil, remaining)
+      }
+      if (!unlimited && Date.now() >= deadline) {
+        throw new Error(`page.waitForURL: timed out waiting for URL (current: ${current})`)
+      }
+      const remaining = unlimited ? 0 : Math.max(1, deadline - Date.now())
+      await this._waitForUrlChange(current, remaining)
+    }
+  }
+  native.Page.prototype.waitForFunction = async function (pageFunction, arg, options) {
+    checkOptions('page.waitForFunction', options, { polling: true, timeout: true })
+    let pollingMs
+    if (options?.polling !== undefined && options.polling !== 'raf') {
+      if (typeof options.polling !== 'number' || !Number.isFinite(options.polling) || options.polling <= 0) {
+        throw new TypeError("page.waitForFunction: polling must be 'raf' or a positive number")
+      }
+      pollingMs = options.polling
+    }
+    return this._waitForFunction(toExpression(pageFunction, arg), pollingMs, options?.timeout)
+  }
   guard(native.Page, 'page', false, [
-    ['goto', 1, { waitUntil: true, timeout: true }],
+    ['goto', 1, NAV_OPTIONS],
+    ['reload', 0, NAV_OPTIONS],
+    ['goBack', 0, NAV_OPTIONS],
+    ['goForward', 0, NAV_OPTIONS],
+    ['setContent', 1, NAV_OPTIONS],
     ['click', 1, { ...CLICK, strict: true }, 'click'],
     ['dblclick', 1, { ...DBLCLICK, strict: true }, 'dblclick'],
     ['hover', 1, { ...HOVER, strict: true }, 'hover'],

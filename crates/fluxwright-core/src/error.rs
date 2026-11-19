@@ -20,8 +20,13 @@ pub enum Error {
 
 impl Error {
     pub fn is_retryable(&self) -> bool {
+        matches!(self, Error::Cdp(e) if e.is_retryable())
+    }
+
+    pub fn is_timeout(&self) -> bool {
         match self {
-            Error::Cdp(e) => e.is_retryable(),
+            Error::AcquireTimeout | Error::JobTimeout => true,
+            Error::Cdp(e) => e.is_timeout(),
             _ => false,
         }
     }

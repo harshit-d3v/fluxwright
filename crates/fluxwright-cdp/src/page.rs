@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-use crate::browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId, TargetState};
+use crate::browser::{BrowserId, CdpBrowser, ContextId, NetActivity, SessionId, TargetId, TargetState};
 use crate::connection::Connection;
 use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
 use crate::input::{
@@ -36,6 +36,156 @@ pub enum WaitUntil {
     Load,
     /// `load`, then no network requests for 500 ms (Chrome's `networkIdle` lifecycle event).
     NetworkIdle,
+}
+
+/// How [`CdpPage::wait_for_function`] polls the expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaitPolling {
+    #[default]
+    Raf,
+    Interval(Duration),
+}
+
+enum NavStep {
+    Continue,
+    Done,
+}
+
+#[derive(Clone)]
+enum GlobTok {
+    Any,
+    NonSlash,
+    Lit(char),
+    Group(Vec<Vec<GlobTok>>),
+}
+
+fn parse_glob(chars: &[char], stop_at_brace: bool) -> (Vec<GlobTok>, usize) {
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if stop_at_brace && (c == '}' || c == ',') {
+            break;
+        }
+        if c == '*' {
+            if chars.get(i + 1) == Some(&'*') {
+                toks.push(GlobTok::Any);
+                i += 2;
+            } else {
+                toks.push(GlobTok::NonSlash);
+                i += 1;
+            }
+        } else if !stop_at_brace && c == '{' {
+            let mut alts = Vec::new();
+            let mut j = i + 1;
+            let mut closed = false;
+            while j <= chars.len() {
+                let (alt, used) = parse_glob(&chars[j..], true);
+                alts.push(alt);
+                j += used;
+                if j >= chars.len() {
+                    break;
+                }
+                if chars[j] == ',' {
+                    j += 1;
+                } else if chars[j] == '}' {
+                    j += 1;
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
+                toks.push(GlobTok::Group(alts));
+                i = j;
+            } else {
+                toks.push(GlobTok::Lit('{'));
+                i += 1;
+            }
+        } else {
+            toks.push(GlobTok::Lit(c));
+            i += 1;
+        }
+    }
+    (toks, i)
+}
+
+fn advance_glob(toks: &[GlobTok], chars: &[char], mut states: Vec<bool>) -> Vec<bool> {
+    let n = chars.len();
+    for tok in toks {
+        let mut next = vec![false; n + 1];
+        match tok {
+            GlobTok::Lit(ch) => {
+                for i in 0..n {
+                    if states[i] && chars[i] == *ch {
+                        next[i + 1] = true;
+                    }
+                }
+            }
+            GlobTok::NonSlash => {
+                let mut active = false;
+                for i in 0..=n {
+                    if states[i] {
+                        active = true;
+                    }
+                    if active {
+                        next[i] = true;
+                    }
+                    if i < n && chars[i] == '/' {
+                        active = false;
+                    }
+                }
+            }
+            GlobTok::Any => {
+                let mut active = false;
+                for i in 0..=n {
+                    if states[i] {
+                        active = true;
+                    }
+                    if active {
+                        next[i] = true;
+                    }
+                }
+            }
+            GlobTok::Group(alts) => {
+                for alt in alts {
+                    let res = advance_glob(alt, chars, states.clone());
+                    for i in 0..=n {
+                        next[i] |= res[i];
+                    }
+                }
+            }
+        }
+        states = next;
+    }
+    states
+}
+
+/// Playwright-style URL glob match (`**` any chars, `*` non-`/`, `{a,b}` alternatives).
+pub fn url_glob_matches(pattern: &str, url: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let chars: Vec<char> = url.chars().collect();
+    let (toks, _) = parse_glob(&pat, false);
+    let mut states = vec![false; chars.len() + 1];
+    states[0] = true;
+    advance_glob(&toks, &chars, states)[chars.len()]
+}
+
+fn is_js_truthy(obj: &Value) -> bool {
+    match obj["type"].as_str() {
+        Some("undefined") => false,
+        Some("boolean") => obj["value"].as_bool().unwrap_or(false),
+        Some("string") => obj["value"].as_str().is_some_and(|s| !s.is_empty()),
+        Some("number") => {
+            if let Some(un) = obj["unserializableValue"].as_str() {
+                un != "NaN" && un != "-0"
+            } else {
+                obj["value"].as_f64().is_some_and(|n| n != 0.0 && !n.is_nan())
+            }
+        }
+        Some("bigint") => obj["unserializableValue"].as_str() != Some("0n"),
+        Some("object") => obj["subtype"].as_str() != Some("null"),
+        _ => true,
+    }
 }
 
 /// Selector engine plus element checks, run in the page or an iframe on every poll.
@@ -427,11 +577,63 @@ pub struct CdpPage {
     pub(crate) setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
     pub(crate) mouse: Arc<std::sync::Mutex<MouseState>>,
     pub(crate) keyboard: Arc<std::sync::Mutex<KeyboardState>>,
+    pub(crate) url: Arc<tokio::sync::watch::Sender<String>>,
+    pub(crate) net: Arc<std::sync::Mutex<NetActivity>>,
 }
 
 impl CdpPage {
     fn sid(&self) -> &str {
         &self.session_id.0
+    }
+
+    pub fn url(&self) -> String {
+        self.url.borrow().clone()
+    }
+
+    pub fn subscribe_url(&self) -> tokio::sync::watch::Receiver<String> {
+        self.url.subscribe()
+    }
+
+    fn set_url(&self, url: &str) {
+        if !url.is_empty() {
+            self.url.send_if_modified(|cur| {
+                if cur.as_str() != url {
+                    *cur = url.to_owned();
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
+    fn drain_url_events(
+        &self,
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<Arc<crate::connection::CdpEvent>>,
+    ) -> bool {
+        let mut saw_url = false;
+        while let Ok(ev) = events.try_recv() {
+            if ev.session_id.as_deref() == Some(self.sid()) {
+                match ev.method.as_str() {
+                    "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
+                        let full = crate::browser::frame_url(&ev.params["frame"]);
+                        if !full.is_empty() {
+                            self.set_url(&full);
+                            saw_url = true;
+                        }
+                    }
+                    "Page.navigatedWithinDocument" if ev.params["frameId"] == self.target_id.0.as_str() => {
+                        let u = ev.params["url"].as_str().unwrap_or("");
+                        if !u.is_empty() {
+                            self.set_url(u);
+                            saw_url = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        saw_url
     }
 
     pub async fn call(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
@@ -466,19 +668,252 @@ impl CdpPage {
             });
         }
         // No loaderId: a same-document navigation (hash change), which is already done.
-        let (Some(frame), Some(loader)) = (res["frameId"].as_str(), res["loaderId"].as_str())
-        else {
+        let (Some(_frame), Some(loader)) = (res["frameId"].as_str(), res["loaderId"].as_str()) else {
+            if !self.drain_url_events(&mut events) {
+                self.set_url(url);
+            }
             return Ok(());
         };
-        let (event, ready_states): (&str, &[&str]) = match wait_until {
-            WaitUntil::Commit => return Ok(()),
-            WaitUntil::DomContentLoaded => ("DOMContentLoaded", &["interactive", "complete"]),
-            WaitUntil::Load => ("load", &["complete"]),
-            WaitUntil::NetworkIdle => ("networkIdle", &[]),
+        if wait_until == WaitUntil::Commit {
+            if !self.drain_url_events(&mut events) {
+                self.set_url(url);
+            }
+            return Ok(());
+        }
+        let waited_url = self
+            .wait_for_navigation(
+                events,
+                wait_until,
+                Some(loader),
+                false,
+                deadline,
+                timeout,
+                &format!("navigation to {url}"),
+            )
+            .await?;
+        if !waited_url {
+            self.set_url(url);
+        }
+        Ok(())
+    }
+
+    pub async fn reload(&self, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let events = self.browser.subscribe_unbounded();
+        self.call("Page.reload", json!({}), timeout).await?;
+        self.wait_for_navigation(events, wait_until, None, false, deadline, timeout, "reload")
+            .await?;
+        Ok(())
+    }
+
+    pub async fn go_back(&self, wait_until: WaitUntil, timeout: Duration) -> Result<bool> {
+        self.navigate_history(-1, wait_until, timeout).await
+    }
+
+    pub async fn go_forward(&self, wait_until: WaitUntil, timeout: Duration) -> Result<bool> {
+        self.navigate_history(1, wait_until, timeout).await
+    }
+
+    async fn navigate_history(&self, delta: isize, wait_until: WaitUntil, timeout: Duration) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let hist = self.call("Page.getNavigationHistory", json!({}), timeout).await?;
+        let current = hist["currentIndex"].as_i64().unwrap_or(0) as isize;
+        let target_idx = current + delta;
+        let Some(entries) = hist["entries"].as_array() else {
+            return Ok(false);
         };
+        if target_idx < 0 || (target_idx as usize) >= entries.len() {
+            return Ok(false);
+        }
+        let entry = &entries[target_idx as usize];
+        let Some(entry_id) = entry["id"].as_i64() else {
+            return Ok(false);
+        };
+        let entry_url = entry["url"].as_str().unwrap_or("");
+        let events = self.browser.subscribe_unbounded();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::timeout(
+                if delta < 0 { "go_back" } else { "go_forward" },
+                timeout.as_millis() as u64,
+            ));
+        }
+        self.call("Page.navigateToHistoryEntry", json!({ "entryId": entry_id }), remaining)
+            .await?;
+        let what = if delta < 0 { "go_back" } else { "go_forward" };
+        let saw_url = self
+            .wait_for_navigation(events, wait_until, None, true, deadline, timeout, what)
+            .await?;
+        if !saw_url && !entry_url.is_empty() {
+            self.set_url(entry_url);
+        }
+        Ok(true)
+    }
+
+    pub async fn set_content(&self, html: &str, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        {
+            let mut net = self.net.lock().unwrap();
+            net.idle_confirmed = false;
+            net.last_change = std::time::Instant::now();
+        }
+        let wait_str = match wait_until {
+            WaitUntil::Commit => "commit",
+            WaitUntil::DomContentLoaded => "domcontentloaded",
+            WaitUntil::Load | WaitUntil::NetworkIdle => "load",
+        };
+        let check_doc = self.evaluate("typeof document.open === 'function'", timeout).await;
+        if check_doc.ok().and_then(|v| v.as_bool()) == Some(true) {
+            let script = format!(
+                r#"((html, waitUntil) => {{
+                    window.stop();
+                    document.open();
+                    let resolved = false;
+                    const p = waitUntil === 'commit'
+                        ? Promise.resolve()
+                        : new Promise((resolve) => {{
+                            const done = () => {{ resolved = true; resolve(); }};
+                            if (waitUntil === 'domcontentloaded') {{
+                                document.addEventListener('DOMContentLoaded', done, {{ once: true }});
+                            }} else {{
+                                window.addEventListener('load', done, {{ once: true }});
+                            }}
+                        }});
+                    document.write(html);
+                    document.close();
+                    if (waitUntil === 'commit') return;
+                    if (waitUntil === 'domcontentloaded' && (document.readyState === 'interactive' || document.readyState === 'complete')) return;
+                    if (waitUntil !== 'domcontentloaded' && document.readyState === 'complete') return;
+                    if (resolved) return;
+                    return p;
+                }})({}, {})"#,
+                serde_json::to_string(html).unwrap(),
+                serde_json::to_string(wait_str).unwrap(),
+            );
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.eval_in(&self.main_scope(), &script, true, remaining).await?;
+        } else {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.call(
+                "Page.setDocumentContent",
+                json!({ "frameId": self.target_id.0, "html": html }),
+                remaining,
+            )
+            .await?;
+            if wait_until != WaitUntil::Commit {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                self.wait_for_load_state(WaitUntil::Load, remaining).await?;
+            }
+        }
+        if wait_until == WaitUntil::NetworkIdle {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.wait_for_load_state(WaitUntil::NetworkIdle, remaining).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn wait_for_load_state(&self, state: WaitUntil, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        match state {
+            WaitUntil::Commit => Ok(()),
+            WaitUntil::DomContentLoaded | WaitUntil::Load => {
+                self.wait_for_document_state(state, deadline, timeout).await
+            }
+            WaitUntil::NetworkIdle => {
+                self.wait_for_document_state(WaitUntil::Load, deadline, timeout).await?;
+                let mut events = self.browser.subscribe_unbounded();
+                let (mut inflight, idle_confirmed, elapsed) = {
+                    let net = self.net.lock().unwrap();
+                    (net.inflight.clone(), net.idle_confirmed, net.last_change.elapsed())
+                };
+                let quiet = Duration::from_millis(500);
+                if idle_confirmed || (inflight.is_empty() && elapsed >= quiet) {
+                    return Ok(());
+                }
+                let mut idle_until = if inflight.is_empty() {
+                    Some(tokio::time::Instant::now() + quiet.saturating_sub(elapsed))
+                } else {
+                    None
+                };
+                loop {
+                    tokio::select! {
+                        _ = async {
+                            match idle_until {
+                                Some(t) => tokio::time::sleep_until(t).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {
+                            return Ok(());
+                        }
+                        ev = events.recv() => {
+                            let Some(ev) = ev else {
+                                return Err(Error::BrowserDead { pid: self.browser_pid });
+                            };
+                            if ev.method == "Fluxwright.disconnected" {
+                                return Err(Error::BrowserDead { pid: self.browser_pid });
+                            }
+                            if ev.session_id.as_deref() != Some(self.sid()) {
+                                continue;
+                            }
+                            match ev.method.as_str() {
+                                "Inspector.targetCrashed" => {
+                                    return Err(Error::TargetCrashed { status: "during wait_for_load_state".into() });
+                                }
+                                "Page.lifecycleEvent"
+                                    if ev.params["name"] == "networkIdle"
+                                        && ev.params["frameId"] == self.target_id.0.as_str() =>
+                                {
+                                    return Ok(());
+                                }
+                                "Network.requestWillBeSent" => {
+                                    if let Some(req_id) = ev.params["requestId"].as_str() {
+                                        if !ev.params["request"]["url"].as_str().unwrap_or("").starts_with("data:") {
+                                            inflight.insert(req_id.to_owned());
+                                            idle_until = None;
+                                        }
+                                    }
+                                }
+                                "Network.loadingFinished" | "Network.loadingFailed" => {
+                                    if let Some(req_id) = ev.params["requestId"].as_str() {
+                                        inflight.remove(req_id);
+                                        if inflight.is_empty() {
+                                            idle_until = Some(tokio::time::Instant::now() + quiet);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {
+                            return Err(Error::timeout("wait_for_load_state (NetworkIdle)", timeout.as_millis() as u64));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_document_state(
+        &self,
+        state: WaitUntil,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<()> {
+        let (events_needed, ready_states): (&[&str], &[&str]) = match state {
+            WaitUntil::DomContentLoaded => (&["DOMContentLoaded", "load"], &["interactive", "complete"]),
+            WaitUntil::Load => (&["load"], &["complete"]),
+            WaitUntil::Commit | WaitUntil::NetworkIdle => return Ok(()),
+        };
+        let mut events = self.browser.subscribe_unbounded();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(v) = self.evaluate("document.readyState", remaining.min(Duration::from_secs(2))).await {
+            if ready_states.contains(&v.as_str().unwrap_or("")) {
+                return Ok(());
+            }
+        }
         let mut tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_millis(500),
-            Duration::from_millis(500),
+            tokio::time::Instant::now() + Duration::from_millis(250),
+            Duration::from_millis(250),
         );
         loop {
             tokio::select! {
@@ -494,16 +929,380 @@ impl CdpPage {
                     }
                     match ev.method.as_str() {
                         "Page.lifecycleEvent"
-                            if ev.params["name"] == event
-                                && ev.params["frameId"] == frame
-                                && ev.params["loaderId"] == loader =>
+                            if ev.params["frameId"] == self.target_id.0.as_str()
+                                && ev.params["name"].as_str().is_some_and(|n| events_needed.contains(&n)) =>
                         {
-                            return Ok(())
+                            return Ok(());
                         }
                         "Inspector.targetCrashed" => {
-                            return Err(Error::TargetCrashed { status: format!("during navigation to {url}") })
+                            return Err(Error::TargetCrashed { status: "during wait_for_load_state".into() });
                         }
                         _ => {}
+                    }
+                }
+                _ = tick.tick() => {
+                    if self.browser.is_dead() {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    }
+                    if let Ok(v) = self.evaluate("document.readyState", Duration::from_secs(2)).await {
+                        if ready_states.contains(&v.as_str().unwrap_or("")) {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(Error::timeout(format!("wait_for_load_state ({state:?})"), timeout.as_millis() as u64));
+                }
+            }
+        }
+    }
+
+    pub async fn wait_for_url<F>(&self, mut predicate: F, wait_until: WaitUntil, timeout: Duration) -> Result<()>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut rx = self.subscribe_url();
+        let mut events = self.browser.subscribe_unbounded();
+        loop {
+            let current = rx.borrow_and_update().clone();
+            if predicate(&current) {
+                if wait_until == WaitUntil::Commit {
+                    return Ok(());
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                return self.wait_for_load_state(wait_until, remaining).await;
+            }
+            tokio::select! {
+                res = rx.changed() => {
+                    if res.is_err() {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    }
+                }
+                ev = events.recv() => {
+                    let Some(ev) = ev else {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    };
+                    if ev.method == "Fluxwright.disconnected" {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    }
+                    if ev.session_id.as_deref() == Some(self.sid()) && ev.method == "Inspector.targetCrashed" {
+                        return Err(Error::TargetCrashed { status: "during wait_for_url".into() });
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(Error::timeout(format!("URL matching (current: {current})"), timeout.as_millis() as u64));
+                }
+            }
+        }
+    }
+
+    pub async fn wait_for_url_change(&self, after_url: &str, timeout: Duration) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut rx = self.subscribe_url();
+        let mut events = self.browser.subscribe_unbounded();
+        loop {
+            let current = rx.borrow_and_update().clone();
+            if current != after_url {
+                return Ok(current);
+            }
+            tokio::select! {
+                res = rx.changed() => {
+                    if res.is_err() {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    }
+                }
+                ev = events.recv() => {
+                    let Some(ev) = ev else {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    };
+                    if ev.method == "Fluxwright.disconnected" {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    }
+                    if ev.session_id.as_deref() == Some(self.sid()) && ev.method == "Inspector.targetCrashed" {
+                        return Err(Error::TargetCrashed { status: "during wait_for_url".into() });
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(Error::timeout(format!("URL change from {after_url}"), timeout.as_millis() as u64));
+                }
+            }
+        }
+    }
+
+    pub async fn wait_for_function(
+        &self,
+        expression: &str,
+        polling: WaitPolling,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::timeout("wait_for_function", timeout.as_millis() as u64));
+            }
+            match self.eval_in(&self.main_scope(), expression, false, remaining).await {
+                Err(Error::Command { ref message, .. })
+                    if message.contains("Execution context was destroyed")
+                        || message.contains("Cannot find context") =>
+                {
+                    let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if rem.is_zero() {
+                        return Err(Error::timeout("wait_for_function", timeout.as_millis() as u64));
+                    }
+                    sleep(Duration::from_millis(50).min(rem)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+                Ok(obj) => {
+                    if is_js_truthy(&obj) {
+                        if let Some(v) = obj.get("value") {
+                            return Ok(v.clone());
+                        }
+                        if let Some(oid) = obj["objectId"].as_str() {
+                            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                            let out = if rem.is_zero() {
+                                Value::Bool(true)
+                            } else {
+                                match self
+                                    .call(
+                                        "Runtime.callFunctionOn",
+                                        json!({
+                                            "objectId": oid,
+                                            "functionDeclaration": "function() { return this; }",
+                                            "returnByValue": true
+                                        }),
+                                        rem.min(Duration::from_secs(5)),
+                                    )
+                                    .await
+                                {
+                                    Ok(res) => res["result"].get("value").cloned().unwrap_or(Value::Bool(true)),
+                                    Err(_) => Value::Bool(true),
+                                }
+                            };
+                            let _ = self
+                                .call("Runtime.releaseObject", json!({ "objectId": oid }), Duration::from_secs(2))
+                                .await;
+                            return Ok(out);
+                        }
+                        return Ok(Value::Bool(true));
+                    }
+                    if let Some(oid) = obj["objectId"].as_str() {
+                        let _ = self
+                            .call("Runtime.releaseObject", json!({ "objectId": oid }), Duration::from_secs(2))
+                            .await;
+                    }
+                    let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if rem.is_zero() {
+                        return Err(Error::timeout("wait_for_function", timeout.as_millis() as u64));
+                    }
+                    match polling {
+                        WaitPolling::Raf => {
+                            let raf_js = "new Promise(r => { const t = setTimeout(r, 100); requestAnimationFrame(() => { clearTimeout(t); r(); }); })";
+                            if let Err(e) = self.eval_in(&self.main_scope(), raf_js, true, rem.min(Duration::from_millis(200))).await {
+                                if !matches!(e, Error::Command { .. }) && e.is_retryable() {
+                                    return Err(e);
+                                }
+                                let rem2 = deadline.saturating_duration_since(tokio::time::Instant::now());
+                                if rem2.is_zero() {
+                                    return Err(Error::timeout("wait_for_function", timeout.as_millis() as u64));
+                                }
+                                sleep(Duration::from_millis(50).min(rem2)).await;
+                            }
+                        }
+                        WaitPolling::Interval(d) => {
+                            sleep(d.min(rem)).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn wait_for_navigation(
+        &self,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<Arc<crate::connection::CdpEvent>>,
+        wait_until: WaitUntil,
+        expected_loader: Option<&str>,
+        allow_same_document: bool,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+        what: &str,
+    ) -> Result<bool> {
+        let adopt_loader = expected_loader.is_none();
+        let mut loader = expected_loader.map(str::to_owned);
+        let mut committed = expected_loader.is_some();
+        let mut saw_url = false;
+        let mut saw_load = false;
+        let mut saw_idle = false;
+        let mut inflight: HashSet<String> = HashSet::new();
+        let mut idle_until: Option<tokio::time::Instant> = None;
+        let quiet = Duration::from_millis(500);
+
+        let handle = |ev: &crate::connection::CdpEvent,
+                          loader: &mut Option<String>,
+                          committed: &mut bool,
+                          saw_url: &mut bool,
+                          saw_load: &mut bool,
+                          saw_idle: &mut bool,
+                          inflight: &mut HashSet<String>,
+                          idle_until: &mut Option<tokio::time::Instant>|
+         -> Result<NavStep> {
+            if ev.method == "Fluxwright.disconnected" {
+                return Err(Error::BrowserDead { pid: self.browser_pid });
+            }
+            if ev.session_id.as_deref() != Some(self.sid()) {
+                return Ok(NavStep::Continue);
+            }
+            match ev.method.as_str() {
+                "Inspector.targetCrashed" => {
+                    return Err(Error::TargetCrashed { status: format!("during {what}") });
+                }
+                "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
+                    let full = crate::browser::frame_url(&ev.params["frame"]);
+                    if !full.is_empty() {
+                        self.set_url(&full);
+                        *saw_url = true;
+                    }
+                    *committed = true;
+                    let bfcache = ev.params["type"].as_str() == Some("BackForwardCacheRestore");
+                    if !bfcache {
+                        *loader = ev.params["frame"]["loaderId"].as_str().map(str::to_owned);
+                        *saw_load = false;
+                        *saw_idle = false;
+                    }
+                    if wait_until == WaitUntil::Commit || bfcache {
+                        return Ok(NavStep::Done);
+                    }
+                }
+                "Page.navigatedWithinDocument" if ev.params["frameId"] == self.target_id.0.as_str() => {
+                    let u = ev.params["url"].as_str().unwrap_or("");
+                    if !u.is_empty() {
+                        self.set_url(u);
+                        *saw_url = true;
+                    }
+                    if allow_same_document {
+                        return Ok(NavStep::Done);
+                    }
+                }
+                "Page.lifecycleEvent" if ev.params["frameId"] == self.target_id.0.as_str() => {
+                    let name = ev.params["name"].as_str().unwrap_or("");
+                    let ev_loader = ev.params["loaderId"].as_str();
+                    if name == "init" && adopt_loader {
+                        if let Some(l) = ev_loader {
+                            *loader = Some(l.to_owned());
+                        }
+                    }
+                    let matches = loader.is_some() && ev_loader == loader.as_deref();
+                    if matches {
+                        if name == "DOMContentLoaded" && wait_until == WaitUntil::DomContentLoaded {
+                            return Ok(NavStep::Done);
+                        }
+                        if name == "load" {
+                            if matches!(wait_until, WaitUntil::DomContentLoaded | WaitUntil::Load) {
+                                return Ok(NavStep::Done);
+                            }
+                            if wait_until == WaitUntil::NetworkIdle {
+                                *saw_load = true;
+                                if *saw_idle {
+                                    return Ok(NavStep::Done);
+                                }
+                                if inflight.is_empty() && idle_until.is_none() {
+                                    *idle_until = Some(tokio::time::Instant::now() + quiet);
+                                }
+                            }
+                        }
+                        if name == "networkIdle" {
+                            *saw_idle = true;
+                            if wait_until == WaitUntil::NetworkIdle {
+                                return Ok(NavStep::Done);
+                            }
+                        }
+                    }
+                }
+                "Network.requestWillBeSent" if wait_until == WaitUntil::NetworkIdle => {
+                    if let Some(req_id) = ev.params["requestId"].as_str() {
+                        if !ev.params["request"]["url"].as_str().unwrap_or("").starts_with("data:") {
+                            inflight.insert(req_id.to_owned());
+                            *idle_until = None;
+                        }
+                    }
+                }
+                ("Network.loadingFinished" | "Network.loadingFailed") if wait_until == WaitUntil::NetworkIdle => {
+                    if let Some(req_id) = ev.params["requestId"].as_str() {
+                        inflight.remove(req_id);
+                        if *saw_load && inflight.is_empty() {
+                            *idle_until = Some(tokio::time::Instant::now() + quiet);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(NavStep::Continue)
+        };
+
+        while let Ok(ev) = events.try_recv() {
+            if matches!(
+                handle(
+                    &ev,
+                    &mut loader,
+                    &mut committed,
+                    &mut saw_url,
+                    &mut saw_load,
+                    &mut saw_idle,
+                    &mut inflight,
+                    &mut idle_until,
+                )?,
+                NavStep::Done
+            ) {
+                return Ok(saw_url);
+            }
+        }
+        if wait_until == WaitUntil::Commit && committed {
+            return Ok(saw_url);
+        }
+
+        let ready_states: &[&str] = match wait_until {
+            WaitUntil::Commit => &[],
+            WaitUntil::DomContentLoaded => &["interactive", "complete"],
+            WaitUntil::Load | WaitUntil::NetworkIdle => &["complete"],
+        };
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        loop {
+            tokio::select! {
+                ev = events.recv() => {
+                    let Some(ev) = ev else {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    };
+                    if matches!(
+                        handle(
+                            &ev,
+                            &mut loader,
+                            &mut committed,
+                            &mut saw_url,
+                            &mut saw_load,
+                            &mut saw_idle,
+                            &mut inflight,
+                            &mut idle_until,
+                        )?,
+                        NavStep::Done
+                    ) {
+                        return Ok(saw_url);
+                    }
+                }
+                _ = async {
+                    match idle_until {
+                        Some(t) => tokio::time::sleep_until(t).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if wait_until == WaitUntil::NetworkIdle && saw_load && inflight.is_empty() {
+                        return Ok(saw_url);
                     }
                 }
                 // Lifecycle events are switched on in prepare_session, which ignores errors.
@@ -512,17 +1311,27 @@ impl CdpPage {
                     if self.browser.is_dead() {
                         return Err(Error::BrowserDead { pid: self.browser_pid });
                     }
-                    if !ready_states.is_empty() {
+                    if committed && !ready_states.is_empty() {
                         if let Ok(v) = self.evaluate("document.readyState", Duration::from_secs(2)).await {
                             if ready_states.contains(&v.as_str().unwrap_or("")) {
-                                return Ok(());
+                                if wait_until == WaitUntil::NetworkIdle {
+                                    saw_load = true;
+                                    if saw_idle {
+                                        return Ok(saw_url);
+                                    }
+                                    if inflight.is_empty() && idle_until.is_none() {
+                                        idle_until = Some(tokio::time::Instant::now() + quiet);
+                                    }
+                                } else {
+                                    return Ok(saw_url);
+                                }
                             }
                         }
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err(Error::timeout(
-                        format!("navigation to {url} ({wait_until:?})"),
+                        format!("{what} ({wait_until:?})"),
                         timeout.as_millis() as u64,
                     ));
                 }
@@ -1867,5 +2676,38 @@ impl ResourceType {
             ResourceType::Stylesheet => "Stylesheet",
             ResourceType::Script => "Script",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_matches_playwright_patterns() {
+        assert!(url_glob_matches("**/done", "http://127.0.0.1:8000/a/b/done"));
+        assert!(url_glob_matches("**/done", "http://127.0.0.1/done"));
+        assert!(!url_glob_matches("**/done", "http://127.0.0.1/done/extra"));
+        assert!(url_glob_matches("https://*.example.com/*", "https://app.example.com/home"));
+        assert!(!url_glob_matches("https://*.example.com/*", "https://app/sub.example.com/home"));
+        assert!(!url_glob_matches("https://*.example.com/*", "https://app.example.com/a/b"));
+        assert!(url_glob_matches("**/{foo,bar}*", "https://host/bar?x=1"));
+        assert!(!url_glob_matches("**/{foo,bar}*", "https://host/baz"));
+    }
+
+    #[test]
+    fn js_truthiness_matches_ecmascript() {
+        assert!(!is_js_truthy(&json!({ "type": "undefined" })));
+        assert!(!is_js_truthy(&json!({ "type": "boolean", "value": false })));
+        assert!(is_js_truthy(&json!({ "type": "boolean", "value": true })));
+        assert!(!is_js_truthy(&json!({ "type": "string", "value": "" })));
+        assert!(is_js_truthy(&json!({ "type": "string", "value": "0" })));
+        assert!(!is_js_truthy(&json!({ "type": "number", "value": 0 })));
+        assert!(!is_js_truthy(&json!({ "type": "number", "unserializableValue": "NaN" })));
+        assert!(is_js_truthy(&json!({ "type": "number", "unserializableValue": "Infinity" })));
+        assert!(!is_js_truthy(&json!({ "type": "bigint", "unserializableValue": "0n" })));
+        assert!(is_js_truthy(&json!({ "type": "bigint", "unserializableValue": "1n" })));
+        assert!(!is_js_truthy(&json!({ "type": "object", "subtype": "null", "value": null })));
+        assert!(is_js_truthy(&json!({ "type": "object", "objectId": "obj-1" })));
     }
 }

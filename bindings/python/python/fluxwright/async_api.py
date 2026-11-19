@@ -22,7 +22,9 @@ import asyncio
 import inspect
 import json as _json
 import logging
+import math
 import re
+import time
 import weakref
 from contextlib import asynccontextmanager, suppress
 from os import PathLike
@@ -33,6 +35,7 @@ from typing import (
     Literal,
     TypeVar,
 )
+from urllib.parse import urljoin, urlparse
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from . import _native
@@ -514,6 +517,56 @@ class Page(_native.Page):
     @property
     def touchscreen(self) -> Touchscreen:
         return Touchscreen(self)
+
+    async def wait_for_url(
+        self,
+        url: URLMatch,
+        *,
+        timeout: float | None = None,
+        wait_until: Literal["load", "domcontentloaded", "networkidle", "commit"] | None = None,
+    ) -> None:
+        if wait_until is not None and wait_until not in ("load", "domcontentloaded", "networkidle", "commit"):
+            raise ValueError(
+                f"wait_until must be load, domcontentloaded, networkidle or commit, not {wait_until!r}"
+            )
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or math.isnan(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be a non-negative number")
+        target: URLMatch = url
+        if isinstance(target, str):
+            base_url = self._base_url()
+            if base_url is not None and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target):
+                if target.startswith("/"):
+                    parsed = urlparse(base_url)
+                    target = f"{parsed.scheme}://{parsed.netloc}{target}"
+                elif not target.startswith("*") and "{" not in target:
+                    target = urljoin(base_url, target)
+        elif not isinstance(target, re.Pattern) and not callable(target):
+            raise TypeError("page.wait_for_url: url must be a str, re.Pattern or callable")
+        matches = _url_matcher(target)
+        state = wait_until or "load"
+        nav_timeout = self._navigation_timeout() if timeout is None else float(timeout)
+        unlimited = nav_timeout == 0 or nav_timeout >= 365 * 24 * 3600 * 1000
+        deadline = None if unlimited else time.monotonic() + (nav_timeout / 1000.0)
+        while True:
+            current = self.url
+            if matches(current):
+                if state == "commit":
+                    return
+                rem = None if deadline is None else max(1.0, (deadline - time.monotonic()) * 1000.0)
+                await self.wait_for_load_state(state, timeout=rem)
+                return
+            if deadline is not None:
+                rem = (deadline - time.monotonic()) * 1000.0
+                if rem <= 0:
+                    raise TimeoutError(f"page.wait_for_url: timeout exceeded (current: {current})")
+            else:
+                rem = None
+            await self._wait_for_url_change(current, timeout=rem)
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
         """Hands matching requests of this page, its popups and iframes to ``handler(route)``
