@@ -124,6 +124,20 @@ const MOUSE_BUTTON = { button: BUTTON, clickCount: true }
 const MOUSE_CLICK = { button: BUTTON, clickCount: true, delay: true }
 const MOUSE_DBLCLICK = { button: BUTTON, delay: true }
 
+const FILTER = { has: true, hasNot: true, hasText: true, hasNotText: true }
+const ROLE = {
+  name: true,
+  exact: true,
+  checked: true,
+  disabled: true,
+  expanded: true,
+  includeHidden: true,
+  level: true,
+  pressed: true,
+  selected: true,
+}
+const STRICT_TIMEOUT = { ...TIMEOUT, strict: true }
+
 function checkOptions(method, options, allowed) {
   if (options == null) return
   if (typeof options !== 'object') throw new TypeError(`${method}: options must be an object`)
@@ -159,7 +173,16 @@ function guard(Class, label, sync, methods) {
           // Playwright's per-call timeout: a locator carries it, and a page method that takes
           // a selector is the same action on that selector's locator.
           const timeout = args[at]?.timeout
-          if (via) return this.locator(args[0])[via](...args.slice(1))
+          if (via) {
+            const opts = args[at]
+            const loc = this.locator(args[0])._strict(opts?.strict ?? false)
+            const forwarded = opts && Object.hasOwn(opts, 'strict')
+              ? (({ strict: _, ...rest }) => rest)(opts)
+              : opts
+            return args.length > at
+              ? loc[via](...args.slice(1, at), forwarded)
+              : loc[via](...args.slice(1))
+          }
           if (timeout != null && this._withTimeout) return call.apply(this._withTimeout(timeout), args)
           return call.apply(this, args)
         }
@@ -839,10 +862,35 @@ try {
     if (options?.path) await save(options.path, bytes)
     return bytes
   }
+function applyFilter(loc, options, label) {
+  checkOptions(label, options, FILTER)
+  if (options.hasText !== undefined) {
+    if (options.hasText instanceof RegExp) loc = loc._hasTextRegex(options.hasText.source, options.hasText.flags)
+    else if (typeof options.hasText === 'string') loc = loc._hasText(options.hasText)
+    else throw new TypeError(`${label}: hasText must be a string or RegExp`)
+  }
+  if (options.hasNotText !== undefined) {
+    if (options.hasNotText instanceof RegExp) loc = loc._hasNotTextRegex(options.hasNotText.source, options.hasNotText.flags)
+    else if (typeof options.hasNotText === 'string') loc = loc._hasNotText(options.hasNotText)
+    else throw new TypeError(`${label}: hasNotText must be a string or RegExp`)
+  }
+  if (options.has !== undefined) {
+    if (!options.has || typeof options.has._frames !== 'function' || typeof options.has._query !== 'function') {
+      throw new TypeError(`${label}: has must be a Locator`)
+    }
+    loc = loc._has(options.has._frames(), options.has._query())
+  }
+  if (options.hasNot !== undefined) {
+    if (!options.hasNot || typeof options.hasNot._frames !== 'function' || typeof options.hasNot._query !== 'function') {
+      throw new TypeError(`${label}: hasNot must be a Locator`)
+    }
+    loc = loc._hasNot(options.hasNot._frames(), options.hasNot._query())
+  }
+  return loc
+}
+
   const builders = [
-    ['locator', 1, NONE],
     ['getByText', 1, EXACT],
-    ['getByRole', 1, { name: true, exact: true }],
     ['getByLabel', 1, EXACT],
     ['getByPlaceholder', 1, EXACT],
     ['getByAltText', 1, EXACT],
@@ -888,25 +936,83 @@ try {
     }
     return this._dragTo(target._frames(), target._query(), options?.force)
   }
+  for (const [Class, label] of [
+    [native.Page, 'page'],
+    [native.FrameLocator, 'frameLocator'],
+    [native.Locator, 'locator'],
+  ]) {
+    const origLocator = Class.prototype.locator
+    Class.prototype.locator = function (selector, options) {
+      let loc = origLocator.call(this, selector)
+      if (options != null) loc = applyFilter(loc, options, `${label}.locator`)
+      return loc
+    }
+    const origGetByRole = Class.prototype.getByRole
+    const origGetByRoleRe = Class.prototype._getByRoleRegex
+    Class.prototype.getByRole = function (role, options) {
+      checkOptions(`${label}.getByRole`, options, ROLE)
+      if (options?.name instanceof RegExp) {
+        const { name, ...rest } = options
+        return origGetByRoleRe.call(this, role, name.source, name.flags, rest)
+      }
+      if (options?.name != null && typeof options.name !== 'string') {
+        throw new TypeError(`${label}.getByRole: name must be a string or RegExp`)
+      }
+      return origGetByRole.call(this, role, options)
+    }
+  }
+  native.Locator.prototype.filter = function (options) {
+    if (!options || typeof options !== 'object') {
+      throw new TypeError('locator.filter: options must be an object')
+    }
+    return applyFilter(this, options, 'locator.filter')
+  }
+  native.Locator.prototype.and = function (locator) {
+    if (!locator || typeof locator._frames !== 'function' || typeof locator._query !== 'function') {
+      throw new TypeError('locator.and: argument must be a Locator')
+    }
+    return this._and(locator._frames(), locator._query())
+  }
+  native.Locator.prototype.or = function (locator) {
+    if (!locator || typeof locator._frames !== 'function' || typeof locator._query !== 'function') {
+      throw new TypeError('locator.or: argument must be a Locator')
+    }
+    return this._or(locator._frames(), locator._query())
+  }
+  native.Locator.prototype.all = async function () {
+    const n = await this.count()
+    return Array.from({ length: n }, (_, i) => this.nth(i))
+  }
   guard(native.Page, 'page', true, builders)
   guard(native.FrameLocator, 'frameLocator', true, builders)
-  guard(native.Locator, 'locator', true, [...builders, ['filter', 0, { hasText: true }]])
+  guard(native.Locator, 'locator', true, builders)
   guard(native.Page, 'page', false, [
     ['goto', 1, { waitUntil: true, timeout: true }],
-    ['click', 1, CLICK, 'click'],
-    ['dblclick', 1, DBLCLICK, 'dblclick'],
-    ['hover', 1, HOVER, 'hover'],
-    ['focus', 1, TIMEOUT, 'focus'],
-    ['fill', 2, TIMEOUT, 'fill'],
-    ['press', 2, PRESS, 'press'],
-    ['type', 2, PRESS, 'pressSequentially'],
-    ['check', 1, CHECK, 'check'],
-    ['uncheck', 1, CHECK, 'uncheck'],
-    ['setChecked', 2, CHECK, 'setChecked'],
-    ['selectOption', 2, FORCE_TIMEOUT, 'selectOption'],
-    ['setInputFiles', 2, TIMEOUT, 'setInputFiles'],
-    ['tap', 1, HOVER, 'tap'],
-    ['waitForSelector', 1, { ...STATE, ...TIMEOUT }, 'waitFor'],
+    ['click', 1, { ...CLICK, strict: true }, 'click'],
+    ['dblclick', 1, { ...DBLCLICK, strict: true }, 'dblclick'],
+    ['hover', 1, { ...HOVER, strict: true }, 'hover'],
+    ['focus', 1, STRICT_TIMEOUT, 'focus'],
+    ['fill', 2, STRICT_TIMEOUT, 'fill'],
+    ['press', 2, { ...PRESS, strict: true }, 'press'],
+    ['type', 2, { ...PRESS, strict: true }, 'pressSequentially'],
+    ['check', 1, { ...CHECK, strict: true }, 'check'],
+    ['uncheck', 1, { ...CHECK, strict: true }, 'uncheck'],
+    ['setChecked', 2, { ...CHECK, strict: true }, 'setChecked'],
+    ['selectOption', 2, { ...FORCE_TIMEOUT, strict: true }, 'selectOption'],
+    ['setInputFiles', 2, STRICT_TIMEOUT, 'setInputFiles'],
+    ['tap', 1, { ...HOVER, strict: true }, 'tap'],
+    ['waitForSelector', 1, { ...STATE, ...STRICT_TIMEOUT }, 'waitFor'],
+    ['textContent', 1, STRICT_TIMEOUT, 'textContent'],
+    ['innerText', 1, STRICT_TIMEOUT, 'innerText'],
+    ['innerHTML', 1, STRICT_TIMEOUT, 'innerHTML'],
+    ['inputValue', 1, STRICT_TIMEOUT, 'inputValue'],
+    ['getAttribute', 2, STRICT_TIMEOUT, 'getAttribute'],
+    ['isVisible', 1, STRICT_TIMEOUT, 'isVisible'],
+    ['isHidden', 1, STRICT_TIMEOUT, 'isHidden'],
+    ['isEnabled', 1, STRICT_TIMEOUT, 'isEnabled'],
+    ['isDisabled', 1, STRICT_TIMEOUT, 'isDisabled'],
+    ['isChecked', 1, STRICT_TIMEOUT, 'isChecked'],
+    ['isEditable', 1, STRICT_TIMEOUT, 'isEditable'],
   ])
   guard(native.Locator, 'locator', false, [
     ['click', 0, CLICK],
@@ -927,12 +1033,30 @@ try {
     ['tap', 0, HOVER],
     ['waitFor', 0, { ...STATE, ...TIMEOUT }],
     ['textContent', 0, TIMEOUT],
+    ['innerText', 0, TIMEOUT],
+    ['innerHTML', 0, TIMEOUT],
+    ['inputValue', 0, TIMEOUT],
+    ['getAttribute', 1, TIMEOUT],
+    ['count', 0, NONE],
+    ['all', 0, NONE],
+    ['allTextContents', 0, NONE],
+    ['allInnerTexts', 0, NONE],
+    ['isVisible', 0, TIMEOUT],
+    ['isHidden', 0, TIMEOUT],
+    ['isEnabled', 0, TIMEOUT],
+    ['isDisabled', 0, TIMEOUT],
+    ['isChecked', 0, TIMEOUT],
+    ['isEditable', 0, TIMEOUT],
     ['boundingBox', 0, TIMEOUT],
   ])
   native.Locator.prototype.type = native.Locator.prototype.pressSequentially
   native.Page.prototype.dragAndDrop = async function (source, target, options) {
-    checkOptions('page.dragAndDrop', options, FORCE_TIMEOUT)
-    return this.locator(source).dragTo(this.locator(target), options)
+    checkOptions('page.dragAndDrop', options, { ...FORCE_TIMEOUT, strict: true })
+    const strict = options?.strict ?? false
+    const forwarded = options && Object.hasOwn(options, 'strict')
+      ? (({ strict: _, ...rest }) => rest)(options)
+      : options
+    return this.locator(source)._strict(strict).dragTo(this.locator(target)._strict(strict), forwarded)
   }
   const devices = new WeakMap()
   const deviceState = (page) => {

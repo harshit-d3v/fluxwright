@@ -15,6 +15,6 @@ pub use fluxwright_cdp::{
     ClickOptions, Clip, ColorScheme, ConsoleMessage, Cookie, Dialog, Download, Emulation,
     FileChooser, FileInput, FilePayload, Fulfill, Geolocation, HoverOptions, ImageFormat,
     InterceptedRequest, LaunchOptions, LogEntry, MouseButton, NetEvent, NetRequest, NetResponse,
-    OriginStorage, Overrides, PageError, PdfMargin, PdfOptions, Proxy, ResourceType,
+    OriginStorage, Overrides, PageError, PdfMargin, PdfOptions, Proxy, ResourceType, RoleOptions,
     ScreenshotOptions, SelectEntry, Selector, StorageItem, StorageState, WaitState, WaitUntil,
 };

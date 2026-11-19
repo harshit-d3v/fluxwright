@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyCFunction, PyDict, PyString};
 use pyo3::IntoPyObjectExt;
@@ -75,6 +75,107 @@ where
     F: for<'a> FnOnce(&'a fluxwright::PageLease) -> BoxFuture<'a, fluxwright::Result<T>>,
 {
     with_page_in(lease, None, f).await
+}
+
+fn page_sel(selector: String, strict: Option<bool>) -> fluxwright::Selector {
+    fluxwright::Selector::new(selector).strict(strict.unwrap_or(false))
+}
+
+enum TextOrRegex {
+    Text(String),
+    Regex(String, String),
+}
+
+fn parse_text_or_regex(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<TextOrRegex> {
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(TextOrRegex::Text(s));
+    }
+    let pattern_ty = obj.py().import("re")?.getattr("Pattern")?;
+    if obj.is_instance(&pattern_ty)? {
+        let pattern: String = obj.getattr("pattern")?.extract()?;
+        let flags_int: u32 = obj.getattr("flags")?.extract()?;
+        let mut flags = String::new();
+        if flags_int & 2 != 0 {
+            flags.push('i');
+        }
+        if flags_int & 8 != 0 {
+            flags.push('m');
+        }
+        if flags_int & 16 != 0 {
+            flags.push('s');
+        }
+        return Ok(TextOrRegex::Regex(pattern, flags));
+    }
+    Err(PyTypeError::new_err(format!("{what} must be a str or re.Pattern")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_role_options(
+    checked: Option<bool>,
+    disabled: Option<bool>,
+    exact: Option<bool>,
+    expanded: Option<bool>,
+    include_hidden: Option<bool>,
+    level: Option<u32>,
+    name: Option<&Bound<'_, PyAny>>,
+    pressed: Option<bool>,
+    selected: Option<bool>,
+) -> PyResult<fluxwright::RoleOptions> {
+    let (name_str, name_regex) = match name {
+        None => (None, None),
+        Some(v) => match parse_text_or_regex(v, "name")? {
+            TextOrRegex::Text(s) => (Some(s), None),
+            TextOrRegex::Regex(p, f) => (None, Some((p, f))),
+        },
+    };
+    Ok(fluxwright::RoleOptions {
+        name: name_str,
+        exact: exact.unwrap_or(false),
+        name_regex,
+        checked,
+        disabled,
+        expanded,
+        include_hidden: include_hidden.unwrap_or(false),
+        level,
+        pressed,
+        selected,
+    })
+}
+
+fn apply_filter(
+    mut sel: fluxwright::Selector,
+    has: Option<PyRef<'_, Locator>>,
+    has_not: Option<PyRef<'_, Locator>>,
+    has_text: Option<&Bound<'_, PyAny>>,
+    has_not_text: Option<&Bound<'_, PyAny>>,
+) -> PyResult<fluxwright::Selector> {
+    if let Some(t) = has_text {
+        let part = match parse_text_or_regex(t, "has_text")? {
+            TextOrRegex::Text(s) => fluxwright::Selector::has_text(&s),
+            TextOrRegex::Regex(p, f) => fluxwright::Selector::has_text_regex(&p, &f),
+        };
+        sel = sel.then(&part);
+    }
+    if let Some(t) = has_not_text {
+        let part = match parse_text_or_regex(t, "has_not_text")? {
+            TextOrRegex::Text(s) => fluxwright::Selector::has_not_text(&s),
+            TextOrRegex::Regex(p, f) => fluxwright::Selector::has_not_text_regex(&p, &f),
+        };
+        sel = sel.then(&part);
+    }
+    if let Some(loc) = has {
+        if sel.frames != loc.selector.frames {
+            return Err(PyValueError::new_err("has locator belongs to a different frame"));
+        }
+        sel = sel.has(&loc.selector);
+    }
+    if let Some(loc) = has_not {
+        if sel.frames != loc.selector.frames {
+            return Err(PyValueError::new_err("has_not locator belongs to a different frame"));
+        }
+        sel = sel.has_not(&loc.selector);
+    }
+    Ok(sel)
 }
 
 /// Playwright's `state`: attached, detached, visible (the default) or hidden.
@@ -1097,6 +1198,7 @@ impl Page {
         modifiers=None,
         force=None,
         trial=None,
+        strict=None,
         timeout=None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1111,12 +1213,13 @@ impl Page {
         modifiers: Option<Vec<String>>,
         force: Option<bool>,
         trial: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         do_click(
             py,
             &self.lease,
-            selector.into(),
+            page_sel(selector, strict),
             button,
             click_count.unwrap_or(1),
             delay,
@@ -1138,6 +1241,7 @@ impl Page {
         modifiers=None,
         force=None,
         trial=None,
+        strict=None,
         timeout=None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1151,12 +1255,13 @@ impl Page {
         modifiers: Option<Vec<String>>,
         force: Option<bool>,
         trial: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         do_click(
             py,
             &self.lease,
-            selector.into(),
+            page_sel(selector, strict),
             button,
             2,
             delay,
@@ -1169,7 +1274,7 @@ impl Page {
         )
     }
 
-    #[pyo3(signature = (selector, *, position=None, modifiers=None, force=None, trial=None, timeout=None))]
+    #[pyo3(signature = (selector, *, position=None, modifiers=None, force=None, trial=None, strict=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn hover<'py>(
         &self,
@@ -1179,12 +1284,13 @@ impl Page {
         modifiers: Option<Vec<String>>,
         force: Option<bool>,
         trial: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         do_hover_or_tap(
             py,
             &self.lease,
-            selector.into(),
+            page_sel(selector, strict),
             position,
             modifiers,
             force,
@@ -1194,7 +1300,7 @@ impl Page {
         )
     }
 
-    #[pyo3(signature = (selector, *, position=None, modifiers=None, force=None, trial=None, timeout=None))]
+    #[pyo3(signature = (selector, *, position=None, modifiers=None, force=None, trial=None, strict=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn tap<'py>(
         &self,
@@ -1204,12 +1310,13 @@ impl Page {
         modifiers: Option<Vec<String>>,
         force: Option<bool>,
         trial: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         do_hover_or_tap(
             py,
             &self.lease,
-            selector.into(),
+            page_sel(selector, strict),
             position,
             modifiers,
             force,
@@ -1219,118 +1326,133 @@ impl Page {
         )
     }
 
-    #[pyo3(signature = (selector, *, timeout=None))]
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
     fn focus<'py>(
         &self,
         py: Python<'py>,
         selector: String,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.focus(selector.as_str()).await.map(none) })
+            Box::pin(async move { p.focus(&sel).await.map(none) })
         })
     }
 
-    #[pyo3(signature = (selector, *, timeout=None))]
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
     fn blur<'py>(
         &self,
         py: Python<'py>,
         selector: String,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.blur(selector.as_str()).await.map(none) })
+            Box::pin(async move { p.blur(&sel).await.map(none) })
         })
     }
 
-    #[pyo3(signature = (selector, *, timeout=None))]
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
     fn scroll_into_view_if_needed<'py>(
         &self,
         py: Python<'py>,
         selector: String,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.scroll_into_view_if_needed(selector.as_str()).await.map(none) })
+            Box::pin(async move { p.scroll_into_view_if_needed(&sel).await.map(none) })
         })
     }
 
-    #[pyo3(signature = (source, target, *, force=None, timeout=None))]
+    #[pyo3(signature = (source, target, *, force=None, strict=None, timeout=None))]
     fn drag_and_drop<'py>(
         &self,
         py: Python<'py>,
         source: String,
         target: String,
         force: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_drag(py, &self.lease, source.into(), target.into(), force, timeout)
+        do_drag(py, &self.lease, page_sel(source, strict), page_sel(target, strict), force, timeout)
     }
 
-    #[pyo3(signature = (selector, value, *, timeout=None))]
+    #[pyo3(signature = (selector, value, *, strict=None, timeout=None))]
     fn fill<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         value: String,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.fill(selector.as_str(), &value).await.map(none) })
+            Box::pin(async move { p.fill(&sel, &value).await.map(none) })
         })
     }
 
-    #[pyo3(signature = (selector, *, force=None, timeout=None))]
+    #[pyo3(signature = (selector, *, force=None, strict=None, timeout=None))]
     fn clear<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         force: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let force = force.unwrap_or(false);
+        let sel = page_sel(selector, strict);
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.clear(selector.as_str(), force).await.map(none) })
+            Box::pin(async move { p.clear(&sel, force).await.map(none) })
         })
     }
 
-    #[pyo3(signature = (selector, key, *, delay=None, timeout=None))]
+    #[pyo3(signature = (selector, key, *, delay=None, strict=None, timeout=None))]
     fn press<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         key: String,
         delay: Option<f64>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_press(py, &self.lease, selector.into(), key, delay, timeout)
+        do_press(py, &self.lease, page_sel(selector, strict), key, delay, timeout)
     }
 
-    #[pyo3(signature = (selector, text, *, delay=None, timeout=None))]
+    #[pyo3(signature = (selector, text, *, delay=None, strict=None, timeout=None))]
     fn press_sequentially<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         text: String,
         delay: Option<f64>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_type(py, &self.lease, selector.into(), text, delay, timeout)
+        do_type(py, &self.lease, page_sel(selector, strict), text, delay, timeout)
     }
 
-    #[pyo3(name = "type", signature = (selector, text, *, delay=None, timeout=None))]
+    #[pyo3(name = "type", signature = (selector, text, *, delay=None, strict=None, timeout=None))]
     fn r#type<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         text: String,
         delay: Option<f64>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_type(py, &self.lease, selector.into(), text, delay, timeout)
+        do_type(py, &self.lease, page_sel(selector, strict), text, delay, timeout)
     }
 
-    #[pyo3(signature = (selector, *, position=None, force=None, trial=None, timeout=None))]
+    #[pyo3(signature = (selector, *, position=None, force=None, trial=None, strict=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
     fn check<'py>(
         &self,
         py: Python<'py>,
@@ -1338,12 +1460,14 @@ impl Page {
         position: Option<&Bound<'_, PyAny>>,
         force: Option<bool>,
         trial: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_check(py, &self.lease, selector.into(), true, position, force, trial, timeout)
+        do_check(py, &self.lease, page_sel(selector, strict), true, position, force, trial, timeout)
     }
 
-    #[pyo3(signature = (selector, *, position=None, force=None, trial=None, timeout=None))]
+    #[pyo3(signature = (selector, *, position=None, force=None, trial=None, strict=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
     fn uncheck<'py>(
         &self,
         py: Python<'py>,
@@ -1351,12 +1475,14 @@ impl Page {
         position: Option<&Bound<'_, PyAny>>,
         force: Option<bool>,
         trial: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_check(py, &self.lease, selector.into(), false, position, force, trial, timeout)
+        do_check(py, &self.lease, page_sel(selector, strict), false, position, force, trial, timeout)
     }
 
-    #[pyo3(signature = (selector, checked, *, position=None, force=None, trial=None, timeout=None))]
+    #[pyo3(signature = (selector, checked, *, position=None, force=None, trial=None, strict=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
     fn set_checked<'py>(
         &self,
         py: Python<'py>,
@@ -1365,12 +1491,13 @@ impl Page {
         position: Option<&Bound<'_, PyAny>>,
         force: Option<bool>,
         trial: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_check(py, &self.lease, selector.into(), checked, position, force, trial, timeout)
+        do_check(py, &self.lease, page_sel(selector, strict), checked, position, force, trial, timeout)
     }
 
-    #[pyo3(signature = (selector, value=None, *, index=None, label=None, element=None, force=None, timeout=None))]
+    #[pyo3(signature = (selector, value=None, *, index=None, label=None, element=None, force=None, strict=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn select_option<'py>(
         &self,
@@ -1381,12 +1508,13 @@ impl Page {
         label: Option<&Bound<'_, PyAny>>,
         element: Option<&Bound<'_, PyAny>>,
         force: Option<bool>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         do_select_option(
             py,
             &self.lease,
-            selector.into(),
+            page_sel(selector, strict),
             value,
             index,
             label,
@@ -1396,15 +1524,16 @@ impl Page {
         )
     }
 
-    #[pyo3(signature = (selector, files, *, timeout=None))]
+    #[pyo3(signature = (selector, files, *, strict=None, timeout=None))]
     fn set_input_files<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         files: &Bound<'_, PyAny>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        do_set_input_files(py, &self.lease, selector.into(), files, timeout)
+        do_set_input_files(py, &self.lease, page_sel(selector, strict), files, timeout)
     }
 
     #[pyo3(name = "_mouse_move", signature = (x, y, *, steps=None))]
@@ -1553,18 +1682,86 @@ impl Page {
         })
     }
 
-    #[pyo3(signature = (selector, *, state=None, timeout=None))]
+    #[pyo3(signature = (selector, *, state=None, strict=None, timeout=None))]
     fn wait_for_selector<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         state: Option<String>,
+        strict: Option<bool>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = wait_state(state)?;
+        let sel = page_sel(selector, strict);
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.wait_for_selector_state(selector.as_str(), state).await.map(none) })
+            Box::pin(async move { p.wait_for_selector_state(&sel, state).await.map(none) })
         })
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn text_content<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.text_content(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn inner_text<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.inner_text(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn inner_html<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.inner_html(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn input_value<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.input_value(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, name, *, strict=None, timeout=None))]
+    fn get_attribute<'py>(&self, py: Python<'py>, selector: String, name: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.get_attribute(&sel, &name).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn is_visible<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_visible(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn is_hidden<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_hidden(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn is_enabled<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_enabled(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn is_disabled<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_disabled(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn is_checked<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_checked(&sel).await }))
+    }
+
+    #[pyo3(signature = (selector, *, strict=None, timeout=None))]
+    fn is_editable<'py>(&self, py: Python<'py>, selector: String, strict: Option<bool>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = page_sel(selector, strict);
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_editable(&sel).await }))
     }
 
     #[pyo3(signature = (expression, arg=None))]
@@ -1808,9 +2005,17 @@ impl Page {
         *self.lease.closing.borrow()
     }
 
-    /// CSS, `text=`, or `role=` selector.
-    fn locator(&self, selector: String) -> Locator {
-        self.top().locator(selector)
+    /// CSS, `text=`, `xpath=`, or `role=` selector.
+    #[pyo3(signature = (selector, *, has=None, has_not=None, has_text=None, has_not_text=None))]
+    fn locator(
+        &self,
+        selector: String,
+        has: Option<PyRef<'_, Locator>>,
+        has_not: Option<PyRef<'_, Locator>>,
+        has_text: Option<&Bound<'_, PyAny>>,
+        has_not_text: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Locator> {
+        self.top().locator(selector, has, has_not, has_text, has_not_text)
     }
 
     #[pyo3(signature = (text, *, exact=None))]
@@ -1818,9 +2023,33 @@ impl Page {
         self.top().get_by_text(text, exact)
     }
 
-    #[pyo3(signature = (role, *, name=None, exact=None))]
-    fn get_by_role(&self, role: &str, name: Option<&str>, exact: Option<bool>) -> Locator {
-        self.top().get_by_role(role, name, exact)
+    #[pyo3(signature = (role, *, checked=None, disabled=None, exact=None, expanded=None, include_hidden=None, level=None, name=None, pressed=None, selected=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn get_by_role(
+        &self,
+        role: &str,
+        checked: Option<bool>,
+        disabled: Option<bool>,
+        exact: Option<bool>,
+        expanded: Option<bool>,
+        include_hidden: Option<bool>,
+        level: Option<u32>,
+        name: Option<&Bound<'_, PyAny>>,
+        pressed: Option<bool>,
+        selected: Option<bool>,
+    ) -> PyResult<Locator> {
+        self.top().get_by_role(
+            role,
+            checked,
+            disabled,
+            exact,
+            expanded,
+            include_hidden,
+            level,
+            name,
+            pressed,
+            selected,
+        )
     }
 
     #[pyo3(signature = (text, *, exact=None))]
@@ -2340,6 +2569,99 @@ impl Locator {
         })
     }
 
+    #[pyo3(signature = (*, timeout=None))]
+    fn inner_text<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.inner_text(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn inner_html<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.inner_html(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn input_value<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.input_value(&sel).await }))
+    }
+
+    #[pyo3(signature = (name, *, timeout=None))]
+    fn get_attribute<'py>(&self, py: Python<'py>, name: String, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.get_attribute(&sel, &name).await }))
+    }
+
+    fn count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run(py, &self.lease, move |p| Box::pin(async move { p.count(&sel).await }))
+    }
+
+    fn all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let lease = self.lease.clone();
+        let base = self.selector.clone();
+        future_into_py(py, async move {
+            let n = with_page(&lease, {
+                let sel = base.clone();
+                move |p| Box::pin(async move { p.count(&sel).await })
+            })
+            .await?;
+            Ok((0..n)
+                .map(|i| Locator {
+                    lease: lease.clone(),
+                    selector: base.then(&format!("nth={i}")),
+                })
+                .collect::<Vec<_>>())
+        })
+    }
+
+    fn all_text_contents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run(py, &self.lease, move |p| Box::pin(async move { p.all_text_contents(&sel).await }))
+    }
+
+    fn all_inner_texts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run(py, &self.lease, move |p| Box::pin(async move { p.all_inner_texts(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn is_visible<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_visible(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn is_hidden<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_hidden(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn is_enabled<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_enabled(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn is_disabled<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_disabled(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn is_checked<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_checked(&sel).await }))
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn is_editable<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| Box::pin(async move { p.is_editable(&sel).await }))
+    }
+
     /// PNG or JPEG of the element, once it is visible and still; with `path`, also written
     /// there (its extension picks the type when `type` is not given).
     #[pyo3(signature = (*, path=None, r#type=None, quality=None, omit_background=None, timeout=None))]
@@ -2414,20 +2736,54 @@ impl Locator {
     }
 
     /// Keeps matches containing `has_text` (case-insensitive substring), as in Playwright.
-    #[pyo3(signature = (*, has_text=None))]
-    fn filter(&self, has_text: Option<&str>) -> Locator {
-        match has_text {
-            Some(text) => self.then(fluxwright::Selector::has_text(text)),
-            None => Locator {
-                lease: self.lease.clone(),
-                selector: self.selector.clone(),
-            },
+    #[pyo3(signature = (*, has=None, has_not=None, has_text=None, has_not_text=None))]
+    fn filter(
+        &self,
+        has: Option<PyRef<'_, Locator>>,
+        has_not: Option<PyRef<'_, Locator>>,
+        has_text: Option<&Bound<'_, PyAny>>,
+        has_not_text: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Locator> {
+        Ok(Locator {
+            lease: self.lease.clone(),
+            selector: apply_filter(self.selector.clone(), has, has_not, has_text, has_not_text)?,
+        })
+    }
+
+    fn and_(&self, locator: &Locator) -> PyResult<Locator> {
+        if self.selector.frames != locator.selector.frames {
+            return Err(PyValueError::new_err("locator combinator belongs to a different frame"));
         }
+        Ok(Locator {
+            lease: self.lease.clone(),
+            selector: self.selector.and(&locator.selector),
+        })
+    }
+
+    fn or_(&self, locator: &Locator) -> PyResult<Locator> {
+        if self.selector.frames != locator.selector.frames {
+            return Err(PyValueError::new_err("locator combinator belongs to a different frame"));
+        }
+        Ok(Locator {
+            lease: self.lease.clone(),
+            selector: self.selector.or(&locator.selector),
+        })
     }
 
     /// Searches inside this locator's matches.
-    fn locator(&self, selector: String) -> Locator {
-        self.then(selector)
+    #[pyo3(signature = (selector, *, has=None, has_not=None, has_text=None, has_not_text=None))]
+    fn locator(
+        &self,
+        selector: String,
+        has: Option<PyRef<'_, Locator>>,
+        has_not: Option<PyRef<'_, Locator>>,
+        has_text: Option<&Bound<'_, PyAny>>,
+        has_not_text: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Locator> {
+        Ok(Locator {
+            lease: self.lease.clone(),
+            selector: apply_filter(self.selector.then(&selector), has, has_not, has_text, has_not_text)?,
+        })
     }
 
     #[pyo3(signature = (text, *, exact=None))]
@@ -2435,13 +2791,23 @@ impl Locator {
         self.then(fluxwright::Selector::text(text, exact.unwrap_or(false)))
     }
 
-    #[pyo3(signature = (role, *, name=None, exact=None))]
-    fn get_by_role(&self, role: &str, name: Option<&str>, exact: Option<bool>) -> Locator {
-        self.then(fluxwright::Selector::role(
-            role,
-            name,
-            exact.unwrap_or(false),
-        ))
+    #[pyo3(signature = (role, *, checked=None, disabled=None, exact=None, expanded=None, include_hidden=None, level=None, name=None, pressed=None, selected=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn get_by_role(
+        &self,
+        role: &str,
+        checked: Option<bool>,
+        disabled: Option<bool>,
+        exact: Option<bool>,
+        expanded: Option<bool>,
+        include_hidden: Option<bool>,
+        level: Option<u32>,
+        name: Option<&Bound<'_, PyAny>>,
+        pressed: Option<bool>,
+        selected: Option<bool>,
+    ) -> PyResult<Locator> {
+        let opts = parse_role_options(checked, disabled, exact, expanded, include_hidden, level, name, pressed, selected)?;
+        Ok(self.then(fluxwright::Selector::role_with(role, &opts)))
     }
 
     #[pyo3(signature = (text, *, exact=None))]
@@ -2494,8 +2860,20 @@ struct FrameLocator {
 
 #[pymethods]
 impl FrameLocator {
-    fn locator(&self, selector: String) -> Locator {
-        self.find(selector)
+    #[pyo3(signature = (selector, *, has=None, has_not=None, has_text=None, has_not_text=None))]
+    fn locator(
+        &self,
+        selector: String,
+        has: Option<PyRef<'_, Locator>>,
+        has_not: Option<PyRef<'_, Locator>>,
+        has_text: Option<&Bound<'_, PyAny>>,
+        has_not_text: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Locator> {
+        let loc = self.find(selector);
+        Ok(Locator {
+            lease: loc.lease,
+            selector: apply_filter(loc.selector, has, has_not, has_text, has_not_text)?,
+        })
     }
 
     #[pyo3(signature = (text, *, exact=None))]
@@ -2503,13 +2881,23 @@ impl FrameLocator {
         self.find(fluxwright::Selector::text(text, exact.unwrap_or(false)))
     }
 
-    #[pyo3(signature = (role, *, name=None, exact=None))]
-    fn get_by_role(&self, role: &str, name: Option<&str>, exact: Option<bool>) -> Locator {
-        self.find(fluxwright::Selector::role(
-            role,
-            name,
-            exact.unwrap_or(false),
-        ))
+    #[pyo3(signature = (role, *, checked=None, disabled=None, exact=None, expanded=None, include_hidden=None, level=None, name=None, pressed=None, selected=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn get_by_role(
+        &self,
+        role: &str,
+        checked: Option<bool>,
+        disabled: Option<bool>,
+        exact: Option<bool>,
+        expanded: Option<bool>,
+        include_hidden: Option<bool>,
+        level: Option<u32>,
+        name: Option<&Bound<'_, PyAny>>,
+        pressed: Option<bool>,
+        selected: Option<bool>,
+    ) -> PyResult<Locator> {
+        let opts = parse_role_options(checked, disabled, exact, expanded, include_hidden, level, name, pressed, selected)?;
+        Ok(self.find(fluxwright::Selector::role_with(role, &opts)))
     }
 
     /// `<label>`, `aria-labelledby` or `aria-label`; case-insensitive substring unless `exact`.
@@ -2559,6 +2947,7 @@ impl FrameLocator {
             selector: fluxwright::Selector {
                 frames: self.frames.clone(),
                 query,
+                strict: true,
             },
         }
     }

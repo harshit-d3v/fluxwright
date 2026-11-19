@@ -1,5 +1,12 @@
 export * from './index'
-import { Chromium, ConsoleMessage, NewPageOptions, Page, PdfOptions, ScreenshotOptions, StorageState, Browser } from './index'
+import { Chromium, ConsoleMessage, Locator, NewPageOptions, Page, PdfOptions, ScreenshotOptions, StorageState, Browser } from './index'
+
+export interface FilterOptions {
+  has?: Locator
+  hasNot?: Locator
+  hasText?: string | RegExp
+  hasNotText?: string | RegExp
+}
 /**
  * Playwright-style export: `chromium.launch(...)`, which is `Chromium.launch` after a check that
  * every option is one Fluxwright implements (others throw a TypeError).
@@ -219,7 +226,11 @@ declare module './index' {
     /** A browser context with `newPage`'s options, as Playwright's `newContext`. */
     newContext(options?: NewPageOptions): Promise<BrowserContext>
   }
+  interface FrameLocator {
+    locator(selector: string, options?: FilterOptions): Locator
+  }
   interface Page {
+    locator(selector: string, options?: FilterOptions): Locator
     /**
      * Runs `pageFunction` in the page with `arg` and returns its result, awaiting promises.
      * As in Playwright, the function is sent as source text: it can use `arg` (JSON-serializable)
@@ -290,30 +301,46 @@ declare module './index' {
     readonly keyboard: Keyboard
     readonly touchscreen: Touchscreen
     /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
-    click(selector: string, options?: ClickOptions): Promise<void>
-    dblclick(selector: string, options?: DblclickOptions): Promise<void>
-    hover(selector: string, options?: HoverOptions): Promise<void>
-    focus(selector: string, options?: { timeout?: number }): Promise<void>
-    dragAndDrop(source: string, target: string, options?: { force?: boolean; timeout?: number }): Promise<void>
-    fill(selector: string, value: string, options?: { timeout?: number }): Promise<void>
-    press(selector: string, key: string, options?: { delay?: number; timeout?: number }): Promise<void>
-    type(selector: string, text: string, options?: { delay?: number; timeout?: number }): Promise<void>
-    check(selector: string, options?: CheckOptions): Promise<void>
-    uncheck(selector: string, options?: CheckOptions): Promise<void>
-    setChecked(selector: string, checked: boolean, options?: CheckOptions): Promise<void>
+    click(selector: string, options?: ClickOptions & { strict?: boolean }): Promise<void>
+    dblclick(selector: string, options?: DblclickOptions & { strict?: boolean }): Promise<void>
+    hover(selector: string, options?: HoverOptions & { strict?: boolean }): Promise<void>
+    focus(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<void>
+    dragAndDrop(source: string, target: string, options?: { force?: boolean; strict?: boolean; timeout?: number }): Promise<void>
+    fill(selector: string, value: string, options?: { strict?: boolean; timeout?: number }): Promise<void>
+    press(selector: string, key: string, options?: { delay?: number; strict?: boolean; timeout?: number }): Promise<void>
+    type(selector: string, text: string, options?: { delay?: number; strict?: boolean; timeout?: number }): Promise<void>
+    check(selector: string, options?: CheckOptions & { strict?: boolean }): Promise<void>
+    uncheck(selector: string, options?: CheckOptions & { strict?: boolean }): Promise<void>
+    setChecked(selector: string, checked: boolean, options?: CheckOptions & { strict?: boolean }): Promise<void>
     selectOption(
       selector: string,
       values: string | SelectOptionFilter | Array<string | SelectOptionFilter> | null,
-      options?: { force?: boolean; timeout?: number },
+      options?: { force?: boolean; strict?: boolean; timeout?: number },
     ): Promise<Array<string>>
-    setInputFiles(selector: string, files: InputFiles, options?: { timeout?: number }): Promise<void>
-    tap(selector: string, options?: HoverOptions): Promise<void>
+    setInputFiles(selector: string, files: InputFiles, options?: { strict?: boolean; timeout?: number }): Promise<void>
+    tap(selector: string, options?: HoverOptions & { strict?: boolean }): Promise<void>
     waitForSelector(
       selector: string,
-      options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; timeout?: number },
+      options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; strict?: boolean; timeout?: number },
     ): Promise<void>
+    textContent(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<string | null>
+    innerText(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<string>
+    innerHTML(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<string>
+    inputValue(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<string>
+    getAttribute(selector: string, name: string, options?: { strict?: boolean; timeout?: number }): Promise<string | null>
+    isVisible(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
+    isHidden(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
+    isEnabled(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
+    isDisabled(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
+    isChecked(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
+    isEditable(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
   }
   interface Locator {
+    locator(selector: string, options?: FilterOptions): Locator
+    filter(options: FilterOptions): Locator
+    and(locator: Locator): Locator
+    or(locator: Locator): Locator
+    all(): Promise<Array<Locator>>
     /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
     click(options?: ClickOptions): Promise<void>
     dblclick(options?: DblclickOptions): Promise<void>
@@ -338,6 +365,16 @@ declare module './index' {
     tap(options?: HoverOptions): Promise<void>
     waitFor(options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; timeout?: number }): Promise<void>
     textContent(options?: { timeout?: number }): Promise<string | null>
+    innerText(options?: { timeout?: number }): Promise<string>
+    innerHTML(options?: { timeout?: number }): Promise<string>
+    inputValue(options?: { timeout?: number }): Promise<string>
+    getAttribute(name: string, options?: { timeout?: number }): Promise<string | null>
+    isVisible(options?: { timeout?: number }): Promise<boolean>
+    isHidden(options?: { timeout?: number }): Promise<boolean>
+    isEnabled(options?: { timeout?: number }): Promise<boolean>
+    isDisabled(options?: { timeout?: number }): Promise<boolean>
+    isChecked(options?: { timeout?: number }): Promise<boolean>
+    isEditable(options?: { timeout?: number }): Promise<boolean>
     boundingBox(options?: { timeout?: number }): Promise<{ x: number; y: number; width: number; height: number } | null>
     /**
      * Calls `pageFunction` with the element and `arg` in the page, as Playwright does, and returns

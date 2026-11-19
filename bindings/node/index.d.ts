@@ -26,6 +26,7 @@ export declare class FrameLocator {
   locator(selector: string): Locator
   getByText(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
+  _getByRoleRegex(role: string, pattern: string, flags: string, options?: GetByRoleOptions | undefined | null): Locator
   /** `<label>`, `aria-labelledby` or `aria-label`; case-insensitive substring unless `exact`. */
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
@@ -80,16 +81,37 @@ export declare class Locator {
   /** Waits until `state`: attached, detached, visible (the default) or hidden. */
   waitFor(state?: string | undefined | null): Promise<void>
   textContent(): Promise<string | null>
+  innerText(): Promise<string>
+  innerHTML(): Promise<string>
+  inputValue(): Promise<string>
+  getAttribute(name: string): Promise<string | null>
+  count(): Promise<number>
+  allTextContents(): Promise<Array<string>>
+  allInnerTexts(): Promise<Array<string>>
+  isVisible(): Promise<boolean>
+  isHidden(): Promise<boolean>
+  isEnabled(): Promise<boolean>
+  isDisabled(): Promise<boolean>
+  isChecked(): Promise<boolean>
+  isEditable(): Promise<boolean>
   /** The `index`th match (0-based; negative counts from the end). */
   nth(index: number): Locator
   first(): Locator
   last(): Locator
-  /** Keeps matches containing `hasText` (case-insensitive substring), as in Playwright. */
-  filter(options: FilterOptions): Locator
+  _strict(strict: boolean): Locator
+  _has(frames: Array<string>, query: string): Locator
+  _hasNot(frames: Array<string>, query: string): Locator
+  _hasText(text: string): Locator
+  _hasTextRegex(pattern: string, flags: string): Locator
+  _hasNotText(text: string): Locator
+  _hasNotTextRegex(pattern: string, flags: string): Locator
+  _and(frames: Array<string>, query: string): Locator
+  _or(frames: Array<string>, query: string): Locator
   /** Searches inside this locator's matches. */
   locator(selector: string): Locator
   getByText(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
+  _getByRoleRegex(role: string, pattern: string, flags: string, options?: GetByRoleOptions | undefined | null): Locator
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByAltText(text: string, options?: GetByTextOptions | undefined | null): Locator
@@ -138,6 +160,7 @@ export declare class Page {
   locator(selector: string): Locator
   getByText(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
+  _getByRoleRegex(role: string, pattern: string, flags: string, options?: GetByRoleOptions | undefined | null): Locator
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByAltText(text: string, options?: GetByTextOptions | undefined | null): Locator
@@ -302,11 +325,6 @@ export interface FilePayloadInput {
   buffer: Buffer
 }
 
-export interface FilterOptions {
-  /** Case-insensitive substring of the element's text. */
-  hasText?: string
-}
-
 export interface FulfillOptions {
   status?: number
   headers?: Record<string, string>
@@ -322,8 +340,15 @@ export interface Geolocation {
 
 export interface GetByRoleOptions {
   /** Accessible name. Default: case-insensitive substring. */
-  name?: string
+  name?: string | RegExp
   exact?: boolean
+  checked?: boolean
+  disabled?: boolean
+  expanded?: boolean
+  includeHidden?: boolean
+  level?: number
+  pressed?: boolean
+  selected?: boolean
 }
 
 export interface GetByTextOptions {
