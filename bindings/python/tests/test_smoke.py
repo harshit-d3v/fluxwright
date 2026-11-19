@@ -1026,7 +1026,7 @@ def test_init_scripts_and_bindings(base, tmp_path):
                 ctx.add_init_script('window.__syncInit = "yes";')
                 page = ctx.new_page()
                 page.goto("/init-page")
-                assert page.evaluate("() => [window.__syncInit, window.syncMul(6, 7)]") == ["yes", 42]
+                assert page.evaluate("async () => [window.__syncInit, await window.syncMul(6, 7)]") == ["yes", 42]
                 # Re-entrant sync callback: calls page.title() without deadlocking the event loop.
                 page.expose_function("syncTitle", lambda s: f"{page.title()}:{s}")
                 assert page.evaluate("() => window.syncTitle('s')") == "PyInitPage:s"
