@@ -495,9 +495,15 @@ fn proxy_bypasses_host(bypass: Option<&str>, host: &str) -> bool {
     false
 }
 
-fn basic_auth_header(username: &str, password: &str) -> String {
+fn basic_auth_header(username: &str, secret: Option<&str>) -> String {
     use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    let mut raw = String::with_capacity(username.len() + 1 + secret.map_or(0, str::len));
+    raw.push_str(username);
+    raw.push(':');
+    if let Some(s) = secret {
+        raw.push_str(s);
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
     format!("Basic {encoded}")
 }
 
@@ -785,7 +791,7 @@ async fn send_single_hop(
         proxy_auth_header = p
             .username
             .as_deref()
-            .map(|u| basic_auth_header(u, p.password.as_deref().unwrap_or("")));
+            .map(|u| basic_auth_header(u, p.password.as_deref()));
 
         let mut tcp = TcpStream::connect(parsed_proxy.connect_host_port()).await?;
         if target.scheme == "https" {
@@ -1165,7 +1171,7 @@ async fn execute_with_redirects(
             set_header_ci(
                 &mut base_headers,
                 "Authorization",
-                basic_auth_header(user, pass),
+                basic_auth_header(user, Some(pass.as_str())),
             );
         }
     }
