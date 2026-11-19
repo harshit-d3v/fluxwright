@@ -1732,6 +1732,7 @@ impl CdpPage {
             None => Ok(res["result"].clone()),
         }
     }
+}
 
 #[derive(Clone)]
 enum Hop {
