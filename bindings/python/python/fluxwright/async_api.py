@@ -58,6 +58,7 @@ __all__ = [
     "Browser",
     "BrowserContext",
     "BrowserType",
+    "CDPSession",
     "ConsoleMessage",
     "Dialog",
     "Download",
@@ -1153,6 +1154,70 @@ def _resolve_init_script(method: str, script: str | None, path: str | PathLike[s
     return script
 
 
+class CDPSession:
+    """Raw Chrome DevTools Protocol session attached via ``context.new_cdp_session(page)``."""
+
+    def __init__(self, impl: _native.CdpSession) -> None:
+        self._impl = impl
+        self._listeners: dict[str, list[tuple[Listener, Listener]]] = {}
+        self._serving = False
+        self._detached = False
+        self._tasks: set[asyncio.Future[Any]] = set()
+
+    async def send(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        if self._detached:
+            raise Error("cdp_session.send: session is detached")
+        if not isinstance(method, str) or not method:
+            raise TypeError("cdp_session.send: method must be a non-empty str")
+        return await self._impl.send(method, params)
+
+    def _ensure_events(self) -> None:
+        if not self._serving and not self._detached:
+            _keep(
+                self._tasks,
+                asyncio.ensure_future(_serve_cdp_events(self._impl._events(), weakref.ref(self), self._tasks)),
+            )
+            self._serving = True
+
+    def on(self, event: str, handler: Listener) -> None:
+        self._ensure_events()
+        self._listeners.setdefault(event, []).append((handler, handler))
+
+    def once(self, event: str, handler: Listener) -> None:
+        self._ensure_events()
+        listeners = self._listeners
+
+        def call(arg: Any) -> Any:
+            with suppress(ValueError):
+                listeners[event].remove((handler, call))
+            return handler(arg)
+
+        self._listeners.setdefault(event, []).append((handler, call))
+
+    def remove_listener(self, event: str, handler: Listener) -> None:
+        _remove_listener(self._listeners, event, handler)
+
+    off = remove_listener
+
+    async def detach(self) -> None:
+        if self._detached:
+            return
+        self._detached = True
+        self._listeners.clear()
+        await self._impl.detach()
+
+
+async def _serve_cdp_events(
+    stream: _native.CdpEventStream, session: weakref.ref[CDPSession], tasks: set[asyncio.Future[Any]]
+) -> None:
+    while (ev := await stream.next()) is not None:
+        s = session()
+        if s is None or s._detached:
+            return
+        params = _json.loads(ev.params_json) if ev.params_json else {}
+        _emit(s._listeners, ev.method, params, tasks)
+
+
 async def _serve_popups(stream: _native.PopupStream, page: PageRef, tasks: set[asyncio.Future[Any]]) -> None:
     while (lease := await stream.next()) is not None:
         popup = Page(lease)
@@ -1521,6 +1586,21 @@ class BrowserContext:
         if self._closed:
             raise Error("browser_context.clear_cookies: the context is closed")
         await self._ctx.clear_cookies()
+
+    async def new_cdp_session(self, page: Page | Frame) -> CDPSession:
+        """Attaches a raw Chrome DevTools Protocol session to ``page`` or an out-of-process ``Frame``."""
+        if self._closed:
+            raise Error("browser_context.new_cdp_session: the context is closed")
+        if isinstance(page, Frame):
+            target_page, frame_id = page.page, page._id
+        elif isinstance(page, Page):
+            target_page, frame_id = page, None
+        else:
+            raise TypeError("browser_context.new_cdp_session: argument must be a Page or Frame")
+        ctx = target_page._context_ref() if target_page._context_ref is not None else None
+        if ctx is not self:
+            raise Error("browser_context.new_cdp_session: page does not belong to this context")
+        return CDPSession(await target_page._new_cdp_session(frame_id))
 
     async def close(self) -> None:
         """Closes this context and all of its pages and popups."""

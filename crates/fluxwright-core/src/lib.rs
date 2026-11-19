@@ -7,6 +7,7 @@ mod pool;
 mod process;
 mod source;
 
+pub use fluxwright_cdp::{CdpSession, CdpSessionEvent};
 pub use config::{EngineConfig, JobOptions, Priority, QueueFullMode};
 pub use error::{Error, Result};
 pub use metrics::MetricsSnapshot;

@@ -49,6 +49,7 @@ __all__ = [
     "Browser",
     "BrowserContext",
     "BrowserType",
+    "CDPSession",
     "ConsoleMessage",
     "Dialog",
     "Download",
@@ -639,6 +640,60 @@ class Frame(_Finders):
 
     def frame_locator(self, selector: str) -> FrameLocator:
         return FrameLocator(self._impl.frame_locator(selector))
+
+
+class CDPSession:
+    """Raw Chrome DevTools Protocol session attached via ``context.new_cdp_session(page)``."""
+
+    def __init__(self, impl: _a.CDPSession) -> None:
+        self._impl = impl
+        self._listener_bridges: list[tuple[str, Callable[[Any], Any], Callable[[Any], Any]]] = []
+        self._listener_thread = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="fluxwright-cdp-listeners")
+
+    def send(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        return _run(self._impl.send, method, params)
+
+    def on(self, event: str, handler: Callable[[Any], Any]) -> None:
+        self._listen("on", event, handler)
+
+    def once(self, event: str, handler: Callable[[Any], Any]) -> None:
+        self._listen("once", event, handler)
+
+    def remove_listener(self, event: str, handler: Callable[[Any], Any]) -> None:
+        for entry in list(self._listener_bridges):
+            if entry[0] == event and entry[1] == handler:
+                with suppress(ValueError):
+                    self._listener_bridges.remove(entry)
+                _run(_on_loop, self._impl.remove_listener, event, entry[2])
+                return
+
+    off = remove_listener
+
+    def detach(self) -> None:
+        _run(self._impl.detach)
+        self._listener_thread.shutdown(wait=False)
+
+    def _listen(self, method: str, event: str, handler: Callable[[Any], Any]) -> None:
+        loop = _event_loop()
+        bridges = self._listener_bridges
+
+        def bridge(arg: Any) -> Any:
+            if method == "once":
+                with suppress(ValueError):
+                    bridges.remove(entry)
+            try:
+                return loop.run_in_executor(self._listener_thread, _listen, handler, arg)
+            except RuntimeError:
+                return None
+
+        entry = (event, handler, bridge)
+        bridges.append(entry)
+        try:
+            _run(_on_loop, getattr(self._impl, method), event, bridge)
+        except BaseException:
+            with suppress(ValueError):
+                bridges.remove(entry)
+            raise
 
 
 class Download:
@@ -1804,6 +1859,12 @@ class BrowserContext:
     def clear_cookies(self) -> None:
         """Clears every cookie in this context."""
         _run(self._impl.clear_cookies)
+
+    def new_cdp_session(self, page: Page | Frame) -> CDPSession:
+        """Attaches a raw Chrome DevTools Protocol session to ``page`` or an out-of-process ``Frame``."""
+        if not isinstance(page, (Page, Frame)):
+            raise TypeError("browser_context.new_cdp_session: argument must be a Page or Frame")
+        return CDPSession(_run(self._impl.new_cdp_session, page._impl))
 
     def close(self) -> None:
         """Closes this context and all of its pages and popups."""

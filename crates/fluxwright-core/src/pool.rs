@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fluxwright_cdp::{
-    BoundingBox, CdpBrowser, CdpPage, ConsoleMessage, ContextId, Download, DownloadQueue,
-    FrameInfo, InterceptedRequest, LogEntry, PageError, PageLog, PdfOptions, Proxy, ResourceType,
-    ScreenshotOptions, Selector,
+    BoundingBox, CdpBrowser, CdpPage, CdpSession, ConsoleMessage, ContextId, Download,
+    DownloadQueue, FrameInfo, InterceptedRequest, LogEntry, PageError, PageLog, PdfOptions, Proxy,
+    ResourceType, ScreenshotOptions, Selector,
 };
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -1286,6 +1286,16 @@ impl ContextLease {
             .await?)
     }
 
+    pub async fn new_cdp_session(&self, page: &PageLease) -> Result<CdpSession> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        if page.page.context_id.0 != self.guard.context.0 {
+            return Err(Error::Other("page does not belong to this context".into()));
+        }
+        page.new_cdp_session().await
+    }
+
     pub async fn close(&self) -> Result<()> {
         self.guard.dispose(true).await;
         Ok(())
@@ -1362,6 +1372,23 @@ impl PageLease {
 
     pub async fn bring_to_front(&self) -> Result<()> {
         Ok(self.page.bring_to_front(self.action_timeout()).await?)
+    }
+
+    pub async fn new_cdp_session(&self) -> Result<CdpSession> {
+        if self.is_closed() {
+            return Err(Error::Other("page is closed".into()));
+        }
+        Ok(self.page.new_cdp_session(self.action_timeout()).await?)
+    }
+
+    pub async fn new_frame_cdp_session(&self, frame_id: &str) -> Result<CdpSession> {
+        if self.is_closed() {
+            return Err(Error::Other("page is closed".into()));
+        }
+        Ok(self
+            .page
+            .new_frame_cdp_session(frame_id, self.action_timeout())
+            .await?)
     }
 
     pub fn subscribe_popups(&self) -> tokio::sync::mpsc::UnboundedReceiver<PageLease> {
@@ -2794,6 +2821,10 @@ impl<'a> Frame<'a> {
 
     pub fn frame_locator(&self, iframe: &str) -> FrameLocator<'a> {
         self.root().frame_locator(iframe)
+    }
+
+    pub async fn new_cdp_session(&self) -> Result<CdpSession> {
+        self.lease.new_frame_cdp_session(&self.info.id).await
     }
 }
 

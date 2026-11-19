@@ -1,4 +1,5 @@
 mod browser;
+mod cdp_session;
 mod connection;
 mod context;
 mod error;
@@ -11,6 +12,7 @@ mod render;
 mod route;
 
 pub use browser::{BrowserId, CdpBrowser, ContextId, FrameInfo, Proxy, SessionId, TargetId};
+pub use cdp_session::{CdpSession, CdpSessionEvent};
 pub use connection::{CdpEvent, Connection};
 pub use context::{ColorScheme, Cookie, Emulation, Geolocation, OriginStorage, StorageItem, StorageState};
 pub use error::{Error, LaunchOptions, Result};

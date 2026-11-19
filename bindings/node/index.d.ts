@@ -270,6 +270,11 @@ export declare class Page {
   _frameGoto(frameId: string, url: string, options?: GotoOptions | undefined | null): Promise<void>
   _frameEvaluate(frameId: string, expression: string): Promise<any>
   _frameById(frameId: string): FrameLocator
+  _newCdpSession(frameId?: string | undefined | null): Promise<number>
+  _cdpSend(sessionId: number, method: string, paramsJson?: string | undefined | null): Promise<any>
+  _cdpOnEvent(sessionId: number, handler: (arg: CdpEventPayload) => void): void
+  _cdpDetach(sessionId: number): Promise<void>
+  _cdpDrop(sessionId: number): void
 }
 
 /**
@@ -303,6 +308,11 @@ export interface BoundingBox {
   y: number
   width: number
   height: number
+}
+
+export interface CdpEventPayload {
+  method: string
+  paramsJson: string
 }
 
 export interface CheckActionOptions {
