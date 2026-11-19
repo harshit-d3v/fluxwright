@@ -499,7 +499,7 @@ try {
       '<script>window.addEventListener("wheel", e => { window.__wheel = e.deltaY; if (window.__resolveWheel) window.__resolveWheel(e.deltaY); }, { passive: false });</script></body>',
   )
   await rich.click('#btn', { trial: true, button: 'right' })
-  assert.equal(await rich.evaluate(() => window.__ctx), undefined)
+  assert.equal(await rich.evaluate(() => window.__ctx), null)
   await rich.click('#btn', { button: 'right', modifiers: ['Shift'], position: { x: 10, y: 12 } })
   assert.deepEqual(await rich.evaluate(() => window.__ctx), [2, true, 10, 12])
   await rich.dblclick('#btn')
