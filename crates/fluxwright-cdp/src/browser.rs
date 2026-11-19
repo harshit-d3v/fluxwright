@@ -11,8 +11,13 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::connection::{CdpEvent, Connection};
-use crate::context::{permission_types, Cookie, Emulation, StorageState};
+use crate::context::{
+    filter_cookies, permission_types, Cookie, CookieFilter, Emulation, StorageState,
+};
 use crate::error::{Error, LaunchOptions, Result};
+use crate::http_client::{
+    send_context_request, ApiRequestOptions, ApiResponse, HttpContextDefaults,
+};
 use crate::launch::{launch_chrome, Launched, Transport};
 use crate::page::{fetch_params_combined, CdpPage, ContextSetup, ResourceType};
 use crate::route::InterceptedRequest;
@@ -955,10 +960,16 @@ impl CdpBrowser {
                 if !block {
                     if let Some(routes) = route_tx {
                         // The job answers it; if it can't (gone), dropping it continues it.
+                        let defaults = ctx_setup
+                            .as_ref()
+                            .map(|s| s.http_defaults(None))
+                            .unwrap_or_else(HttpContextDefaults::default);
                         if let Some(req) = InterceptedRequest::from_paused(
                             &ev.params,
                             self.conn.clone(),
                             sid.clone(),
+                            ctx.unwrap_or_default(),
+                            defaults,
                         ) {
                             let _ = routes.send(req);
                             return;
@@ -1341,18 +1352,13 @@ impl CdpBrowser {
             .ok_or_else(|| Error::Other("createBrowserContext: no id".into()))?
             .to_string();
         self.contexts.lock().await.insert(id.clone());
-        if let Some(Proxy {
-            username: Some(user),
-            password,
-            ..
-        }) = proxy
-        {
-            self.setups
-                .lock()
-                .await
-                .entry(id.clone())
-                .or_default()
-                .proxy_auth = Some((user.clone(), password.clone().unwrap_or_default()));
+        if let Some(p) = proxy {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(id.clone()).or_default();
+            setup.proxy = Some(p.clone());
+            if let Some(user) = &p.username {
+                setup.proxy_auth = Some((user.clone(), p.password.clone().unwrap_or_default()));
+            }
         }
         Ok(ContextId(id))
     }
@@ -1650,6 +1656,16 @@ impl CdpBrowser {
             .unwrap_or_default())
     }
 
+    pub async fn context_cookies_for_urls(
+        &self,
+        ctx: &ContextId,
+        urls: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<Cookie>> {
+        let all = self.context_cookies(ctx, timeout).await?;
+        filter_cookies(&all, urls)
+    }
+
     pub async fn context_add_cookies(&self, ctx: &ContextId, cookies: &[Cookie], timeout: Duration) -> Result<()> {
         if cookies.is_empty() {
             return Ok(());
@@ -1674,6 +1690,51 @@ impl CdpBrowser {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn context_clear_cookies_filtered(
+        &self,
+        ctx: &ContextId,
+        filter: &CookieFilter,
+        timeout: Duration,
+    ) -> Result<()> {
+        if filter.is_empty() {
+            return self.context_clear_cookies(ctx, timeout).await;
+        }
+        let all = self.context_cookies(ctx, timeout).await?;
+        let mut removed = false;
+        let mut keep = Vec::new();
+        for c in all {
+            if filter.matches(&c) {
+                removed = true;
+            } else {
+                keep.push(c);
+            }
+        }
+        if removed {
+            self.context_replace_cookies(ctx, &keep, timeout).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn context_replace_cookies(
+        &self,
+        ctx: &ContextId,
+        cookies: &[Cookie],
+        timeout: Duration,
+    ) -> Result<()> {
+        self.context_clear_cookies(ctx, timeout).await?;
+        self.context_add_cookies(ctx, cookies, timeout).await
+    }
+
+    pub async fn context_api_fetch(
+        &self,
+        ctx: &ContextId,
+        defaults: &HttpContextDefaults,
+        url: &str,
+        opts: &ApiRequestOptions,
+    ) -> Result<ApiResponse> {
+        send_context_request(&self.conn, &ctx.0, defaults, url, opts, None).await
     }
 
     pub async fn context_set_http_credentials(

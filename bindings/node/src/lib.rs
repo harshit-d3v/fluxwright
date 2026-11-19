@@ -59,11 +59,48 @@ fn callback<T: ToNapiValue + 'static>(f: Function<T, ()>) -> Result<Callback<T>>
 #[napi]
 pub struct InterceptedRoute {
     request: Arc<Mutex<Option<fluxwright::InterceptedRequest>>>,
+    fetch_handle: fluxwright::RouteFetchHandle,
     url: String,
     method: String,
     headers: HashMap<String, String>,
     post_data: Option<String>,
     resource_type: String,
+}
+
+#[napi(object)]
+pub struct HeaderEntry {
+    pub name: String,
+    pub value: String,
+}
+
+#[napi(object)]
+pub struct ApiFetchOptions {
+    pub method: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub params: Option<Vec<HeaderEntry>>,
+    pub data: Option<Either<String, Buffer>>,
+    pub fail_on_status_code: Option<bool>,
+    pub max_redirects: Option<u32>,
+    pub timeout_ms: Option<f64>,
+}
+
+#[napi(object)]
+pub struct ApiResponseData {
+    pub url: String,
+    pub status: u32,
+    pub status_text: String,
+    pub headers: Vec<HeaderEntry>,
+    pub body: Buffer,
+}
+
+#[napi(object)]
+pub struct RouteFetchOptions {
+    pub url: Option<String>,
+    pub method: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub post_data: Option<Either<String, Buffer>>,
+    pub max_redirects: Option<u32>,
+    pub timeout_ms: Option<f64>,
 }
 
 #[napi(object)]
@@ -89,9 +126,55 @@ fn bytes(b: Either<String, Buffer>) -> Vec<u8> {
     }
 }
 
+fn parse_timeout_ms(ms: Option<f64>) -> Option<std::time::Duration> {
+    ms.map(|v| {
+        if v <= 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_millis(v as u64)
+        }
+    })
+}
+
+fn to_api_options(options: Option<ApiFetchOptions>) -> fluxwright::ApiRequestOptions {
+    let Some(o) = options else {
+        return fluxwright::ApiRequestOptions::default();
+    };
+    fluxwright::ApiRequestOptions {
+        method: o.method,
+        headers: o.headers.unwrap_or_default().into_iter().collect(),
+        params: o
+            .params
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| (p.name, p.value))
+            .collect(),
+        data: o.data.map(bytes),
+        fail_on_status_code: o.fail_on_status_code.unwrap_or(false),
+        max_redirects: o.max_redirects.map(|n| n as usize),
+        timeout: parse_timeout_ms(o.timeout_ms),
+    }
+}
+
+fn to_api_response(resp: fluxwright::ApiResponse) -> ApiResponseData {
+    ApiResponseData {
+        url: resp.url,
+        status: u32::from(resp.status),
+        status_text: resp.status_text,
+        headers: resp
+            .headers
+            .into_iter()
+            .map(|(name, value)| HeaderEntry { name, value })
+            .collect(),
+        body: Buffer::from(resp.body),
+    }
+}
+
 impl InterceptedRoute {
     fn new(req: fluxwright::InterceptedRequest) -> Self {
+        let fetch_handle = req.fetch_handle();
         InterceptedRoute {
+            fetch_handle,
             url: req.url.clone(),
             method: req.method.clone(),
             headers: req.headers.iter().cloned().collect(),
@@ -132,6 +215,36 @@ impl InterceptedRoute {
     #[napi(getter)]
     pub fn resource_type(&self) -> String {
         self.resource_type.clone()
+    }
+
+    #[napi]
+    pub async fn fetch(&self, options: Option<RouteFetchOptions>) -> Result<ApiResponseData> {
+        if self.request.lock().await.is_none() {
+            return Err(Error::from_reason("route is already handled"));
+        }
+        let o = options.unwrap_or(RouteFetchOptions {
+            url: None,
+            method: None,
+            headers: None,
+            post_data: None,
+            max_redirects: None,
+            timeout_ms: None,
+        });
+        let opts = fluxwright::RouteFetchOptions {
+            url: o.url,
+            method: o.method,
+            headers: o.headers.map(|h| h.into_iter().collect()),
+            post_data: o.post_data.map(bytes),
+            max_redirects: o.max_redirects.map(|n| n as usize),
+            timeout: parse_timeout_ms(o.timeout_ms),
+        };
+        let handle = self.fetch_handle.clone();
+        let resp = RT
+            .spawn(async move { handle.fetch(&opts).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(to_api_response(resp))
     }
 
     #[napi]
@@ -1317,6 +1430,8 @@ pub struct Cookie {
 pub struct OriginStorage {
     pub origin: String,
     pub local_storage: Vec<StorageItem>,
+    #[napi(js_name = "indexedDB", ts_type = "Array<{ name: string; version: number; stores: Array<{ name: string; autoIncrement: boolean; keyPath?: string; keyPathArray?: Array<string>; records: Array<{ key?: any; keyEncoded?: any; value?: any; valueEncoded?: any }>; indexes: Array<{ name: string; keyPath?: string; keyPathArray?: Array<string>; multiEntry: boolean; unique: boolean }> }> }>")]
+    pub indexed_db: Option<serde_json::Value>,
 }
 
 #[napi(object)]
@@ -1359,23 +1474,33 @@ impl From<fluxwright::Cookie> for Cookie {
     }
 }
 
-impl From<StorageState> for fluxwright::StorageState {
-    fn from(s: StorageState) -> Self {
-        fluxwright::StorageState {
-            cookies: s.cookies.into_iter().map(Into::into).collect(),
-            origins: s
-                .origins
-                .into_iter()
-                .map(|o| fluxwright::OriginStorage {
-                    origin: o.origin,
-                    local_storage: o
-                        .local_storage
-                        .into_iter()
-                        .map(|i| fluxwright::StorageItem { name: i.name, value: i.value })
-                        .collect(),
-                })
-                .collect(),
+impl TryFrom<StorageState> for fluxwright::StorageState {
+    type Error = Error;
+
+    fn try_from(s: StorageState) -> Result<Self> {
+        let mut origins = Vec::with_capacity(s.origins.len());
+        for o in s.origins {
+            let indexed_db = match o.indexed_db {
+                Some(v) if !v.is_null() => Some(
+                    serde_json::from_value::<Vec<fluxwright::IndexedDbDatabase>>(v)
+                        .map_err(|e| Error::from_reason(format!("invalid storageState indexedDB: {e}")))?,
+                ),
+                _ => None,
+            };
+            origins.push(fluxwright::OriginStorage {
+                origin: o.origin,
+                local_storage: o
+                    .local_storage
+                    .into_iter()
+                    .map(|i| fluxwright::StorageItem { name: i.name, value: i.value })
+                    .collect(),
+                indexed_db,
+            });
         }
+        Ok(fluxwright::StorageState {
+            cookies: s.cookies.into_iter().map(Into::into).collect(),
+            origins,
+        })
     }
 }
 
@@ -1404,6 +1529,10 @@ impl From<fluxwright::StorageState> for StorageState {
                 .map(|o| OriginStorage {
                     origin: o.origin,
                     local_storage: o.local_storage.into_iter().map(|i| StorageItem { name: i.name, value: i.value }).collect(),
+                    indexed_db: o
+                        .indexed_db
+                        .filter(|dbs| !dbs.is_empty())
+                        .and_then(|dbs| serde_json::to_value(dbs).ok()),
                 })
                 .collect(),
         }
@@ -1445,7 +1574,7 @@ fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
             bypass_csp: o.bypass_csp.unwrap_or(false),
         },
         permissions: o.permissions.unwrap_or_default(),
-        storage_state: o.storage_state.map(Into::into),
+        storage_state: o.storage_state.map(TryInto::try_into).transpose()?,
         base_url: o.base_url,
         http_credentials: o.http_credentials.map(|c| (c.username, c.password)),
         ..Default::default()
@@ -1766,10 +1895,15 @@ impl Browser {
     }
 
     #[napi(js_name = "_contextCookies")]
-    pub async fn context_cookies(&self, ctx_id: u32) -> Result<Vec<Cookie>> {
+    pub async fn context_cookies(&self, ctx_id: u32, urls: Option<Vec<String>>) -> Result<Vec<Cookie>> {
         let ctx = self.get_context(ctx_id)?;
         let cookies = RT
-            .spawn(async move { ctx.cookies().await })
+            .spawn(async move {
+                match urls {
+                    Some(u) if !u.is_empty() => ctx.cookies_for_urls(&u).await,
+                    _ => ctx.cookies().await,
+                }
+            })
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -1793,6 +1927,33 @@ impl Browser {
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "_contextReplaceCookies")]
+    pub async fn context_replace_cookies(&self, ctx_id: u32, cookies: Vec<Cookie>) -> Result<()> {
+        let ctx = self.get_context(ctx_id)?;
+        let cookies: Vec<fluxwright::Cookie> = cookies.into_iter().map(Into::into).collect();
+        RT.spawn(async move { ctx.replace_cookies(&cookies).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "_contextApiFetch")]
+    pub async fn context_api_fetch(
+        &self,
+        ctx_id: u32,
+        url: String,
+        options: Option<ApiFetchOptions>,
+    ) -> Result<ApiResponseData> {
+        let ctx = self.get_context(ctx_id)?;
+        let opts = to_api_options(options);
+        let resp = RT
+            .spawn(async move { ctx.request().fetch(&url, &opts).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(to_api_response(resp))
     }
 
     #[napi(js_name = "_contextAddInitScript")]
@@ -1922,8 +2083,9 @@ impl Page {
     /// Every cookie in this page's context, plus localStorage of the current origin. Pass it
     /// (or a file it was saved to) as `newPage({ storageState })` to skip logging in again.
     #[napi]
-    pub async fn storage_state(&self) -> Result<StorageState> {
-        with_page(self.lease.clone(), |p| Box::pin(async move { p.storage_state().await }))
+    pub async fn storage_state(&self, indexed_db: Option<bool>) -> Result<StorageState> {
+        let include = indexed_db.unwrap_or(false);
+        with_page(self.lease.clone(), move |p| Box::pin(async move { p.storage_state_with(include).await }))
             .await
             .map(Into::into)
     }
@@ -2300,6 +2462,16 @@ impl Page {
     #[napi(js_name = "_clearCookies")]
     pub async fn clear_cookies(&self) -> Result<()> {
         with_page(self.lease.clone(), |p| Box::pin(async move { p.clear_cookies().await })).await
+    }
+
+    #[napi(js_name = "_apiFetch")]
+    pub async fn api_fetch(&self, url: String, options: Option<ApiFetchOptions>) -> Result<ApiResponseData> {
+        let opts = to_api_options(options);
+        let resp = with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.request().fetch(&url, &opts).await })
+        })
+        .await?;
+        Ok(to_api_response(resp))
     }
 
     #[napi(js_name = "_emulateMedia")]

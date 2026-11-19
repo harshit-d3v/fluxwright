@@ -23,6 +23,7 @@ import inspect
 import json as _json
 import logging
 import math
+import os
 import re
 import time
 import weakref
@@ -35,8 +36,8 @@ from typing import (
     Literal,
     TypeVar,
 )
-from urllib.parse import urljoin, urlparse
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
 from . import _native
 from ._errors import Error, TimeoutError
@@ -55,6 +56,8 @@ from ._types import (
 )
 
 __all__ = [
+    "APIRequestContext",
+    "APIResponse",
     "Browser",
     "BrowserContext",
     "BrowserType",
@@ -364,6 +367,241 @@ class Touchscreen:
         await self._page._touchscreen_tap(x, y)
 
 
+def _save_storage_json_private(path: str | PathLike[str], data: dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(p, flags, 0o600)
+    fh = None
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+        _json.dump(data, fh, indent=2)
+    finally:
+        if fh is not None:
+            fh.close()
+        else:
+            with suppress(OSError):
+                os.close(fd)
+
+
+def _has_header_ci(headers: Mapping[str, str], target: str) -> bool:
+    tl = target.lower()
+    return any(k.lower() == tl for k in headers)
+
+
+def _encode_query_params(
+    params: Mapping[str, Any] | Sequence[tuple[str, Any]] | str | None,
+) -> list[tuple[str, str]] | None:
+    if params is None:
+        return None
+    if isinstance(params, str):
+        raw = params[1:] if params.startswith("?") else params
+        return [(k, v) for k, v in parse_qsl(raw, keep_blank_values=True)]
+    if isinstance(params, Mapping):
+        return [(str(k), str(v)) for k, v in params.items()]
+    return [(str(k), str(v)) for k, v in params]
+
+
+def _encode_multipart(multipart: Mapping[str, Any]) -> tuple[str, bytes]:
+    def _clean(s: Any) -> str:
+        return str(s).replace("\r", "").replace("\n", "").replace('"', "")
+
+    boundary = f"----FluxwrightBoundary{os.urandom(8).hex()}"
+    parts: list[bytes] = []
+    for name, value in multipart.items():
+        parts.append(f"--{boundary}\r\n".encode())
+        if isinstance(value, Mapping) and "buffer" in value:
+            filename = value.get("name") or "file"
+            mime = value.get("mimeType") or "application/octet-stream"
+            buf = value["buffer"]
+            if isinstance(buf, str):
+                buf = buf.encode("utf-8")
+            elif not isinstance(buf, (bytes, bytearray)):
+                buf = bytes(buf)
+            parts.append(
+                f'Content-Disposition: form-data; name="{_clean(name)}"; filename="{_clean(filename)}"\r\n'
+                f"Content-Type: {_clean(mime)}\r\n\r\n".encode()
+            )
+            parts.append(bytes(buf))
+            parts.append(b"\r\n")
+        elif isinstance(value, (bytes, bytearray)):
+            parts.append(
+                f'Content-Disposition: form-data; name="{_clean(name)}"; filename="blob"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n".encode()
+            )
+            parts.append(bytes(value))
+            parts.append(b"\r\n")
+        else:
+            parts.append(f'Content-Disposition: form-data; name="{_clean(name)}"\r\n\r\n'.encode())
+            parts.append(str(value).encode("utf-8"))
+            parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return f"multipart/form-data; boundary={boundary}", b"".join(parts)
+
+
+def _cookie_field_matches(flt: str | re.Pattern[str], value: str, *, is_domain: bool = False) -> bool:
+    if isinstance(flt, re.Pattern):
+        return flt.search(value) is not None
+    if not is_domain:
+        return value == flt
+    f = flt.lower()
+    v = value.lower()
+    return v == f if f.startswith(".") else (v == f or v == f".{f}")
+
+
+class APIResponse:
+    """HTTP response returned by ``APIRequestContext`` and ``route.fetch()``."""
+
+    def __init__(self, native: _native.ApiResponse) -> None:
+        self._native = native
+        self._headers_cache: dict[str, str] | None = None
+
+    @property
+    def url(self) -> str:
+        return self._native.url
+
+    @property
+    def status(self) -> int:
+        return self._native.status
+
+    @property
+    def status_text(self) -> str:
+        return self._native.status_text
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self._native.status <= 299
+
+    @property
+    def headers(self) -> dict[str, str]:
+        if self._headers_cache is None:
+            merged: dict[str, str] = {}
+            for k, v in self._native.headers:
+                kl = k.lower()
+                if kl in merged:
+                    merged[kl] += ("\n" if kl == "set-cookie" else ", ") + v
+                else:
+                    merged[kl] = v
+            self._headers_cache = merged
+        return dict(self._headers_cache)
+
+    def headers_array(self) -> list[dict[str, str]]:
+        return [{"name": k, "value": v} for k, v in self._native.headers]
+
+    async def body(self) -> bytes:
+        return self._native.body
+
+    async def text(self) -> str:
+        return (await self.body()).decode("utf-8", errors="replace")
+
+    async def json(self) -> Any:
+        return _json.loads(await self.text())
+
+    async def dispose(self) -> None:
+        self._native.dispose()
+
+
+class APIRequestContext:
+    """HTTP client sharing cookies and defaults with a ``BrowserContext`` or ``Page``."""
+
+    def __init__(
+        self,
+        sender: Callable[..., Awaitable[_native.ApiResponse]],
+        cookies_fn: Callable[[], Awaitable[list[dict[str, Any]]]],
+        is_closed_fn: Callable[[], bool],
+    ) -> None:
+        self._sender = sender
+        self._cookies_fn = cookies_fn
+        self._is_closed_fn = is_closed_fn
+        self._disposed = False
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, Any] | Sequence[tuple[str, Any]] | str | None = None,
+        method: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        data: Any = None,
+        form: Mapping[str, Any] | None = None,
+        multipart: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+        fail_on_status_code: bool = False,
+        max_redirects: int | None = None,
+    ) -> APIResponse:
+        if self._disposed or self._is_closed_fn():
+            raise Error("api_request_context.fetch: target is closed or disposed")
+        modes = sum(x is not None for x in (data, form, multipart))
+        if modes > 1:
+            raise TypeError("api_request_context.fetch: pass at most one of data, form, or multipart")
+        sent_headers = {str(k): str(v) for k, v in (headers or {}).items()}
+        body: str | bytes | None = None
+        if data is not None:
+            if isinstance(data, (bytes, bytearray)):
+                body = bytes(data)
+                if not _has_header_ci(sent_headers, "content-type"):
+                    sent_headers["content-type"] = "application/octet-stream"
+            elif isinstance(data, str):
+                body = data
+                if not _has_header_ci(sent_headers, "content-type"):
+                    sent_headers["content-type"] = "application/octet-stream"
+            else:
+                body = _json.dumps(data)
+                if not _has_header_ci(sent_headers, "content-type"):
+                    sent_headers["content-type"] = "application/json"
+        elif form is not None:
+            body = urlencode({str(k): str(v) for k, v in form.items()})
+            if not _has_header_ci(sent_headers, "content-type"):
+                sent_headers["content-type"] = "application/x-www-form-urlencoded"
+        elif multipart is not None:
+            ctype, body = _encode_multipart(multipart)
+            if not _has_header_ci(sent_headers, "content-type"):
+                sent_headers["content-type"] = ctype
+
+        native = await self._sender(
+            str(url),
+            method=method,
+            headers=sent_headers or None,
+            params=_encode_query_params(params),
+            data=body,
+            fail_on_status_code=bool(fail_on_status_code),
+            max_redirects=max_redirects,
+            timeout=timeout,
+        )
+        return APIResponse(native)
+
+    async def get(self, url: str, **kwargs: Any) -> APIResponse:
+        return await self.fetch(url, method="GET", **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> APIResponse:
+        return await self.fetch(url, method="POST", **kwargs)
+
+    async def put(self, url: str, **kwargs: Any) -> APIResponse:
+        return await self.fetch(url, method="PUT", **kwargs)
+
+    async def patch(self, url: str, **kwargs: Any) -> APIResponse:
+        return await self.fetch(url, method="PATCH", **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> APIResponse:
+        return await self.fetch(url, method="DELETE", **kwargs)
+
+    async def head(self, url: str, **kwargs: Any) -> APIResponse:
+        return await self.fetch(url, method="HEAD", **kwargs)
+
+    async def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
+        if self._disposed or self._is_closed_fn():
+            raise Error("api_request_context.storage_state: target is closed or disposed")
+        state: StorageState = {"cookies": await self._cookies_fn(), "origins": []}
+        if path is not None:
+            _save_storage_json_private(path, state)
+        return state
+
+    async def dispose(self) -> None:
+        self._disposed = True
+
+
 class Route:
     """How a route handler answers a request, as Playwright's ``Route``. Each request takes one
     answer; the methods return awaitables."""
@@ -380,6 +618,38 @@ class Route:
     def request(self) -> Request:
         return self._request
 
+    async def fetch(
+        self,
+        *,
+        url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        post_data: Any = None,
+        max_redirects: int | None = None,
+        timeout: float | None = None,
+    ) -> APIResponse:
+        if self._returned:
+            raise Error("route: handler already returned")
+        if self._answer is not None or self._fell_back:
+            raise Error("route is already handled")
+        encoded_post: str | bytes | None = None
+        if post_data is not None:
+            if isinstance(post_data, (bytes, bytearray)):
+                encoded_post = bytes(post_data)
+            elif isinstance(post_data, str):
+                encoded_post = post_data
+            else:
+                encoded_post = _json.dumps(post_data)
+        raw = await self._native.fetch(
+            url=url,
+            method=method,
+            headers=headers,
+            post_data=encoded_post,
+            max_redirects=max_redirects,
+            timeout=timeout,
+        )
+        return APIResponse(raw)
+
     def fulfill(
         self,
         *,
@@ -389,21 +659,50 @@ class Route:
         json: Any = None,
         path: str | PathLike[str] | None = None,
         content_type: str | None = None,
+        response: APIResponse | None = None,
     ) -> Awaitable[None]:
         """A made-up response. ``json`` is serialized and sets the content type; ``path`` is a
         file to send."""
 
         async def answer() -> None:
-            sent = dict(headers or {})
+            eff_status = status
+            sent: dict[str, str] = {}
             data = body
-            if json is not None:
-                data = _json.dumps(json)
-                sent.setdefault("content-type", "application/json")
-            if path is not None:
-                data = Path(path).read_bytes()
+            if response is not None:
+                if eff_status is None:
+                    eff_status = response.status
+                skip = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+                for h in response.headers_array():
+                    kl = h["name"].lower()
+                    if kl in skip:
+                        continue
+                    if kl in sent:
+                        sent[kl] += ("\n" if kl == "set-cookie" else ", ") + h["value"]
+                    else:
+                        sent[kl] = h["value"]
+                if headers:
+                    for k, v in headers.items():
+                        for ek in [ek for ek in sent if ek.lower() == k.lower()]:
+                            del sent[ek]
+                        sent[k] = v
+                if json is not None:
+                    data = _json.dumps(json)
+                    if not _has_header_ci(sent, "content-type"):
+                        sent["content-type"] = "application/json"
+                elif path is not None:
+                    data = Path(path).read_bytes()
+                elif data is None:
+                    data = await response.body()
+            else:
+                sent = dict(headers or {})
+                if json is not None:
+                    data = _json.dumps(json)
+                    sent.setdefault("content-type", "application/json")
+                if path is not None:
+                    data = Path(path).read_bytes()
             if content_type is not None:
                 sent["content-type"] = content_type
-            await self._native.fulfill(status=status, headers=sent, body=data)
+            await self._native.fulfill(status=eff_status, headers=sent, body=data)
 
         return self._answer_with(answer)
 
@@ -662,8 +961,22 @@ class Page(_native.Page):
         self._tasks: set[asyncio.Future[Any]] = set()
         self._expects: set[asyncio.Future[Any]] = set()
         self._context_ref: weakref.ref[BrowserContext] | None = None
+        self._request: APIRequestContext | None = None
         self._frame_cache: weakref.WeakValueDictionary[str, Frame] = weakref.WeakValueDictionary()
         _pages_by_target[self._target_id()] = self
+
+    @property
+    def request(self) -> APIRequestContext:
+        ctx = self._context_ref() if self._context_ref is not None else None
+        if ctx is not None:
+            return ctx.request
+        if self._request is None:
+            async def _cookies() -> list[dict[str, Any]]:
+                st = await self.storage_state()
+                return list(st.get("cookies", []))
+
+            self._request = APIRequestContext(self._api_fetch, _cookies, self.is_closed)
+        return self._request
 
     @property
     def mouse(self) -> Mouse:
@@ -1471,6 +1784,17 @@ class BrowserContext:
         self._bindings: dict[str, Callable[..., Any]] = {}
         self._serving_bindings = False
         self._tasks: set[asyncio.Future[Any]] = set()
+        self._request: APIRequestContext | None = None
+
+    @property
+    def request(self) -> APIRequestContext:
+        if self._request is None:
+            self._request = APIRequestContext(
+                self._ctx.api_fetch,
+                self._ctx.cookies,
+                lambda: self._closed,
+            )
+        return self._request
 
     @property
     def browser(self) -> Browser:
@@ -1560,20 +1884,38 @@ class BrowserContext:
                 del self._bindings[name]
             raise
 
-    async def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
-        """The cookies and localStorage of this context, usable before or after ``new_page()``."""
+    async def storage_state(
+        self, *, path: str | PathLike[str] | None = None, indexed_db: bool = False
+    ) -> StorageState:
+        """The cookies, localStorage, and optionally IndexedDB of this context, usable before or after ``new_page()``."""
         if self._closed:
             raise Error("browser_context.storage_state: the context is closed")
         pages = self.pages
-        if pages:
-            return await pages[0].storage_state(path=path)
-        return await self._ctx.storage_state(path=path)
+        if not pages:
+            return await self._ctx.storage_state(path=path, indexed_db=indexed_db)
+        if len(pages) == 1:
+            return await pages[0].storage_state(path=path, indexed_db=indexed_db)
+        by_origin: dict[str, dict[str, Any]] = {}
+        cookies: list[dict[str, Any]] = []
+        for idx, page_item in enumerate(pages):
+            st = await page_item.storage_state(indexed_db=indexed_db)
+            if idx == 0:
+                cookies = list(st.get("cookies", []))
+            for origin in st.get("origins", []):
+                by_origin[origin["origin"]] = origin
+        merged: StorageState = {"cookies": cookies, "origins": list(by_origin.values())}
+        if path is not None:
+            _save_storage_json_private(path, merged)
+        return merged
 
-    async def cookies(self) -> list[dict[str, Any]]:
-        """Every cookie in this context."""
+    async def cookies(self, urls: str | Sequence[str] | None = None) -> list[dict[str, Any]]:
+        """Cookies in this context (all, or matching ``urls``)."""
         if self._closed:
             raise Error("browser_context.cookies: the context is closed")
-        return await self._ctx.cookies()
+        if urls is None:
+            return await self._ctx.cookies()
+        url_list = [urls] if isinstance(urls, str) else list(urls)
+        return await self._ctx.cookies(url_list)
 
     async def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
         """Adds cookies to this context."""
@@ -1581,11 +1923,31 @@ class BrowserContext:
             raise Error("browser_context.add_cookies: the context is closed")
         await self._ctx.add_cookies(cookies)
 
-    async def clear_cookies(self) -> None:
-        """Clears every cookie in this context."""
+    async def clear_cookies(
+        self,
+        *,
+        name: str | re.Pattern[str] | None = None,
+        domain: str | re.Pattern[str] | None = None,
+        path: str | re.Pattern[str] | None = None,
+    ) -> None:
+        """Clears cookies in this context, optionally filtered by name, domain, and/or path."""
         if self._closed:
             raise Error("browser_context.clear_cookies: the context is closed")
-        await self._ctx.clear_cookies()
+        if name is None and domain is None and path is None:
+            await self._ctx.clear_cookies()
+            return
+        all_cookies = await self._ctx.cookies()
+        keep = [
+            c
+            for c in all_cookies
+            if not (
+                (name is None or _cookie_field_matches(name, c["name"]))
+                and (domain is None or _cookie_field_matches(domain, c["domain"], is_domain=True))
+                and (path is None or _cookie_field_matches(path, c["path"]))
+            )
+        ]
+        if len(keep) != len(all_cookies):
+            await self._ctx.replace_cookies(keep)
 
     async def new_cdp_session(self, page: Page | Frame) -> CDPSession:
         """Attaches a raw Chrome DevTools Protocol session to ``page`` or an out-of-process ``Frame``."""

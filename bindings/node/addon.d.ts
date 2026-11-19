@@ -84,9 +84,68 @@ export interface Dialog {
   dismiss(): Promise<void>
 }
 
+export interface IndexedDBDatabase {
+  name: string
+  version: number
+  stores: Array<{
+    name: string
+    autoIncrement: boolean
+    keyPath?: string
+    keyPathArray?: Array<string>
+    records: Array<{ key?: any; keyEncoded?: any; value?: any; valueEncoded?: any }>
+    indexes: Array<{ name: string; keyPath?: string; keyPathArray?: Array<string>; multiEntry: boolean; unique: boolean }>
+  }>
+}
+
+export interface APIResponse {
+  url(): string
+  status(): number
+  statusText(): string
+  ok(): boolean
+  headers(): Record<string, string>
+  headersArray(): Array<{ name: string; value: string }>
+  body(): Promise<Buffer>
+  text(): Promise<string>
+  json(): Promise<any>
+  dispose(): Promise<void>
+}
+
+export interface APIRequestOptions {
+  method?: string
+  headers?: Record<string, string>
+  params?: Record<string, string | number | boolean> | URLSearchParams | string
+  data?: string | Buffer | unknown
+  form?: Record<string, string | number | boolean> | URLSearchParams
+  multipart?: FormData | Record<string, string | number | boolean | NodeJS.ReadableStream | { name: string; mimeType: string; buffer: Buffer }>
+  failOnStatusCode?: boolean
+  maxRedirects?: number
+  timeout?: number
+}
+
+export interface APIRequestContext {
+  fetch(url: string, options?: APIRequestOptions): Promise<APIResponse>
+  get(url: string, options?: Omit<APIRequestOptions, 'method'>): Promise<APIResponse>
+  post(url: string, options?: Omit<APIRequestOptions, 'method'>): Promise<APIResponse>
+  put(url: string, options?: Omit<APIRequestOptions, 'method'>): Promise<APIResponse>
+  patch(url: string, options?: Omit<APIRequestOptions, 'method'>): Promise<APIResponse>
+  delete(url: string, options?: Omit<APIRequestOptions, 'method'>): Promise<APIResponse>
+  head(url: string, options?: Omit<APIRequestOptions, 'method'>): Promise<APIResponse>
+  storageState(options?: { path?: string }): Promise<StorageState>
+  dispose(): Promise<void>
+}
+
 /** How a `page.route` handler answers, as in Playwright. Each request takes one answer. */
 export interface Route {
   request(): Request
+  /** Performs the request without fulfilling it, so the response can be inspected or modified. */
+  fetch(options?: {
+    url?: string
+    method?: string
+    headers?: Record<string, string>
+    postData?: string | Buffer | unknown
+    maxRedirects?: number
+    timeout?: number
+  }): Promise<APIResponse>
   /** A made-up response. `json` is serialized and sets the content type; `path` reads a file. */
   fulfill(options?: {
     status?: number
@@ -95,6 +154,7 @@ export interface Route {
     body?: string | Buffer
     json?: unknown
     path?: string
+    response?: APIResponse
   }): Promise<void>
   /** Sends the request on, changed if asked; `headers` replaces all of them. */
   continue(options?: { url?: string; method?: string; headers?: Record<string, string>; postData?: string | Buffer }): Promise<void>
@@ -213,10 +273,10 @@ export interface BrowserContext {
   addInitScript<Arg>(script: (arg: Arg) => unknown, arg: Arg): Promise<void>
   addInitScript(script: (() => unknown) | string | { path?: string; content?: string }): Promise<void>
   exposeFunction(name: string, callback: (...args: any[]) => unknown): Promise<void>
-  /** The cookies and localStorage of this context, usable before or after `newPage()`. */
-  storageState(options?: { path?: string }): Promise<StorageState>
-  /** Every cookie in this context. */
-  cookies(): Promise<StorageState['cookies']>
+  /** The cookies, localStorage, and optionally IndexedDB of this context, usable before or after `newPage()`. */
+  storageState(options?: { path?: string; indexedDB?: boolean }): Promise<StorageState>
+  /** Cookies in this context (all or matching `urls`). */
+  cookies(urls?: string | Array<string>): Promise<StorageState['cookies']>
   addCookies(
     cookies: Array<{
       name: string
@@ -232,7 +292,8 @@ export interface BrowserContext {
       _crHasCrossSiteAncestor?: boolean
     }>,
   ): Promise<void>
-  clearCookies(): Promise<void>
+  clearCookies(options?: { name?: string | RegExp; domain?: string | RegExp; path?: string | RegExp }): Promise<void>
+  readonly request: APIRequestContext
   newCDPSession(page: Page | Frame): Promise<CDPSession>
   /** Closes this context and all of its pages and popups. */
   close(): Promise<void>
@@ -289,7 +350,8 @@ declare module './index' {
      */
     evaluate<R, Arg = undefined>(pageFunction: (arg: Arg) => R, arg?: Arg): Promise<Awaited<R>>
     /** Also writes the state to `path` as JSON, which `newPage({ storageState: path })` reads. */
-    storageState(options?: { path?: string }): Promise<StorageState>
+    storageState(options?: { path?: string; indexedDB?: boolean }): Promise<StorageState>
+    readonly request: APIRequestContext
     /** Exceptions nothing caught so far, as `Error` objects. */
     pageErrors(): Promise<Error[]>
     /** Also writes the image to `path`; without `type`, its extension picks PNG or JPEG. */

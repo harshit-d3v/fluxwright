@@ -72,16 +72,41 @@ class Engine:
     def close(self) -> Awaitable[None]: ...
 
 
+class ApiResponse:
+    url: str
+    status: int
+    status_text: str
+    headers: list[tuple[str, str]]
+    @property
+    def body(self) -> bytes: ...
+    def dispose(self) -> None: ...
+
+
 class Context:
     def new_page(self) -> Awaitable[Lease]: ...
-    def cookies(self) -> Awaitable[list[dict[str, Any]]]: ...
+    def cookies(self, urls: Sequence[str] | None = None) -> Awaitable[list[dict[str, Any]]]: ...
     def add_cookies(self, cookies: list[dict[str, Any]]) -> Awaitable[None]: ...
     def clear_cookies(self) -> Awaitable[None]: ...
+    def replace_cookies(self, cookies: list[dict[str, Any]]) -> Awaitable[None]: ...
+    def api_fetch(
+        self,
+        url: str,
+        *,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        params: Sequence[tuple[str, str]] | None = None,
+        data: str | bytes | None = None,
+        fail_on_status_code: bool = False,
+        max_redirects: int | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[ApiResponse]: ...
     def add_init_script(self, source: str) -> Awaitable[None]: ...
     def expose_binding(self, name: str) -> Awaitable[None]: ...
     def binding_calls(self) -> BindingStream: ...
     def intercept(self) -> Awaitable[RouteStream]: ...
-    def storage_state(self, *, path: _Path | None = None) -> Awaitable[dict[str, Any]]: ...
+    def storage_state(
+        self, *, path: _Path | None = None, indexed_db: bool = False
+    ) -> Awaitable[dict[str, Any]]: ...
     def is_closed(self) -> bool: ...
     def close(self) -> Awaitable[None]: ...
 
@@ -340,8 +365,10 @@ class Page:
     ) -> Awaitable[bytes]:
         """The page printed to PDF (headless only); with ``path``, also written there."""
     def set_viewport_size(self, viewport_size: Mapping[str, int]) -> Awaitable[None]: ...
-    def storage_state(self, *, path: _Path | None = None) -> Awaitable[dict[str, Any]]:
-        """Every cookie in this page's context plus localStorage of the current origin, in
+    def storage_state(
+        self, *, path: _Path | None = None, indexed_db: bool = False
+    ) -> Awaitable[dict[str, Any]]:
+        """Every cookie in this page's context plus localStorage (and optionally IndexedDB) of the current origin, in
         Playwright's format; with ``path``, also saved as JSON for ``new_page(storage_state=path)``."""
     def console_messages(self) -> Awaitable[list[ConsoleMessage]]:
         """What the page, its popups and iframes logged so far (the last 1000)."""
@@ -431,6 +458,18 @@ class Page:
     def _emulate_media(self, *, media: str | None = None, color_scheme: str | None = None) -> Awaitable[None]: ...
     def _add_cookies(self, cookies: list[dict[str, Any]]) -> Awaitable[None]: ...
     def _clear_cookies(self) -> Awaitable[None]: ...
+    def _api_fetch(
+        self,
+        url: str,
+        *,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        params: Sequence[tuple[str, str]] | None = None,
+        data: str | bytes | None = None,
+        fail_on_status_code: bool = False,
+        max_redirects: int | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[ApiResponse]: ...
     def bring_to_front(self) -> Awaitable[None]: ...
     def _target_id(self) -> str: ...
     def _opener_target_id(self) -> str | None: ...
@@ -672,6 +711,16 @@ class Route:
     headers: dict[str, str]
     post_data: str | None
     resource_type: str
+    def fetch(
+        self,
+        *,
+        url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        post_data: str | bytes | None = None,
+        max_redirects: int | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[ApiResponse]: ...
     def fulfill(
         self,
         *,

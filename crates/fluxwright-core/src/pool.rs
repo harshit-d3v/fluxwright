@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fluxwright_cdp::{
-    BoundingBox, CdpBrowser, CdpPage, CdpSession, ConsoleMessage, ContextId, Download,
-    DownloadQueue, FrameInfo, InterceptedRequest, LogEntry, PageError, PageLog, PdfOptions, Proxy,
-    ResourceType, ScreenshotOptions, Selector,
+    http_client::HttpContextDefaults, ApiRequestOptions, ApiResponse, BoundingBox, CdpBrowser,
+    CdpPage, CdpSession, ConsoleMessage, ContextId, CookieFilter, Download, DownloadQueue,
+    FrameInfo, InterceptedRequest, LogEntry, PageError, PageLog, PdfOptions, Proxy, ResourceType,
+    ScreenshotOptions, Selector,
 };
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -91,6 +92,7 @@ struct ContextGuard {
     browser: Arc<CdpBrowser>,
     context: ContextId,
     download_dir: std::path::PathBuf,
+    http_defaults: std::sync::Mutex<HttpContextDefaults>,
     runtime: tokio::runtime::Handle,
     disposed: AtomicBool,
 }
@@ -135,6 +137,82 @@ impl Drop for ContextGuard {
             let _ = browser.dispose_context(&ctx).await;
             engine.release_slot(&browser, true).await;
         });
+    }
+}
+
+/// HTTP client sharing cookies and defaults (`baseURL`, `extraHTTPHeaders`, `httpCredentials`,
+/// `proxy`) with its browser context.
+#[derive(Clone)]
+pub struct ApiRequestContext {
+    guard: Arc<ContextGuard>,
+    default_timeout: Duration,
+}
+
+impl ApiRequestContext {
+    pub async fn fetch(&self, url: &str, opts: &ApiRequestOptions) -> Result<ApiResponse> {
+        if self.guard.is_disposed() {
+            return Err(Error::Other("APIRequestContext is disposed".into()));
+        }
+        let defaults = self.guard.http_defaults.lock().unwrap().clone();
+        let mut effective = opts.clone();
+        if effective.timeout.is_none() {
+            effective.timeout = Some(self.default_timeout);
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_api_fetch(&self.guard.context, &defaults, url, &effective)
+            .await?)
+    }
+
+    async fn with_method(
+        &self,
+        method: &str,
+        url: &str,
+        opts: &ApiRequestOptions,
+    ) -> Result<ApiResponse> {
+        let mut o = opts.clone();
+        o.method = Some(method.to_string());
+        self.fetch(url, &o).await
+    }
+
+    pub async fn get(&self, url: &str, opts: &ApiRequestOptions) -> Result<ApiResponse> {
+        self.with_method("GET", url, opts).await
+    }
+
+    pub async fn post(&self, url: &str, opts: &ApiRequestOptions) -> Result<ApiResponse> {
+        self.with_method("POST", url, opts).await
+    }
+
+    pub async fn put(&self, url: &str, opts: &ApiRequestOptions) -> Result<ApiResponse> {
+        self.with_method("PUT", url, opts).await
+    }
+
+    pub async fn patch(&self, url: &str, opts: &ApiRequestOptions) -> Result<ApiResponse> {
+        self.with_method("PATCH", url, opts).await
+    }
+
+    pub async fn delete(&self, url: &str, opts: &ApiRequestOptions) -> Result<ApiResponse> {
+        self.with_method("DELETE", url, opts).await
+    }
+
+    pub async fn head(&self, url: &str, opts: &ApiRequestOptions) -> Result<ApiResponse> {
+        self.with_method("HEAD", url, opts).await
+    }
+
+    pub async fn storage_state(&self) -> Result<fluxwright_cdp::StorageState> {
+        if self.guard.is_disposed() {
+            return Err(Error::Other("APIRequestContext is disposed".into()));
+        }
+        let cookies = self
+            .guard
+            .browser
+            .context_cookies(&self.guard.context, self.default_timeout)
+            .await?;
+        Ok(fluxwright_cdp::StorageState {
+            cookies,
+            origins: Vec::new(),
+        })
     }
 }
 
@@ -320,9 +398,17 @@ impl Engine {
     /// Acquires an isolated browser context configured with `opts`; open tabs via [`ContextLease::new_page`].
     pub async fn acquire_context_with(&self, opts: &JobOptions) -> Result<ContextLease> {
         let timeout_budget = opts.timeout.unwrap_or(self.inner.config.acquire_timeout);
-        let guard = self
+        let ctx = self
             .acquire_context_guard(opts.priority, opts.proxy.clone(), timeout_budget)
             .await?;
+        let guard = ctx;
+        *guard.http_defaults.lock().unwrap() = HttpContextDefaults {
+            base_url: opts.base_url.clone(),
+            extra_http_headers: opts.emulation.extra_http_headers.clone(),
+            user_agent: opts.emulation.user_agent.clone(),
+            http_credentials: opts.http_credentials.clone(),
+            proxy: opts.proxy.clone(),
+        };
         let setup_res = async {
             apply_context_blocking(&guard, opts).await?;
             let timeout = Duration::from_secs(5);
@@ -842,6 +928,7 @@ impl Inner {
             browser,
             context: ctx,
             download_dir,
+            http_defaults: std::sync::Mutex::new(HttpContextDefaults::default()),
             runtime: tokio::runtime::Handle::current(),
             disposed: AtomicBool::new(false),
         }))
@@ -1190,6 +1277,17 @@ impl ContextLease {
             .await?)
     }
 
+    pub async fn cookies_for_urls(&self, urls: &[String]) -> Result<Vec<fluxwright_cdp::Cookie>> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_cookies_for_urls(&self.guard.context, urls, self.timeout())
+            .await?)
+    }
+
     pub async fn add_cookies(&self, cookies: &[fluxwright_cdp::Cookie]) -> Result<()> {
         if self.is_closed() {
             return Err(Error::Other("browser context is closed".into()));
@@ -1210,6 +1308,35 @@ impl ContextLease {
             .browser
             .context_clear_cookies(&self.guard.context, self.timeout())
             .await?)
+    }
+
+    pub async fn clear_cookies_filtered(&self, filter: &CookieFilter) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_clear_cookies_filtered(&self.guard.context, filter, self.timeout())
+            .await?)
+    }
+
+    pub async fn replace_cookies(&self, cookies: &[fluxwright_cdp::Cookie]) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_replace_cookies(&self.guard.context, cookies, self.timeout())
+            .await?)
+    }
+
+    pub fn request(&self) -> ApiRequestContext {
+        ApiRequestContext {
+            guard: self.guard.clone(),
+            default_timeout: self.timeout(),
+        }
     }
 
     pub async fn add_init_script(&self, source: &str) -> Result<()> {
@@ -1465,7 +1592,24 @@ impl PageLease {
     /// Playwright's `storageState` format. Start a later job from it with
     /// `JobOptions::storage_state` to skip logging in again.
     pub async fn storage_state(&self) -> Result<fluxwright_cdp::StorageState> {
-        Ok(self.page.storage_state(self.action_timeout()).await?)
+        self.storage_state_with(false).await
+    }
+
+    pub async fn storage_state_with(
+        &self,
+        include_indexed_db: bool,
+    ) -> Result<fluxwright_cdp::StorageState> {
+        Ok(self
+            .page
+            .storage_state_with(include_indexed_db, self.action_timeout())
+            .await?)
+    }
+
+    pub fn request(&self) -> ApiRequestContext {
+        ApiRequestContext {
+            guard: self.context.clone(),
+            default_timeout: self.action_timeout(),
+        }
     }
 
     pub async fn add_cookies(&self, cookies: &[fluxwright_cdp::Cookie]) -> Result<()> {

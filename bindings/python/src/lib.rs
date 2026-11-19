@@ -366,6 +366,77 @@ fn options<T: serde::de::DeserializeOwned>(value: &Bound<'_, PyAny>, what: &str)
         .map_err(|e| PyValueError::new_err(format!("{what}: {e}")))
 }
 
+fn parse_api_timeout(timeout: Option<f64>) -> Option<Duration> {
+    timeout.map(|ms| {
+        if ms <= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(ms as u64)
+        }
+    })
+}
+
+fn build_api_options(
+    method: Option<String>,
+    headers: Option<HashMap<String, String>>,
+    params: Option<Vec<(String, String)>>,
+    data: Option<&Bound<'_, PyAny>>,
+    fail_on_status_code: bool,
+    max_redirects: Option<usize>,
+    timeout: Option<f64>,
+) -> PyResult<fluxwright::ApiRequestOptions> {
+    Ok(fluxwright::ApiRequestOptions {
+        method,
+        headers: headers.unwrap_or_default().into_iter().collect(),
+        params: params.unwrap_or_default(),
+        data: data.map(bytes).transpose()?,
+        fail_on_status_code,
+        max_redirects,
+        timeout: parse_api_timeout(timeout),
+    })
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct ApiResponse {
+    #[pyo3(get)]
+    url: String,
+    #[pyo3(get)]
+    status: u16,
+    #[pyo3(get)]
+    status_text: String,
+    #[pyo3(get)]
+    headers: Vec<(String, String)>,
+    body: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl ApiResponse {
+    fn from_core(resp: fluxwright::ApiResponse) -> Self {
+        Self {
+            url: resp.url,
+            status: resp.status,
+            status_text: resp.status_text,
+            headers: resp.headers,
+            body: std::sync::Mutex::new(Some(resp.body)),
+        }
+    }
+}
+
+#[pymethods]
+impl ApiResponse {
+    #[getter]
+    fn body<'py>(&self, py: Python<'py>) -> PyResult<Py<PyBytes>> {
+        let g = self.body.lock().unwrap();
+        let data = g
+            .as_deref()
+            .ok_or_else(|| py_errors::Error::new_err("Response has been disposed"))?;
+        Ok(PyBytes::new(py, data).unbind())
+    }
+
+    fn dispose(&self) {
+        *self.body.lock().unwrap() = None;
+    }
+}
+
 /// `str` or `bytes`.
 fn bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     match value.cast::<PyBytes>() {
@@ -1292,10 +1363,18 @@ impl Context {
         })
     }
 
-    fn cookies<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (urls=None))]
+    fn cookies<'py>(
+        &self,
+        py: Python<'py>,
+        urls: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let ctx = self.inner.clone();
         future_into_py(py, async move {
-            let cookies = ctx.cookies().await.map_err(error)?;
+            let cookies = match urls {
+                Some(u) if !u.is_empty() => ctx.cookies_for_urls(&u).await.map_err(error)?,
+                _ => ctx.cookies().await.map_err(error)?,
+            };
             let json =
                 serde_json::to_value(&cookies).map_err(|e| PyValueError::new_err(e.to_string()))?;
             Ok(Json(json))
@@ -1318,6 +1397,48 @@ impl Context {
         let ctx = self.inner.clone();
         future_into_py(py, async move {
             ctx.clear_cookies().await.map(none).map_err(error)
+        })
+    }
+
+    fn replace_cookies<'py>(
+        &self,
+        py: Python<'py>,
+        cookies: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let parsed = parse_cookies(cookies)?;
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            ctx.replace_cookies(&parsed).await.map(none).map_err(error)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (url, *, method=None, headers=None, params=None, data=None, fail_on_status_code=false, max_redirects=None, timeout=None))]
+    fn api_fetch<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        method: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        params: Option<Vec<(String, String)>>,
+        data: Option<Bound<'py, PyAny>>,
+        fail_on_status_code: bool,
+        max_redirects: Option<usize>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = build_api_options(
+            method,
+            headers,
+            params,
+            data.as_ref(),
+            fail_on_status_code,
+            max_redirects,
+            timeout,
+        )?;
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            let resp = ctx.request().fetch(&url, &opts).await.map_err(error)?;
+            Ok(ApiResponse::from_core(resp))
         })
     }
 
@@ -1347,12 +1468,14 @@ impl Context {
         })
     }
 
-    #[pyo3(signature = (*, path=None))]
+    #[pyo3(signature = (*, path=None, indexed_db=false))]
     fn storage_state<'py>(
         &self,
         py: Python<'py>,
         path: Option<PathBuf>,
+        indexed_db: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = indexed_db;
         let ctx = self.inner.clone();
         future_into_py(py, async move {
             let cookies = ctx.cookies().await.map_err(error)?;
@@ -2331,17 +2454,18 @@ impl Page {
         })
     }
 
-    /// Every cookie in this page's context, plus localStorage of the current origin, in
+    /// Every cookie in this page's context, plus localStorage (and optionally IndexedDB) of the current origin, in
     /// Playwright's format; with `path`, also saved as JSON for `new_page(storage_state=path)`.
-    #[pyo3(signature = (*, path=None))]
+    #[pyo3(signature = (*, path=None, indexed_db=false))]
     fn storage_state<'py>(
         &self,
         py: Python<'py>,
         path: Option<PathBuf>,
+        indexed_db: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let lease = self.lease.clone();
         future_into_py(py, async move {
-            let state = with_page(&lease, |p| Box::pin(p.storage_state())).await?;
+            let state = with_page(&lease, move |p| Box::pin(p.storage_state_with(indexed_db))).await?;
             let json =
                 serde_json::to_value(&state).map_err(|e| PyValueError::new_err(e.to_string()))?;
             save_storage_json(json, path).await
@@ -2574,6 +2698,37 @@ impl Page {
     fn clear_cookies<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         run(py, &self.lease, |p| {
             Box::pin(async move { p.clear_cookies().await.map(none) })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(name = "_api_fetch", signature = (url, *, method=None, headers=None, params=None, data=None, fail_on_status_code=false, max_redirects=None, timeout=None))]
+    fn api_fetch<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        method: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        params: Option<Vec<(String, String)>>,
+        data: Option<Bound<'py, PyAny>>,
+        fail_on_status_code: bool,
+        max_redirects: Option<usize>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = build_api_options(
+            method,
+            headers,
+            params,
+            data.as_ref(),
+            fail_on_status_code,
+            max_redirects,
+            timeout,
+        )?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move {
+                let resp = p.request().fetch(&url, &opts).await?;
+                Ok(ApiResponse::from_core(resp))
+            })
         })
     }
 
@@ -3518,6 +3673,7 @@ impl FrameLocator {
 #[pyclass(frozen, module = "fluxwright._native")]
 struct Route {
     request: Arc<Mutex<Option<fluxwright::InterceptedRequest>>>,
+    fetch_handle: fluxwright::RouteFetchHandle,
     #[pyo3(get)]
     url: String,
     #[pyo3(get)]
@@ -3532,12 +3688,14 @@ struct Route {
 
 impl Route {
     fn new(req: fluxwright::InterceptedRequest) -> Self {
+        let fetch_handle = req.fetch_handle();
         Route {
             url: req.url.clone(),
             method: req.method.clone(),
             headers: req.headers.iter().cloned().collect(),
             post_data: req.post_data.clone(),
             resource_type: req.resource_type.clone(),
+            fetch_handle,
             request: Arc::new(Mutex::new(Some(req))),
         }
     }
@@ -3555,6 +3713,36 @@ impl Route {
 
 #[pymethods]
 impl Route {
+    #[pyo3(signature = (*, url=None, method=None, headers=None, post_data=None, max_redirects=None, timeout=None))]
+    fn fetch<'py>(
+        &self,
+        py: Python<'py>,
+        url: Option<String>,
+        method: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        post_data: Option<Bound<'py, PyAny>>,
+        max_redirects: Option<usize>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = fluxwright::RouteFetchOptions {
+            url,
+            method,
+            headers: headers.map(|h| h.into_iter().collect()),
+            post_data: post_data.map(|b| bytes(&b)).transpose()?,
+            max_redirects,
+            timeout: parse_api_timeout(timeout),
+        };
+        let slot = self.request.clone();
+        let handle = self.fetch_handle.clone();
+        future_into_py(py, async move {
+            if slot.lock().await.is_none() {
+                return Err(py_errors::Error::new_err("route is already handled"));
+            }
+            let resp = handle.fetch(&opts).await.map_err(error)?;
+            Ok(ApiResponse::from_core(resp))
+        })
+    }
+
     #[pyo3(signature = (*, status=None, headers=None, body=None))]
     fn fulfill<'py>(
         &self,
@@ -4193,6 +4381,7 @@ impl CdpSession {
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<ApiResponse>()?;
     m.add_class::<Engine>()?;
     m.add_class::<Context>()?;
     m.add_class::<FrameInfo>()?;

@@ -11,11 +11,14 @@ use tokio::time::sleep;
 
 use crate::browser::{
     install_binding_on_sessions, BrowserId, CdpBrowser, ContextId, FrameInfo, FrameTree,
-    NetActivity, PageSetup, SessionId, TargetId, TargetState,
+    NetActivity, PageSetup, Proxy, SessionId, TargetId, TargetState,
 };
 use crate::cdp_session::CdpSession;
 use crate::connection::Connection;
-use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
+use crate::context::{
+    filter_cookies, permission_types, Cookie, CookieFilter, Emulation, OriginStorage,
+    StorageState, LOCAL_STORAGE_JS, STORAGE_WITH_INDEXED_DB_JS,
+};
 use crate::input::{
     canonicalize_local_paths, dispatch_key_event, encode_file_payloads, parse_chord, resolve_key,
     CheckOptions, ClickOptions, FileInput, HoverOptions, KeyboardState, MouseButton, MouseState,
@@ -2096,6 +2099,46 @@ impl CdpPage {
         Ok(())
     }
 
+    /// Returns cookies in this page's context matching `urls` (or all cookies when empty).
+    pub async fn cookies_for_urls(&self, urls: &[String], timeout: Duration) -> Result<Vec<Cookie>> {
+        let res = self
+            .browser
+            .call(
+                "Storage.getCookies",
+                json!({ "browserContextId": self.context_id.0 }),
+                None,
+                timeout,
+            )
+            .await?;
+        let cookies: Vec<Cookie> = res["cookies"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Cookie::from_cdp).collect())
+            .unwrap_or_default();
+        filter_cookies(&cookies, urls)
+    }
+
+    /// Clears cookies matching `filter` in this page's context.
+    pub async fn clear_cookies_filtered(&self, filter: &CookieFilter, timeout: Duration) -> Result<()> {
+        if filter.is_empty() {
+            return self.clear_cookies(timeout).await;
+        }
+        let all = self.cookies_for_urls(&[], timeout).await?;
+        let mut removed = false;
+        let mut keep = Vec::new();
+        for c in all {
+            if filter.matches(&c) {
+                removed = true;
+            } else {
+                keep.push(c);
+            }
+        }
+        if removed {
+            self.clear_cookies(timeout).await?;
+            self.add_cookies(&keep, timeout).await?;
+        }
+        Ok(())
+    }
+
     /// Changes the CSS media type and/or `prefers-color-scheme` (`""` resets either).
     pub async fn emulate_media(
         &self,
@@ -2349,15 +2392,29 @@ impl CdpPage {
         Ok(())
     }
 
-    /// Every cookie in this page's context, plus localStorage of the page's current origin.
+    /// Every cookie in this page's context, plus localStorage (and optionally IndexedDB) of the current origin.
     pub async fn storage_state(&self, timeout: Duration) -> Result<StorageState> {
+        self.storage_state_with(false, timeout).await
+    }
+
+    /// Every cookie in this page's context, plus localStorage (and IndexedDB when requested) of the current origin.
+    pub async fn storage_state_with(&self, include_indexed_db: bool, timeout: Duration) -> Result<StorageState> {
         let res = self
             .browser
             .call("Storage.getCookies", json!({ "browserContextId": self.context_id.0 }), None, timeout)
             .await?;
         let cookies = res["cookies"].as_array().map(|a| a.iter().filter_map(Cookie::from_cdp).collect()).unwrap_or_default();
-        let local: Option<OriginStorage> = serde_json::from_value(self.evaluate(LOCAL_STORAGE_JS, timeout).await?).unwrap_or(None);
-        let origins = local.into_iter().filter(|o| !o.local_storage.is_empty()).collect();
+        let js = if include_indexed_db { STORAGE_WITH_INDEXED_DB_JS } else { LOCAL_STORAGE_JS };
+        let mut local: Option<OriginStorage> = serde_json::from_value(self.evaluate(js, timeout).await?).unwrap_or(None);
+        if let Some(ref mut orig) = local {
+            if orig.indexed_db.as_ref().is_some_and(Vec::is_empty) {
+                orig.indexed_db = None;
+            }
+        }
+        let origins = local
+            .into_iter()
+            .filter(|o| !o.local_storage.is_empty() || o.indexed_db.as_ref().is_some_and(|d| !d.is_empty()))
+            .collect();
         Ok(StorageState { cookies, origins })
     }
 
@@ -3361,10 +3418,24 @@ pub(crate) struct ContextSetup {
     pub(crate) init_scripts: Vec<String>,
     pub(crate) types: Vec<ResourceType>,
     pub(crate) urls: Vec<String>,
+    pub(crate) proxy: Option<Proxy>,
     pub(crate) proxy_auth: Option<(String, String)>,
     pub(crate) http_auth: Option<(String, String)>,
     /// Requests already given credentials: a second challenge means they were rejected.
     pub(crate) answered: std::collections::HashSet<String>,
+}
+
+impl ContextSetup {
+    pub(crate) fn http_defaults(&self, base_url: Option<String>) -> crate::http_client::HttpContextDefaults {
+        let em = self.emulation.as_ref();
+        crate::http_client::HttpContextDefaults {
+            base_url,
+            extra_http_headers: em.map(|e| e.extra_http_headers.clone()).unwrap_or_default(),
+            user_agent: em.and_then(|e| e.user_agent.clone()),
+            http_credentials: self.http_auth.clone(),
+            proxy: self.proxy.clone(),
+        }
+    }
 }
 
 pub(crate) fn binding_shims(name: &str) -> (String, String) {

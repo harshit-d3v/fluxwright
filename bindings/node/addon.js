@@ -81,8 +81,10 @@ const PAGE = {
   bypassCSP: true,
   storageState: true,
 }
-const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true }
+const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true, response: true }
 const CONTINUE = { url: true, method: true, headers: true, postData: true }
+const ROUTE_FETCH = { url: true, method: true, headers: true, postData: true, maxRedirects: true, timeout: true }
+const API_REQ = { method: true, headers: true, params: true, data: true, form: true, multipart: true, failOnStatusCode: true, maxRedirects: true, timeout: true }
 const BUTTON = ['left', 'right', 'middle']
 const MODIFIER_NAMES = ['Alt', 'Control', 'Meta', 'Shift', 'ControlOrMeta']
 const MODIFIERS = (v, m) => {
@@ -658,18 +660,64 @@ async function dispatchRoutes(list, extra, native) {
         }
         const route = {
           request: () => request,
+          fetch: async (o = {}) => {
+            if (returned) return late('route')
+            if (answer || fellBack) throw new Error('route is already handled')
+            checkOptions('route.fetch', o, ROUTE_FETCH)
+            let postData = o.postData
+            if (postData !== undefined && !Buffer.isBuffer(postData) && typeof postData !== 'string') {
+              postData = JSON.stringify(postData)
+            }
+            const raw = await native.fetch({
+              url: o.url,
+              method: o.method,
+              headers: o.headers,
+              postData,
+              maxRedirects: o.maxRedirects,
+              timeoutMs: o.timeout,
+            })
+            return new APIResponse(raw)
+          },
           fulfill: (o = {}) =>
             answerWith(async () => {
               checkOptions('route.fulfill', o, FULFILL)
-              const headers = { ...o.headers }
+              let status = o.status
+              let headers = {}
               let body = o.body
-              if (o.json !== undefined) {
-                body = JSON.stringify(o.json)
-                headers['content-type'] ??= 'application/json'
+              if (o.response) {
+                status ??= o.response.status()
+                const skip = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection'])
+                for (const h of o.response.headersArray()) {
+                  const k = h.name.toLowerCase()
+                  if (skip.has(k)) continue
+                  headers[k] = k in headers ? `${headers[k]}${k === 'set-cookie' ? '\n' : ', '}${h.value}` : h.value
+                }
+                if (o.headers) {
+                  for (const [k, v] of Object.entries(o.headers)) {
+                    for (const ek of Object.keys(headers)) {
+                      if (ek.toLowerCase() === k.toLowerCase()) delete headers[ek]
+                    }
+                    headers[k] = v
+                  }
+                }
+                if (o.json !== undefined) {
+                  body = JSON.stringify(o.json)
+                  headers['content-type'] ??= 'application/json'
+                } else if (o.path) {
+                  body = await fs.readFile(o.path)
+                } else if (body === undefined) {
+                  body = await o.response.body()
+                }
+              } else {
+                headers = { ...o.headers }
+                if (o.json !== undefined) {
+                  body = JSON.stringify(o.json)
+                  headers['content-type'] ??= 'application/json'
+                }
+                if (o.path) body = await fs.readFile(o.path)
               }
-              if (o.path) body = await fs.readFile(o.path)
               if (o.contentType) headers['content-type'] = o.contentType
-              return native.fulfill({ status: o.status, headers, body })
+              return native.fulfill({ status, headers, body })
             }),
           continue: (o = {}) =>
             answerWith(async () => {
@@ -749,6 +797,232 @@ function installRoutes(Page) {
   }
 }
 
+function hasHeaderCI(headers, name) {
+  const lower = name.toLowerCase()
+  return Object.keys(headers).some((k) => k.toLowerCase() === lower)
+}
+
+function encodeQueryEntries(params) {
+  if (params == null) return undefined
+  if (typeof params === 'string') {
+    return [...new URLSearchParams(params.startsWith('?') ? params.slice(1) : params).entries()].map(([name, value]) => ({ name, value }))
+  }
+  if (params instanceof URLSearchParams) {
+    return [...params.entries()].map(([name, value]) => ({ name, value }))
+  }
+  if (typeof params === 'object') {
+    return Object.entries(params).map(([name, value]) => ({ name, value: String(value) }))
+  }
+  throw new TypeError('apiRequestContext.fetch: params must be an object, URLSearchParams, or string')
+}
+
+async function encodeMultipartBody(multipart) {
+  const boundary = `----FluxwrightBoundary${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`
+  const chunks = []
+  const push = (s) => chunks.push(typeof s === 'string' ? Buffer.from(s, 'utf8') : s)
+  const cleanParam = (s) => String(s).replace(/[\r\n"]/g, '')
+  const addField = async (name, value) => {
+    push(`--${boundary}\r\n`)
+    if (value && typeof value === 'object' && ('buffer' in value || typeof value.arrayBuffer === 'function' || typeof value.pipe === 'function')) {
+      let filename = value.name ?? 'file'
+      let mime = value.mimeType || value.type || 'application/octet-stream'
+      let buf
+      if (Buffer.isBuffer(value.buffer)) {
+        buf = value.buffer
+      } else if (typeof value.arrayBuffer === 'function') {
+        buf = Buffer.from(await value.arrayBuffer())
+      } else if (typeof value.pipe === 'function') {
+        if (typeof value.path === 'string' && !value.name) filename = require('node:path').basename(value.path)
+        const parts = []
+        for await (const chunk of value) parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+        buf = Buffer.concat(parts)
+      } else {
+        buf = Buffer.from(value.buffer)
+      }
+      push(`Content-Disposition: form-data; name="${cleanParam(name)}"; filename="${cleanParam(filename)}"\r\nContent-Type: ${mime}\r\n\r\n`)
+      push(buf)
+      push('\r\n')
+    } else {
+      push(`Content-Disposition: form-data; name="${cleanParam(name)}"\r\n\r\n`)
+      push(String(value))
+      push('\r\n')
+    }
+  }
+  if (typeof FormData !== 'undefined' && multipart instanceof FormData) {
+    for (const [k, v] of multipart.entries()) await addField(k, v)
+  } else if (multipart && typeof multipart === 'object') {
+    for (const [k, v] of Object.entries(multipart)) await addField(k, v)
+  } else {
+    throw new TypeError('apiRequestContext.fetch: multipart must be an object or FormData')
+  }
+  push(`--${boundary}--\r\n`)
+  return { contentType: `multipart/form-data; boundary=${boundary}`, body: Buffer.concat(chunks) }
+}
+
+class APIResponse {
+  #data
+  #disposed = false
+  #headersObj = null
+
+  constructor(data) {
+    this.#data = data
+  }
+
+  url() {
+    return this.#data.url
+  }
+
+  status() {
+    return this.#data.status
+  }
+
+  statusText() {
+    return this.#data.statusText
+  }
+
+  ok() {
+    return this.#data.status >= 200 && this.#data.status <= 299
+  }
+
+  headers() {
+    if (!this.#headersObj) {
+      const obj = {}
+      for (const h of this.#data.headers) {
+        const k = h.name.toLowerCase()
+        obj[k] = k in obj ? `${obj[k]}${k === 'set-cookie' ? '\n' : ', '}${h.value}` : h.value
+      }
+      this.#headersObj = obj
+    }
+    return { ...this.#headersObj }
+  }
+
+  headersArray() {
+    return this.#data.headers.map((h) => ({ name: h.name, value: h.value }))
+  }
+
+  async body() {
+    if (this.#disposed) throw new Error('Response has been disposed')
+    return this.#data.body
+  }
+
+  async text() {
+    return (await this.body()).toString('utf8')
+  }
+
+  async json() {
+    return JSON.parse(await this.text())
+  }
+
+  async dispose() {
+    this.#disposed = true
+    this.#data = { ...this.#data, body: Buffer.alloc(0) }
+  }
+}
+
+class APIRequestContext {
+  #sender
+  #cookiesFn
+  #isClosedFn
+  #disposed = false
+
+  constructor(sender, cookiesFn, isClosedFn) {
+    this.#sender = sender
+    this.#cookiesFn = cookiesFn
+    this.#isClosedFn = isClosedFn
+  }
+
+  async fetch(url, options = {}) {
+    checkOptions('apiRequestContext.fetch', options, API_REQ)
+    if (this.#disposed || this.#isClosedFn?.()) throw new Error('apiRequestContext.fetch: target is closed or disposed')
+    const bodyModes = [options.data, options.form, options.multipart].filter((x) => x !== undefined)
+    if (bodyModes.length > 1) {
+      throw new TypeError('apiRequestContext.fetch: pass at most one of data, form, or multipart')
+    }
+    const headers = {}
+    if (options.headers) {
+      for (const [k, v] of Object.entries(options.headers)) headers[k] = String(v)
+    }
+    let data
+    if (options.data !== undefined) {
+      if (Buffer.isBuffer(options.data) || typeof options.data === 'string') {
+        data = options.data
+        if (!hasHeaderCI(headers, 'content-type')) headers['content-type'] = 'application/octet-stream'
+      } else {
+        data = JSON.stringify(options.data)
+        if (!hasHeaderCI(headers, 'content-type')) headers['content-type'] = 'application/json'
+      }
+    } else if (options.form !== undefined) {
+      const sp = options.form instanceof URLSearchParams
+        ? options.form
+        : new URLSearchParams(Object.entries(options.form).map(([k, v]) => [k, String(v)]))
+      data = sp.toString()
+      if (!hasHeaderCI(headers, 'content-type')) headers['content-type'] = 'application/x-www-form-urlencoded'
+    } else if (options.multipart !== undefined) {
+      const mp = await encodeMultipartBody(options.multipart)
+      data = mp.body
+      if (!hasHeaderCI(headers, 'content-type')) headers['content-type'] = mp.contentType
+    }
+    const params = encodeQueryEntries(options.params)
+    const raw = await this.#sender(String(url), {
+      method: options.method,
+      headers: Object.keys(headers).length ? headers : undefined,
+      params,
+      data,
+      failOnStatusCode: options.failOnStatusCode,
+      maxRedirects: options.maxRedirects,
+      timeoutMs: options.timeout,
+    })
+    return new APIResponse(raw)
+  }
+
+  get(url, options) {
+    return this.fetch(url, { ...options, method: 'GET' })
+  }
+
+  post(url, options) {
+    return this.fetch(url, { ...options, method: 'POST' })
+  }
+
+  put(url, options) {
+    return this.fetch(url, { ...options, method: 'PUT' })
+  }
+
+  patch(url, options) {
+    return this.fetch(url, { ...options, method: 'PATCH' })
+  }
+
+  delete(url, options) {
+    return this.fetch(url, { ...options, method: 'DELETE' })
+  }
+
+  head(url, options) {
+    return this.fetch(url, { ...options, method: 'HEAD' })
+  }
+
+  async storageState(options) {
+    checkOptions('apiRequestContext.storageState', options, { path: true })
+    if (this.#disposed || this.#isClosedFn?.()) throw new Error('apiRequestContext.storageState: target is closed or disposed')
+    const state = { cookies: await this.#cookiesFn(), origins: [] }
+    if (options?.path) await savePrivate(options.path, JSON.stringify(state, null, 2))
+    return state
+  }
+
+  async dispose() {
+    this.#disposed = true
+  }
+}
+
+function cookieFilterMatches(filter, value, isDomain = false) {
+  if (filter instanceof RegExp) {
+    filter.lastIndex = 0
+    return filter.test(value)
+  }
+  if (!isDomain) return value === filter
+  const f = filter.toLowerCase()
+  const v = value.toLowerCase()
+  return f.startsWith('.') ? v === f : v === f || v === `.${f}`
+}
+
 // browser.newContext() and context.newPage(), as in Playwright. Each context can hold multiple
 // pages and popups sharing cookies, storage, init scripts, exposed functions and routes.
 class BrowserContext {
@@ -762,6 +1036,7 @@ class BrowserContext {
   #bindings = new Map()
   #bindingStarted = false
   #routeGetter
+  #request
 
   constructor(browser, id, ensurePopup) {
     this.#browser = browser
@@ -770,6 +1045,15 @@ class BrowserContext {
     const ref = new WeakRef(this)
     this.#routeGetter = () => ref.deref()?.#routes ?? []
     contextRegistry.register(this, { browser, id }, this)
+  }
+
+  get request() {
+    this.#request ??= new APIRequestContext(
+      (url, opts) => this.#browser._contextApiFetch(this.#id, url, opts),
+      () => this.#browser._contextCookies(this.#id, null),
+      () => this.#closed,
+    )
+    return this.#request
   }
 
   browser() {
@@ -879,18 +1163,35 @@ class BrowserContext {
   }
 
   async storageState(options) {
-    checkOptions('browserContext.storageState', options, { path: true })
+    checkOptions('browserContext.storageState', options, { path: true, indexedDB: true })
     if (this.#closed) throw new Error('browserContext.storageState: the context is closed')
-    const [p] = this.pages()
-    const state = p ? await p.storageState() : { cookies: await this.#browser._contextCookies(this.#id), origins: [] }
+    const indexedDB = options?.indexedDB ?? false
+    const pages = this.pages()
+    let state
+    if (!pages.length) {
+      state = { cookies: await this.#browser._contextCookies(this.#id, null), origins: [] }
+    } else {
+      const states = await Promise.all(pages.map((p) => p.storageState({ indexedDB })))
+      const byOrigin = new Map()
+      for (const s of states) {
+        for (const o of s.origins) byOrigin.set(o.origin, o)
+      }
+      state = { cookies: states[0].cookies, origins: [...byOrigin.values()] }
+    }
     if (options?.path) await savePrivate(options.path, JSON.stringify(state, null, 2))
     return state
   }
 
   async cookies(urls) {
-    if (urls !== undefined) throw new TypeError('browserContext.cookies: filtering by URL is not supported (see MISSING.md)')
     if (this.#closed) throw new Error('browserContext.cookies: the context is closed')
-    return this.#browser._contextCookies(this.#id)
+    let urlList = null
+    if (urls !== undefined) {
+      urlList = typeof urls === 'string' ? [urls] : Array.isArray(urls) ? urls : null
+      if (!urlList || urlList.some((u) => typeof u !== 'string')) {
+        throw new TypeError('browserContext.cookies: urls must be a string or string[]')
+      }
+    }
+    return this.#browser._contextCookies(this.#id, urlList)
   }
 
   async addCookies(cookies) {
@@ -930,9 +1231,25 @@ class BrowserContext {
   }
 
   async clearCookies(options) {
-    checkOptions('browserContext.clearCookies', options, NONE)
+    checkOptions('browserContext.clearCookies', options, { name: true, domain: true, path: true })
     if (this.#closed) throw new Error('browserContext.clearCookies: the context is closed')
-    return this.#browser._contextClearCookies(this.#id)
+    const hasFilter = options && (options.name !== undefined || options.domain !== undefined || options.path !== undefined)
+    if (!hasFilter) return this.#browser._contextClearCookies(this.#id)
+    for (const k of ['name', 'domain', 'path']) {
+      if (options[k] !== undefined && typeof options[k] !== 'string' && !(options[k] instanceof RegExp)) {
+        throw new TypeError(`browserContext.clearCookies: ${k} must be a string or RegExp`)
+      }
+    }
+    const all = await this.#browser._contextCookies(this.#id, null)
+    const keep = all.filter((c) => {
+      const matchName = options.name === undefined || cookieFilterMatches(options.name, c.name, false)
+      const matchDomain = options.domain === undefined || cookieFilterMatches(options.domain, c.domain, true)
+      const matchPath = options.path === undefined || cookieFilterMatches(options.path, c.path, false)
+      return !(matchName && matchDomain && matchPath)
+    })
+    if (keep.length !== all.length) {
+      await this.#browser._contextReplaceCookies(this.#id, keep)
+    }
   }
 
   async newCDPSession(page) {
@@ -1341,11 +1658,29 @@ try {
   }
   const storageState = native.Page.prototype.storageState
   native.Page.prototype.storageState = async function (options) {
-    checkOptions('page.storageState', options, { path: true })
-    const state = await storageState.call(this)
+    checkOptions('page.storageState', options, { path: true, indexedDB: true })
+    const state = await storageState.call(this, options?.indexedDB)
     if (options?.path) await savePrivate(options.path, JSON.stringify(state, null, 2))
     return state
   }
+  const pageRequests = new WeakMap()
+  Object.defineProperty(native.Page.prototype, 'request', {
+    configurable: true,
+    get() {
+      const ctx = pageContext.get(this)?.deref()
+      if (ctx) return ctx.request
+      let req = pageRequests.get(this)
+      if (!req) {
+        req = new APIRequestContext(
+          (url, opts) => this._apiFetch(url, opts),
+          async () => (await storageState.call(this, false)).cookies,
+          () => this.isClosed(),
+        )
+        pageRequests.set(this, req)
+      }
+      return req
+    },
+  })
   // Playwright's locator.evaluate(fn, arg) calls fn(element, arg).
   const evaluateOn = native.Locator.prototype.evaluate
   native.Locator.prototype.evaluate = async function (pageFunction, arg, options) {
