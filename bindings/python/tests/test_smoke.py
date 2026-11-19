@@ -14,7 +14,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import pytest
 
@@ -271,6 +271,74 @@ async def async_smoke(base: str, tmp: Path) -> None:
         with pytest.raises(TimeoutError):  # after the fixed 10 s action timeout
             await ui.wait_for_selector("#missing")
         await ui.close()
+
+        # Locator reading, filtering, combinators, XPath, extended get_by_role, and strict mode (async).
+        lr = await browser.new_page()
+        await lr.goto(
+            "data:text/html,"
+            + quote(
+                """<!doctype html>
+                <h2 aria-level="2">Sub Header</h2>
+                <ul id="list">
+                  <li><b>Apple</b> <span>red</span></li>
+                  <li><em>Pear</em> <span>green</span></li>
+                  <li style="display:none">HiddenItem</li>
+                </ul>
+                <input id="ro" readonly value="locked" data-kind="ro">
+                <input id="ed" value="ok">
+                <input id="dis" disabled>
+                <input id="chk" type="checkbox" checked>
+                <div id="ce" contenteditable="true">Hi <b>there</b></div>
+                <button id="tog" aria-pressed="true" aria-expanded="false">Toggle</button>
+                <button id="hid" style="display:none">Secret</button>
+                <div role="tab" aria-selected="true">TabA</div>
+                <div id="parent"><span id="child">Kid</span></div>
+                <p class="m">First</p><p class="m">Second</p>"""
+            )
+        )
+        items = lr.locator("#list li")
+        assert await items.count() == 3
+        all_items = await items.all()
+        assert len(all_items) == 3
+        assert await all_items[1].inner_text() == "Pear green"
+        assert await items.all_text_contents() == ["Apple red", "Pear green", "HiddenItem"]
+        assert len(await items.all_inner_texts()) == 3
+        assert await items.first.inner_html() == "<b>Apple</b> <span>red</span>"
+        assert await lr.locator("#ed").input_value() == "ok"
+        assert await lr.locator("#ro").get_attribute("data-kind") == "ro"
+        assert await lr.locator("#ro").get_attribute("missing") is None
+        assert await lr.locator("#missing").is_visible() is False
+        assert await lr.locator("#missing").is_hidden() is True
+        assert await lr.locator("#ed").is_enabled() is True
+        assert await lr.locator("#dis").is_disabled() is True
+        assert await lr.locator("#chk").is_checked() is True
+        assert await lr.locator("#ed").is_editable() is True
+        assert await lr.locator("#ro").is_editable() is False
+        assert await lr.locator("#ce").is_editable() is True
+        assert await lr.inner_text(".m") == "First"
+        with pytest.raises(Error, match="strict mode violation"):
+            await lr.locator(".m").inner_text()
+        with pytest.raises(Error, match="strict mode violation"):
+            await lr.inner_text(".m", strict=True)
+        with pytest.raises(Error, match="strict mode violation"):
+            await lr.locator(".m").is_visible()
+        assert await items.filter(has=lr.locator("b")).inner_text() == "Apple red"
+        assert (
+            await lr.locator("#list li", has_not=lr.locator("b"), has_not_text=re.compile(r"Hidden")).inner_text()
+            == "Pear green"
+        )
+        assert await items.filter(has_text=re.compile(r"^pear", re.I)).inner_text() == "Pear green"
+        assert await lr.locator("input").and_(lr.locator("#ed")).input_value() == "ok"
+        assert await lr.locator("#ed").or_(lr.locator("#chk")).count() == 2
+        assert await lr.locator("//button[@id='tog']").inner_text() == "Toggle"
+        assert await lr.locator("#child").locator("..").get_attribute("id") == "parent"
+        assert await lr.get_by_role("heading", level=2, name=re.compile(r"^Sub")).inner_text() == "Sub Header"
+        assert await lr.get_by_role("button", pressed=True, expanded=False).get_attribute("id") == "tog"
+        assert await lr.get_by_role("button", name="Secret", include_hidden=True).get_attribute("id") == "hid"
+        assert await lr.get_by_role("checkbox", checked=True).get_attribute("id") == "chk"
+        assert await lr.get_by_role("tab", selected=True).inner_text() == "TabA"
+        assert await lr.frame_locator("#nope").locator("div").count() == 0
+        await lr.close()
 
         # page.on, page.route (glob, regex, function, fallback, unroute) and downloads.
         live = await browser.new_page()
@@ -878,6 +946,31 @@ def test_sync_api(base, tmp_path):
         rich.touchscreen.tap(15, 15)
         assert rich.evaluate("() => window.__tap") == 2
         rich.close()
+
+        # Sync locator reading, filtering, combinators, XPath, extended get_by_role, and strict mode.
+        lr_sync = browser.new_page()
+        lr_sync.goto(
+            "data:text/html,"
+            + quote(
+                """<!doctype html>
+                <ul><li>One</li><li>Two</li></ul>
+                <input id="inp" value="v"><input id="dis" disabled>
+                <button aria-pressed="true">Tog</button>
+                <span class="m">A</span><span class="m">B</span>"""
+            )
+        )
+        assert lr_sync.locator("li").count() == 2
+        assert [x.inner_text() for x in lr_sync.locator("li").all()] == ["One", "Two"]
+        assert lr_sync.locator("li").filter(has_text=re.compile(r"^t", re.I)).inner_text() == "Two"
+        assert lr_sync.locator("#inp").and_(lr_sync.locator("input")).input_value() == "v"
+        assert lr_sync.locator("#inp").or_(lr_sync.locator("#dis")).count() == 2
+        assert lr_sync.get_by_role("button", pressed=True).inner_text() == "Tog"
+        assert lr_sync.inner_text(".m") == "A"
+        with pytest.raises(Error, match="strict mode violation"):
+            lr_sync.inner_text(".m", strict=True)
+        with pytest.raises(Error, match="strict mode violation"):
+            lr_sync.locator(".m").inner_text()
+        lr_sync.close()
 
         # One browser shared by a pool of threads.
         def job(n):

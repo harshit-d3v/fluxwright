@@ -566,8 +566,34 @@ pub struct GetByTextOptions {
 #[napi(object)]
 pub struct GetByRoleOptions {
     /// Accessible name. Default: case-insensitive substring.
+    #[napi(ts_type = "string | RegExp")]
     pub name: Option<String>,
     pub exact: Option<bool>,
+    pub checked: Option<bool>,
+    pub disabled: Option<bool>,
+    pub expanded: Option<bool>,
+    pub include_hidden: Option<bool>,
+    pub level: Option<u32>,
+    pub pressed: Option<bool>,
+    pub selected: Option<bool>,
+}
+
+fn to_role_options(options: Option<GetByRoleOptions>, name_regex: Option<(String, String)>) -> fluxwright::RoleOptions {
+    match options {
+        None => fluxwright::RoleOptions { name_regex, ..Default::default() },
+        Some(o) => fluxwright::RoleOptions {
+            name: if name_regex.is_some() { None } else { o.name },
+            exact: o.exact.unwrap_or(false),
+            name_regex,
+            checked: o.checked,
+            disabled: o.disabled,
+            expanded: o.expanded,
+            include_hidden: o.include_hidden.unwrap_or(false),
+            level: o.level,
+            pressed: o.pressed,
+            selected: o.selected,
+        },
+    }
 }
 
 /// Lazy, like Playwright's: every action runs the query again.
@@ -657,7 +683,7 @@ impl Locator {
     #[napi(js_name = "_dragTo")]
     pub async fn drag_to(&self, frames: Vec<String>, query: String, force: Option<bool>) -> Result<()> {
         let src = self.selector.clone();
-        let dst = fluxwright::Selector { frames, query };
+        let dst = fluxwright::Selector { frames, query, strict: self.selector.strict };
         let force = force.unwrap_or(false);
         with_page_in(self.lease.clone(), self.timeout, move |p| {
             Box::pin(async move { p.drag_and_drop(&src, &dst, force).await })
@@ -792,6 +818,88 @@ impl Locator {
         with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.text_content(&sel).await })).await
     }
 
+    #[napi]
+    pub async fn inner_text(&self) -> Result<String> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.inner_text(&sel).await })).await
+    }
+
+    #[napi(js_name = "innerHTML")]
+    pub async fn inner_html(&self) -> Result<String> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.inner_html(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn input_value(&self) -> Result<String> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.input_value(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn get_attribute(&self, name: String) -> Result<Option<String>> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| {
+            Box::pin(async move { p.get_attribute(&sel, &name).await })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn count(&self) -> Result<u32> {
+        let sel = self.selector.clone();
+        let n = with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.count(&sel).await })).await?;
+        Ok(n as u32)
+    }
+
+    #[napi]
+    pub async fn all_text_contents(&self) -> Result<Vec<String>> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.all_text_contents(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn all_inner_texts(&self) -> Result<Vec<String>> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.all_inner_texts(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn is_visible(&self) -> Result<bool> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.is_visible(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn is_hidden(&self) -> Result<bool> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.is_hidden(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn is_enabled(&self) -> Result<bool> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.is_enabled(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn is_disabled(&self) -> Result<bool> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.is_disabled(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn is_checked(&self) -> Result<bool> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.is_checked(&sel).await })).await
+    }
+
+    #[napi]
+    pub async fn is_editable(&self) -> Result<bool> {
+        let sel = self.selector.clone();
+        with_page_in(self.lease.clone(), self.timeout, move |p| Box::pin(async move { p.is_editable(&sel).await })).await
+    }
+
     /// The `index`th match (0-based; negative counts from the end).
     #[napi]
     pub fn nth(&self, index: i32) -> Locator {
@@ -808,13 +916,53 @@ impl Locator {
         self.nth(-1)
     }
 
-    /// Keeps matches containing `hasText` (case-insensitive substring), as in Playwright.
-    #[napi]
-    pub fn filter(&self, options: FilterOptions) -> Locator {
-        match options.has_text {
-            Some(text) => self.then(fluxwright::Selector::has_text(&text)),
-            None => self.then_selector(self.selector.clone()),
-        }
+    #[napi(js_name = "_strict")]
+    pub fn with_strict(&self, strict: bool) -> Locator {
+        self.then_selector(self.selector.clone().strict(strict))
+    }
+
+    #[napi(js_name = "_has")]
+    pub fn has(&self, frames: Vec<String>, query: String) -> Result<Locator> {
+        self.same_frame(&frames)?;
+        Ok(self.then_selector(self.selector.has(&fluxwright::Selector { frames, query, strict: true })))
+    }
+
+    #[napi(js_name = "_hasNot")]
+    pub fn has_not(&self, frames: Vec<String>, query: String) -> Result<Locator> {
+        self.same_frame(&frames)?;
+        Ok(self.then_selector(self.selector.has_not(&fluxwright::Selector { frames, query, strict: true })))
+    }
+
+    #[napi(js_name = "_hasText")]
+    pub fn has_text(&self, text: String) -> Locator {
+        self.then(fluxwright::Selector::has_text(&text))
+    }
+
+    #[napi(js_name = "_hasTextRegex")]
+    pub fn has_text_regex(&self, pattern: String, flags: String) -> Locator {
+        self.then(fluxwright::Selector::has_text_regex(&pattern, &flags))
+    }
+
+    #[napi(js_name = "_hasNotText")]
+    pub fn has_not_text(&self, text: String) -> Locator {
+        self.then(fluxwright::Selector::has_not_text(&text))
+    }
+
+    #[napi(js_name = "_hasNotTextRegex")]
+    pub fn has_not_text_regex(&self, pattern: String, flags: String) -> Locator {
+        self.then(fluxwright::Selector::has_not_text_regex(&pattern, &flags))
+    }
+
+    #[napi(js_name = "_and")]
+    pub fn and(&self, frames: Vec<String>, query: String) -> Result<Locator> {
+        self.same_frame(&frames)?;
+        Ok(self.then_selector(self.selector.and(&fluxwright::Selector { frames, query, strict: true })))
+    }
+
+    #[napi(js_name = "_or")]
+    pub fn or(&self, frames: Vec<String>, query: String) -> Result<Locator> {
+        self.same_frame(&frames)?;
+        Ok(self.then_selector(self.selector.or(&fluxwright::Selector { frames, query, strict: true })))
     }
 
     /// Searches inside this locator's matches.
@@ -830,8 +978,12 @@ impl Locator {
 
     #[napi]
     pub fn get_by_role(&self, role: String, options: Option<GetByRoleOptions>) -> Locator {
-        let (name, exact) = options.map(|o| (o.name, o.exact.unwrap_or(false))).unwrap_or_default();
-        self.then(fluxwright::Selector::role(&role, name.as_deref(), exact))
+        self.then(fluxwright::Selector::role_with(&role, &to_role_options(options, None)))
+    }
+
+    #[napi(js_name = "_getByRoleRegex")]
+    pub fn get_by_role_regex(&self, role: String, pattern: String, flags: String, options: Option<GetByRoleOptions>) -> Locator {
+        self.then(fluxwright::Selector::role_with(&role, &to_role_options(options, Some((pattern, flags)))))
     }
 
     #[napi]
@@ -898,16 +1050,17 @@ impl Locator {
     fn then_selector(&self, selector: fluxwright::Selector) -> Locator {
         Locator { lease: self.lease.clone(), selector, timeout: self.timeout }
     }
+
+    fn same_frame(&self, frames: &[String]) -> Result<()> {
+        if self.selector.frames != frames {
+            return Err(Error::from_reason("locator combinator requires locators from the same frame"));
+        }
+        Ok(())
+    }
 }
 
 fn exact(flag: Option<bool>) -> bool {
     flag.unwrap_or(false)
-}
-
-#[napi(object)]
-pub struct FilterOptions {
-    /// Case-insensitive substring of the element's text.
-    pub has_text: Option<String>,
 }
 
 /// CSS pixels, relative to the top-level page's viewport.
@@ -946,7 +1099,7 @@ impl FrameLocator {
     fn find(&self, query: String) -> Locator {
         Locator {
             lease: self.lease.clone(),
-            selector: fluxwright::Selector { frames: self.frames.clone(), query },
+            selector: fluxwright::Selector { frames: self.frames.clone(), query, strict: true },
             timeout: None,
         }
     }
@@ -967,8 +1120,12 @@ impl FrameLocator {
 
     #[napi]
     pub fn get_by_role(&self, role: String, options: Option<GetByRoleOptions>) -> Locator {
-        let (name, exact) = options.map(|o| (o.name, o.exact.unwrap_or(false))).unwrap_or_default();
-        self.find(fluxwright::Selector::role(&role, name.as_deref(), exact))
+        self.find(fluxwright::Selector::role_with(&role, &to_role_options(options, None)))
+    }
+
+    #[napi(js_name = "_getByRoleRegex")]
+    pub fn get_by_role_regex(&self, role: String, pattern: String, flags: String, options: Option<GetByRoleOptions>) -> Locator {
+        self.find(fluxwright::Selector::role_with(&role, &to_role_options(options, Some((pattern, flags)))))
     }
 
     /// `<label>`, `aria-labelledby` or `aria-label`; case-insensitive substring unless `exact`.
@@ -1551,6 +1708,11 @@ impl Page {
     #[napi]
     pub fn get_by_role(&self, role: String, options: Option<GetByRoleOptions>) -> Locator {
         self.top().get_by_role(role, options)
+    }
+
+    #[napi(js_name = "_getByRoleRegex")]
+    pub fn get_by_role_regex(&self, role: String, pattern: String, flags: String, options: Option<GetByRoleOptions>) -> Locator {
+        self.top().get_by_role_regex(role, pattern, flags, options)
     }
 
     #[napi]

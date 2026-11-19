@@ -99,7 +99,7 @@ try {
   await page.waitForSelector('p', { state: 'attached' })
   await assert.rejects(page.locator('p').waitFor({ timeout: 300 }))
   await page.evaluate(() => (document.querySelector('p').style.display = ''))
-  assert.throws(() => page.locator('p', { hasText: 'x' }), TypeError)
+  assert.throws(() => page.locator('p', { bogusOption: 'x' }), TypeError)
   await assert.rejects(page.click('p', { noWaitAfter: true }), TypeError)
   await assert.rejects(page.click('p', { button: 'fourth' }), TypeError)
   await assert.rejects(page.click('p', { modifiers: ['Bogus'] }), TypeError)
@@ -637,6 +637,67 @@ try {
     } finally {
       await small.close()
     }
+  }
+
+  // Locator reading, filtering, combinators, XPath, extended getByRole, and strict mode.
+  {
+    const lr = await browser.newPage()
+    await lr.goto('data:text/html,' + encodeURIComponent(`<!doctype html>
+      <h2 aria-level="2">Sub Header</h2>
+      <ul id="list">
+        <li><b>Apple</b> <span>red</span></li>
+        <li><em>Pear</em> <span>green</span></li>
+        <li style="display:none">HiddenItem</li>
+      </ul>
+      <input id="ro" readonly value="locked" data-kind="ro">
+      <input id="ed" value="ok">
+      <input id="dis" disabled>
+      <input id="chk" type="checkbox" checked>
+      <div id="ce" contenteditable="true">Hi <b>there</b></div>
+      <button id="tog" aria-pressed="true" aria-expanded="false">Toggle</button>
+      <button id="hid" style="display:none">Secret</button>
+      <div role="tab" aria-selected="true">TabA</div>
+      <div id="parent"><span id="child">Kid</span></div>
+      <p class="m">First</p><p class="m">Second</p>`))
+    const list = lr.locator('#list li')
+    assert.equal(await list.count(), 3)
+    const all = await list.all()
+    assert.equal(all.length, 3)
+    assert.equal(await all[1].innerText(), 'Pear green')
+    assert.deepEqual(await list.allTextContents(), ['Apple red', 'Pear green', 'HiddenItem'])
+    assert.equal((await list.allInnerTexts()).length, 3)
+    assert.equal(await list.first().innerHTML(), '<b>Apple</b> <span>red</span>')
+    assert.equal(await lr.locator('#ed').inputValue(), 'ok')
+    assert.equal(await lr.locator('#ro').getAttribute('data-kind'), 'ro')
+    assert.equal(await lr.locator('#ro').getAttribute('missing'), null)
+    assert.equal(await lr.locator('#missing').isVisible(), false)
+    assert.equal(await lr.locator('#missing').isHidden(), true)
+    assert.equal(await lr.locator('#ed').isEnabled(), true)
+    assert.equal(await lr.locator('#dis').isDisabled(), true)
+    assert.equal(await lr.locator('#chk').isChecked(), true)
+    assert.equal(await lr.locator('#ed').isEditable(), true)
+    assert.equal(await lr.locator('#ro').isEditable(), false)
+    assert.equal(await lr.locator('#ce').isEditable(), true)
+
+    assert.equal(await lr.innerText('.m'), 'First')
+    await assert.rejects(() => lr.locator('.m').innerText(), /strict mode violation/)
+    await assert.rejects(() => lr.innerText('.m', { strict: true }), /strict mode violation/)
+    await assert.rejects(() => lr.locator('.m').isVisible(), /strict mode violation/)
+
+    assert.equal(await list.filter({ has: lr.locator('b') }).innerText(), 'Apple red')
+    assert.equal(await lr.locator('#list li', { hasNot: lr.locator('b'), hasNotText: /Hidden/ }).innerText(), 'Pear green')
+    assert.equal(await list.filter({ hasText: /^Pear/i }).innerText(), 'Pear green')
+    assert.equal(await lr.locator('input').and(lr.locator('#ed')).inputValue(), 'ok')
+    assert.equal(await lr.locator('#ed').or(lr.locator('#chk')).count(), 2)
+    assert.equal(await lr.locator('//button[@id="tog"]').innerText(), 'Toggle')
+    assert.equal(await lr.locator('#child').locator('..').getAttribute('id'), 'parent')
+    assert.equal(await lr.getByRole('heading', { level: 2, name: /^Sub/ }).innerText(), 'Sub Header')
+    assert.equal(await lr.getByRole('button', { pressed: true, expanded: false }).getAttribute('id'), 'tog')
+    assert.equal(await lr.getByRole('button', { name: 'Secret', includeHidden: true }).getAttribute('id'), 'hid')
+    assert.equal(await lr.getByRole('checkbox', { checked: true }).getAttribute('id'), 'chk')
+    assert.equal(await lr.getByRole('tab', { selected: true }).innerText(), 'TabA')
+    assert.equal(await lr.frameLocator('#nope').locator('div').count(), 0)
+    await lr.close()
   }
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).

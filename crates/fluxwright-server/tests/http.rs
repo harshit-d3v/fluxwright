@@ -562,7 +562,7 @@ async fn worker_pulls_and_executes_jobs_from_coordinator() {
     let fail_sub = submit(
         &coordinator,
         json!({
-            "timeout_ms": 1200,
+            "timeout_ms": 3000,
             "steps": [
                 { "action": "goto", "url": format!("{}/forms", fixture.base_url) },
                 { "action": "wait_for_selector", "selector": "#missing-cluster-el" }
@@ -707,5 +707,74 @@ async fn executes_rich_input_and_form_steps() {
     let results = job.results.unwrap();
     assert_eq!(results[6], json!(["b"]));
     assert_eq!(results[7], json!(["new", true, "1", true, "b"]));
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn executes_locator_read_and_state_steps() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let html = r#"<!doctype html>
+        <ul><li>One</li><li>Two</li></ul>
+        <div id="box"><b>Hi</b></div>
+        <input id="inp" value="val" data-k="v">
+        <input id="dis" disabled>
+        <input id="chk" type="checkbox" checked>
+        <p id="hid" style="display:none">Secret</p>"#;
+    let app = axum::Router::new().route("/", axum::routing::get(move || async move { axum::response::Html(html) }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let server = server().await;
+    let sub = submit(
+        &server,
+        json!({ "steps": [
+            { "action": "goto", "url": format!("http://127.0.0.1:{port}/") },
+            { "action": "count", "selector": "li" },
+            { "action": "all_text_contents", "selector": "li" },
+            { "action": "all_inner_texts", "selector": "li" },
+            { "action": "inner_text", "selector": "#box" },
+            { "action": "inner_html", "selector": "#box" },
+            { "action": "input_value", "selector": "#inp" },
+            { "action": "get_attribute", "selector": "#inp", "name": "data-k" },
+            { "action": "is_visible", "selector": "#box" },
+            { "action": "is_hidden", "selector": "#hid" },
+            { "action": "is_enabled", "selector": "#inp" },
+            { "action": "is_disabled", "selector": "#dis" },
+            { "action": "is_checked", "selector": "#chk" },
+            { "action": "is_editable", "selector": "#inp" }
+        ] }),
+    )
+    .await;
+
+    let job = finish(&server, sub).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+    let results = job.results.unwrap();
+    assert_eq!(results[1], json!(2));
+    assert_eq!(results[2], json!(["One", "Two"]));
+    assert_eq!(results[3], json!(["One", "Two"]));
+    assert_eq!(results[4], json!("Hi"));
+    assert_eq!(results[5], json!("<b>Hi</b>"));
+    assert_eq!(results[6], json!("val"));
+    assert_eq!(results[7], json!("v"));
+    assert_eq!(results[8], json!(true));
+    assert_eq!(results[9], json!(true));
+    assert_eq!(results[10], json!(true));
+    assert_eq!(results[11], json!(true));
+    assert_eq!(results[12], json!(true));
+    assert_eq!(results[13], json!(true));
+
+    // strict: true rejects multiple matches.
+    let bad = submit(
+        &server,
+        json!({ "steps": [
+            { "action": "goto", "url": format!("http://127.0.0.1:{port}/") },
+            { "action": "inner_text", "selector": "li", "strict": true }
+        ] }),
+    )
+    .await;
+    let bad_job = finish(&server, bad).await;
+    assert_eq!(bad_job.status, JobStatus::Failed);
+    assert!(bad_job.error.unwrap_or_default().contains("strict mode violation"));
+
     server.shutdown(Duration::from_secs(5)).await.unwrap();
 }

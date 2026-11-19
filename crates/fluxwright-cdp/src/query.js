@@ -40,15 +40,19 @@
     return parts;
   };
 
-  // "Foo" is exact; "Foo"i and a bare Foo are case-insensitive substrings. `has` decides whether
-  // anything inside an element can still match, `is` whether the element itself does.
+  // "Foo" is exact; "Foo"i, bare Foo are case-insensitive substrings; re:"pat","flags" is RegExp.
+  // `has` decides whether anything inside an element can still match, `is` whether the element itself does.
   const matcher = (body) => {
+    if (body.startsWith('re:')) {
+      const re = parseRe(body);
+      return { has: (t) => re.test(t), is: (t) => re.test(t), prune: false };
+    }
     const q = /^("(?:[^"\\]|\\.)*")(i?)$/.exec(body);
     const want = norm(q ? JSON.parse(q[1]) : body);
     const exact = !!q && !q[2];
     const lw = want.toLowerCase();
     const has = (t) => (exact ? t.includes(want) : t.toLowerCase().includes(lw));
-    return { has, is: (t) => (exact ? t === want : has(t)) };
+    return { has, is: (t) => (exact ? t === want : has(t)), prune: true };
   };
 
   const implicitRole = (el) => {
@@ -85,16 +89,16 @@
     /^(button|link|heading|cell|columnheader|option|listitem|tab|menuitem|checkbox|radio|switch|treeitem|row)$/;
   // Name from content (AccName 2F, compact): descendant text, alt text, aria-label and input
   // button values, skipping hidden descendants. <button><img alt="Save"></button> is "Save".
-  const contentName = (node) => {
+  const contentName = (node, includeHidden) => {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
     if (node.nodeType !== Node.ELEMENT_NODE) return '';
     const st = getComputedStyle(node);
-    if (node.getAttribute('aria-hidden') === 'true' || st.display === 'none' || st.visibility === 'hidden') return '';
+    if (!includeHidden && (node.getAttribute('aria-hidden') === 'true' || st.display === 'none' || st.visibility === 'hidden')) return '';
     const label = norm(node.getAttribute('aria-label'));
     if (label) return label;
     if (node.tagName === 'IMG' || (node.tagName === 'INPUT' && node.type === 'image')) return node.getAttribute('alt') || '';
     if (node.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(node.type)) return node.value;
-    return [...node.childNodes].map(contentName).join(' ');
+    return [...node.childNodes].map((c) => contentName(c, includeHidden)).join(' ');
   };
   const labelledBy = (el) => {
     const ids = el.getAttribute('aria-labelledby');
@@ -102,7 +106,7 @@
   };
   // A compact accessible-name computation: aria-labelledby, aria-label, <label>, value of
   // input buttons, alt, then content for roles named by content, placeholder, title.
-  const nameOf = (el) => {
+  const nameOf = (el, includeHidden) => {
     const byIds = labelledBy(el);
     if (byIds) return byIds;
     const label = norm(el.getAttribute('aria-label'));
@@ -116,7 +120,7 @@
       if (alt) return alt;
     }
     if (nameFromContent.test(roleOf(el) || '')) {
-      const t = norm([...el.childNodes].map(contentName).join(' '));
+      const t = norm([...el.childNodes].map((c) => contentName(c, includeHidden)).join(' '));
       if (t) return t;
     }
     return norm(el.getAttribute('placeholder')) || norm(el.getAttribute('title'));
@@ -159,7 +163,7 @@
         // on it, a Next.js page's __NEXT_DATA__ made <body> the element, so a wait for text not
         // shown yet returned at once and the click landed mid-page.
         const t = norm(el.textContent);
-        if (!m.has(t) && !el.querySelector(buttons)) return false; // nothing below can match
+        if (m.prune && !m.has(t) && !el.querySelector(buttons)) return false; // nothing below can match
         let below = false;
         for (const c of el.children) {
           if (skip.test(c.tagName)) continue;
@@ -175,14 +179,79 @@
       return out;
     },
     role: (body, root, first) => {
-      const r = /^([\w-]+)(?:\[name=("(?:[^"\\]|\\.)*")(s?)\])?$/.exec(body);
-      if (!r) throw new SyntaxError('expected role=button or role=button[name="Save"], got ' + body);
-      const want = r[1].toLowerCase();
-      const name = r[2] === undefined ? null : norm(JSON.parse(r[2]));
-      const exact = r[3] === 's';
+      const m = /^([\w-]+)([\s\S]*)$/.exec(body);
+      if (!m) throw new SyntaxError('expected role=button, got ' + body);
+      const want = m[1].toLowerCase();
+      let rest = m[2];
+      let name = null;
+      let exact = false;
+      let nameRe = null;
+      let includeHidden = false;
+      const checks = [];
+      const attrRe = /^\[([\w-]+)=("(?:[^"\\]|\\.)*"s?|re:"(?:[^"\\]|\\.)*","(?:[^"\\]|\\.)*"|true|false|\d+)\]/;
+      while (rest.length) {
+        const a = attrRe.exec(rest);
+        if (!a) throw new SyntaxError('invalid role attribute in ' + body);
+        rest = rest.slice(a[0].length);
+        const [, k, v] = a;
+        if (k === 'name') {
+          if (v.startsWith('re:')) {
+            nameRe = parseRe(v);
+          } else {
+            exact = v.endsWith('s');
+            name = norm(JSON.parse(exact ? v.slice(0, -1) : v));
+          }
+        } else if (k === 'include-hidden') {
+          includeHidden = v === 'true';
+        } else if (k === 'level') {
+          const wantLevel = Number(v);
+          checks.push((el) => levelOf(el) === wantLevel);
+        } else if (k === 'disabled') {
+          const wantDisabled = v === 'true';
+          checks.push((el) => isDisabledEl(el) === wantDisabled);
+        } else if (k === 'checked') {
+          const wantChecked = v === 'true';
+          checks.push((el) => isCheckedEl(el) === wantChecked);
+        } else if (k === 'selected') {
+          const wantSelected = v === 'true';
+          checks.push((el) => isSelectedEl(el) === wantSelected);
+        } else if (k === 'expanded') {
+          const wantExpanded = v === 'true';
+          checks.push((el) => isExpandedEl(el) === wantExpanded);
+        } else if (k === 'pressed') {
+          const wantPressed = v === 'true';
+          checks.push((el) => isPressedEl(el) === wantPressed);
+        } else {
+          throw new SyntaxError('unknown role attribute ' + k);
+        }
+      }
       const nameOk = (n) =>
-        name === null || (exact ? n === name : n.toLowerCase().includes(name.toLowerCase()));
-      return pick([...root.querySelectorAll('*')], (el) => roleOf(el) === want && rendered(el) && nameOk(nameOf(el)), first);
+        nameRe
+          ? nameRe.test(n)
+          : name === null || (exact ? n === name : n.toLowerCase().includes(name.toLowerCase()));
+      return pick(
+        [...root.querySelectorAll('*')],
+        (el) => roleOf(el) === want && (includeHidden || rendered(el)) && checks.every((fn) => fn(el)) && nameOk(nameOf(el, includeHidden)),
+        first,
+      );
+    },
+    xpath: (body, root, first) => {
+      const expr = root !== document && body.startsWith('/') ? '.' + body : body;
+      let snap;
+      try {
+        snap = document.evaluate(expr, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      } catch (e) {
+        throw new SyntaxError('invalid xpath ' + body + ': ' + e.message);
+      }
+      const out = [];
+      for (let i = 0; i < snap.snapshotLength; i++) {
+        const node = snap.snapshotItem(i);
+        if (node && node.nodeType === Node.ELEMENT_NODE) {
+          out.push(node);
+          if (first) break;
+        }
+      }
+      return out;
     },
     // <label> (for= or wrapping), aria-labelledby or aria-label, as in Playwright's getByLabel.
     label: (body, root, first) => {
@@ -215,34 +284,115 @@
       return pick([...root.querySelectorAll('[data-testid]')], (el) => el.getAttribute('data-testid') === id, first);
     },
   };
+  function parseRe(body) {
+    const m = /^re:("(?:[^"\\]|\\.)*"),("(?:[^"\\]|\\.)*")$/.exec(body);
+    if (!m) throw new SyntaxError('invalid regex selector: ' + body);
+    return new RegExp(JSON.parse(m[1]), JSON.parse(m[2]).replace(/[gy]/g, ''));
+  }
+  function ariaBool(el, attr) {
+    const v = el.getAttribute(attr);
+    return v === null ? null : v.toLowerCase();
+  }
+  function isDisabledEl(el) {
+    if (el.matches(':disabled')) return true;
+    for (let cur = el; cur && cur.nodeType === 1; cur = cur.parentElement) {
+      const v = cur.getAttribute('aria-disabled');
+      if (v !== null) return v.toLowerCase() === 'true';
+    }
+    return false;
+  }
+  function isCheckedEl(el) {
+    if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
+      return el.indeterminate ? 'mixed' : !!el.checked;
+    }
+    const v = ariaBool(el, 'aria-checked');
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    if (v === 'mixed') return 'mixed';
+    return /^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(roleOf(el)) ? false : null;
+  }
+  function isSelectedEl(el) {
+    if (el.tagName === 'OPTION') return !!el.selected;
+    const v = ariaBool(el, 'aria-selected');
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    return /^(gridcell|option|row|tab)$/.test(roleOf(el)) ? false : null;
+  }
+  function isExpandedEl(el) {
+    const v = ariaBool(el, 'aria-expanded');
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    return el.tagName === 'DETAILS' ? !!el.open : null;
+  }
+  function isPressedEl(el) {
+    const v = ariaBool(el, 'aria-pressed');
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    if (v === 'mixed') return 'mixed';
+    return null;
+  }
+  function levelOf(el) {
+    const v = el.getAttribute('aria-level');
+    if (v !== null) {
+      const n = Number(v);
+      if (Number.isInteger(n) && n >= 1) return n;
+    }
+    const hm = /^H([1-6])$/.exec(el.tagName);
+    return hm ? Number(hm[1]) : null;
+  }
+  const describeEl = (el) => {
+    const html = el.outerHTML || ('<' + el.tagName.toLowerCase() + '>');
+    const idx = html.indexOf('>');
+    const head = idx >= 0 ? html.slice(0, idx + 1) : html;
+    return head.length > 80 ? head.slice(0, 77) + '...' : head;
+  };
+  const strictViolation = (s, list) =>
+    `strict mode violation: ${s} resolved to ${list.length} elements:\n` +
+    list.slice(0, 10).map((e, i) => `    ${i + 1}) ${describeEl(e)}`).join('\n');
   const inOrder = (els) =>
     [...new Set(els)].sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
   // Throws SyntaxError on a malformed selector (caught below).
-  const find = () => {
-    const parts = split(sel);
-    let found = null; // null until the first part searched the document
+  const findAll = (selStr, docRoot, limitOne) => {
+    const parts = split(selStr);
+    let found = null; // null until the first part searched docRoot
     parts.forEach((part, i) => {
-      const m = /^(css|text|role|label|placeholder|alt|title|testid|nth|has-text)=([\s\S]*)$/.exec(part);
-      const [engine, body] = m ? [m[1], m[2]] : ['css', part];
-      if ((engine === 'nth' || engine === 'has-text') && found === null) {
+      const m = /^(css|xpath|text|role|label|placeholder|alt|title|testid|nth|has-text|has-not-text|has|has-not|and|or)=([\s\S]*)$/.exec(part);
+      const [engine, body] = m
+        ? [m[1], m[2]]
+        : part.startsWith('//') || part.startsWith('..')
+          ? ['xpath', part]
+          : ['css', part];
+      if ((engine === 'nth' || engine === 'has-text' || engine === 'has-not-text' || engine === 'has' || engine === 'has-not' || engine === 'and' || engine === 'or') && found === null) {
         throw new SyntaxError(engine + '= needs a selector before it');
       }
       if (engine === 'nth') {
         const n = Number(body);
         if (!Number.isInteger(n)) throw new SyntaxError('nth= expects an integer, got ' + body);
         found = [found[n < 0 ? found.length + n : n]].filter(Boolean);
-      } else if (engine === 'has-text') {
+      } else if (engine === 'has-text' || engine === 'has-not-text') {
         const t = matcher(body);
-        found = found.filter((el) => t.has(norm(shownText(el))));
+        const want = engine === 'has-text';
+        found = found.filter((el) => t.has(norm(shownText(el))) === want);
+      } else if (engine === 'has' || engine === 'has-not') {
+        const sub = JSON.parse(body);
+        const want = engine === 'has';
+        found = found.filter((el) => (findAll(sub, el, true).length > 0) === want);
+      } else if (engine === 'and') {
+        const sub = JSON.parse(body);
+        const other = new Set(findAll(sub, docRoot, false));
+        found = found.filter((el) => other.has(el));
+      } else if (engine === 'or') {
+        const sub = JSON.parse(body);
+        found = inOrder([...found, ...findAll(sub, docRoot, false)]);
       } else {
-        // Only the last part may stop at its first match: later parts need them all.
-        const first = i === parts.length - 1;
+        // Only the last part may stop at its first match when strict/bulk don't need them all.
+        const first = limitOne && i === parts.length - 1;
         found = found === null
-          ? engines[engine](body, document, first)
+          ? engines[engine](body, docRoot, first)
           : inOrder(found.flatMap((root) => engines[engine](body, root, first)));
       }
     });
-    return found[0] || null;
+    return found || [];
   };
 
   // fill() steps act on the element the click just checked, not a fresh match: the page may
@@ -274,15 +424,74 @@
     return { ok: true };
   }
 
-  let el;
+  let matches;
+  const strict = !!(arg && arg.strict);
+  const bulk = mode === 'count' || mode === 'all_text_contents' || mode === 'all_inner_texts';
   try {
-    el = find();
+    matches = [...new Set(findAll(sel, document, !strict && !bulk))];
   } catch (e) {
     return { ok: false, fatal: true, reason: 'invalid selector: ' + e.message };
   }
+  if (mode === 'count') return { ok: true, count: matches.length };
+  if (mode === 'all_text_contents') return { ok: true, texts: matches.map((e) => e.textContent ?? '') };
+  if (mode === 'all_inner_texts') {
+    return { ok: true, texts: matches.map((e) => (e instanceof HTMLElement ? e.innerText : e.textContent) ?? '') };
+  }
+  if (strict && matches.length > 1) {
+    return { ok: false, fatal: true, reason: strictViolation(sel, matches) };
+  }
+  if (mode === 'is_visible') {
+    return { ok: true, visible: matches.length === 1 && matches[0].isConnected && visible(matches[0]) };
+  }
+  const el = matches[0] || null;
   if (!el) return { ok: false, reason: 'no element matches selector' };
   if (mode === 'element') return el; // as a remote object, for locator.evaluate
   if (mode === 'attached') return { ok: true, text: el.textContent };
+  if (mode === 'inner_text') {
+    return { ok: true, text: (el instanceof HTMLElement ? el.innerText : el.textContent) ?? '' };
+  }
+  if (mode === 'inner_html') return { ok: true, html: el.innerHTML };
+  if (mode === 'input_value') {
+    if (!/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) {
+      return { ok: false, fatal: true, reason: 'element is not an <input>, <textarea> or <select> element' };
+    }
+    return { ok: true, value: el.value };
+  }
+  if (mode === 'get_attribute') {
+    const name = arg && arg.name;
+    return { ok: true, value: el.hasAttribute(name) ? el.getAttribute(name) : null };
+  }
+  if (mode === 'is_enabled') return { ok: true, enabled: !isDisabledEl(el) };
+  if (mode === 'is_checked') {
+    const v = isCheckedEl(el);
+    if (v === null) {
+      return { ok: false, fatal: true, reason: 'element is not a checkbox, radio button or switch' };
+    }
+    return { ok: true, checked: v === true };
+  }
+  if (mode === 'is_editable') {
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+      return {
+        ok: true,
+        editable: !el.readOnly && !isDisabledEl(el) && ariaBool(el, 'aria-readonly') !== 'true',
+      };
+    }
+    if (el.tagName === 'SELECT') {
+      return { ok: true, editable: !isDisabledEl(el) && ariaBool(el, 'aria-readonly') !== 'true' };
+    }
+    if (el.isContentEditable) {
+      return { ok: true, editable: !isDisabledEl(el) && ariaBool(el, 'aria-readonly') !== 'true' };
+    }
+    const r = roleOf(el);
+    if (/^(checkbox|combobox|gridcell|listbox|menuitemcheckbox|menuitemradio|radiogroup|searchbox|slider|spinbutton|switch|textbox)$/.test(r)) {
+      return { ok: true, editable: !isDisabledEl(el) && ariaBool(el, 'aria-readonly') !== 'true' };
+    }
+    return {
+      ok: false,
+      fatal: true,
+      reason: 'element is not an <input>, <textarea>, <select> or [contenteditable]',
+    };
+  }
   if (mode === 'focus') {
     el.focus();
     return { ok: true };
