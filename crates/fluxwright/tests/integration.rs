@@ -2897,21 +2897,31 @@ async fn api_request_cookies_and_indexeddb() {
                 return await new Promise((resolve, reject) => {
                     const req = indexedDB.open('authDb', 2);
                     req.onsuccess = () => {
-                        const db = req.result;
-                        const tx = db.transaction(['tokens', 'kv'], 'readonly');
-                        const r1 = tx.objectStore('tokens').get('u1');
-                        const r2 = tx.objectStore('kv').get('stamp');
-                        tx.oncomplete = () => {
-                            const out = {
-                                ls: localStorage.getItem('lsKey'),
-                                token: r1.result && r1.result.token,
-                                hasDate: r2.result && (r2.result.when instanceof Date) && r2.result.when.toISOString(),
-                                idx: Array.from(tx.objectStore('tokens').indexNames),
+                        try {
+                            const db = req.result;
+                            const tx = db.transaction(['tokens', 'kv'], 'readonly');
+                            const tokStore = tx.objectStore('tokens');
+                            const idx = Array.from(tokStore.indexNames);
+                            const r1 = tokStore.get('u1');
+                            const r2 = tx.objectStore('kv').get('stamp');
+                            tx.oncomplete = () => {
+                                try {
+                                    const out = {
+                                        ls: localStorage.getItem('lsKey'),
+                                        token: r1.result && r1.result.token,
+                                        hasDate: r2.result && (r2.result.when instanceof Date) && r2.result.when.toISOString(),
+                                        idx,
+                                    };
+                                    db.close();
+                                    resolve(out);
+                                } catch (e) {
+                                    reject(e);
+                                }
                             };
-                            db.close();
-                            resolve(out);
-                        };
-                        tx.onerror = () => reject(tx.error);
+                            tx.onerror = () => reject(tx.error);
+                        } catch (e) {
+                            reject(e);
+                        }
                     };
                     req.onerror = () => reject(req.error);
                 });
