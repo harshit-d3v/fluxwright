@@ -1907,7 +1907,7 @@ impl<'a> Locator<'a> {
 
     pub async fn all(&self) -> Result<Vec<Locator<'a>>> {
         let n = self.count().await?;
-        Ok((0..n).map(|i| self.nth(i as isize)).collect())
+        Ok((0..n).map(|i| self.nth(i as i32)).collect())
     }
 
     pub async fn all_text_contents(&self) -> Result<Vec<String>> {
