@@ -157,12 +157,20 @@ export async function typed(): Promise<void> {
     ;(window as any).__ctxArg = n
   }, 7)
   await context.exposeFunction('ctxAdd', (a: number, b: number) => a + b)
+  const cdp = await context.newCDPSession(only)
+  cdp.on('Runtime.consoleAPICalled', (ev) => void ev)
+  const cdpEval: unknown = await cdp.send('Runtime.evaluate', { expression: '1 + 1', returnByValue: true })
+  await cdp.detach()
+  if (byName) {
+    const fcdp = await context.newCDPSession(byName)
+    await fcdp.detach()
+  }
   await only.addInitScript({ path: 'init.js' })
   await only.exposeFunction('pageEcho', async (x: string) => x)
   await only.addScriptTag({ content: 'window.__tag = 1', type: 'module' })
   await only.addStyleTag({ content: 'body { color: red; }' })
   const cookies: { name: string }[] = await context.cookies()
-  void [closed, currentUrl, wf1, wf2, wf3, cookies, context.pages().length, context.browser()]
+  void [closed, currentUrl, wf1, wf2, wf3, cookies, cdpEval, context.pages().length, context.browser()]
   await context.close()
   await browser.close()
 }

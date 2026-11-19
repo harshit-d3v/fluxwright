@@ -1000,6 +1000,42 @@ try {
       assert.match(await cross.content(), /clicked-cross/)
       assert.equal(await cross.evaluate((x) => x + 10, 5), 15)
 
+      const otherCtx = await browser.newContext()
+      try {
+        await assert.rejects(() => otherCtx.newCDPSession(opener), /belong to this context/)
+      } finally {
+        await otherCtx.close()
+      }
+      const cdp = await ctx.newCDPSession(opener)
+      const consolePromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timed out waiting for CDP console event')), 5000)
+        cdp.on('Runtime.consoleAPICalled', (ev) => {
+          if (ev?.args?.[0]?.value === 'cdp-node') {
+            clearTimeout(timer)
+            resolve(ev)
+          }
+        })
+      })
+      await cdp.send('Runtime.enable')
+      const evalRes = await cdp.send('Runtime.evaluate', {
+        expression: "console.log('cdp-node'); 6 * 7",
+        returnByValue: true,
+      })
+      assert.equal(evalRes.result.value, 42)
+      await consolePromise
+      await cdp.detach()
+      await assert.rejects(() => cdp.send('Runtime.evaluate', { expression: '1' }))
+      assert.equal(await opener.evaluate(() => 3 + 4), 7)
+
+      await assert.rejects(() => ctx.newCDPSession(same), /separate CDP session/)
+      const crossCdp = await ctx.newCDPSession(cross)
+      const crossEval = await crossCdp.send('Runtime.evaluate', {
+        expression: "document.getElementById('cb').textContent",
+        returnByValue: true,
+      })
+      assert.equal(crossEval.result.value, 'clicked-cross')
+      await crossCdp.detach()
+
       await same.goto('/same-next')
       assert.equal(await same.locator('#sn').innerText(), 'navigated-same')
 
