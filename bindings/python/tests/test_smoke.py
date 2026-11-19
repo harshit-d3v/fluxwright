@@ -1386,6 +1386,8 @@ def test_multi_tab_popups_and_frames(base):
                     raise AssertionError("sync frames did not load")
                 cross = opener.frame("cross-fr")
                 assert cross is not None
+                cross.locator("#cb").wait_for()
+                cross.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
                 cross.locator("#cb").click()
                 assert cross.locator("#cb").inner_text() == "clicked-cross"
                 assert cross.evaluate("(x) => x * 2", 7) == 14
