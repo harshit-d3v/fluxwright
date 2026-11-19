@@ -240,6 +240,13 @@ export declare class Page {
   _keyboardType(text: string, delay?: number | undefined | null): Promise<void>
   _keyboardInsertText(text: string): Promise<void>
   _touchscreenTap(x: number, y: number): Promise<void>
+  _addInitScript(source: string): Promise<void>
+  _addScriptTag(url?: string | undefined | null, content?: string | undefined | null, scriptType?: string | undefined | null): Promise<void>
+  _addStyleTag(url?: string | undefined | null, content?: string | undefined | null): Promise<void>
+  _onBinding(handler: (arg: BindingCallEvent) => void): void
+  _exposeBinding(name: string): Promise<void>
+  _resolveBinding(id: number, valueJson: string): Promise<void>
+  _rejectBinding(id: number, message: string): Promise<void>
 }
 
 /**
@@ -259,6 +266,12 @@ export declare class PendingDialog {
 export interface ActionPoint {
   x: number
   y: number
+}
+
+export interface BindingCallEvent {
+  id: number
+  name: string
+  argsJson: string
 }
 
 /** CSS pixels, relative to the top-level page's viewport. */

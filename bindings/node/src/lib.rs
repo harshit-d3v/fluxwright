@@ -30,6 +30,7 @@ pub struct Page {
     /// The JavaScript route dispatcher, once `page.route` was called.
     routes: Arc<std::sync::Mutex<Option<Arc<Callback<InterceptedRoute>>>>>,
     file_choosers: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::FileChooser>)>>,
+    bindings: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::BindingCall>)>>,
     url: tokio::sync::watch::Receiver<String>,
 }
 
@@ -332,6 +333,13 @@ impl PendingDialog {
 pub struct FileChooserEvent {
     pub id: u32,
     pub is_multiple: bool,
+}
+
+#[napi(object)]
+pub struct BindingCallEvent {
+    pub id: u32,
+    pub name: String,
+    pub args_json: String,
 }
 
 /// One console message or uncaught error, for `page.on`.
@@ -1613,6 +1621,7 @@ impl Browser {
             lease: Arc::new(PageSlot { page: RwLock::new(Some(lease)), closing: tokio::sync::watch::Sender::new(false) }),
             routes: Default::default(),
             file_choosers: Default::default(),
+            bindings: Default::default(),
             url,
         })
     }
@@ -1985,6 +1994,7 @@ impl Page {
         // The route callback keeps the JS dispatcher and its handlers: free them now.
         self.routes.lock().unwrap().take();
         self.file_choosers.lock().unwrap().1.clear();
+        self.bindings.lock().unwrap().1.clear();
         // Calls still running give up now (see `with_page`), so the write lock comes at once.
         self.lease.closing.send_replace(true);
         let slot = self.lease.clone();
@@ -2211,6 +2221,84 @@ impl Page {
         })
         .await
     }
+
+    #[napi(js_name = "_addInitScript")]
+    pub async fn add_init_script(&self, source: String) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.add_init_script(&source).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_addScriptTag")]
+    pub async fn add_script_tag(
+        &self,
+        url: Option<String>,
+        content: Option<String>,
+        script_type: Option<String>,
+    ) -> Result<()> {
+        let opts = fluxwright::ScriptTagOptions { url, content, script_type };
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.add_script_tag(&opts).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_addStyleTag")]
+    pub async fn add_style_tag(&self, url: Option<String>, content: Option<String>) -> Result<()> {
+        let opts = fluxwright::StyleTagOptions { url, content };
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.add_style_tag(&opts).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_onBinding")]
+    pub fn on_binding(&self, handler: Function<BindingCallEvent, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
+        let mut rx = self.now(|p| p.subscribe_bindings())?;
+        let store = self.bindings.clone();
+        RT.spawn(async move {
+            while let Some(call) = rx.recv().await {
+                let name = call.name.clone();
+                let args_json = serde_json::to_string(&call.args).unwrap_or_else(|_| "[]".into());
+                let id = {
+                    let mut g = store.lock().unwrap();
+                    g.0 = g.0.wrapping_add(1);
+                    if g.1.len() >= 256 {
+                        if let Some(&oldest) = g.1.keys().min() {
+                            g.1.remove(&oldest);
+                        }
+                    }
+                    let id = g.0;
+                    g.1.insert(id, call);
+                    id
+                };
+                tsfn.call(BindingCallEvent { id, name, args_json }, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    #[napi(js_name = "_exposeBinding")]
+    pub async fn expose_binding(&self, name: String) -> Result<()> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.expose_binding(&name).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_resolveBinding")]
+    pub async fn resolve_binding(&self, id: u32, value_json: String) -> Result<()> {
+        let value: serde_json::Value = serde_json::from_str(&value_json)
+            .map_err(|e| Error::from_reason(format!("resolveBinding invalid JSON: {e}")))?;
+        self.finish_binding(id, Ok(value)).await
+    }
+
+    #[napi(js_name = "_rejectBinding")]
+    pub async fn reject_binding(&self, id: u32, message: String) -> Result<()> {
+        self.finish_binding(id, Err(message)).await
+    }
 }
 
 impl Page {
@@ -2246,6 +2334,26 @@ impl Page {
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(Error::from_reason)
+    }
+
+    async fn finish_binding(&self, id: u32, outcome: std::result::Result<serde_json::Value, String>) -> Result<()> {
+        let call = self
+            .bindings
+            .lock()
+            .unwrap()
+            .1
+            .remove(&id)
+            .ok_or_else(|| Error::from_reason("binding call is no longer available"))?;
+        RT.spawn(async move {
+            let res = match outcome {
+                Ok(v) => call.resolve(&v).await,
+                Err(msg) => call.reject(&msg).await,
+            };
+            res.map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| Error::from_reason(e.to_string()))?
+        .map_err(Error::from_reason)
     }
 
     /// Runs `f` on the page at once, for subscriptions, which must be in place when they return;

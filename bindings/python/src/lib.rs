@@ -2331,6 +2331,62 @@ impl Page {
             Box::pin(async move { p.clear_cookies().await.map(none) })
         })
     }
+
+    #[pyo3(name = "_add_init_script")]
+    fn add_init_script<'py>(&self, py: Python<'py>, source: String) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.add_init_script(&source).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_add_script_tag", signature = (*, url=None, content=None, script_type=None))]
+    fn add_script_tag<'py>(
+        &self,
+        py: Python<'py>,
+        url: Option<String>,
+        content: Option<String>,
+        script_type: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move {
+                p.add_script_tag(&fluxwright::ScriptTagOptions {
+                    url,
+                    content,
+                    script_type,
+                })
+                .await
+                .map(none)
+            })
+        })
+    }
+
+    #[pyo3(name = "_add_style_tag", signature = (*, url=None, content=None))]
+    fn add_style_tag<'py>(
+        &self,
+        py: Python<'py>,
+        url: Option<String>,
+        content: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move {
+                p.add_style_tag(&fluxwright::StyleTagOptions { url, content })
+                    .await
+                    .map(none)
+            })
+        })
+    }
+
+    #[pyo3(name = "_binding_calls")]
+    fn binding_calls(&self) -> PyResult<BindingStream> {
+        self.now(|p| BindingStream(Arc::new(Mutex::new(p.subscribe_bindings()))))
+    }
+
+    #[pyo3(name = "_expose_binding")]
+    fn expose_binding<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.expose_binding(&name).await.map(none) })
+        })
+    }
 }
 
 impl Page {
@@ -3495,6 +3551,76 @@ impl FileChooserStream {
     }
 }
 
+/// An exposed-binding invocation waiting for its Python callback's outcome.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct BindingCall {
+    inner: Arc<Mutex<Option<fluxwright::BindingCall>>>,
+    name: String,
+    args_json: String,
+}
+
+impl BindingCall {
+    fn new(call: fluxwright::BindingCall) -> Self {
+        let name = call.name.clone();
+        let args_json = serde_json::to_string(&call.args).unwrap_or_else(|_| "[]".into());
+        Self {
+            inner: Arc::new(Mutex::new(Some(call))),
+            name,
+            args_json,
+        }
+    }
+}
+
+#[pymethods]
+impl BindingCall {
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[getter]
+    fn args_json(&self) -> &str {
+        &self.args_json
+    }
+
+    fn resolve<'py>(&self, py: Python<'py>, value_json: String) -> PyResult<Bound<'py, PyAny>> {
+        let value: serde_json::Value = serde_json::from_str(&value_json)
+            .map_err(|e| PyValueError::new_err(format!("resolve binding: invalid JSON: {e}")))?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let Some(call) = inner.lock().await.take() else {
+                return Ok(none(()));
+            };
+            call.resolve(&value).await.map(none).map_err(error)
+        })
+    }
+
+    fn reject<'py>(&self, py: Python<'py>, message: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let Some(call) = inner.lock().await.take() else {
+                return Ok(none(()));
+            };
+            call.reject(&message).await.map(none).map_err(error)
+        })
+    }
+}
+
+/// Exposed-binding calls on this page, in order.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct BindingStream(Arc<Mutex<UnboundedReceiver<fluxwright::BindingCall>>>);
+
+#[pymethods]
+impl BindingStream {
+    /// The next binding call, or `None` once the page closed.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx.lock().await.recv().await.map(BindingCall::new))
+        })
+    }
+}
+
 /// Requests `page.route` intercepted, in order.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct RouteStream(Arc<Mutex<UnboundedReceiver<fluxwright::InterceptedRequest>>>);
@@ -3651,6 +3777,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DialogStream>()?;
     m.add_class::<FileChooser>()?;
     m.add_class::<FileChooserStream>()?;
+    m.add_class::<BindingCall>()?;
+    m.add_class::<BindingStream>()?;
     m.py().import("atexit")?.call_method1("register", (wrap_pyfunction!(wait_for_hand_overs, m)?,))?;
     Ok(())
 }
