@@ -2472,10 +2472,9 @@ async fn multi_tab_popups_and_frames() {
     let base = format!("http://127.0.0.1:{port}");
 
     let eng = engine(1, 2).await;
-    let ctx = eng
-        .acquire_context_with(&JobOptions::default().locale("fr-FR").base_url(&base))
-        .await
-        .unwrap();
+    let mut opts = JobOptions::default().locale("fr-FR");
+    opts.base_url = Some(base.clone());
+    let ctx = eng.acquire_context_with(&opts).await.unwrap();
 
     // Context-wide init script and exposed function reach all tabs and popups.
     ctx.add_init_script("window.__ctxInit = 'shared-init';")
@@ -2509,7 +2508,7 @@ async fn multi_tab_popups_and_frames() {
                     })
                     .await;
             } else {
-                let _ = req.continue_(fluxwright::Overrides::default()).await;
+                let _ = req.continue_with(fluxwright::Overrides::default()).await;
             }
         }
     });
