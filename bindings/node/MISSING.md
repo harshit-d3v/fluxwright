@@ -11,9 +11,9 @@ The Node binding covers the same page API as the Rust crate. Some Playwright fea
 
 napi would silently ignore an option the binding does not implement, so it throws a TypeError instead. The main ones:
 
-- A per-call `timeout` on `title`, `content`, `evaluate`, `pdf` and `setViewportSize` (Playwright has none there either); `goto`, `click`, `fill`, `waitForSelector`, `screenshot` and the locator actions take one
+- A per-call `timeout` on `title`, `content`, `evaluate`, `pdf` and `setViewportSize` (Playwright has none there either); `goto`, `click`, `dblclick`, `hover`, `focus`, `blur`, `scrollIntoViewIfNeeded`, `dragTo`, `dragAndDrop`, `fill`, `press`, `pressSequentially`, `clear`, `check`, `uncheck`, `setChecked`, `selectOption`, `setInputFiles`, `tap`, `waitForSelector`, `waitForFileChooser`, `screenshot` and the locator actions take one
 - `waitForSelector` and `locator.waitFor` with `strict`
-- Click and fill options (`button`, `clickCount`, `modifiers`, `position`, `force`, ...)
+- Pointer/input options beyond the implemented subset (`noWaitAfter`, `sourcePosition` / `targetPosition` on `dragTo` / `dragAndDrop`)
 - Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and WebP (see `docs/DECISIONS.md`)
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)
 - `newPage` / `newContext` options the README does not list (`recordVideo`, ...), and `launch` options other than the supported ones (`args`; for `proxy`, give `newPage` one)

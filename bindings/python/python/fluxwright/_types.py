@@ -55,3 +55,14 @@ class PdfMargins(TypedDict, total=False):
 class HttpCredentials(TypedDict):
     username: str
     password: str
+
+
+class Position(TypedDict):
+    x: float
+    y: float
+
+
+class FilePayload(TypedDict):
+    name: str
+    mimeType: str
+    buffer: bytes

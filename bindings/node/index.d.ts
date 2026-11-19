@@ -57,8 +57,26 @@ export declare class InterceptedRoute {
 export declare class Locator {
   /** This locator with `timeout` (milliseconds; 0 for none) for its actions. */
   _withTimeout(timeout: number): Locator
-  click(): Promise<void>
+  click(options?: ClickActionOptions | undefined | null): Promise<void>
+  dblclick(options?: ClickActionOptions | undefined | null): Promise<void>
+  hover(options?: HoverActionOptions | undefined | null): Promise<void>
+  focus(): Promise<void>
+  blur(): Promise<void>
+  scrollIntoViewIfNeeded(): Promise<void>
+  _frames(): Array<string>
+  _query(): string
+  _dragTo(frames: Array<string>, query: string, force?: boolean | undefined | null): Promise<void>
   fill(value: string): Promise<void>
+  press(key: string, delay?: number | undefined | null): Promise<void>
+  pressSequentially(text: string, delay?: number | undefined | null): Promise<void>
+  clear(force?: boolean | undefined | null): Promise<void>
+  check(options?: CheckActionOptions | undefined | null): Promise<void>
+  uncheck(options?: CheckActionOptions | undefined | null): Promise<void>
+  setChecked(checked: boolean, options?: CheckActionOptions | undefined | null): Promise<void>
+  selectOption(items: Array<SelectOptionItem>, force?: boolean | undefined | null): Promise<Array<string>>
+  _setInputPaths(paths: Array<string>): Promise<void>
+  _setInputPayloads(files: Array<FilePayloadInput>): Promise<void>
+  tap(options?: HoverActionOptions | undefined | null): Promise<void>
   /** Waits until `state`: attached, detached, visible (the default) or hidden. */
   waitFor(state?: string | undefined | null): Promise<void>
   textContent(): Promise<string | null>
@@ -174,6 +192,21 @@ export declare class Page {
   _addCookies(cookies: Array<Cookie>): Promise<void>
   _clearCookies(): Promise<void>
   _emulateMedia(media?: string | undefined | null, colorScheme?: string | undefined | null): Promise<void>
+  _onFileChooser(handler: (arg: FileChooserEvent) => void): void
+  _setFileChooserPaths(id: number, paths: Array<string>, timeout?: number | undefined | null): Promise<void>
+  _setFileChooserPayloads(id: number, files: Array<FilePayloadInput>, timeout?: number | undefined | null): Promise<void>
+  _mouseMove(x: number, y: number, steps?: number | undefined | null): Promise<void>
+  _mouseDown(button?: string | undefined | null, clickCount?: number | undefined | null): Promise<void>
+  _mouseUp(button?: string | undefined | null, clickCount?: number | undefined | null): Promise<void>
+  _mouseClick(x: number, y: number, button?: string | undefined | null, clickCount?: number | undefined | null, delay?: number | undefined | null): Promise<void>
+  _mouseDblclick(x: number, y: number, button?: string | undefined | null, delay?: number | undefined | null): Promise<void>
+  _mouseWheel(deltaX: number, deltaY: number): Promise<void>
+  _keyboardDown(key: string): Promise<void>
+  _keyboardUp(key: string): Promise<void>
+  _keyboardPress(key: string, delay?: number | undefined | null): Promise<void>
+  _keyboardType(text: string, delay?: number | undefined | null): Promise<void>
+  _keyboardInsertText(text: string): Promise<void>
+  _touchscreenTap(x: number, y: number): Promise<void>
 }
 
 /**
@@ -190,12 +223,35 @@ export declare class PendingDialog {
   dismiss(): Promise<void>
 }
 
+export interface ActionPoint {
+  x: number
+  y: number
+}
+
 /** CSS pixels, relative to the top-level page's viewport. */
 export interface BoundingBox {
   x: number
   y: number
   width: number
   height: number
+}
+
+export interface CheckActionOptions {
+  position?: ActionPoint
+  force?: boolean
+  trial?: boolean
+  timeout?: number
+}
+
+export interface ClickActionOptions {
+  button?: 'left' | 'right' | 'middle'
+  clickCount?: number
+  delay?: number
+  position?: ActionPoint
+  modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'>
+  force?: boolean
+  trial?: boolean
+  timeout?: number
 }
 
 export interface ConsoleMessage {
@@ -235,6 +291,17 @@ export interface DownloadInfo {
   path: string
 }
 
+export interface FileChooserEvent {
+  id: number
+  isMultiple: boolean
+}
+
+export interface FilePayloadInput {
+  name: string
+  mimeType: string
+  buffer: Buffer
+}
+
 export interface FilterOptions {
   /** Case-insensitive substring of the element's text. */
   hasText?: string
@@ -268,6 +335,14 @@ export interface GotoOptions {
   /** Default "load". */
   waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit'
   /** Milliseconds; 0 for no timeout. Default: the page's or the engine's navigation timeout. */
+  timeout?: number
+}
+
+export interface HoverActionOptions {
+  position?: ActionPoint
+  modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'>
+  force?: boolean
+  trial?: boolean
   timeout?: number
 }
 
@@ -437,6 +512,12 @@ export interface ScreenshotOptions {
   omitBackground?: boolean
   /** Milliseconds; 0 for no timeout. Default: the page's or the engine's action timeout. */
   timeout?: number
+}
+
+export interface SelectOptionItem {
+  value?: string
+  label?: string
+  index?: number
 }
 
 export interface StorageItem {

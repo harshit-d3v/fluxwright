@@ -1,4 +1,4 @@
-# HTTP server mode (unreleased)
+# HTTP server mode
 
 One HTTP service owns one Fluxwright fleet. Clients submit JSON steps, get a job ID immediately,
 then poll for results or cancel the job. No Node or Python binding is required on the client.
@@ -169,8 +169,17 @@ failed job returns **409**.
 | Action | Fields | Result |
 |---|---|---|
 | `goto` | `url`, optional `wait_until` | `null` |
-| `click` | `selector` | `null` |
+| `click` | `selector`, optional `button` (`"left"` \| `"right"` \| `"middle"`), `click_count`, `delay_ms`, `position` (`{ x, y }`), `modifiers` (`["Alt" \| "Control" \| "Meta" \| "Shift" \| "ControlOrMeta"]`), `force`, `trial` | `null` |
+| `dblclick` | `selector`, optional `button`, `delay_ms`, `position`, `modifiers`, `force`, `trial` | `null` |
+| `hover` | `selector`, optional `position`, `modifiers`, `force`, `trial` | `null` |
+| `focus` / `blur` | `selector` | `null` |
+| `press` | `selector`, `key`, optional `delay_ms` | `null` |
+| `type` | `selector`, `text`, optional `delay_ms` | `null` |
+| `clear` | `selector`, optional `force` | `null` |
 | `fill` | `selector`, `value` | `null` |
+| `check` / `uncheck` | `selector`, optional `position`, `force`, `trial` | `null` |
+| `select_option` | `selector`, `values` (string, `{ value \| label \| index }`, or array), optional `force` | Array of selected option values |
+| `tap` | `selector`, optional `position`, `modifiers`, `force`, `trial` | `null` |
 | `wait_for_selector` | `selector` | `null` |
 | `text_content` | `selector` | String or `null` |
 | `evaluate` | `expression` | JSON value, evaluated in the page, **not** on the host |

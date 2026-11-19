@@ -1,10 +1,10 @@
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 
 from ._errors import Error
-from ._types import FloatRect, PdfMargins
+from ._types import FilePayload, FloatRect, PdfMargins, Position
 
 _Path = str | PathLike[str]
 
@@ -61,10 +61,116 @@ class Page:
         """The timeout in milliseconds for this page's ``goto`` from now on; 0 for none."""
     def title(self) -> Awaitable[str]: ...
     def content(self) -> Awaitable[str]: ...
-    def click(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]:
+    def click(
+        self,
+        selector: str,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]:
         """Scrolls into view and waits until the element is enabled, stable and not covered.
         ``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
+    def dblclick(
+        self,
+        selector: str,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def hover(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def tap(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def focus(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def blur(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def scroll_into_view_if_needed(self, selector: str, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def drag_and_drop(
+        self, source: str, target: str, *, force: bool | None = None, timeout: float | None = None
+    ) -> Awaitable[None]: ...
     def fill(self, selector: str, value: str, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def clear(self, selector: str, *, force: bool | None = None, timeout: float | None = None) -> Awaitable[None]: ...
+    def press(
+        self, selector: str, key: str, *, delay: float | None = None, timeout: float | None = None
+    ) -> Awaitable[None]: ...
+    def press_sequentially(
+        self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None
+    ) -> Awaitable[None]: ...
+    def type(
+        self, selector: str, text: str, *, delay: float | None = None, timeout: float | None = None
+    ) -> Awaitable[None]: ...
+    def check(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def uncheck(
+        self,
+        selector: str,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def set_checked(
+        self,
+        selector: str,
+        checked: bool,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def select_option(
+        self,
+        selector: str,
+        value: str | Sequence[str] | Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+        *,
+        index: int | Sequence[int] | None = None,
+        label: str | Sequence[str] | None = None,
+        element: Any = None,
+        force: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[list[str]]: ...
+    def set_input_files(
+        self,
+        selector: str,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
     def wait_for_selector(
         self,
         selector: str,
@@ -136,6 +242,38 @@ class Page:
     def _logs(self) -> LogStream: ...
     def _network(self) -> NetworkStream: ...
     def _dialogs(self) -> DialogStream: ...
+    def _file_choosers(self) -> FileChooserStream: ...
+    def _mouse_move(self, x: float, y: float, *, steps: int | None = None) -> Awaitable[None]: ...
+    def _mouse_down(
+        self, *, button: Literal["left", "right", "middle"] | None = None, click_count: int | None = None
+    ) -> Awaitable[None]: ...
+    def _mouse_up(
+        self, *, button: Literal["left", "right", "middle"] | None = None, click_count: int | None = None
+    ) -> Awaitable[None]: ...
+    def _mouse_click(
+        self,
+        x: float,
+        y: float,
+        *,
+        delay: float | None = None,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+    ) -> Awaitable[None]: ...
+    def _mouse_dblclick(
+        self,
+        x: float,
+        y: float,
+        *,
+        delay: float | None = None,
+        button: Literal["left", "right", "middle"] | None = None,
+    ) -> Awaitable[None]: ...
+    def _mouse_wheel(self, delta_x: float, delta_y: float) -> Awaitable[None]: ...
+    def _keyboard_down(self, key: str) -> Awaitable[None]: ...
+    def _keyboard_up(self, key: str) -> Awaitable[None]: ...
+    def _keyboard_press(self, key: str, *, delay: float | None = None) -> Awaitable[None]: ...
+    def _keyboard_type(self, text: str, *, delay: float | None = None) -> Awaitable[None]: ...
+    def _keyboard_insert_text(self, text: str) -> Awaitable[None]: ...
+    def _touchscreen_tap(self, x: float, y: float) -> Awaitable[None]: ...
     def _intercept(self) -> Awaitable[RouteStream]: ...
     def _emulate_media(self, *, media: str | None = None, color_scheme: str | None = None) -> Awaitable[None]: ...
     def _add_cookies(self, cookies: list[dict[str, Any]]) -> Awaitable[None]: ...
@@ -144,9 +282,100 @@ class Page:
 class Locator:
     """Lazy, like Playwright's: every action runs the query again."""
 
-    def click(self, *, timeout: float | None = None) -> Awaitable[None]:
+    def click(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]:
         """``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
+    def dblclick(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def hover(
+        self,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def tap(
+        self,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def focus(self, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def blur(self, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def drag_to(self, target: Locator, *, force: bool | None = None, timeout: float | None = None) -> Awaitable[None]: ...
     def fill(self, value: str, *, timeout: float | None = None) -> Awaitable[None]: ...
+    def clear(self, *, force: bool | None = None, timeout: float | None = None) -> Awaitable[None]: ...
+    def press(self, key: str, *, delay: float | None = None, timeout: float | None = None) -> Awaitable[None]: ...
+    def press_sequentially(
+        self, text: str, *, delay: float | None = None, timeout: float | None = None
+    ) -> Awaitable[None]: ...
+    def type(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> Awaitable[None]: ...
+    def check(
+        self,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def uncheck(
+        self,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def set_checked(
+        self,
+        checked: bool,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+    def select_option(
+        self,
+        value: str | Sequence[str] | Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+        *,
+        index: int | Sequence[int] | None = None,
+        label: str | Sequence[str] | None = None,
+        element: Any = None,
+        force: bool | None = None,
+        timeout: float | None = None,
+    ) -> Awaitable[list[str]]: ...
+    def set_input_files(
+        self,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
     def wait_for(
         self,
         *,
@@ -281,3 +510,15 @@ class Dialog:
 
 class DialogStream:
     def next(self) -> Awaitable[Dialog | None]: ...
+
+class FileChooser:
+    def is_multiple(self) -> bool: ...
+    def set_files(
+        self,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> Awaitable[None]: ...
+
+class FileChooserStream:
+    def next(self) -> Awaitable[FileChooser | None]: ...

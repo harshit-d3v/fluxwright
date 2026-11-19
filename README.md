@@ -51,7 +51,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. The names are Playwright's, so a Playwright script for these features runs after changing its import. In Node, an option Fluxwright does not implement, such as a click's `button`, throws a TypeError instead of being ignored (new in the next release: 0.6.0 ignored them), so such a script fails loudly at the call rather than quietly doing something else.
+Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. The names are Playwright's, so a Playwright script for these features runs after changing its import. In Node, an option Fluxwright does not implement, such as a click's `noWaitAfter`, throws a TypeError instead of being ignored (0.6.0 ignored unimplemented options), so such a script fails loudly at the call rather than quietly doing something else.
 
 ## What a page can do
 
@@ -59,7 +59,7 @@ Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. T
 |---|---|
 | Navigate | `goto(url, { waitUntil })` with `load` (default), `domcontentloaded`, `networkidle` or `commit`, event-driven like Playwright |
 | Find | `getByRole(role, { name })`, `getByText`, `getByLabel`, `getByPlaceholder`, `getByAltText`, `getByTitle`, `getByTestId`, `locator(css \| "text=…" \| "role=…")`, `frameLocator(iframe)` for same- and cross-origin iframes. Narrow with `nth(i)`, `first()`, `last()`, `filter({ hasText })` and chained getBy… calls |
-| Act | `click()` and `fill()` wait until the element is visible, enabled, stable and not covered; `waitFor()`, `waitForSelector()` |
+| Act | `click()`, `dblclick()`, `hover()`, `tap()`, `focus()`, `blur()`, `scrollIntoViewIfNeeded()`, `dragAndDrop()`, `fill()`, `clear()`, `press()`, `pressSequentially()`, `check()`/`uncheck()`, `selectOption()`, `setInputFiles()`, `page.mouse`/`keyboard`/`touchscreen`, `waitFor()`, `waitForSelector()` |
 | Read | `title()`, `content()`, `textContent()`, `evaluate(fn, arg)` or `evaluate("expression")`, `locator.evaluate((el, arg) => …)`, `locator.boundingBox()` |
 | Capture | `screenshot({ fullPage, path, type, quality, clip, omitBackground })` in PNG or JPEG, `locator.screenshot(...)` (also inside scrolling containers and iframes), `pdf({ format, margin, printBackground, ... })` with Playwright's options (headless), `setViewportSize({ width, height })` |
 | Errors | `consoleMessages()` and `pageErrors()` from the page, its popups and iframes, so a job can fail on JavaScript errors; `page.on('console' \| 'pageerror', handler)` as they happen |
@@ -86,7 +86,7 @@ The full Node API is in [bindings/node/README.md](bindings/node/README.md) and t
 - **Firefox or Safari (WebKit):** Fluxwright drives Chromium only.
 - **End-to-end tests:** Playwright Test gives you a runner, `expect`, fixtures, a trace viewer and a recorder. Fluxwright is an engine, not a test framework.
 - **Java or .NET:** Fluxwright has Node, Python and Rust.
-- **Touch and mobile emulation, request and response events:** not yet. See [MISSING.md](bindings/node/MISSING.md) and the roadmap.
+- **Strict mode, `filter({ has })`, popup events:** not yet. See [MISSING.md](bindings/node/MISSING.md) and the roadmap.
 
 Use Fluxwright when you run many browser jobs, such as scraping, crawling, PDF and screenshot rendering, or automation at volume, and want the fleet handled for you.
 
@@ -137,9 +137,9 @@ Requires Rust 1.95+ and Chrome or Chromium (found on the standard install paths,
 | `fluxwright-cdp` | One connection per browser (DevTools pipe on Linux/macOS, WebSocket on Windows), flat sessions |
 | `fluxwright-core` | Pool, scheduler, memory ceiling, recycling, metrics |
 | `fluxwright` | Public API |
-| `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `benchmark` / `serve` (HTTP, unreleased) |
+| `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `benchmark` / `serve` / `coordinate` |
 | `fluxwright-mcp` | MCP server: open, goto, click, fill, evaluate, screenshot, close |
-| `fluxwright-server` | Authenticated HTTP job API over one local or remote CDP fleet (unreleased) |
+| `fluxwright-server` | Authenticated HTTP job API over one local or remote CDP fleet |
 
 ## MCP server
 
@@ -160,7 +160,7 @@ cargo run -p fluxwright-cli -- doctor
 
 The `start` / `stats` / `browsers` control channel is a Unix socket, or `\\.\pipe\fluxwright` on Windows. Those commands do not listen on TCP.
 
-### HTTP server (unreleased)
+### HTTP server
 
 `fluxwright serve` owns a fleet and accepts JSON browser jobs from any HTTP client. It defaults
 to `127.0.0.1:7331` and requires `FLUXWRIGHT_SERVER_TOKEN` (a random token of 32–256 printable

@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use crate::connection::Connection;
 use crate::error::{Error, Result};
+use crate::input::{canonicalize_local_paths, encode_file_payloads, FileInput};
 
 /// A request the page, one of its frames or popups sent.
 #[derive(Debug, Clone)]
@@ -221,4 +222,110 @@ pub(crate) async fn respond(
     )
     .await
     .map(|_| ())
+}
+
+const FILE_CHOOSER_SET_JS: &str = "function(files) { \
+    const dt = new DataTransfer(); \
+    for (const f of files) { \
+        const bin = atob(f.base64); \
+        const bytes = new Uint8Array(bin.length); \
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); \
+        dt.items.add(new File([bytes], f.name, { type: f.mimeType || '' })); \
+    } \
+    this.files = dt.files; \
+    this.dispatchEvent(new Event('input', { bubbles: true })); \
+    this.dispatchEvent(new Event('change', { bubbles: true })); \
+}";
+
+/// An intercepted file chooser dialog (`page.on('filechooser')`), holding the underlying `<input>` node.
+#[derive(Clone)]
+pub struct FileChooser {
+    pub is_multiple: bool,
+    backend_node_id: Option<i64>,
+    conn: Arc<Connection>,
+    session: String,
+    is_remote: bool,
+}
+
+impl std::fmt::Debug for FileChooser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileChooser")
+            .field("is_multiple", &self.is_multiple)
+            .finish()
+    }
+}
+
+impl FileChooser {
+    pub(crate) fn new(params: &Value, conn: Arc<Connection>, session: String, is_remote: bool) -> Self {
+        Self {
+            is_multiple: params["mode"].as_str() == Some("selectMultiple"),
+            backend_node_id: params["backendNodeId"].as_i64(),
+            conn,
+            session,
+            is_remote,
+        }
+    }
+
+    pub async fn set_files(&self, files: &FileInput, timeout: Duration) -> Result<()> {
+        let Some(backend_node_id) = self.backend_node_id else {
+            return Err(Error::Other("file chooser has no backendNodeId".into()));
+        };
+        if files.len() > 1 && !self.is_multiple {
+            return Err(Error::Other(
+                "non-multiple file input can only accept single file".into(),
+            ));
+        }
+        if let FileInput::Paths(paths) = files {
+            if !self.is_remote && !paths.is_empty() {
+                let strs = canonicalize_local_paths(paths).await?;
+                self.conn
+                    .call(
+                        "DOM.setFileInputFiles",
+                        json!({ "files": strs, "backendNodeId": backend_node_id }),
+                        Some(&self.session),
+                        timeout,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
+        let encoded = encode_file_payloads(files).await?;
+        let resolved = self
+            .conn
+            .call(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend_node_id }),
+                Some(&self.session),
+                timeout,
+            )
+            .await?;
+        let object_id = resolved["object"]["objectId"]
+            .as_str()
+            .ok_or_else(|| Error::Other("file chooser input element went away".into()))?
+            .to_string();
+        let res = self
+            .conn
+            .call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "functionDeclaration": FILE_CHOOSER_SET_JS,
+                    "objectId": object_id,
+                    "arguments": [{ "value": encoded }],
+                    "returnByValue": true
+                }),
+                Some(&self.session),
+                timeout,
+            )
+            .await;
+        let _ = self
+            .conn
+            .call(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&self.session),
+                timeout,
+            )
+            .await;
+        res.map(|_| ())
+    }
 }
