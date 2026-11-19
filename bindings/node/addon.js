@@ -307,6 +307,82 @@ const pagesByTarget = new Map()
 const contextRegistry = new FinalizationRegistry(({ browser, id }) => {
   browser._dropContext(id)
 })
+const frameIds = new WeakMap()
+const cdpSessionRegistry = new FinalizationRegistry(({ page, id }) => {
+  page._cdpDrop(id)
+})
+
+class CDPSession {
+  #page
+  #id
+  #emitter = new EventEmitter()
+  #started = false
+  #detached = false
+
+  constructor(page, id) {
+    this.#page = page
+    this.#id = id
+    this.#emitter.setMaxListeners(0)
+    cdpSessionRegistry.register(this, { page, id }, this)
+  }
+
+  #ensureEvents() {
+    if (this.#started) return
+    this.#started = true
+    const ref = new WeakRef(this)
+    this.#page._cdpOnEvent(this.#id, (ev) => {
+      const s = ref.deref()
+      if (!s || s.#detached) return
+      let params = {}
+      try {
+        params = ev.paramsJson ? JSON.parse(ev.paramsJson) : {}
+      } catch {}
+      emitSafely(s.#emitter, ev.method, params)
+    })
+  }
+
+  async send(method, params) {
+    if (this.#detached) throw new Error('cdpSession.send: session is detached')
+    if (typeof method !== 'string' || !method) {
+      throw new TypeError('cdpSession.send: method must be a non-empty string')
+    }
+    const paramsJson = params === undefined ? undefined : JSON.stringify(params)
+    return this.#page._cdpSend(this.#id, method, paramsJson)
+  }
+
+  on(event, handler) {
+    this.#ensureEvents()
+    this.#emitter.on(event, handler)
+    return this
+  }
+
+  once(event, handler) {
+    this.#ensureEvents()
+    this.#emitter.once(event, handler)
+    return this
+  }
+
+  addListener(event, handler) {
+    return this.on(event, handler)
+  }
+
+  off(event, handler) {
+    this.#emitter.off(event, handler)
+    return this
+  }
+
+  removeListener(event, handler) {
+    return this.off(event, handler)
+  }
+
+  async detach() {
+    if (this.#detached) return
+    this.#detached = true
+    cdpSessionRegistry.unregister(this)
+    this.#emitter.removeAllListeners()
+    await this.#page._cdpDetach(this.#id)
+  }
+}
 
 function trackTarget(page) {
   const tid = page._targetId()
@@ -859,6 +935,21 @@ class BrowserContext {
     return this.#browser._contextClearCookies(this.#id)
   }
 
+  async newCDPSession(page) {
+    if (this.#closed) throw new Error('browserContext.newCDPSession: the context is closed')
+    const frameEntry = page && typeof page === 'object' ? frameIds.get(page) : null
+    const targetPage = frameEntry ? frameEntry.page : page
+    const frameId = frameEntry ? frameEntry.id : null
+    if (!targetPage || pageContext.get(targetPage)?.deref() !== this) {
+      if (targetPage && typeof targetPage._targetId === 'function') {
+        throw new Error('browserContext.newCDPSession: page does not belong to this context')
+      }
+      throw new TypeError('browserContext.newCDPSession: argument must be a Page or Frame')
+    }
+    const id = await targetPage._newCdpSession(frameId)
+    return new CDPSession(targetPage, id)
+  }
+
   async close(options) {
     checkOptions('browserContext.close', options, NONE)
     if (this.#closed) return
@@ -1020,6 +1111,7 @@ function installFrames(Page, applyFilter) {
       this.#page = page
       this.#id = info.id
       this.#update(info)
+      frameIds.set(this, { page, id: info.id })
     }
 
     #update(info) {

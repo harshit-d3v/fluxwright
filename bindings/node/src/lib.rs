@@ -34,9 +34,16 @@ pub struct Page {
     routes: Arc<std::sync::Mutex<Option<Arc<Callback<InterceptedRoute>>>>>,
     file_choosers: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::FileChooser>)>>,
     bindings: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::BindingCall>)>>,
+    cdp_sessions: Arc<std::sync::Mutex<(u32, HashMap<u32, fluxwright::CdpSession>)>>,
     url: tokio::sync::watch::Receiver<String>,
     target_id: String,
     opener_target_id: Option<String>,
+}
+
+#[napi(object)]
+pub struct CdpEventPayload {
+    pub method: String,
+    pub params_json: String,
 }
 
 /// A thread-safe JavaScript callback (errors are not passed to it) that does not keep Node
@@ -2244,10 +2251,14 @@ impl Page {
         self.routes.lock().unwrap().take();
         self.file_choosers.lock().unwrap().1.clear();
         self.bindings.lock().unwrap().1.clear();
+        let sessions: Vec<_> = self.cdp_sessions.lock().unwrap().1.drain().map(|(_, s)| s).collect();
         // Calls still running give up now (see `with_page`), so the write lock comes at once.
         self.lease.closing.send_replace(true);
         let slot = self.lease.clone();
         RT.spawn(async move {
+            for s in sessions {
+                let _ = s.detach(std::time::Duration::from_secs(5)).await;
+            }
             *slot.page.write().await = None;
         })
         .await
@@ -2593,6 +2604,91 @@ impl Page {
             frames: vec![fluxwright::Selector::frame_id_hop(&frame_id)],
         }
     }
+
+    #[napi(js_name = "_newCdpSession")]
+    pub async fn new_cdp_session(&self, frame_id: Option<String>) -> Result<u32> {
+        let session = with_page(self.lease.clone(), move |p| {
+            Box::pin(async move {
+                match frame_id.as_deref() {
+                    Some(fid) => p.new_frame_cdp_session(fid).await,
+                    None => p.new_cdp_session().await,
+                }
+            })
+        })
+        .await?;
+        let mut g = self.cdp_sessions.lock().unwrap();
+        g.0 = g.0.wrapping_add(1);
+        let id = g.0;
+        g.1.insert(id, session);
+        Ok(id)
+    }
+
+    #[napi(js_name = "_cdpSend")]
+    pub async fn cdp_send(
+        &self,
+        session_id: u32,
+        method: String,
+        params_json: Option<String>,
+    ) -> Result<serde_json::Value> {
+        let session = self
+            .cdp_sessions
+            .lock()
+            .unwrap()
+            .1
+            .get(&session_id)
+            .cloned()
+            .filter(|s| !s.is_detached())
+            .ok_or_else(|| Error::from_reason("CDP session is detached"))?;
+        let params: serde_json::Value = match params_json {
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| Error::from_reason(format!("cdpSession.send invalid JSON: {e}")))?,
+            None => serde_json::json!({}),
+        };
+        let timeout = self.now(|p| p.navigation_timeout()).unwrap_or(std::time::Duration::from_secs(30));
+        RT.spawn(async move { session.send(&method, params, timeout).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi(js_name = "_cdpOnEvent")]
+    pub fn cdp_on_event(&self, session_id: u32, handler: Function<CdpEventPayload, ()>) -> Result<()> {
+        let session = self
+            .cdp_sessions
+            .lock()
+            .unwrap()
+            .1
+            .get(&session_id)
+            .cloned()
+            .filter(|s| !s.is_detached())
+            .ok_or_else(|| Error::from_reason("CDP session is detached"))?;
+        let tsfn = callback(handler)?;
+        let mut rx = session.subscribe_events();
+        RT.spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let params_json = ev.params.to_string();
+                tsfn.call(CdpEventPayload { method: ev.method, params_json }, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    #[napi(js_name = "_cdpDetach")]
+    pub async fn cdp_detach(&self, session_id: u32) -> Result<()> {
+        let session = self.cdp_sessions.lock().unwrap().1.remove(&session_id);
+        if let Some(s) = session {
+            RT.spawn(async move { s.detach(std::time::Duration::from_secs(5)).await })
+                .await
+                .map_err(|e| Error::from_reason(e.to_string()))?
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[napi(js_name = "_cdpDrop")]
+    pub fn cdp_drop(&self, session_id: u32) {
+        self.cdp_sessions.lock().unwrap().1.remove(&session_id);
+    }
 }
 
 impl Page {
@@ -2608,6 +2704,7 @@ impl Page {
             routes: Default::default(),
             file_choosers: Default::default(),
             bindings: Default::default(),
+            cdp_sessions: Default::default(),
             url,
             target_id,
             opener_target_id,

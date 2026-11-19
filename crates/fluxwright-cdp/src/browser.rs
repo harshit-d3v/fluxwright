@@ -638,6 +638,15 @@ impl CdpBrowser {
                     Some(c) => self.contexts.lock().await.contains(c),
                     None => false,
                 };
+                let waiting = ev.params["waitingForDebugger"].as_bool().unwrap_or(false);
+                let already_attached = self.targets.lock().await.get(&target_id).is_some_and(|t| {
+                    t.active_session_id.is_some()
+                        && t.active_session_id.as_deref() != Some(session_id.as_str())
+                });
+                if already_attached && !waiting {
+                    // Secondary session (e.g. Target.attachToTarget from newCDPSession): keep primary session intact.
+                    return;
+                }
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
 
                 let (owner_page, effective_opener, url_tx, net, frames, closed) = {
@@ -751,7 +760,6 @@ impl CdpBrowser {
 
                 // Do not await CDP on this task: it is the only consumer of
                 // attachedToTarget and must stay ahead of createTarget.
-                let waiting = ev.params["waitingForDebugger"].as_bool().unwrap_or(false);
                 if (ty != "page" && ty != "iframe") || !ours {
                     // Chrome's own targets (browser_ui, extension workers, background pages)
                     // and workers: nothing drives them, and setup hung on ~1 in 3 browser_ui

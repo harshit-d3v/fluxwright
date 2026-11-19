@@ -1391,3 +1391,92 @@ def test_multi_tab_popups_and_frames(base):
                 assert cross.evaluate("(x) => x * 2", 7) == 14
         finally:
             browser.close()
+
+
+def test_cdp_session(base):
+    async def run_async():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(max_browsers=1)
+            try:
+                async with (
+                    await browser.new_context(base_url=base) as ctx,
+                    await browser.new_context() as other_ctx,
+                ):
+                    page = await ctx.new_page()
+                    with pytest.raises(Error, match="belong to this context"):
+                        await other_ctx.new_cdp_session(page)
+
+                    cdp = await ctx.new_cdp_session(page)
+                    seen = []
+                    got = asyncio.Event()
+
+                    def on_console(ev):
+                        if ev.get("args") and ev["args"][0].get("value") == "cdp-py":
+                            seen.append(ev)
+                            got.set()
+
+                    cdp.on("Runtime.consoleAPICalled", on_console)
+                    await cdp.send("Runtime.enable")
+                    eval_res = await cdp.send(
+                        "Runtime.evaluate",
+                        {"expression": "console.log('cdp-py'); 6 * 7", "returnByValue": True},
+                    )
+                    assert eval_res["result"]["value"] == 42
+                    await asyncio.wait_for(got.wait(), timeout=5.0)
+                    assert len(seen) == 1
+
+                    await cdp.detach()
+                    with pytest.raises(Error):
+                        await cdp.send("Runtime.evaluate", {"expression": "1"})
+                    assert await page.evaluate("3 + 4") == 7
+
+                    await page.goto("/frames-host")
+                    for _ in range(100):
+                        fs = page.frames
+                        if any(f.name == "same-fr" and f.url.endswith("/same-child") for f in fs) and any(
+                            f.name == "cross-fr" and f.url.endswith("/cross-child") for f in fs
+                        ):
+                            break
+                        await asyncio.sleep(0.03)
+                    else:
+                        raise AssertionError("frames did not load")
+
+                    same = page.frame("same-fr")
+                    cross = page.frame("cross-fr")
+                    assert same is not None and cross is not None
+                    with pytest.raises(Error, match="separate CDP session"):
+                        await ctx.new_cdp_session(same)
+                    cross_cdp = await ctx.new_cdp_session(cross)
+                    res = await cross_cdp.send(
+                        "Runtime.evaluate",
+                        {"expression": "document.getElementById('cb').textContent", "returnByValue": True},
+                    )
+                    assert res["result"]["value"] == "CrossBtn"
+                    await cross_cdp.detach()
+            finally:
+                await browser.close()
+
+    asyncio.run(run_async())
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(max_browsers=1)
+        try:
+            with browser.new_context(base_url=base) as ctx:
+                page = ctx.new_page()
+                cdp = ctx.new_cdp_session(page)
+                done = threading.Event()
+                cdp.on(
+                    "Runtime.consoleAPICalled",
+                    lambda ev: done.set() if ev.get("args") and ev["args"][0].get("value") == "cdp-sync" else None,
+                )
+                cdp.send("Runtime.enable")
+                out = cdp.send(
+                    "Runtime.evaluate",
+                    {"expression": "console.log('cdp-sync'); 9 * 9", "returnByValue": True},
+                )
+                assert out["result"]["value"] == 81
+                assert done.wait(timeout=5.0)
+                cdp.detach()
+                assert page.evaluate("1 + 2") == 3
+        finally:
+            browser.close()

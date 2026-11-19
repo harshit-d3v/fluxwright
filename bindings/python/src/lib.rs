@@ -2709,6 +2709,27 @@ impl Page {
             frames: vec![fluxwright::Selector::frame_id_hop(&frame_id)],
         }
     }
+
+    #[pyo3(name = "_new_cdp_session", signature = (frame_id=None))]
+    fn new_cdp_session<'py>(
+        &self,
+        py: Python<'py>,
+        frame_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            let default_timeout = p.navigation_timeout();
+            Box::pin(async move {
+                let inner = match frame_id.as_deref() {
+                    Some(fid) => p.new_frame_cdp_session(fid).await?,
+                    None => p.new_cdp_session().await?,
+                };
+                Ok(CdpSession {
+                    inner,
+                    default_timeout,
+                })
+            })
+        })
+    }
 }
 
 impl Page {
@@ -4099,11 +4120,85 @@ impl Download {
     }
 }
 
+#[pyclass(frozen, module = "fluxwright._native")]
+struct CdpSessionEvent {
+    #[pyo3(get)]
+    method: String,
+    #[pyo3(get)]
+    params_json: String,
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct CdpEventStream(Arc<Mutex<UnboundedReceiver<fluxwright::CdpSessionEvent>>>);
+
+#[pymethods]
+impl CdpEventStream {
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx.lock().await.recv().await.map(|ev| CdpSessionEvent {
+                method: ev.method,
+                params_json: ev.params.to_string(),
+            }))
+        })
+    }
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct CdpSession {
+    inner: fluxwright::CdpSession,
+    default_timeout: Duration,
+}
+
+#[pymethods]
+impl CdpSession {
+    #[pyo3(signature = (method, params=None))]
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        method: String,
+        params: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let params = match params {
+            Some(p) => to_json(&p)?,
+            None => serde_json::json!({}),
+        };
+        let session = self.inner.clone();
+        let timeout = self.default_timeout;
+        future_into_py(py, async move {
+            session
+                .send(&method, params, timeout)
+                .await
+                .map(Json)
+                .map_err(error)
+        })
+    }
+
+    #[pyo3(name = "_events")]
+    fn events(&self) -> CdpEventStream {
+        CdpEventStream(Arc::new(Mutex::new(self.inner.subscribe_events())))
+    }
+
+    fn detach<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.inner.clone();
+        future_into_py(py, async move {
+            session
+                .detach(Duration::from_secs(5))
+                .await
+                .map(none)
+                .map_err(error)
+        })
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<Context>()?;
     m.add_class::<FrameInfo>()?;
+    m.add_class::<CdpSessionEvent>()?;
+    m.add_class::<CdpEventStream>()?;
+    m.add_class::<CdpSession>()?;
     m.add_class::<Lease>()?;
     m.add_class::<Page>()?;
     m.add_class::<Locator>()?;
