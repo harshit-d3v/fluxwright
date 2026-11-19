@@ -503,6 +503,8 @@ class Page(_native.Page):
         self._network_task: asyncio.Future[Any] | None = None
         self._answering_dialogs = False
         self._serving_file_choosers = False
+        self._bindings: dict[str, Callable[..., Any]] = {}
+        self._serving_bindings = False
         self._tasks: set[asyncio.Future[Any]] = set()
         self._expects: set[asyncio.Future[Any]] = set()
 
@@ -584,6 +586,62 @@ class Page(_native.Page):
     async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         """Removes the handlers added for ``url`` (only ``handler``, when given)."""
         self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
+
+    async def add_init_script(
+        self, script: str | None = None, *, path: str | PathLike[str] | None = None
+    ) -> None:
+        """Adds a script evaluated whenever the page navigates or reloads."""
+        source = _resolve_init_script("page.add_init_script", script, path)
+        await self._add_init_script(source)
+
+    async def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
+        """Exposes ``callback`` on ``window.<name>``; calls from the page return a Promise."""
+        if not isinstance(name, str) or not name:
+            raise TypeError("page.expose_function: name must be a non-empty str")
+        if not callable(callback):
+            raise TypeError("page.expose_function: callback must be callable")
+        if name in self._bindings:
+            raise Error(f'Function "{name}" has been already registered')
+        if not self._serving_bindings:
+            _keep(
+                self._tasks,
+                asyncio.ensure_future(_serve_bindings(self._binding_calls(), weakref.ref(self), self._tasks)),
+            )
+            self._serving_bindings = True
+        self._bindings[name] = callback
+        try:
+            await self._expose_binding(name)
+        except BaseException:
+            if self._bindings.get(name) is callback:
+                del self._bindings[name]
+            raise
+
+    async def add_script_tag(
+        self,
+        *,
+        url: str | None = None,
+        path: str | PathLike[str] | None = None,
+        content: str | None = None,
+        type: str | None = None,
+    ) -> None:
+        """Adds a ``<script>`` tag into the page with the given ``url``, ``path`` or ``content``."""
+        if (url is not None) + (path is not None) + (content is not None) != 1:
+            raise ValueError("page.add_script_tag: provide exactly one of url, path, or content")
+        text = Path(path).read_text(encoding="utf-8") if path is not None else content
+        await self._add_script_tag(url=url, content=text, script_type=type)
+
+    async def add_style_tag(
+        self,
+        *,
+        url: str | None = None,
+        path: str | PathLike[str] | None = None,
+        content: str | None = None,
+    ) -> None:
+        """Adds a ``<style>`` or ``<link rel="stylesheet">`` tag into the page."""
+        if (url is not None) + (path is not None) + (content is not None) != 1:
+            raise ValueError("page.add_style_tag: provide exactly one of url, path, or content")
+        text = Path(path).read_text(encoding="utf-8") if path is not None else content
+        await self._add_style_tag(url=url, content=text)
 
     def on(self, event: str, handler: Listener) -> None:
         """Calls ``handler`` from now on with each ``"console"`` message (a ``ConsoleMessage``),
@@ -674,6 +732,7 @@ class Page(_native.Page):
                 future.set_exception(Error("page closed"))
         self._routes.clear()
         self._listeners.clear()
+        self._bindings.clear()
         await super().close()
 
     async def emulate_media(
@@ -851,6 +910,46 @@ async def _serve_file_choosers(
 ) -> None:
     while (native := await stream.next()) is not None:
         _emit(_listeners_of(page), "filechooser", FileChooser(native), tasks)
+
+
+def _resolve_init_script(method: str, script: str | None, path: str | PathLike[str] | None) -> str:
+    if (script is not None) + (path is not None) != 1:
+        raise ValueError(f"{method}: provide either script or path")
+    if path is not None:
+        return Path(path).read_text(encoding="utf-8")
+    if not isinstance(script, str):
+        raise TypeError(f"{method}: script must be a str")
+    return script
+
+
+async def _serve_bindings(
+    stream: _native.BindingStream,
+    page: PageRef,
+    tasks: set[asyncio.Future[Any]],
+) -> None:
+    while (call := await stream.next()) is not None:
+        _keep(tasks, asyncio.ensure_future(_invoke_binding(call, page)))
+
+
+async def _invoke_binding(call: _native.BindingCall, page: PageRef) -> None:
+    p = page()
+    cb = p._bindings.get(call.name) if p is not None else None
+    if cb is None:
+        with suppress(Error):
+            await call.reject(f'Function "{call.name}" is not exposed')
+        return
+    try:
+        args = _json.loads(call.args_json)
+        result = cb(*args)
+        if inspect.isawaitable(result):
+            result = await result
+        encoded = _json.dumps(result)
+    except Exception as exc:
+        with suppress(Error):
+            await call.reject(str(exc))
+        return
+    with suppress(Error):
+        await call.resolve(encoded)
 
 
 async def _answer_dialog(listeners: list[tuple[Listener, Listener]], dialog: Dialog) -> None:
@@ -1061,6 +1160,8 @@ class BrowserContext:
         self._closed = False
         self._routes: list[tuple[URLMatch, Callable[..., Any]]] = []
         self._cookies: list[dict[str, Any]] = []
+        self._init_scripts: list[str] = []
+        self._exposed: list[tuple[str, Callable[..., Any]]] = []
 
     @property
     def browser(self) -> Browser:
@@ -1081,6 +1182,10 @@ class BrowserContext:
             try:
                 if self._cookies:
                     await page._add_cookies(self._cookies)
+                for name, callback in self._exposed:
+                    await page.expose_function(name, callback)
+                for source in self._init_scripts:
+                    await page._add_init_script(source)
                 for url, handler in self._routes:
                     await page.route(url, handler)
                 # close() ran while the page was coming: it would otherwise stay open on a closed
@@ -1106,6 +1211,31 @@ class BrowserContext:
         self._routes = [r for r in self._routes if not (r[0] == url and (handler is None or r[1] == handler))]
         if self._page is not None:
             await self._page.unroute(url, handler)
+
+    async def add_init_script(
+        self, script: str | None = None, *, path: str | PathLike[str] | None = None
+    ) -> None:
+        """``page.add_init_script`` for this context's page; added before ``new_page()``, it runs from the first navigation."""
+        source = _resolve_init_script("browser_context.add_init_script", script, path)
+        self._init_scripts.append(source)
+        if self._page is not None:
+            await self._page._add_init_script(source)
+
+    async def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
+        """``page.expose_function`` for this context's page."""
+        if not isinstance(name, str) or not name:
+            raise TypeError("browser_context.expose_function: name must be a non-empty str")
+        if not callable(callback):
+            raise TypeError("browser_context.expose_function: callback must be callable")
+        if any(n == name for n, _ in self._exposed):
+            raise Error(f'Function "{name}" has been already registered')
+        self._exposed.append((name, callback))
+        if self._page is not None:
+            try:
+                await self._page.expose_function(name, callback)
+            except BaseException:
+                self._exposed = [(n, c) for n, c in self._exposed if n != name]
+                raise
 
     async def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
         """The cookies and localStorage of this context's page, as ``page.storage_state``."""

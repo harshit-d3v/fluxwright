@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { chmodSync, statSync } from 'node:fs'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -40,6 +40,26 @@ const server = http.createServer((req, res) => {
   if (req.url === '/nav-done') {
     res.setHeader('Content-Type', 'text/html')
     return res.end('<title>NavDone</title>')
+  }
+  if (req.url === '/init-page') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end(
+      '<title>InitPage</title>' +
+        '<script>window.__seenAtParse = { fromStr: window.__initStr, fromFn: window.__initFn, hasBound: typeof window.ctxFn === "function" }</script>' +
+        '<p id="tag-target">Hello</p>',
+    )
+  }
+  if (req.url === '/tag.js') {
+    res.setHeader('Content-Type', 'application/javascript')
+    return res.end('window.__urlScript = (window.__urlScript || 0) + 1;')
+  }
+  if (req.url === '/tag.css') {
+    res.setHeader('Content-Type', 'text/css')
+    return res.end('#tag-target { color: rgb(255, 0, 0); }')
+  }
+  if (req.url === '/missing-tag.js') {
+    res.statusCode = 404
+    return res.end('missing')
   }
   if (req.url === '/report') {
     res.setHeader('Content-Disposition', 'attachment; filename="report.csv"')
@@ -785,6 +805,84 @@ try {
     await assert.rejects(() => nav.waitForFunction(() => false, undefined, { timeout: 250 }), /timed out/)
     await assert.rejects(() => nav.waitForLoadState('bogus'), TypeError)
     await nav.close()
+  }
+
+  // Init scripts, exposed functions, script tags, and style tags (page & context).
+  {
+    const initPath = join(tmpdir(), `fluxwright-node-init-${process.pid}.js`)
+    const tagJsPath = join(tmpdir(), `fluxwright-node-tag-${process.pid}.js`)
+    const tagCssPath = join(tmpdir(), `fluxwright-node-tag-${process.pid}.css`)
+    await writeFile(initPath, 'window.__initPath = true;')
+    await writeFile(tagJsPath, 'window.__fileTag = "from-file";')
+    await writeFile(tagCssPath, '#tag-target { margin-left: 17px; }')
+    const ctx = await browser.newContext({ baseURL: base })
+    try {
+      await ctx.exposeFunction('ctxFn', async (n) => n * 3)
+      await ctx.addInitScript('window.__initStr = "ok";')
+      await ctx.addInitScript((v) => {
+        window.__initFn = v.tag
+      }, { tag: 99 })
+
+      const p = await ctx.newPage()
+      await p.addInitScript({ path: initPath })
+      await p.addInitScript({ content: 'window.__initContent = "c";' })
+      await p.goto('/init-page')
+
+      assert.deepEqual(await p.evaluate(() => window.__seenAtParse), {
+        fromStr: 'ok',
+        fromFn: 99,
+        hasBound: true,
+      })
+      assert.deepEqual(await p.evaluate(() => [window.__initPath, window.__initContent]), [true, 'c'])
+      assert.equal(await p.evaluate(() => window.ctxFn(14)), 42)
+
+      await p.exposeFunction('withTitle', async (suffix) => `${await p.title()}:${suffix}`)
+      assert.equal(await p.evaluate(() => window.withTitle('x')), 'InitPage:x')
+      await p.exposeFunction('noReturn', () => {})
+      await p.evaluate(() => window.noReturn())
+      await p.exposeFunction('boomFn', async () => {
+        throw new Error('cb-boom')
+      })
+      await assert.rejects(() => p.evaluate(() => window.boomFn()), /cb-boom/)
+      await assert.rejects(() => p.exposeFunction('ctxFn', () => 1), /already registered/)
+      await assert.rejects(() => ctx.exposeFunction('ctxFn', () => 1), /already registered/)
+
+      await p.reload()
+      assert.deepEqual(await p.evaluate(() => [window.__initStr, window.__initFn]), ['ok', 99])
+      assert.equal(await p.evaluate(() => window.withTitle('r')), 'InitPage:r')
+
+      await p.addScriptTag({ content: 'window.__inlineTag = 7;' })
+      await p.addScriptTag({ url: `${base}/tag.js` })
+      await p.addScriptTag({ path: tagJsPath })
+      await p.addScriptTag({ content: 'window.__modLoaded = true;', type: 'module' })
+      await p.waitForFunction(() => window.__modLoaded === true)
+      assert.deepEqual(
+        await p.evaluate(() => [
+          window.__inlineTag,
+          window.__urlScript,
+          window.__fileTag,
+          document.querySelector('script[type="module"]') !== null,
+        ]),
+        [7, 1, 'from-file', true],
+      )
+      await assert.rejects(() => p.addScriptTag({ url: `${base}/missing-tag.js` }))
+      await assert.rejects(() => p.addScriptTag({}), TypeError)
+
+      await p.addStyleTag({ content: 'body { background-color: rgb(1, 2, 3); }' })
+      await p.addStyleTag({ url: `${base}/tag.css` })
+      await p.addStyleTag({ path: tagCssPath })
+      assert.deepEqual(
+        await p.evaluate(() => [
+          getComputedStyle(document.body).backgroundColor,
+          getComputedStyle(document.querySelector('#tag-target')).color,
+          getComputedStyle(document.querySelector('#tag-target')).marginLeft,
+        ]),
+        ['rgb(1, 2, 3)', 'rgb(255, 0, 0)', '17px'],
+      )
+    } finally {
+      await ctx.close()
+      await Promise.all([rm(initPath, { force: true }), rm(tagJsPath, { force: true }), rm(tagCssPath, { force: true })])
+    }
   }
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).

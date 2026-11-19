@@ -1349,6 +1349,42 @@ class Page(_Finders):
                 self._route_bridges.remove(entry)
                 _run(self._impl.unroute, url, entry[2])
 
+    def add_init_script(self, script: str | None = None, *, path: str | PathLike[str] | None = None) -> None:
+        """Adds a script evaluated whenever the page navigates or reloads."""
+        _run(self._impl.add_init_script, script, path=path)
+
+    def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
+        """Exposes ``callback`` on ``window.<name>``; runs on the worker pool so it can call the page."""
+        if not callable(callback):
+            raise TypeError("page.expose_function: callback must be callable")
+        loop = _event_loop()
+
+        def bridge(*args: Any) -> Any:
+            return loop.run_in_executor(None, lambda: callback(*args))
+
+        _run(self._impl.expose_function, name, bridge)
+
+    def add_script_tag(
+        self,
+        *,
+        url: str | None = None,
+        path: str | PathLike[str] | None = None,
+        content: str | None = None,
+        type: str | None = None,
+    ) -> None:
+        """Adds a ``<script>`` tag into the page with the given ``url``, ``path`` or ``content``."""
+        _run(self._impl.add_script_tag, url=url, path=path, content=content, type=type)
+
+    def add_style_tag(
+        self,
+        *,
+        url: str | None = None,
+        path: str | PathLike[str] | None = None,
+        content: str | None = None,
+    ) -> None:
+        """Adds a ``<style>`` or ``<link rel="stylesheet">`` tag into the page."""
+        _run(self._impl.add_style_tag, url=url, path=path, content=content)
+
     def on(self, event: str, handler: Callable[[Any], Any]) -> None:
         """Calls ``handler`` from now on with each ``"console"`` message (a ``ConsoleMessage``),
         ``"pageerror"`` (an ``Error``), ``"request"``, ``"requestfinished"`` and
@@ -1620,6 +1656,8 @@ class BrowserContext:
         self._closed = False
         self._routes: list[tuple[URLMatch, Callable[..., Any]]] = []
         self._cookies: list[dict[str, Any]] = []
+        self._init_scripts: list[str] = []
+        self._exposed: list[tuple[str, Callable[..., Any]]] = []
 
     @property
     def browser(self) -> Browser:
@@ -1641,6 +1679,10 @@ class BrowserContext:
             try:
                 if self._cookies:
                     _run(page._impl._add_cookies, list(self._cookies))
+                for name, callback in self._exposed:
+                    page.expose_function(name, callback)
+                for source in self._init_scripts:
+                    _run(page._impl._add_init_script, source)
                 for url, handler in self._routes:
                     page.route(url, handler)
                 # close() from another thread while the page was coming: it would otherwise stay
@@ -1668,6 +1710,34 @@ class BrowserContext:
         self._routes = [r for r in self._routes if not (r[0] == url and (handler is None or r[1] == handler))]
         if self._page is not None:
             self._page.unroute(url, handler)
+
+    def add_init_script(self, script: str | None = None, *, path: str | PathLike[str] | None = None) -> None:
+        """``page.add_init_script`` for this context's page."""
+        source = _a._resolve_init_script("browser_context.add_init_script", script, path)
+        with self._lock:
+            self._init_scripts.append(source)
+            page = self._page
+        if page is not None:
+            _run(page._impl._add_init_script, source)
+
+    def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
+        """``page.expose_function`` for this context's page."""
+        if not isinstance(name, str) or not name:
+            raise TypeError("browser_context.expose_function: name must be a non-empty str")
+        if not callable(callback):
+            raise TypeError("browser_context.expose_function: callback must be callable")
+        with self._lock:
+            if any(n == name for n, _ in self._exposed):
+                raise Error(f'Function "{name}" has been already registered')
+            self._exposed.append((name, callback))
+            page = self._page
+        if page is not None:
+            try:
+                page.expose_function(name, callback)
+            except BaseException:
+                with self._lock:
+                    self._exposed = [(n, c) for n, c in self._exposed if n != name]
+                raise
 
     def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
         """The cookies and localStorage of this context's page, as ``page.storage_state``."""

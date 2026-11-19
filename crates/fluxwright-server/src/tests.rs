@@ -1229,3 +1229,26 @@ async fn rejects_invalid_navigation_and_wait_steps() {
     }
     server.shutdown(Duration::ZERO).await.unwrap();
 }
+
+#[tokio::test]
+async fn rejects_invalid_init_script_and_tag_steps() {
+    let server = server(2).await;
+    for payload in [
+        r#"{"steps":[{"action":"add_init_script","script":"  "}]}"#,
+        r#"{"steps":[{"action":"add_script_tag"}]}"#,
+        r#"{"steps":[{"action":"add_script_tag","url":"https://example.com/a.js","content":"1"}]}"#,
+        r#"{"steps":[{"action":"add_script_tag","url":"file:///etc/passwd"}]}"#,
+        r#"{"steps":[{"action":"add_script_tag","url":"//169.254.169.254/a.js"}]}"#,
+        r#"{"steps":[{"action":"add_script_tag","url":"javascript:alert(1)"}]}"#,
+        r#"{"steps":[{"action":"add_style_tag","url":""}]}"#,
+        r#"{"steps":[{"action":"add_style_tag","content":"a{}","path":"/tmp/a.css"}]}"#,
+    ] {
+        let response = call(&server, "POST", "/v1/jobs", payload).await;
+        assert!(
+            matches!(response.status(), StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY),
+            "expected 400/422 for {payload}, got {}",
+            response.status()
+        );
+    }
+    server.shutdown(Duration::ZERO).await.unwrap();
+}

@@ -608,6 +608,30 @@ impl CdpBrowser {
                     }
                 }
             }
+            "Runtime.bindingCalled" if ev.params["name"] == "__fluxwright_binding" => {
+                if let (Some(sid), Some(raw), Some(ctx_id)) = (
+                    ev.session_id.clone(),
+                    ev.params["payload"].as_str(),
+                    ev.params["executionContextId"].as_i64(),
+                ) {
+                    if let (Some(tx), Ok(v)) = (
+                        self.setup_for_session(&sid).await.and_then(|s| s.bindings),
+                        serde_json::from_str::<Value>(raw),
+                    ) {
+                        if let (Some(name), Some(seq)) = (v["name"].as_str(), v["seq"].as_u64()) {
+                            let args = v["args"].as_array().cloned().unwrap_or_default();
+                            let _ = tx.send(crate::events::BindingCall::new(
+                                name.to_owned(),
+                                seq,
+                                args,
+                                self.conn.clone(),
+                                sid,
+                                ctx_id,
+                            ));
+                        }
+                    }
+                }
+            }
             "Page.frameNavigated" if ev.params["frame"]["parentId"].is_null() => {
                 if let Some(frame_id) = ev.params["frame"]["id"].as_str() {
                     let full = frame_url(&ev.params["frame"]);
@@ -1110,6 +1134,9 @@ async fn prepare_session(
     if let Some(setup) = setup.filter(|_| ty == "page" || ty == "iframe") {
         if let Some(e) = &setup.emulation {
             calls.extend(e.calls(ty == "page"));
+        }
+        if setup.bindings_enabled {
+            calls.push(("Runtime.addBinding", json!({ "name": "__fluxwright_binding" })));
         }
         for source in &setup.init_scripts {
             calls.push((

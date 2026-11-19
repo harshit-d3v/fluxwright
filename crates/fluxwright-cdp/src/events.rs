@@ -329,3 +329,74 @@ impl FileChooser {
         res.map(|_| ())
     }
 }
+
+/// An invocation of a function exposed via `expose_function` from a page or iframe.
+#[derive(Clone)]
+pub struct BindingCall {
+    pub name: String,
+    pub seq: u64,
+    pub args: Vec<Value>,
+    conn: Arc<Connection>,
+    session: String,
+    context_id: i64,
+}
+
+impl std::fmt::Debug for BindingCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BindingCall")
+            .field("name", &self.name)
+            .field("seq", &self.seq)
+            .field("args", &self.args)
+            .finish()
+    }
+}
+
+impl BindingCall {
+    pub(crate) fn new(
+        name: String,
+        seq: u64,
+        args: Vec<Value>,
+        conn: Arc<Connection>,
+        session: String,
+        context_id: i64,
+    ) -> Self {
+        Self { name, seq, args, conn, session, context_id }
+    }
+
+    pub async fn resolve(&self, value: &Value) -> Result<()> {
+        self.finish(true, value, None).await
+    }
+
+    pub async fn reject(&self, message: &str) -> Result<()> {
+        self.finish(false, &Value::Null, Some(message)).await
+    }
+
+    async fn finish(&self, ok: bool, value: &Value, err_msg: Option<&str>) -> Result<()> {
+        let expression = format!(
+            "globalThis.__fwBindingResolve && globalThis.__fwBindingResolve({}, {}, {}, {})",
+            self.seq,
+            ok,
+            serde_json::to_string(value).unwrap(),
+            serde_json::to_string(&err_msg).unwrap(),
+        );
+        let mut params = json!({ "expression": expression, "returnByValue": true });
+        if self.context_id > 0 {
+            params["contextId"] = json!(self.context_id);
+        }
+        match self
+            .conn
+            .call("Runtime.evaluate", params, Some(&self.session), Duration::from_secs(5))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(Error::SessionGone(_)) => Ok(()),
+            Err(Error::Command { ref message, .. })
+                if message.contains("Cannot find context")
+                    || message.contains("Execution context was destroyed") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}

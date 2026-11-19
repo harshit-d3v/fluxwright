@@ -554,6 +554,19 @@ fn js_error(res: &Value) -> Option<Error> {
     Some(Error::JavaScript(msg))
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScriptTagOptions {
+    pub url: Option<String>,
+    pub content: Option<String>,
+    pub script_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StyleTagOptions {
+    pub url: Option<String>,
+    pub content: Option<String>,
+}
+
 /// An iframe element's content box before transforms: width and height (its frame's viewport),
 /// then its origin in the parent's viewport, which is right only when nothing transforms it.
 const FRAME_BOX_JS: &str = "function() { const r = this.getBoundingClientRect(), s = getComputedStyle(this), \
@@ -1616,9 +1629,227 @@ impl CdpPage {
     pub async fn set_storage_state(&self, state: &StorageState, timeout: Duration) -> Result<()> {
         self.add_cookies(&state.cookies, timeout).await?;
         if let Some(source) = state.restore_script() {
-            self.setups.lock().await.entry(self.context_id.0.clone()).or_default().init_scripts.push(source.clone());
-            self.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": source }), timeout).await?;
+            self.add_init_script(&source, timeout).await?;
         }
+        Ok(())
+    }
+
+    /// Registers `source` to run before any page script on every navigation in this context
+    /// (including iframes and popups).
+    pub async fn add_init_script(&self, source: &str, timeout: Duration) -> Result<()> {
+        self.setups
+            .lock()
+            .await
+            .entry(self.context_id.0.clone())
+            .or_default()
+            .init_scripts
+            .push(source.to_string());
+        let mut sessions = CdpBrowser::sessions_in_context(&self.targets, &self.context_id.0).await;
+        if !sessions.iter().any(|s| s == self.sid()) {
+            sessions.push(self.sid().to_string());
+        }
+        for s in sessions {
+            let res = self
+                .session_call(
+                    &s,
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": source }),
+                    timeout,
+                )
+                .await;
+            if s == self.sid() {
+                res?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Invocations of functions exposed via `expose_binding` on this page and its frames.
+    pub async fn bindings(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::events::BindingCall> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.setups
+            .lock()
+            .await
+            .entry(self.context_id.0.clone())
+            .or_default()
+            .bindings = Some(tx);
+        rx
+    }
+
+    /// Exposes `globalThis[name]` on this page and its frames across navigations; calls arrive
+    /// on the receiver from [`Self::bindings`].
+    pub async fn expose_binding(&self, name: &str, timeout: Duration) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Other("exposeFunction: name must not be empty".into()));
+        }
+        let name_json = serde_json::to_string(name).unwrap();
+        let install = format!(
+            r#"const name = {name_json};
+            const install = (w) => {{
+                const root = w.__fwBindings || (w.__fwBindings = {{ seq: 0, pending: new w.Map() }});
+                if (typeof w.__fwBindingResolve !== 'function') {{
+                    w.__fwBindingResolve = (seq, ok, value, errMsg) => {{
+                        const entry = root.pending.get(seq);
+                        if (!entry) return;
+                        root.pending.delete(seq);
+                        if (ok) entry.resolve(value);
+                        else entry.reject(new w.Error(errMsg || 'exposed function failed'));
+                    }};
+                }}
+                w[name] = (...args) => new w.Promise((resolve, reject) => {{
+                    const seq = ++root.seq;
+                    root.pending.set(seq, {{ resolve, reject }});
+                    try {{
+                        w.__fluxwright_binding(JSON.stringify({{ name, seq, args }}));
+                    }} catch (e) {{
+                        root.pending.delete(seq);
+                        reject(e);
+                    }}
+                }});
+            }};"#
+        );
+        let shim = format!("(() => {{ {install} install(globalThis); }})()");
+        let eval_shim = format!(
+            "(() => {{ {install} const walk = (w) => {{ install(w); for (let i = 0; i < w.frames.length; i++) {{ try {{ if (w.frames[i].document) walk(w.frames[i]); }} catch {{}} }} }}; walk(globalThis); }})()"
+        );
+        let need_binding = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(self.context_id.0.clone()).or_default();
+            if !setup.exposed_bindings.insert(name.to_string()) {
+                return Err(Error::Other(format!(
+                    "Function \"{name}\" has been already registered"
+                )));
+            }
+            let first = !setup.bindings_enabled;
+            setup.bindings_enabled = true;
+            setup.init_scripts.push(shim.clone());
+            first
+        };
+        let mut sessions = CdpBrowser::sessions_in_context(&self.targets, &self.context_id.0).await;
+        if !sessions.iter().any(|s| s == self.sid()) {
+            sessions.push(self.sid().to_string());
+        }
+        for s in sessions {
+            if need_binding {
+                let r = self
+                    .session_call(
+                        &s,
+                        "Runtime.addBinding",
+                        json!({ "name": "__fluxwright_binding" }),
+                        timeout,
+                    )
+                    .await;
+                if s == self.sid() {
+                    r?;
+                }
+            }
+            let r1 = self
+                .session_call(
+                    &s,
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": &shim }),
+                    timeout,
+                )
+                .await;
+            if s == self.sid() {
+                r1?;
+            }
+            let r2 = self
+                .session_call(
+                    &s,
+                    "Runtime.evaluate",
+                    json!({ "expression": &eval_shim, "returnByValue": true }),
+                    timeout,
+                )
+                .await;
+            if s == self.sid() {
+                r2?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Injects a `<script>` element into the page by external URL or inline content.
+    pub async fn add_script_tag(&self, opts: &ScriptTagOptions, timeout: Duration) -> Result<()> {
+        if opts.url.is_some() == opts.content.is_some() {
+            return Err(Error::Other(
+                "add_script_tag: specify exactly one of url or content".into(),
+            ));
+        }
+        if opts.url.as_ref().is_some_and(|u| u.trim().is_empty()) {
+            return Err(Error::Other("add_script_tag: url must not be empty".into()));
+        }
+        let type_json = serde_json::to_string(&opts.script_type).unwrap();
+        let js = if let Some(ref url) = opts.url {
+            format!(
+                r#"((url, type) => new Promise((resolve, reject) => {{
+                    const script = document.createElement('script');
+                    if (type) script.type = type;
+                    script.onload = () => resolve();
+                    script.onerror = () => reject(new Error('Failed to load script: ' + url));
+                    script.src = url;
+                    (document.head || document.documentElement).appendChild(script);
+                }}))({}, {type_json})"#,
+                serde_json::to_string(url).unwrap(),
+            )
+        } else {
+            let content = opts.content.as_deref().unwrap_or("");
+            format!(
+                r#"((content, type) => {{
+                    const script = document.createElement('script');
+                    if (type) script.type = type;
+                    let err = null;
+                    const onError = (e) => {{ err = e.error || new Error(e.message || 'Script error'); }};
+                    window.addEventListener('error', onError);
+                    try {{
+                        script.text = content;
+                        (document.head || document.documentElement).appendChild(script);
+                    }} finally {{
+                        window.removeEventListener('error', onError);
+                    }}
+                    if (err) throw err;
+                }})({}, {type_json})"#,
+                serde_json::to_string(content).unwrap(),
+            )
+        };
+        self.eval_in(&self.main_scope(), &js, true, timeout).await?;
+        Ok(())
+    }
+
+    /// Injects a `<link rel="stylesheet">` or `<style>` element into the page.
+    pub async fn add_style_tag(&self, opts: &StyleTagOptions, timeout: Duration) -> Result<()> {
+        if opts.url.is_some() == opts.content.is_some() {
+            return Err(Error::Other(
+                "add_style_tag: specify exactly one of url or content".into(),
+            ));
+        }
+        if opts.url.as_ref().is_some_and(|u| u.trim().is_empty()) {
+            return Err(Error::Other("add_style_tag: url must not be empty".into()));
+        }
+        let js = if let Some(ref url) = opts.url {
+            format!(
+                r#"((url) => new Promise((resolve, reject) => {{
+                    const link = document.createElement('link');
+                    link.rel = 'stylesheet';
+                    link.onload = () => resolve();
+                    link.onerror = () => reject(new Error('Failed to load stylesheet: ' + url));
+                    link.href = url;
+                    (document.head || document.documentElement).appendChild(link);
+                }}))({})"#,
+                serde_json::to_string(url).unwrap(),
+            )
+        } else {
+            let content = opts.content.as_deref().unwrap_or("");
+            format!(
+                r#"((content) => {{
+                    const style = document.createElement('style');
+                    style.textContent = content;
+                    (document.head || document.documentElement).appendChild(style);
+                }})({})"#,
+                serde_json::to_string(content).unwrap(),
+            )
+        };
+        self.eval_in(&self.main_scope(), &js, true, timeout).await?;
         Ok(())
     }
 
@@ -2619,6 +2850,10 @@ pub(crate) struct ContextSetup {
     pub(crate) dialogs: Option<tokio::sync::mpsc::UnboundedSender<crate::events::Dialog>>,
     /// Where intercepted file chooser dialogs go (`page.on('filechooser')`).
     pub(crate) file_choosers: Option<tokio::sync::mpsc::UnboundedSender<crate::events::FileChooser>>,
+    /// Where invocations from `expose_binding` / `expose_function` go.
+    pub(crate) bindings: Option<tokio::sync::mpsc::UnboundedSender<crate::events::BindingCall>>,
+    pub(crate) bindings_enabled: bool,
+    pub(crate) exposed_bindings: std::collections::HashSet<String>,
     pub(crate) emulation: Option<Emulation>,
     pub(crate) init_scripts: Vec<String>,
     pub(crate) types: Vec<ResourceType>,
