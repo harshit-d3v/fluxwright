@@ -626,6 +626,8 @@ class BrowserContext {
   #closed = false
   #routes = []
   #cookies = []
+  #initScripts = []
+  #exposed = []
 
   constructor(browser, options) {
     this.#browser = browser
@@ -648,6 +650,8 @@ class BrowserContext {
       const page = await this.#browser.newPage(this.#options)
       try {
         if (this.#cookies.length) await page._addCookies(this.#cookies)
+        for (const [name, callback] of this.#exposed) await page.exposeFunction(name, callback)
+        for (const source of this.#initScripts) await page._addInitScript(source)
         for (const [url, handler] of this.#routes) await page.route(url, handler)
         // close() ran while the page was coming: it would otherwise stay open on a closed context.
         if (this.#closed) throw new Error('browserContext.newPage: the context is closed')
@@ -672,6 +676,33 @@ class BrowserContext {
   async unroute(url, handler) {
     this.#routes = this.#routes.filter(([u, h]) => !(u === url && (!handler || h === handler)))
     if (this.#page) await this.#page.unroute(url, handler)
+  }
+
+  async addInitScript(script, arg) {
+    const source = await resolveInitScript('browserContext.addInitScript', script, arg)
+    this.#initScripts.push(source)
+    if (this.#page) await this.#page._addInitScript(source)
+  }
+
+  async exposeFunction(name, callback) {
+    if (typeof name !== 'string' || !name) {
+      throw new TypeError('browserContext.exposeFunction: name must be a non-empty string')
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError('browserContext.exposeFunction: callback must be a function')
+    }
+    if (this.#exposed.some(([n]) => n === name)) {
+      throw new Error(`Function "${name}" has been already registered`)
+    }
+    this.#exposed.push([name, callback])
+    if (this.#page) {
+      try {
+        await this.#page.exposeFunction(name, callback)
+      } catch (err) {
+        this.#exposed = this.#exposed.filter(([n]) => n !== name)
+        throw err
+      }
+    }
   }
 
   async storageState(options) {
@@ -748,6 +779,109 @@ function installDownloads(Page) {
         await fs.copyFile(d.path, path)
       },
     }
+  }
+}
+
+const TAG_SCRIPT = { url: true, path: true, content: true, type: true }
+const TAG_STYLE = { url: true, path: true, content: true }
+
+async function resolveInitScript(method, script, arg) {
+  if (typeof script === 'function') return toExpression(script, arg)
+  if (typeof script === 'string') return script
+  if (script && typeof script === 'object') {
+    checkOptions(method, script, { path: true, content: true })
+    if (script.path != null && script.content != null) {
+      throw new TypeError(`${method}: specify either path or content, not both`)
+    }
+    if (script.path != null) return fs.readFile(script.path, 'utf8')
+    if (script.content != null) return String(script.content)
+  }
+  throw new TypeError(`${method}: script must be a function, string, or { path, content }`)
+}
+
+function installBindings(Page) {
+  const pages = new WeakMap()
+  const starts = new WeakSet()
+
+  function subscribe(page) {
+    const ref = new WeakRef(page)
+    page._onBinding(async (ev) => {
+      const p = ref.deref()
+      if (!p) return
+      const cb = pages.get(p)?.get(ev.name)
+      if (!cb) {
+        await p._rejectBinding(ev.id, `Function "${ev.name}" is not exposed`).catch(() => {})
+        return
+      }
+      try {
+        const args = JSON.parse(ev.argsJson)
+        const value = await cb(...args)
+        const encoded = value === undefined ? 'null' : (JSON.stringify(value) ?? 'null')
+        await p._resolveBinding(ev.id, encoded).catch(() => {})
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        await p._rejectBinding(ev.id, msg).catch(() => {})
+      }
+    })
+  }
+
+  Page.prototype.addInitScript = async function (script, arg) {
+    const source = await resolveInitScript('page.addInitScript', script, arg)
+    return this._addInitScript(source)
+  }
+
+  Page.prototype.exposeFunction = async function (name, callback) {
+    if (typeof name !== 'string' || !name) {
+      throw new TypeError('page.exposeFunction: name must be a non-empty string')
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError('page.exposeFunction: callback must be a function')
+    }
+    let map = pages.get(this)
+    if (!map) {
+      map = new Map()
+      pages.set(this, map)
+    }
+    if (map.has(name)) {
+      throw new Error(`Function "${name}" has been already registered`)
+    }
+    if (!starts.has(this)) {
+      subscribe(this)
+      starts.set(this, true)
+    }
+    map.set(name, callback)
+    try {
+      await this._exposeBinding(name)
+    } catch (err) {
+      if (map.get(name) === callback) map.delete(name)
+      throw err
+    }
+  }
+
+  Page.prototype.addScriptTag = async function (options) {
+    checkOptions('page.addScriptTag', options, TAG_SCRIPT)
+    const sources = ['url', 'path', 'content'].filter((k) => options?.[k] != null)
+    if (sources.length !== 1) {
+      throw new TypeError('page.addScriptTag: provide exactly one of url, path, or content')
+    }
+    const content = options.path != null ? await fs.readFile(options.path, 'utf8') : options.content
+    return this._addScriptTag(options.url, content, options.type)
+  }
+
+  Page.prototype.addStyleTag = async function (options) {
+    checkOptions('page.addStyleTag', options, TAG_STYLE)
+    const sources = ['url', 'path', 'content'].filter((k) => options?.[k] != null)
+    if (sources.length !== 1) {
+      throw new TypeError('page.addStyleTag: provide exactly one of url, path, or content')
+    }
+    const content = options.path != null ? await fs.readFile(options.path, 'utf8') : options.content
+    return this._addStyleTag(options.url, content)
+  }
+
+  const close = Page.prototype.close
+  Page.prototype.close = async function (options) {
+    pages.delete(this)
+    return close.call(this, options)
   }
 }
 
@@ -1187,6 +1321,7 @@ function applyFilter(loc, options, label) {
   installEvents(native.Page)
   installRoutes(native.Page)
   installDownloads(native.Page)
+  installBindings(native.Page)
   module.exports = native
   // Chromium.launch is read-only on the native class, so `chromium` is a checked stand-in.
   module.exports.chromium = {

@@ -105,6 +105,10 @@ pub struct PageLease {
     dialog_listeners: Listeners<fluxwright_cdp::Dialog>,
     /// Who receives intercepted file choosers on this page.
     file_chooser_listeners: Listeners<fluxwright_cdp::FileChooser>,
+    /// Invocations of exposed JS->host bindings on this page.
+    binding_listeners: Listeners<fluxwright_cdp::BindingCall>,
+    binding_handlers: Arc<std::sync::Mutex<HashMap<String, BindingHandler>>>,
+    binding_dispatch_started: AtomicBool,
     /// `set_default_timeout` and `set_default_navigation_timeout`, when called.
     default_timeouts: std::sync::Mutex<(Option<Duration>, Option<Duration>)>,
     /// This page's place on the host it navigated to, when hosts are limited.
@@ -128,6 +132,11 @@ pub async fn with_timeout<F: std::future::Future>(timeout: Option<Duration>, cal
 }
 
 type Listeners<T> = Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<T>>>>;
+type BindingHandler = Arc<
+    dyn Fn(Vec<serde_json::Value>) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<serde_json::Value, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Routes events (dialogs, file choosers) to the newest listener still subscribed; an
 /// unhandled event is dropped cleanly. Ends with the context.
@@ -709,6 +718,8 @@ impl Inner {
         route_newest(page.dialogs().await, dialog_listeners.clone());
         let file_chooser_listeners = Listeners::default();
         route_newest(page.file_choosers().await, file_chooser_listeners.clone());
+        let binding_listeners = Listeners::default();
+        route_newest(page.bindings().await, binding_listeners.clone());
         Ok(PageLease {
             engine: self.clone(),
             browser,
@@ -723,6 +734,9 @@ impl Inner {
             download_dir,
             dialog_listeners,
             file_chooser_listeners,
+            binding_listeners,
+            binding_handlers: Default::default(),
+            binding_dispatch_started: AtomicBool::new(false),
             default_timeouts: Default::default(),
             host_slot: HostSlot::default(),
             base_url: Default::default(),
@@ -1629,6 +1643,124 @@ impl PageLease {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.file_chooser_listeners.lock().unwrap().push(tx);
         rx
+    }
+
+    /// Invocations of exposed bindings on this page and its frames from now on.
+    pub fn subscribe_bindings(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::BindingCall> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.binding_listeners.lock().unwrap().push(tx);
+        rx
+    }
+
+    pub async fn add_init_script(&self, source: &str) -> Result<()> {
+        Ok(self.page.add_init_script(source, self.action_timeout()).await?)
+    }
+
+    pub async fn add_init_script_path(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let p = path.as_ref();
+        let source = tokio::fs::read_to_string(p)
+            .await
+            .map_err(|e| Error::Other(format!("add_init_script {}: {e}", p.display())))?;
+        self.add_init_script(&source).await
+    }
+
+    pub async fn expose_binding(&self, name: &str) -> Result<()> {
+        Ok(self.page.expose_binding(name, self.action_timeout()).await?)
+    }
+
+    pub async fn expose_function<F, Fut>(&self, name: &str, handler: F) -> Result<()>
+    where
+        F: Fn(Vec<serde_json::Value>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<serde_json::Value, String>>
+            + Send
+            + 'static,
+    {
+        if self
+            .binding_dispatch_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let mut rx = self.subscribe_bindings();
+            let handlers = self.binding_handlers.clone();
+            tokio::spawn(async move {
+                while let Some(call) = rx.recv().await {
+                    let h = handlers.lock().unwrap().get(&call.name).cloned();
+                    tokio::spawn(async move {
+                        match h {
+                            Some(handler) => match handler(call.args.clone()).await {
+                                Ok(val) => {
+                                    let _ = call.resolve(&val).await;
+                                }
+                                Err(msg) => {
+                                    let _ = call.reject(&msg).await;
+                                }
+                            },
+                            None => {
+                                let _ = call
+                                    .reject(&format!("Function \"{}\" is not registered", call.name))
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        let handler: BindingHandler = Arc::new(move |args| Box::pin(handler(args)));
+        {
+            let mut handlers = self.binding_handlers.lock().unwrap();
+            if handlers.contains_key(name) {
+                return Err(Error::Other(format!(
+                    "Function \"{name}\" has been already registered"
+                )));
+            }
+            handlers.insert(name.to_string(), handler);
+        }
+        if let Err(err) = self.expose_binding(name).await {
+            self.binding_handlers.lock().unwrap().remove(name);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub async fn add_script_tag(&self, opts: &fluxwright_cdp::ScriptTagOptions) -> Result<()> {
+        Ok(self.page.add_script_tag(opts, self.action_timeout()).await?)
+    }
+
+    pub async fn add_script_tag_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        script_type: Option<&str>,
+    ) -> Result<()> {
+        let p = path.as_ref();
+        let mut content = tokio::fs::read_to_string(p)
+            .await
+            .map_err(|e| Error::Other(format!("add_script_tag {}: {e}", p.display())))?;
+        content.push_str(&format!("\n//# sourceURL={}", p.display()));
+        self.add_script_tag(&fluxwright_cdp::ScriptTagOptions {
+            url: None,
+            content: Some(content),
+            script_type: script_type.map(str::to_owned),
+        })
+        .await
+    }
+
+    pub async fn add_style_tag(&self, opts: &fluxwright_cdp::StyleTagOptions) -> Result<()> {
+        Ok(self.page.add_style_tag(opts, self.action_timeout()).await?)
+    }
+
+    pub async fn add_style_tag_path(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let p = path.as_ref();
+        let mut content = tokio::fs::read_to_string(p)
+            .await
+            .map_err(|e| Error::Other(format!("add_style_tag {}: {e}", p.display())))?;
+        content.push_str(&format!("\n/*# sourceURL={} */", p.display()));
+        self.add_style_tag(&fluxwright_cdp::StyleTagOptions {
+            url: None,
+            content: Some(content),
+        })
+        .await
     }
 
     pub fn subscribe_logs(&self) -> tokio::sync::mpsc::UnboundedReceiver<LogEntry> {

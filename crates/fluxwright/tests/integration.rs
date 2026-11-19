@@ -2228,3 +2228,168 @@ async fn navigation_and_wait_helpers() {
     page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_scripts_bindings_and_tags() {
+    let app = axum::Router::new()
+        .route(
+            "/page",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><html><body>",
+                    "<p id='out'></p><p id='styled'>StyleMe</p>",
+                    "<iframe id='sub' src='/child'></iframe>",
+                    "<script>document.getElementById('out').textContent = String(window.__early);</script>",
+                    "</body></html>",
+                ))
+            }),
+        )
+        .route(
+            "/child",
+            axum::routing::get(|| async {
+                axum::response::Html("<span id='c'></span><script>window.__childEarly = window.__early;</script>")
+            }),
+        )
+        .route(
+            "/ext.js",
+            axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+                    "window.__fromUrl = 'ext-ok';",
+                )
+            }),
+        )
+        .route(
+            "/ext.css",
+            axum::routing::get(|| async {
+                ([(axum::http::header::CONTENT_TYPE, "text/css")], "#styled { margin-left: 24px; }")
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+
+    let eng = engine(1, 1).await;
+    let page = eng.acquire_job(&JobOptions::default()).await.unwrap();
+
+    // 1. add_init_script runs before inline page script, survives reload, and runs inside iframes.
+    page.add_init_script("window.__early = (window.__early || 0) + 41;")
+        .await
+        .unwrap();
+    page.goto(&format!("{base}/page")).await.unwrap();
+    assert_eq!(page.inner_text("#out").await.unwrap(), "41");
+    assert_eq!(
+        page.evaluate("document.getElementById('sub').contentWindow.__childEarly")
+            .await
+            .unwrap(),
+        json!(41)
+    );
+    page.reload().await.unwrap();
+    assert_eq!(page.inner_text("#out").await.unwrap(), "41");
+
+    // 2. expose_function works immediately, across reload, from iframes, propagates errors, and rejects duplicates.
+    page.expose_function("hostAdd", |args| async move {
+        let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        Ok(json!(a + b))
+    })
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("hostAdd(19, 23)").await.unwrap(), json!(42));
+    assert_eq!(
+        page.evaluate("document.getElementById('sub').contentWindow.hostAdd(5, 6)")
+            .await
+            .unwrap(),
+        json!(11)
+    );
+    page.reload().await.unwrap();
+    assert_eq!(page.evaluate("hostAdd(10, 5)").await.unwrap(), json!(15));
+
+    let dup = page
+        .expose_function("hostAdd", |_| async { Ok(json!(0)) })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(dup.contains("already registered"), "got {dup}");
+
+    page.expose_function("hostFail", |_| async { Err("boom-from-rust".into()) })
+        .await
+        .unwrap();
+    let err = page
+        .evaluate("hostFail()")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("boom-from-rust"), "got {err}");
+
+    // 3. add_script_tag & add_style_tag: content, url, path, and missing URL rejection.
+    page.add_script_tag(&fluxwright::ScriptTagOptions {
+        content: Some("window.__inlineTag = 77;".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("window.__inlineTag").await.unwrap(), json!(77));
+
+    page.add_script_tag(&fluxwright::ScriptTagOptions {
+        url: Some(format!("{base}/ext.js")),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("window.__fromUrl").await.unwrap(), json!("ext-ok"));
+
+    let dir = std::env::temp_dir();
+    let js_path = dir.join(format!("fluxwright-it-{}.js", std::process::id()));
+    let css_path = dir.join(format!("fluxwright-it-{}.css", std::process::id()));
+    std::fs::write(&js_path, "window.__fromFile = 'file-ok';").unwrap();
+    std::fs::write(&css_path, "#styled { padding-top: 13px; }").unwrap();
+    page.add_script_tag_path(&js_path, None).await.unwrap();
+    page.add_style_tag_path(&css_path).await.unwrap();
+    let _ = std::fs::remove_file(&js_path);
+    let _ = std::fs::remove_file(&css_path);
+    assert_eq!(page.evaluate("window.__fromFile").await.unwrap(), json!("file-ok"));
+    assert_eq!(
+        page.evaluate("getComputedStyle(document.getElementById('styled')).paddingTop")
+            .await
+            .unwrap(),
+        json!("13px")
+    );
+
+    assert!(page
+        .add_script_tag(&fluxwright::ScriptTagOptions {
+            url: Some(format!("{base}/missing.js")),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+
+    page.add_style_tag(&fluxwright::StyleTagOptions {
+        content: Some("#styled { color: rgb(255, 0, 0); }".into()),
+        url: None,
+    })
+    .await
+    .unwrap();
+    page.add_style_tag(&fluxwright::StyleTagOptions {
+        url: Some(format!("{base}/ext.css")),
+        content: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        page.evaluate("getComputedStyle(document.getElementById('styled')).color")
+            .await
+            .unwrap(),
+        json!("rgb(255, 0, 0)")
+    );
+    assert_eq!(
+        page.evaluate("getComputedStyle(document.getElementById('styled')).marginLeft")
+            .await
+            .unwrap(),
+        json!("24px")
+    );
+
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}

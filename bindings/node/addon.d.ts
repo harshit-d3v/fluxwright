@@ -197,6 +197,9 @@ export interface BrowserContext {
   /** `page.route` for this context's page; added before `newPage()`, it applies from the first request. */
   route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
   unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
+  addInitScript<Arg>(script: (arg: Arg) => unknown, arg: Arg): Promise<void>
+  addInitScript(script: (() => unknown) | string | { path?: string; content?: string }): Promise<void>
+  exposeFunction(name: string, callback: (...args: any[]) => unknown): Promise<void>
   /** The cookies and localStorage of this context's page, as `page.storageState`. */
   storageState(options?: { path?: string }): Promise<StorageState>
   /** Every cookie in this context. */
@@ -349,6 +352,11 @@ declare module './index' {
       arg?: unknown,
       options?: { polling?: 'raf' | number; timeout?: number },
     ): Promise<any>
+    addInitScript<Arg>(script: (arg: Arg) => unknown, arg: Arg): Promise<void>
+    addInitScript(script: (() => unknown) | string | { path?: string; content?: string }): Promise<void>
+    exposeFunction(name: string, callback: (...args: any[]) => unknown): Promise<void>
+    addScriptTag(options: { url?: string; path?: string; content?: string; type?: string }): Promise<void>
+    addStyleTag(options: { url?: string; path?: string; content?: string }): Promise<void>
   }
   interface Locator {
     locator(selector: string, options?: FilterOptions): Locator
