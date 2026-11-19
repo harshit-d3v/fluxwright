@@ -2717,3 +2717,310 @@ async fn cdp_session_send_events_and_oopif() {
     ctx.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_request_cookies_and_indexeddb() {
+    use std::collections::HashMap;
+    use axum::{
+        extract::Query,
+        http::{header, HeaderMap, StatusCode},
+        response::{Html, IntoResponse, Redirect},
+        routing::{get, post},
+        Json, Router,
+    };
+    use fluxwright::{ApiRequestOptions, Cookie, CookieFilter, Fulfill, RouteFetchOptions};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route("/idb", get(|| async { Html("<p id='ready'>ok</p>") }))
+        .route("/app/sub", get(|| async { Html("<p>app</p>") }))
+        .route("/apple", get(|| async { Html("<p>apple</p>") }))
+        .route(
+            "/api/login",
+            post(|headers: HeaderMap, body: String| async move {
+                let extra = headers
+                    .get("x-ctx")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let mut out_headers = HeaderMap::new();
+                out_headers.append(
+                    header::SET_COOKIE,
+                    "api_tok=secret99; Path=/; HttpOnly".parse().unwrap(),
+                );
+                out_headers.append(
+                    header::SET_COOKIE,
+                    "vis=yes; Path=/".parse().unwrap(),
+                );
+                (out_headers, Json(json!({ "body": body, "xCtx": extra })))
+            }),
+        )
+        .route(
+            "/api/echo",
+            get(|Query(q): Query<HashMap<String, String>>, headers: HeaderMap| async move {
+                let cookie = headers
+                    .get("cookie")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let extra = headers
+                    .get("x-ctx")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                Json(json!({ "cookie": cookie, "xCtx": extra, "q": q }))
+            }),
+        )
+        .route("/api/redir", get(|| async { Redirect::temporary("/api/echo") }))
+        .route(
+            "/api/fail",
+            get(|| async { (StatusCode::NOT_FOUND, "missing").into_response() }),
+        )
+        .route(
+            "/api/data",
+            get(|| async { Json(json!({ "items": ["real"] })) }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let eng = engine(1, 2).await;
+    let mut opts = JobOptions::default();
+    opts.emulation
+        .extra_http_headers
+        .push(("X-Ctx".into(), "from-ctx".into()));
+    opts.base_url = Some(base.clone());
+    let ctx = eng.acquire_context_with(&opts).await.unwrap();
+
+    // 1. Cookies URL filtering & selective clearCookies.
+    let mk = |name: &str, path: &str, domain: &str| Cookie {
+        name: name.into(),
+        value: format!("{name}-v"),
+        domain: domain.into(),
+        path: path.into(),
+        expires: -1.0,
+        http_only: false,
+        secure: false,
+        same_site: "Lax".into(),
+        partition_key: None,
+        cross_site_ancestor: None,
+    };
+    ctx.add_cookies(&[
+        mk("root_c", "/", "127.0.0.1"),
+        mk("app_c", "/app", "127.0.0.1"),
+        mk("loc_c", "/", "localhost"),
+    ])
+    .await
+    .unwrap();
+    let app_cookies = ctx
+        .cookies_for_urls(&[format!("{base}/app/sub")])
+        .await
+        .unwrap();
+    let mut app_names: Vec<_> = app_cookies.iter().map(|c| c.name.as_str()).collect();
+    app_names.sort();
+    assert_eq!(app_names, vec!["app_c", "root_c"]);
+
+    let apple_cookies = ctx
+        .cookies_for_urls(&[format!("{base}/apple")])
+        .await
+        .unwrap();
+    assert_eq!(
+        apple_cookies.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["root_c"]
+    );
+
+    ctx.clear_cookies_filtered(&CookieFilter {
+        name: Some("app_c".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    ctx.clear_cookies_filtered(&CookieFilter {
+        domain: Some("localhost".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let rem = ctx.cookies().await.unwrap();
+    assert_eq!(
+        rem.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["root_c"]
+    );
+    ctx.clear_cookies().await.unwrap();
+
+    // 2. IndexedDB storageState capture + zero-race restore.
+    let page = ctx.new_page().await.unwrap();
+    page.goto("/idb").await.unwrap();
+    page.evaluate(
+        r#"(async () => {
+            localStorage.setItem('lsKey', 'lsVal');
+            await new Promise((resolve, reject) => {
+                const req = indexedDB.open('authDb', 2);
+                req.onupgradeneeded = () => {
+                    const db = req.result;
+                    const tokens = db.createObjectStore('tokens', { keyPath: 'id' });
+                    tokens.createIndex('byRole', 'role', { unique: false });
+                    db.createObjectStore('kv');
+                };
+                req.onsuccess = () => {
+                    const db = req.result;
+                    const tx = db.transaction(['tokens', 'kv'], 'readwrite');
+                    tx.objectStore('tokens').put({ id: 'u1', role: 'admin', token: 'tok-123' });
+                    tx.objectStore('kv').put({ when: new Date('2026-01-02T03:04:05.000Z') }, 'stamp');
+                    tx.oncomplete = () => { db.close(); resolve(true); };
+                    tx.onerror = () => reject(tx.error);
+                };
+                req.onerror = () => reject(req.error);
+            });
+        })()"#,
+    )
+    .await
+    .unwrap();
+    let idb_state = page.storage_state_with(true).await.unwrap();
+    assert!(
+        idb_state
+            .origins
+            .iter()
+            .any(|o| o.indexed_db.as_ref().is_some_and(|dbs| dbs.iter().any(|d| d.name == "authDb"))),
+        "expected authDb in storageState: {idb_state:?}"
+    );
+
+    let restored_ctx = eng
+        .acquire_context_with(&JobOptions::default().storage_state(idb_state))
+        .await
+        .unwrap();
+    let restored_page = restored_ctx.new_page().await.unwrap();
+    restored_page.goto(&format!("{base}/idb")).await.unwrap();
+    let restored = restored_page
+        .evaluate(
+            r#"(async () => {
+                return await new Promise((resolve, reject) => {
+                    const req = indexedDB.open('authDb', 2);
+                    req.onsuccess = () => {
+                        try {
+                            const db = req.result;
+                            const tx = db.transaction(['tokens', 'kv'], 'readonly');
+                            const tokStore = tx.objectStore('tokens');
+                            const idx = Array.from(tokStore.indexNames);
+                            const r1 = tokStore.get('u1');
+                            const r2 = tx.objectStore('kv').get('stamp');
+                            tx.oncomplete = () => {
+                                try {
+                                    const out = {
+                                        ls: localStorage.getItem('lsKey'),
+                                        token: r1.result && r1.result.token,
+                                        hasDate: r2.result && (r2.result.when instanceof Date) && r2.result.when.toISOString(),
+                                        idx,
+                                    };
+                                    db.close();
+                                    resolve(out);
+                                } catch (e) {
+                                    reject(e);
+                                }
+                            };
+                            tx.onerror = () => reject(tx.error);
+                        } catch (e) {
+                            reject(e);
+                        }
+                    };
+                    req.onerror = () => reject(req.error);
+                });
+            })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored["ls"], json!("lsVal"));
+    assert_eq!(restored["token"], json!("tok-123"));
+    assert_eq!(restored["hasDate"], json!("2026-01-02T03:04:05.000Z"));
+    assert_eq!(restored["idx"], json!(["byRole"]));
+    restored_ctx.close().await.unwrap();
+
+    // 3. APIRequestContext shared cookie jar, redirects, failOnStatusCode.
+    let api = ctx.request();
+    let login = api
+        .post(
+            "/api/login",
+            &ApiRequestOptions {
+                data: Some(b"hello".to_vec()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(login.ok());
+    let login_json = login.json().unwrap();
+    assert_eq!(login_json["body"], json!("hello"));
+    assert_eq!(login_json["xCtx"], json!("from-ctx"));
+
+    // Page sees non-HttpOnly cookie set by APIRequestContext, and adds its own cookie.
+    assert_eq!(
+        page.evaluate("document.cookie").await.unwrap(),
+        json!("vis=yes")
+    );
+    page.evaluate("document.cookie = 'from_page=abc; Path=/'")
+        .await
+        .unwrap();
+
+    let echo = api
+        .get(
+            "/api/echo",
+            &ApiRequestOptions {
+                params: vec![("k".into(), "v 1".into())],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let echo_json = echo.json().unwrap();
+    let cookie_hdr = echo_json["cookie"].as_str().unwrap();
+    assert!(cookie_hdr.contains("api_tok=secret99"), "{cookie_hdr}");
+    assert!(cookie_hdr.contains("from_page=abc"), "{cookie_hdr}");
+    assert_eq!(echo_json["q"]["k"], json!("v 1"));
+
+    let no_redir = api
+        .get(
+            "/api/redir",
+            &ApiRequestOptions {
+                max_redirects: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_redir.status, 307);
+
+    let failed = api
+        .get(
+            "/api/fail",
+            &ApiRequestOptions {
+                fail_on_status_code: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(failed.is_err());
+
+    // 4. route.fetch() + fulfill(from_response) with mutation.
+    let mut routes = page.intercept().await.unwrap();
+    let route_task = tokio::spawn(async move {
+        while let Some(req) = routes.recv().await {
+            if req.url.ends_with("/api/data") {
+                let resp = req.fetch(&RouteFetchOptions::default()).await.unwrap();
+                let mut val = resp.json().unwrap();
+                val["items"].as_array_mut().unwrap().push(json!("patched"));
+                let mut fulfill = Fulfill::from_response(&resp);
+                fulfill.body = serde_json::to_vec(&val).unwrap();
+                req.fulfill(fulfill).await.unwrap();
+            }
+        }
+    });
+    let patched = page
+        .evaluate("(async () => (await fetch('/api/data')).json())()")
+        .await
+        .unwrap();
+    assert_eq!(patched["items"], json!(["real", "patched"]));
+    route_task.abort();
+
+    ctx.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}

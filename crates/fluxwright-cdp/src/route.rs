@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 
 use crate::connection::Connection;
 use crate::error::{Error, Result};
+use crate::http_client::{
+    send_context_request, ApiRequestOptions, ApiResponse, HttpContextDefaults, RouteFetchOptions,
+};
 
 /// A paused request. Answer it with [`fulfill`](Self::fulfill), [`continue_with`](Self::continue_with)
 /// or [`abort`](Self::abort); one that is dropped unanswered continues unchanged.
@@ -18,7 +21,68 @@ pub struct InterceptedRequest {
     pub post_data: Option<String>,
     /// Playwright's names: `document`, `script`, `stylesheet`, `image`, `xhr`, `fetch`, ...
     pub resource_type: String,
+    context_id: String,
+    defaults: HttpContextDefaults,
     reply: Reply,
+}
+
+/// Cloneable handle for performing `route.fetch()` before settling an intercepted request.
+#[derive(Clone)]
+pub struct RouteFetchHandle {
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    post_data: Option<String>,
+    conn: Arc<Connection>,
+    context_id: String,
+    defaults: HttpContextDefaults,
+}
+
+impl RouteFetchHandle {
+    pub async fn fetch(&self, opts: &RouteFetchOptions) -> Result<ApiResponse> {
+        let target_url = opts.url.as_deref().unwrap_or(&self.url);
+        let method = opts.method.clone().unwrap_or_else(|| self.method.clone());
+        let stripped_inherited: Vec<(String, String)> = self
+            .headers
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "accept-encoding" | "connection" | "content-length" | "cookie" | "host"
+                )
+            })
+            .cloned()
+            .collect();
+        let (inherit_headers, caller_headers) = match &opts.headers {
+            Some(h) => (None, h.clone()),
+            None => (Some(stripped_inherited.as_slice()), Vec::new()),
+        };
+        let api_opts = ApiRequestOptions {
+            method: Some(method),
+            headers: caller_headers,
+            params: Vec::new(),
+            data: opts
+                .post_data
+                .clone()
+                .or_else(|| self.post_data.as_ref().map(|s| s.as_bytes().to_vec())),
+            fail_on_status_code: false,
+            max_redirects: opts.max_redirects,
+            timeout: opts.timeout,
+        };
+        let mut defaults = self.defaults.clone();
+        if defaults.base_url.is_none() {
+            defaults.base_url = Some(self.url.clone());
+        }
+        send_context_request(
+            &self.conn,
+            &self.context_id,
+            &defaults,
+            target_url,
+            &api_opts,
+            inherit_headers,
+        )
+        .await
+    }
 }
 
 /// A response made up by the job.
@@ -28,6 +92,28 @@ pub struct Fulfill {
     pub status: Option<u16>,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl Fulfill {
+    /// Builds a fulfill payload from a fetched [`ApiResponse`], dropping hop-by-hop headers.
+    pub fn from_response(resp: &ApiResponse) -> Self {
+        let headers = resp
+            .headers
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "connection" | "content-encoding" | "content-length" | "transfer-encoding"
+                )
+            })
+            .cloned()
+            .collect();
+        Fulfill {
+            status: Some(resp.status),
+            headers,
+            body: resp.body.clone(),
+        }
+    }
 }
 
 /// Changes to make before the request goes on. `headers` replaces all of them.
@@ -103,7 +189,13 @@ fn parse_paused_fields(params: &Value) -> Option<(String, String, Vec<(String, S
 
 impl InterceptedRequest {
     /// From a `Fetch.requestPaused` event on `session`.
-    pub(crate) fn from_paused(params: &Value, conn: Arc<Connection>, session: String) -> Option<Self> {
+    pub(crate) fn from_paused(
+        params: &Value,
+        conn: Arc<Connection>,
+        session: String,
+        context_id: String,
+        defaults: HttpContextDefaults,
+    ) -> Option<Self> {
         let (url, method, headers, post_data, resource_type, request_id) =
             parse_paused_fields(params)?;
         Some(InterceptedRequest {
@@ -112,6 +204,8 @@ impl InterceptedRequest {
             headers,
             post_data,
             resource_type,
+            context_id,
+            defaults,
             reply: Reply {
                 conn,
                 session,
@@ -120,6 +214,22 @@ impl InterceptedRequest {
                 done: false,
             },
         })
+    }
+
+    pub fn fetch_handle(&self) -> RouteFetchHandle {
+        RouteFetchHandle {
+            url: self.url.clone(),
+            method: self.method.clone(),
+            headers: self.headers.clone(),
+            post_data: self.post_data.clone(),
+            conn: self.reply.conn.clone(),
+            context_id: self.context_id.clone(),
+            defaults: self.defaults.clone(),
+        }
+    }
+
+    pub async fn fetch(&self, opts: &RouteFetchOptions) -> Result<ApiResponse> {
+        self.fetch_handle().fetch(opts).await
     }
 
     pub async fn fulfill(mut self, f: Fulfill) -> Result<()> {

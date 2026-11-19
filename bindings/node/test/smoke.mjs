@@ -1049,6 +1049,138 @@ try {
     }
   }
 
+  // PR 4B: cookies(urls), clearCookies(filter), storageState({ indexedDB }), APIRequestContext, route.fetch()
+  {
+    const http = await import('node:http')
+    const srv = http.createServer(async (req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1')
+      const chunks = []
+      for await (const c of req) chunks.push(c)
+      const rawBody = Buffer.concat(chunks).toString('utf8')
+      if (u.pathname === '/idb') {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<p id="idb-page">ok</p>')
+      } else if (u.pathname === '/api/login') {
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'set-cookie': ['api_tok=node99; Path=/; HttpOnly', 'vis=yes; Path=/'],
+        })
+        res.end(JSON.stringify({ method: req.method, ctype: req.headers['content-type'] || '', body: rawBody, xCtx: req.headers['x-ctx'] || '' }))
+      } else if (u.pathname === '/api/echo') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ cookie: req.headers.cookie || '', query: u.searchParams.get('q') }))
+      } else if (u.pathname === '/api/redir') {
+        res.writeHead(302, { location: '/api/echo?q=fromredir' })
+        res.end()
+      } else if (u.pathname === '/api/fail') {
+        res.writeHead(404, { 'content-type': 'text/plain' })
+        res.end('nope')
+      } else if (u.pathname === '/api/data') {
+        res.writeHead(200, { 'content-type': 'application/json', 'x-orig': 'yes' })
+        res.end(JSON.stringify({ items: ['real'] }))
+      } else {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('ok')
+      }
+    })
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+    const apiBase = `http://127.0.0.1:${srv.address().port}`
+    const ctx = await browser.newContext({ baseURL: apiBase, extraHTTPHeaders: { 'x-ctx': 'node-ctx' } })
+    try {
+      await ctx.addCookies([
+        { name: 'root_c', value: '1', domain: '127.0.0.1', path: '/' },
+        { name: 'app_c', value: '2', domain: '127.0.0.1', path: '/app' },
+        { name: 'loc_c', value: '3', domain: 'localhost', path: '/' },
+      ])
+      const appNames = (await ctx.cookies(`${apiBase}/app/sub`)).map((c) => c.name).sort()
+      assert.deepEqual(appNames, ['app_c', 'root_c'])
+      assert.deepEqual((await ctx.cookies([`${apiBase}/apple`])).map((c) => c.name), ['root_c'])
+      await ctx.clearCookies({ name: /^app_/ })
+      await ctx.clearCookies({ domain: 'localhost' })
+      assert.deepEqual((await ctx.cookies()).map((c) => c.name), ['root_c'])
+      await ctx.clearCookies()
+
+      const p = await ctx.newPage()
+      await p.goto('/idb')
+      await p.evaluate(async () => {
+        localStorage.setItem('lsNode', 'val')
+        await new Promise((resolve, reject) => {
+          const req = indexedDB.open('nodeDb', 1)
+          req.onupgradeneeded = () => {
+            const db = req.result
+            db.createObjectStore('store', { keyPath: 'id' })
+          }
+          req.onsuccess = () => {
+            const db = req.result
+            const tx = db.transaction('store', 'readwrite')
+            tx.objectStore('store').put({ id: 'k1', ts: new Date('2026-02-03T04:05:06.000Z'), secret: 'idb-ok' })
+            tx.oncomplete = () => { db.close(); resolve() }
+            tx.onerror = () => reject(tx.error)
+          }
+        })
+      })
+      const idbState = await ctx.storageState({ indexedDB: true })
+      assert.ok(idbState.origins.some((o) => o.indexedDB?.some((d) => d.name === 'nodeDb')))
+
+      const restoredCtx = await browser.newContext({ storageState: idbState })
+      try {
+        const rp = await restoredCtx.newPage()
+        await rp.goto(`${apiBase}/idb`)
+        const got = await rp.evaluate(() => new Promise((resolve, reject) => {
+          const req = indexedDB.open('nodeDb', 1)
+          req.onsuccess = () => {
+            const db = req.result
+            const tx = db.transaction('store', 'readonly')
+            const get = tx.objectStore('store').get('k1')
+            tx.oncomplete = () => {
+              const r = get.result
+              db.close()
+              resolve({ ls: localStorage.getItem('lsNode'), secret: r?.secret, isDate: r?.ts instanceof Date })
+            }
+            tx.onerror = () => reject(tx.error)
+          }
+        }))
+        assert.deepEqual(got, { ls: 'val', secret: 'idb-ok', isDate: true })
+      } finally {
+        await restoredCtx.close()
+      }
+
+      const login = await ctx.request.post('/api/login', { data: { hello: 1 } })
+      assert.equal(login.ok(), true)
+      const lj = await login.json()
+      assert.equal(lj.xCtx, 'node-ctx')
+      assert.match(lj.ctype, /application\/json/)
+      assert.equal(await p.evaluate(() => document.cookie), 'vis=yes')
+      await p.evaluate(() => { document.cookie = 'from_pg=xyz; Path=/' })
+
+      const echo = await p.request.get('/api/echo', { params: { q: 'hi there' } })
+      const ej = await echo.json()
+      assert.ok(ej.cookie.includes('api_tok=node99') && ej.cookie.includes('from_pg=xyz'))
+      assert.equal(ej.query, 'hi there')
+
+      const mp = await ctx.request.post('/api/login', { multipart: { f: { name: 'hello.txt', mimeType: 'text/plain', buffer: Buffer.from('abc') } } })
+      const mj = await mp.json()
+      assert.match(mj.ctype, /^multipart\/form-data/)
+      assert.ok(mj.body.includes('filename="hello.txt"') && mj.body.includes('abc'))
+
+      const noRedir = await ctx.request.get('/api/redir', { maxRedirects: 0 })
+      assert.equal(noRedir.status(), 302)
+      await assert.rejects(() => ctx.request.get('/api/fail', { failOnStatusCode: true }), /404/)
+
+      await p.route('**/api/data', async (route) => {
+        const resp = await route.fetch()
+        const json = await resp.json()
+        json.items.push('patched')
+        await route.fulfill({ response: resp, json })
+      })
+      const patched = await p.evaluate(() => fetch('/api/data').then((r) => r.json()))
+      assert.deepEqual(patched.items, ['real', 'patched'])
+    } finally {
+      await ctx.close()
+      srv.close()
+    }
+  }
+
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
 } finally {

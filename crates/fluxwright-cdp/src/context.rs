@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use crate::http_client::ParsedUrl;
 
 /// How a page presents itself. Unset fields keep Chrome's defaults.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -171,13 +172,88 @@ pub(crate) fn permission_types(names: &[String]) -> Result<Vec<&'static str>> {
         .collect()
 }
 
-/// Cookies and localStorage, in Playwright's `storageState` JSON format.
+/// Cookies, localStorage, and IndexedDB in Playwright's `storageState` JSON format.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageState {
     #[serde(default)]
     pub cookies: Vec<Cookie>,
     #[serde(default)]
     pub origins: Vec<OriginStorage>,
+}
+
+/// Optional exact-match filters for `context.clear_cookies_filtered`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CookieFilter {
+    pub name: Option<String>,
+    pub domain: Option<String>,
+    pub path: Option<String>,
+}
+
+impl CookieFilter {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.domain.is_none() && self.path.is_none()
+    }
+
+    pub fn matches(&self, c: &Cookie) -> bool {
+        if let Some(name) = &self.name {
+            if c.name != *name {
+                return false;
+            }
+        }
+        if let Some(domain) = &self.domain {
+            let d = domain.to_ascii_lowercase();
+            let cd = c.domain.to_ascii_lowercase();
+            let domain_ok = if d.starts_with('.') {
+                cd == d
+            } else {
+                cd == d || cd == format!(".{d}")
+            };
+            if !domain_ok {
+                return false;
+            }
+        }
+        if let Some(path) = &self.path {
+            if c.path != *path {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Returns cookies that apply to at least one of `urls` (or all cookies when `urls` is empty).
+pub fn filter_cookies(cookies: &[Cookie], urls: &[String]) -> Result<Vec<Cookie>> {
+    if urls.is_empty() {
+        return Ok(cookies.to_vec());
+    }
+    let parsed: Vec<ParsedUrl> = urls
+        .iter()
+        .map(|u| ParsedUrl::parse(u))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(cookies
+        .iter()
+        .filter(|c| parsed.iter().any(|u| cookie_matches_url(c, u)))
+        .cloned()
+        .collect())
+}
+
+fn cookie_matches_url(c: &Cookie, u: &ParsedUrl) -> bool {
+    if c.secure && u.scheme != "https" && u.host != "localhost" {
+        return false;
+    }
+    let cd = c.domain.to_ascii_lowercase();
+    let domain_ok = if let Some(bare) = cd.strip_prefix('.') {
+        u.host == bare || u.host.ends_with(&cd)
+    } else {
+        u.host == cd
+    };
+    if !domain_ok {
+        return false;
+    }
+    let cp = if c.path.is_empty() { "/" } else { c.path.as_str() };
+    u.path == cp
+        || (u.path.starts_with(cp)
+            && (cp.ends_with('/') || u.path.as_bytes().get(cp.len()) == Some(&b'/')))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,7 +281,62 @@ pub struct Cookie {
 #[serde(rename_all = "camelCase")]
 pub struct OriginStorage {
     pub origin: String,
+    #[serde(default)]
     pub local_storage: Vec<StorageItem>,
+    #[serde(rename = "indexedDB", default, skip_serializing_if = "Option::is_none")]
+    pub indexed_db: Option<Vec<IndexedDbDatabase>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedDbDatabase {
+    pub name: String,
+    pub version: u64,
+    #[serde(default)]
+    pub stores: Vec<IndexedDbStore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedDbStore {
+    pub name: String,
+    #[serde(default)]
+    pub auto_increment: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path_array: Option<Vec<String>>,
+    #[serde(default)]
+    pub records: Vec<IndexedDbRecord>,
+    #[serde(default)]
+    pub indexes: Vec<IndexedDbIndex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedDbRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_encoded: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_encoded: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexedDbIndex {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path_array: Option<Vec<String>>,
+    #[serde(default)]
+    pub multi_entry: bool,
+    #[serde(default)]
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -260,26 +391,137 @@ impl Cookie {
 }
 
 impl StorageState {
-    /// Fills localStorage the first time each saved origin loads in a page. A sessionStorage
-    /// marker stops later loads from undoing the page's own changes (a logout, for example).
+    /// Fills localStorage and IndexedDB the first time each saved origin loads in a page. A
+    /// sessionStorage marker stops later loads from undoing the page's own changes. Initiating
+    /// `indexedDB.open(..., version)` synchronously holds Chromium's `versionchange` lock so page
+    /// scripts opening the DB wait for stores and records to commit.
     pub(crate) fn restore_script(&self) -> Option<String> {
+        let has_idb = self
+            .origins
+            .iter()
+            .any(|o| o.indexed_db.as_ref().is_some_and(|dbs| !dbs.is_empty()));
         let saved: serde_json::Map<String, Value> = self
             .origins
             .iter()
-            .filter(|o| !o.local_storage.is_empty())
+            .filter(|o| {
+                !o.local_storage.is_empty()
+                    || o.indexed_db.as_ref().is_some_and(|dbs| !dbs.is_empty())
+            })
             .map(|o| {
-                let items: Vec<Value> = o.local_storage.iter().map(|i| json!([i.name, i.value])).collect();
-                (o.origin.clone(), Value::Array(items))
+                let items: Vec<Value> = o
+                    .local_storage
+                    .iter()
+                    .map(|i| json!([i.name, i.value]))
+                    .collect();
+                if has_idb {
+                    let dbs = o.indexed_db.as_deref().unwrap_or(&[]);
+                    (
+                        o.origin.clone(),
+                        json!({ "localStorage": items, "indexedDB": dbs }),
+                    )
+                } else {
+                    (o.origin.clone(), Value::Array(items))
+                }
             })
             .collect();
         if saved.is_empty() {
             return None;
         }
+        if !has_idb {
+            return Some(format!(
+                "(() => {{ const items = {}[location.origin]; if (!items) return; try {{ \
+                 if (sessionStorage.getItem('__fluxwright_restored')) return; \
+                 for (const [k, v] of items) localStorage.setItem(k, v); \
+                 sessionStorage.setItem('__fluxwright_restored', '1'); }} catch {{}} }})()",
+                Value::Object(saved)
+            ));
+        }
         Some(format!(
-            "(() => {{ const items = {}[location.origin]; if (!items) return; try {{ \
-             if (sessionStorage.getItem('__fluxwright_restored')) return; \
-             for (const [k, v] of items) localStorage.setItem(k, v); \
-             sessionStorage.setItem('__fluxwright_restored', '1'); }} catch {{}} }})()",
+            "(() => {{ \
+const entry = ({})[location.origin]; \
+if (!entry) return; \
+try {{ \
+  if (sessionStorage.getItem('__fluxwright_restored')) return; \
+  sessionStorage.setItem('__fluxwright_restored', '1'); \
+  for (const [k, v] of (entry.localStorage || [])) localStorage.setItem(k, v); \
+  const dbs = entry.indexedDB || []; \
+  if (!dbs.length || typeof indexedDB === 'undefined') return; \
+  const b64ToBuf = (b64) => {{ \
+    const bin = atob(b64); \
+    const out = new Uint8Array(bin.length); \
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); \
+    return out.buffer; \
+  }}; \
+  const taMap = {{ i8: Int8Array, ui8: Uint8Array, ui8c: Uint8ClampedArray, i16: Int16Array, ui16: Uint16Array, i32: Int32Array, ui32: Uint32Array, f32: Float32Array, f64: Float64Array, bi64: BigInt64Array, bui64: BigUint64Array }}; \
+  const dec = (v) => {{ \
+    if (v === null || typeof v !== 'object') return v; \
+    if ('v' in v) {{ \
+      if (v.v === 'undefined') return undefined; \
+      if (v.v === 'null') return null; \
+      if (v.v === 'NaN') return NaN; \
+      if (v.v === 'Infinity') return Infinity; \
+      if (v.v === '-Infinity') return -Infinity; \
+      if (v.v === '-0') return -0; \
+      return undefined; \
+    }} \
+    if ('d' in v) return new Date(v.d); \
+    if ('u' in v) return new URL(v.u); \
+    if ('bi' in v) return BigInt(v.bi); \
+    if ('r' in v) return new RegExp(v.r.p, v.r.f); \
+    if ('ab' in v) return b64ToBuf(v.ab); \
+    if ('ta' in v && taMap[v.ta.k]) return new taMap[v.ta.k](b64ToBuf(v.ta.b)); \
+    if ('m' in v) return new Map(v.m.map(([k, val]) => [dec(k), dec(val)])); \
+    if ('s' in v) return new Set(v.s.map(dec)); \
+    if ('a' in v) return v.a.map(dec); \
+    if ('o' in v) {{ const obj = {{}}; for (const {{ k, v: val }} of v.o) obj[k] = dec(val); return obj; }} \
+    return v; \
+  }}; \
+  for (const dbInfo of dbs) {{ \
+    const req = indexedDB.open(dbInfo.name, dbInfo.version || 1); \
+    let upgraded = false; \
+    req.onupgradeneeded = () => {{ \
+      upgraded = true; \
+      const db = req.result; \
+      for (const s of dbInfo.stores || []) {{ \
+        if (db.objectStoreNames.contains(s.name)) db.deleteObjectStore(s.name); \
+        const kp = s.keyPathArray !== undefined ? s.keyPathArray : (s.keyPath !== undefined ? s.keyPath : null); \
+        const os = db.createObjectStore(s.name, {{ autoIncrement: !!s.autoIncrement, ...(kp !== null ? {{ keyPath: kp }} : {{}}) }}); \
+        for (const idx of s.indexes || []) {{ \
+          const ikp = idx.keyPathArray !== undefined ? idx.keyPathArray : idx.keyPath; \
+          if (ikp !== undefined) os.createIndex(idx.name, ikp, {{ unique: !!idx.unique, multiEntry: !!idx.multiEntry }}); \
+        }} \
+        const inline = kp !== null; \
+        for (const rec of s.records || []) {{ \
+          const val = rec.value !== undefined ? rec.value : dec(rec.valueEncoded); \
+          const key = rec.key !== undefined ? rec.key : dec(rec.keyEncoded); \
+          if (inline || key === undefined) os.put(val); \
+          else os.put(val, key); \
+        }} \
+      }} \
+    }}; \
+    req.onsuccess = () => {{ \
+      const db = req.result; \
+      if (upgraded || !(dbInfo.stores || []).length) {{ db.close(); return; }} \
+      const names = (dbInfo.stores || []).map(s => s.name).filter(n => db.objectStoreNames.contains(n)); \
+      if (!names.length) {{ db.close(); return; }} \
+      const tx = db.transaction(names, 'readwrite'); \
+      for (const s of dbInfo.stores || []) {{ \
+        if (!db.objectStoreNames.contains(s.name)) continue; \
+        const os = tx.objectStore(s.name); \
+        os.clear(); \
+        const inline = s.keyPathArray !== undefined || s.keyPath !== undefined; \
+        for (const rec of s.records || []) {{ \
+          const val = rec.value !== undefined ? rec.value : dec(rec.valueEncoded); \
+          const key = rec.key !== undefined ? rec.key : dec(rec.keyEncoded); \
+          if (inline || key === undefined) os.put(val); \
+          else os.put(val, key); \
+        }} \
+      }} \
+      tx.oncomplete = () => db.close(); \
+      tx.onabort = () => db.close(); \
+    }}; \
+  }} \
+}} catch {{}} }})()",
             Value::Object(saved)
         ))
     }
@@ -290,9 +532,187 @@ pub(crate) const LOCAL_STORAGE_JS: &str = "(() => { try { \
     const localStorage_ = Object.keys(localStorage).map(name => ({ name, value: localStorage.getItem(name) })); \
     return { origin: location.origin, localStorage: localStorage_ }; } catch { return null; } })()";
 
+/// localStorage + IndexedDB of the page's own origin, or `null` where there is none.
+pub(crate) const STORAGE_WITH_INDEXED_DB_JS: &str = r#"(async () => {
+  try {
+    const origin = location.origin;
+    if (!origin || origin === 'null') return null;
+    const localStorage_ = Object.keys(localStorage).map(name => ({ name, value: localStorage.getItem(name) }));
+    const decodeKeyPath = (kp) => {
+      if (kp == null) return {};
+      if (Array.isArray(kp)) return { keyPathArray: [...kp] };
+      return { keyPath: String(kp) };
+    };
+    const isSimple = (v, seen = new Set()) => {
+      if (v === null) return true;
+      const t = typeof v;
+      if (t === 'boolean' || t === 'string') return true;
+      if (t === 'number') return Number.isFinite(v) && !Object.is(v, -0);
+      if (t !== 'object') return false;
+      if (v instanceof Date || v instanceof RegExp || v instanceof ArrayBuffer || ArrayBuffer.isView(v) || v instanceof Map || v instanceof Set || v instanceof URL || v instanceof Error) return false;
+      if (seen.has(v)) return false;
+      seen.add(v);
+      if (Array.isArray(v)) {
+        const ok = v.every(item => item !== undefined && isSimple(item, seen));
+        seen.delete(v);
+        return ok;
+      }
+      const proto = Object.getPrototypeOf(v);
+      if (proto !== null && proto !== Object.prototype) return false;
+      for (const k of Object.keys(v)) {
+        if (v[k] === undefined || !isSimple(v[k], seen)) { seen.delete(v); return false; }
+      }
+      seen.delete(v);
+      return true;
+    };
+    const abToB64 = (buf, offset = 0, len = buf.byteLength) => {
+      const bytes = new Uint8Array(buf, offset, len);
+      let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    };
+    const encodeVal = (v) => {
+      if (v === undefined) return { v: 'undefined' };
+      if (v === null) return { v: 'null' };
+      if (typeof v === 'number') {
+        if (Number.isNaN(v)) return { v: 'NaN' };
+        if (v === Infinity) return { v: 'Infinity' };
+        if (v === -Infinity) return { v: '-Infinity' };
+        if (Object.is(v, -0)) return { v: '-0' };
+        return v;
+      }
+      if (typeof v === 'boolean' || typeof v === 'string') return v;
+      if (typeof v === 'bigint') return { bi: v.toString() };
+      if (v instanceof Date) return { d: v.toISOString() };
+      if (v instanceof URL) return { u: v.toString() };
+      if (v instanceof RegExp) return { r: { p: v.source, f: v.flags } };
+      if (v instanceof ArrayBuffer) return { ab: abToB64(v) };
+      if (ArrayBuffer.isView(v)) {
+        const map = [
+          [Int8Array, 'i8'], [Uint8Array, 'ui8'], [Uint8ClampedArray, 'ui8c'],
+          [Int16Array, 'i16'], [Uint16Array, 'ui16'], [Int32Array, 'i32'],
+          [Uint32Array, 'ui32'], [Float32Array, 'f32'], [Float64Array, 'f64'],
+          [BigInt64Array, 'bi64'], [BigUint64Array, 'bui64']
+        ];
+        const found = map.find(([C]) => v instanceof C);
+        if (found) return { ta: { b: abToB64(v.buffer, v.byteOffset, v.byteLength), k: found[1] } };
+      }
+      if (v instanceof Map) return { m: Array.from(v.entries()).map(([k, val]) => [encodeVal(k), encodeVal(val)]) };
+      if (v instanceof Set) return { s: Array.from(v.values()).map(encodeVal) };
+      if (Array.isArray(v)) return { a: v.map(encodeVal) };
+      if (typeof v === 'object') {
+        return { o: Object.keys(v).map(k => ({ k, v: encodeVal(v[k]) })) };
+      }
+      return null;
+    };
+    const dbs = typeof indexedDB !== 'undefined' && indexedDB.databases ? await indexedDB.databases() : [];
+    const indexedDB_ = [];
+    for (const dbMeta of dbs) {
+      if (!dbMeta.name) continue;
+      const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open(dbMeta.name);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      try {
+        const storeNames = Array.from(db.objectStoreNames);
+        let stores = [];
+        if (storeNames.length > 0) {
+          const tx = db.transaction(storeNames, 'readonly');
+          stores = await Promise.all(storeNames.map(sName => new Promise((resolve, reject) => {
+            const os = tx.objectStore(sName);
+            const indexes = Array.from(os.indexNames).map(iName => {
+              const idx = os.index(iName);
+              return { name: idx.name, ...decodeKeyPath(idx.keyPath), multiEntry: idx.multiEntry, unique: idx.unique };
+            });
+            const records = [];
+            const curReq = os.openCursor();
+            curReq.onsuccess = () => {
+              const cur = curReq.result;
+              if (!cur) {
+                resolve({ name: os.name, autoIncrement: os.autoIncrement, ...decodeKeyPath(os.keyPath), records, indexes });
+                return;
+              }
+              const rec = {};
+              if (os.keyPath === null) {
+                if (isSimple(cur.primaryKey)) rec.key = cur.primaryKey;
+                else rec.keyEncoded = encodeVal(cur.primaryKey);
+              }
+              if (isSimple(cur.value)) rec.value = cur.value;
+              else rec.valueEncoded = encodeVal(cur.value);
+              records.push(rec);
+              cur.continue();
+            };
+            curReq.onerror = () => reject(curReq.error);
+          })));
+        }
+        indexedDB_.push({ name: db.name, version: db.version, stores });
+      } finally {
+        db.close();
+      }
+    }
+    return { origin, localStorage: localStorage_, indexedDB: indexedDB_ };
+  } catch {
+    return null;
+  }
+})()"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_cookie(name: &str, domain: &str, path: &str, secure: bool) -> Cookie {
+        Cookie {
+            name: name.into(),
+            value: "v".into(),
+            domain: domain.into(),
+            path: path.into(),
+            expires: -1.0,
+            http_only: false,
+            secure,
+            same_site: "Lax".into(),
+            partition_key: None,
+            cross_site_ancestor: None,
+        }
+    }
+
+    #[test]
+    fn filter_cookies_matches_domain_path_and_secure() {
+        let cookies = vec![
+            mk_cookie("a", "example.com", "/", false),
+            mk_cookie("b", ".example.com", "/app", false),
+            mk_cookie("c", ".example.com", "/", true),
+            mk_cookie("d", "other.test", "/", false),
+        ];
+        let http_app = filter_cookies(&cookies, &["http://sub.example.com/app/users".into()]).unwrap();
+        let names: Vec<&str> = http_app.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["b"]);
+
+        let http_apple = filter_cookies(&cookies, &["http://example.com/apple".into()]).unwrap();
+        let names: Vec<&str> = http_apple.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a"]);
+
+        let https_sub = filter_cookies(&cookies, &["https://sub.example.com/".into()]).unwrap();
+        let names: Vec<&str> = https_sub.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["c"]);
+
+        assert!(filter_cookies(&cookies, &["not-a-url".into()]).is_err());
+    }
+
+    #[test]
+    fn cookie_filter_matches_fields_and_dot_domains() {
+        let dot = mk_cookie("sid", ".example.com", "/api", false);
+        let host = mk_cookie("sid", "example.com", "/", false);
+        let f = CookieFilter {
+            name: Some("sid".into()),
+            domain: Some("example.com".into()),
+            path: Some("/api".into()),
+        };
+        assert!(f.matches(&dot));
+        assert!(!f.matches(&host));
+        assert!(!f.is_empty());
+        assert!(CookieFilter::default().is_empty());
+    }
 
     #[test]
     fn cookies_round_trip_through_cdp() {
@@ -322,11 +742,37 @@ mod tests {
     fn restore_script_only_for_origins_with_items() {
         let mut state = StorageState::default();
         assert!(state.restore_script().is_none());
-        state.origins.push(OriginStorage { origin: "http://a.test".into(), local_storage: vec![] });
+        state.origins.push(OriginStorage { origin: "http://a.test".into(), local_storage: vec![], indexed_db: None });
         assert!(state.restore_script().is_none());
         state.origins[0].local_storage.push(StorageItem { name: "k".into(), value: "it's".into() });
         let js = state.restore_script().unwrap();
         assert!(js.contains(r#""http://a.test":[["k","it's"]]"#), "{js}");
+    }
+
+    #[test]
+    fn indexed_db_storage_state_serializes_and_restores() {
+        let raw = json!({
+            "cookies": [],
+            "origins": [{
+                "origin": "http://127.0.0.1:8080",
+                "localStorage": [],
+                "indexedDB": [{
+                    "name": "authDb",
+                    "version": 1,
+                    "stores": [{
+                        "name": "tokens",
+                        "autoIncrement": false,
+                        "keyPath": "id",
+                        "records": [{ "value": { "id": "u1", "token": "secret" } }],
+                        "indexes": [{ "name": "byToken", "keyPath": "token", "multiEntry": false, "unique": true }]
+                    }]
+                }]
+            }]
+        });
+        let parsed: StorageState = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), raw);
+        let js = parsed.restore_script().unwrap();
+        assert!(js.contains("authDb") && js.contains("onupgradeneeded"), "{js}");
     }
 
     #[test]
