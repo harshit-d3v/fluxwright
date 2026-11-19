@@ -11,6 +11,11 @@ use tokio::time::sleep;
 use crate::browser::{BrowserId, CdpBrowser, ContextId, SessionId, TargetId, TargetState};
 use crate::connection::Connection;
 use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
+use crate::input::{
+    canonicalize_local_paths, dispatch_key_event, encode_file_payloads, parse_chord, resolve_key,
+    CheckOptions, ClickOptions, FileInput, HoverOptions, KeyboardState, MouseButton, MouseState,
+    SelectEntry,
+};
 use crate::log::{DownloadResult, PageLog};
 
 /// Finished downloads, oldest first.
@@ -175,13 +180,10 @@ impl std::str::FromStr for WaitState {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Wait {
-    Attached,
-    Visible,
-    Click,
+    Query { mode: &'static str, scroll: bool },
+    Click { force: bool },
     /// Visible, scrolled into view and unmoved across two polls: for element screenshots.
     Box,
-    /// Attached; reports the box without scrolling, `null` when hidden.
-    Rect,
 }
 
 /// An element's box in CSS pixels, relative to the top-level page's viewport.
@@ -252,10 +254,15 @@ impl Affine {
 }
 
 fn engine_call(query: &str, mode: &str) -> String {
+    engine_call_with(query, mode, &Value::Null)
+}
+
+fn engine_call_with(query: &str, mode: &str, arg: &Value) -> String {
     format!(
-        "({QUERY_JS})({}, {})",
+        "({QUERY_JS})({}, {}, {})",
         serde_json::to_string(query).unwrap(),
-        serde_json::to_string(mode).unwrap()
+        serde_json::to_string(mode).unwrap(),
+        serde_json::to_string(arg).unwrap(),
     )
 }
 
@@ -288,6 +295,7 @@ pub struct CdpPage {
     pub browser_pid: u32,
     pub browser_id: BrowserId,
     pub headless: bool,
+    pub is_remote: bool,
     pub context_id: ContextId,
     pub target_id: TargetId,
     pub session_id: SessionId,
@@ -295,6 +303,8 @@ pub struct CdpPage {
     /// Isolated worlds made for same-process iframes, by frame id.
     pub(crate) worlds: Arc<Mutex<HashMap<String, i64>>>,
     pub(crate) setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
+    pub(crate) mouse: Arc<std::sync::Mutex<MouseState>>,
+    pub(crate) keyboard: Arc<std::sync::Mutex<KeyboardState>>,
 }
 
 impl CdpPage {
@@ -739,7 +749,7 @@ impl CdpPage {
     /// The first match's box relative to the top-level viewport, without scrolling; `None`
     /// when it is not visible. Waits until the element exists.
     pub async fn bounding_box(&self, sel: &Selector, timeout: Duration) -> Result<Option<BoundingBox>> {
-        let (v, scope) = self.wait_element(sel, Wait::Rect, timeout).await?;
+        let (v, scope) = self.wait_element(sel, Wait::Query { mode: "rect", scroll: false }, timeout).await?;
         let b = &v["box"];
         if b.is_null() {
             return Ok(None);
@@ -752,7 +762,7 @@ impl CdpPage {
     /// Calls `function` (JavaScript source, such as `(el, arg) => el.value`) with the first match
     /// and `arg`, in the page's own world as Playwright does, and returns its JSON result.
     pub async fn evaluate_on(&self, sel: &Selector, function: &str, arg: Option<Value>, timeout: Duration) -> Result<Value> {
-        let (_, scope) = self.wait_element(sel, Wait::Attached, timeout).await?;
+        let (_, scope) = self.wait_element(sel, Wait::Query { mode: "attached", scroll: false }, timeout).await?;
         let found = self.eval_in(&scope, &engine_call(&sel.query, "element"), false, timeout).await?;
         let Some(isolated) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
             return Err(Error::NotActionable { selector: sel.to_string(), reason: "element went away".into() });
@@ -844,6 +854,13 @@ impl CdpPage {
         rx
     }
 
+    /// Hands intercepted file chooser dialogs of this page and its frames to the returned queue.
+    pub async fn file_choosers(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::events::FileChooser> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.setups.lock().await.entry(self.context_id.0.clone()).or_default().file_choosers = Some(tx);
+        rx
+    }
+
     /// Lets this page's context download files into `dir`, named by download id.
     pub async fn allow_downloads(&self, dir: &Path, timeout: Duration) -> Result<()> {
         let params = json!({
@@ -883,22 +900,24 @@ impl CdpPage {
     /// Waits until the element is visible (Playwright's default `waitForSelector` state):
     /// non-empty box, not `visibility: hidden`. Opacity 0 counts as visible, as in Playwright.
     pub async fn wait_for_selector(&self, sel: &Selector, timeout: Duration) -> Result<Value> {
-        Ok(self.wait_element(sel, Wait::Visible, timeout).await?.0)
+        Ok(self.wait_element(sel, Wait::Query { mode: "visible", scroll: false }, timeout).await?.0)
     }
 
     /// Waits for the selector to reach `state`, as Playwright's `waitForSelector({ state })`.
     pub async fn wait_for_selector_state(&self, sel: &Selector, state: WaitState, timeout: Duration) -> Result<()> {
-        let (wait, present) = match state {
-            WaitState::Attached => (Wait::Attached, true),
-            WaitState::Visible => (Wait::Visible, true),
-            WaitState::Detached => (Wait::Attached, false),
-            WaitState::Hidden => (Wait::Visible, false),
+        let (mode, present) = match state {
+            WaitState::Attached => ("attached", true),
+            WaitState::Visible => ("visible", true),
+            WaitState::Detached => ("attached", false),
+            WaitState::Hidden => ("visible", false),
         };
         if present {
-            return self.wait_element(sel, wait, timeout).await.map(|_| ());
+            return self
+                .wait_element(sel, Wait::Query { mode, scroll: false }, timeout)
+                .await
+                .map(|_| ());
         }
-        // Waiting for it to go: poll until the check that `wait` makes fails.
-        let mode = if wait == Wait::Attached { "attached" } else { "visible" };
+        // Waiting for it to go: poll until the check that `mode` makes fails.
         let expr = engine_call(&sel.query, mode);
         let start = Instant::now();
         loop {
@@ -921,7 +940,7 @@ impl CdpPage {
                 },
             }
             if start.elapsed() > timeout {
-                let what = if wait == Wait::Attached { "still attached" } else { "still visible" };
+                let what = if mode == "attached" { "still attached" } else { "still visible" };
                 return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
             }
             sleep(Duration::from_millis(50)).await;
@@ -930,26 +949,27 @@ impl CdpPage {
 
     /// `textContent` of the first match, once it exists (visible or not).
     pub async fn text_content(&self, sel: &Selector, timeout: Duration) -> Result<Option<String>> {
-        let (v, _) = self.wait_element(sel, Wait::Attached, timeout).await?;
+        let (v, _) = self.wait_element(sel, Wait::Query { mode: "attached", scroll: false }, timeout).await?;
         Ok(v["text"].as_str().map(String::from))
     }
 
-    /// Polls until the element is there (and visible, for `Visible`). `Click` also scrolls it
-    /// into view and requires it enabled, unmoved across two polls, and topmost at its centre;
-    /// the returned `x`/`y` are in top-level page coordinates.
     async fn wait_element(&self, sel: &Selector, wait: Wait, timeout: Duration) -> Result<(Value, Scope)> {
+        self.wait_element_with(sel, wait, &Value::Null, timeout).await
+    }
+
+    /// Polls until `wait` succeeds (and is unmoved / topmost for `Click` and `Box`);
+    /// for `Click`, the returned `x`/`y` are in top-level page coordinates.
+    async fn wait_element_with(&self, sel: &Selector, wait: Wait, arg: &Value, timeout: Duration) -> Result<(Value, Scope)> {
         let start = Instant::now();
         let mut last_pos: Option<(f64, f64)> = None;
         let mut last_box: Option<[f64; 4]> = None;
         let mut last_reason = String::from("never checked");
-        let mode = match wait {
-            Wait::Attached => "attached",
-            Wait::Visible => "visible",
-            Wait::Click => "click",
-            Wait::Box => "box",
-            Wait::Rect => "rect",
+        let (mode, scroll, force) = match wait {
+            Wait::Query { mode, scroll } => (mode, scroll, false),
+            Wait::Click { force } => ("point", true, force),
+            Wait::Box => ("box", true, false),
         };
-        let expr = engine_call(&sel.query, mode);
+        let expr = engine_call_with(&sel.query, mode, arg);
         loop {
             if start.elapsed() > timeout {
                 // A timeout like any other, so callers (Python's `except TimeoutError`) see one.
@@ -958,7 +978,6 @@ impl CdpPage {
             if self.browser.is_dead() {
                 return Err(Error::BrowserDead { pid: self.browser_pid });
             }
-            let scroll = matches!(wait, Wait::Click | Wait::Box);
             let (scope, hops) = match self.scope(&sel.frames, scroll, timeout).await? {
                 Ok(found) => found,
                 Err(reason) => {
@@ -988,10 +1007,13 @@ impl CdpPage {
                     sleep(Duration::from_millis(50)).await;
                     continue;
                 }
-                if wait != Wait::Click {
+                if !matches!(wait, Wait::Click { .. }) {
                     return Ok((v, scope));
                 }
                 let (x, y) = scope.map.apply(v["x"].as_f64().unwrap_or(0.0), v["y"].as_f64().unwrap_or(0.0));
+                if force {
+                    return Ok((json!({ "x": x, "y": y }), scope));
+                }
                 let stable = last_pos.is_some_and(|(px, py)| (px - x).abs() < 1.0 && (py - y).abs() < 1.0);
                 last_pos = Some((x, y));
                 if !stable {
@@ -1013,35 +1035,86 @@ impl CdpPage {
     }
 
     pub async fn click(&self, sel: &Selector, timeout: Duration) -> Result<()> {
-        self.click_in_scope(sel, timeout).await.map(|_| ())
+        self.click_with(sel, &ClickOptions::default(), timeout).await
+    }
+
+    pub async fn click_with(&self, sel: &Selector, opts: &ClickOptions, timeout: Duration) -> Result<()> {
+        self.click_in_scope(sel, opts, timeout).await.map(|_| ())
+    }
+
+    pub async fn dblclick(&self, sel: &Selector, opts: &ClickOptions, timeout: Duration) -> Result<()> {
+        let mut opts = opts.clone();
+        opts.click_count = 2;
+        self.click_with(sel, &opts, timeout).await
+    }
+
+    pub async fn hover(&self, sel: &Selector, opts: &HoverOptions, timeout: Duration) -> Result<()> {
+        let arg = point_arg(opts.position, opts.force, false);
+        let (pt, _) = self
+            .wait_element_with(sel, Wait::Click { force: opts.force }, &arg, timeout)
+            .await?;
+        if opts.trial {
+            return Ok(());
+        }
+        let x = pt["x"].as_f64().unwrap_or(0.0);
+        let y = pt["y"].as_f64().unwrap_or(0.0);
+        self.mouse_move_with(x, y, 1, opts.modifiers, timeout).await
+    }
+
+    pub async fn focus(&self, sel: &Selector, timeout: Duration) -> Result<()> {
+        self.wait_element(sel, Wait::Query { mode: "focus", scroll: true }, timeout).await.map(|_| ())
+    }
+
+    pub async fn blur(&self, sel: &Selector, timeout: Duration) -> Result<()> {
+        self.wait_element(sel, Wait::Query { mode: "blur", scroll: false }, timeout).await.map(|_| ())
+    }
+
+    pub async fn scroll_into_view_if_needed(&self, sel: &Selector, timeout: Duration) -> Result<()> {
+        self.wait_element(sel, Wait::Query { mode: "scroll", scroll: true }, timeout).await.map(|_| ())
+    }
+
+    // shortcut: dispatches pointer/mouse drag events; pages relying on HTML5 DataTransfer dragstart need evaluate.
+    pub async fn drag_and_drop(&self, source: &Selector, target: &Selector, force: bool, timeout: Duration) -> Result<()> {
+        let arg = point_arg(None, force, false);
+        let (src, _) = self.wait_element_with(source, Wait::Click { force }, &arg, timeout).await?;
+        let sx = src["x"].as_f64().unwrap_or(0.0);
+        let sy = src["y"].as_f64().unwrap_or(0.0);
+        self.mouse_move(sx, sy, 1, timeout).await?;
+        self.mouse_down(MouseButton::Left, 1, timeout).await?;
+        let finish = async {
+            let (dst, _) = self.wait_element_with(target, Wait::Click { force }, &arg, timeout).await?;
+            let tx = dst["x"].as_f64().unwrap_or(0.0);
+            let ty = dst["y"].as_f64().unwrap_or(0.0);
+            self.mouse_move(tx, ty, 5, timeout).await
+        }
+        .await;
+        let release = self.mouse_up(MouseButton::Left, 1, timeout).await;
+        finish?;
+        release
     }
 
     /// Clicks, and returns the scope the element lives in (for fill's follow-up steps).
-    async fn click_in_scope(&self, sel: &Selector, timeout: Duration) -> Result<Scope> {
-        let (pt, scope) = self.wait_element(sel, Wait::Click, timeout).await?;
+    async fn click_in_scope(&self, sel: &Selector, opts: &ClickOptions, timeout: Duration) -> Result<Scope> {
+        let arg = point_arg(opts.position, opts.force, true);
+        let (pt, scope) = self
+            .wait_element_with(sel, Wait::Click { force: opts.force }, &arg, timeout)
+            .await?;
+        if opts.trial {
+            return Ok(scope);
+        }
         let x = pt["x"].as_f64().unwrap_or(0.0);
         let y = pt["y"].as_f64().unwrap_or(0.0);
-        // Top-level session and coordinates: Chrome routes the event into the right frame.
-        for (ty, btn) in [("mouseMoved", "none"), ("mousePressed", "left"), ("mouseReleased", "left")]
-        {
-            self.call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": ty,
-                    "x": x,
-                    "y": y,
-                    "button": btn,
-                    "clickCount": if ty == "mouseMoved" { 0 } else { 1 }
-                }),
-                timeout,
-            )
-            .await?;
-        }
+        self.dispatch_mouse_click(x, y, opts, timeout).await?;
         Ok(scope)
     }
 
     pub async fn fill(&self, sel: &Selector, value: &str, timeout: Duration) -> Result<()> {
-        let scope = self.click_in_scope(sel, timeout).await?;
+        self.fill_with(sel, value, false, timeout).await
+    }
+
+    pub async fn fill_with(&self, sel: &Selector, value: &str, force: bool, timeout: Duration) -> Result<()> {
+        let opts = ClickOptions { force, ..Default::default() };
+        let scope = self.click_in_scope(sel, &opts, timeout).await?;
         // Both steps act on the clicked element (see query.js); any failure is an error, never
         // text typed into whatever else has focus.
         let step = |mode: &'static str| {
@@ -1062,6 +1135,423 @@ impl CdpPage {
         self.session_call(&scope.session, "Input.insertText", json!({ "text": value }), timeout)
             .await?;
         step("changed").await
+    }
+
+    pub async fn press(&self, sel: &Selector, key: &str, delay: Option<Duration>, timeout: Duration) -> Result<()> {
+        let (_, scope) = self
+            .wait_element(sel, Wait::Query { mode: "focus", scroll: true }, timeout)
+            .await?;
+        self.keyboard_press_in(Some(&scope.session), key, delay, timeout).await
+    }
+
+    pub async fn press_sequentially(
+        &self,
+        sel: &Selector,
+        text: &str,
+        delay: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let (_, scope) = self
+            .wait_element(sel, Wait::Query { mode: "focus", scroll: true }, timeout)
+            .await?;
+        self.keyboard_type_in(Some(&scope.session), text, delay, timeout).await
+    }
+
+    pub async fn set_checked(&self, sel: &Selector, checked: bool, opts: &CheckOptions, timeout: Duration) -> Result<()> {
+        let (st, _) = self
+            .wait_element_with(
+                sel,
+                Wait::Query { mode: "check_state", scroll: true },
+                &json!({ "want": checked }),
+                timeout,
+            )
+            .await?;
+        if st["checked"].as_bool() == Some(checked) {
+            if opts.trial {
+                let arg = point_arg(opts.position, opts.force, true);
+                self.wait_element_with(sel, Wait::Click { force: opts.force }, &arg, timeout).await?;
+            }
+            return Ok(());
+        }
+        let click_opts = ClickOptions {
+            position: opts.position,
+            force: opts.force,
+            trial: opts.trial,
+            ..Default::default()
+        };
+        let scope = self.click_in_scope(sel, &click_opts, timeout).await?;
+        if opts.trial {
+            return Ok(());
+        }
+        let r = self
+            .eval_in(
+                &scope,
+                &engine_call_with(&sel.query, "check_state", &json!({ "want": checked })),
+                true,
+                timeout,
+            )
+            .await?;
+        if r["value"]["checked"].as_bool() == Some(checked) {
+            Ok(())
+        } else {
+            Err(Error::NotActionable {
+                selector: sel.to_string(),
+                reason: "clicking the checkbox did not change its state".into(),
+            })
+        }
+    }
+
+    pub async fn select_option(
+        &self,
+        sel: &Selector,
+        items: &[SelectEntry],
+        force: bool,
+        timeout: Duration,
+    ) -> Result<Vec<String>> {
+        let encoded: Vec<Value> = items.iter().map(SelectEntry::to_json).collect();
+        let (v, _) = self
+            .wait_element_with(
+                sel,
+                Wait::Query { mode: "select_options", scroll: true },
+                &json!({ "items": encoded, "force": force }),
+                timeout,
+            )
+            .await?;
+        Ok(v["values"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default())
+    }
+
+    pub async fn set_input_files(&self, sel: &Selector, files: &FileInput, timeout: Duration) -> Result<()> {
+        if let FileInput::Paths(paths) = files {
+            if !self.is_remote && !paths.is_empty() {
+                let strs = canonicalize_local_paths(paths).await?;
+                let (_, scope) = self
+                    .wait_element_with(
+                        sel,
+                        Wait::Query { mode: "check_file_input", scroll: false },
+                        &json!({ "count": strs.len() }),
+                        timeout,
+                    )
+                    .await?;
+                let found = self.eval_in(&scope, &engine_call(&sel.query, "element"), false, timeout).await?;
+                let Some(isolated) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
+                    return Err(Error::NotActionable {
+                        selector: sel.to_string(),
+                        reason: "element went away".into(),
+                    });
+                };
+                let res = async {
+                    let node = self
+                        .session_call(&scope.session, "DOM.describeNode", json!({ "objectId": isolated }), timeout)
+                        .await?;
+                    let backend_id = node["node"]["backendNodeId"]
+                        .as_i64()
+                        .ok_or_else(|| Error::Other("missing backendNodeId".into()))?;
+                    self.session_call(
+                        &scope.session,
+                        "DOM.setFileInputFiles",
+                        json!({ "files": strs, "backendNodeId": backend_id }),
+                        timeout,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                .await;
+                let _ = self
+                    .session_call(&scope.session, "Runtime.releaseObject", json!({ "objectId": isolated }), timeout)
+                    .await;
+                return res;
+            }
+        }
+        let encoded = encode_file_payloads(files).await?;
+        self.wait_element_with(
+            sel,
+            Wait::Query { mode: "set_files", scroll: false },
+            &json!({ "files": encoded }),
+            timeout,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn tap(&self, sel: &Selector, opts: &HoverOptions, timeout: Duration) -> Result<()> {
+        let arg = point_arg(opts.position, opts.force, true);
+        let (pt, _) = self
+            .wait_element_with(sel, Wait::Click { force: opts.force }, &arg, timeout)
+            .await?;
+        if opts.trial {
+            return Ok(());
+        }
+        let x = pt["x"].as_f64().unwrap_or(0.0);
+        let y = pt["y"].as_f64().unwrap_or(0.0);
+        self.touchscreen_tap_with(x, y, opts.modifiers, timeout).await
+    }
+
+    pub async fn mouse_move(&self, x: f64, y: f64, steps: u32, timeout: Duration) -> Result<()> {
+        self.mouse_move_with(x, y, steps, 0, timeout).await
+    }
+
+    async fn mouse_move_with(&self, x: f64, y: f64, steps: u32, extra_mods: u8, timeout: Duration) -> Result<()> {
+        let steps = steps.max(1);
+        let (from_x, from_y, buttons) = {
+            let st = self.mouse.lock().unwrap();
+            (st.x, st.y, st.buttons)
+        };
+        let mods = self.keyboard.lock().unwrap().modifiers | extra_mods;
+        for step in 1..=steps {
+            let t = step as f64 / steps as f64;
+            let cx = from_x + (x - from_x) * t;
+            let cy = from_y + (y - from_y) * t;
+            self.call(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseMoved",
+                    "x": cx,
+                    "y": cy,
+                    "button": "none",
+                    "buttons": buttons,
+                    "modifiers": mods,
+                }),
+                timeout,
+            )
+            .await?;
+            let mut st = self.mouse.lock().unwrap();
+            st.x = cx;
+            st.y = cy;
+        }
+        Ok(())
+    }
+
+    pub async fn mouse_down(&self, button: MouseButton, click_count: u32, timeout: Duration) -> Result<()> {
+        self.mouse_button("mousePressed", button, click_count, 0, timeout).await
+    }
+
+    pub async fn mouse_up(&self, button: MouseButton, click_count: u32, timeout: Duration) -> Result<()> {
+        self.mouse_button("mouseReleased", button, click_count, 0, timeout).await
+    }
+
+    async fn mouse_button(
+        &self,
+        ty: &'static str,
+        button: MouseButton,
+        click_count: u32,
+        extra_mods: u8,
+        timeout: Duration,
+    ) -> Result<()> {
+        let (x, y, buttons) = {
+            let mut st = self.mouse.lock().unwrap();
+            if ty == "mousePressed" {
+                st.buttons |= button.bit();
+            } else {
+                st.buttons &= !button.bit();
+            }
+            (st.x, st.y, st.buttons)
+        };
+        let mods = self.keyboard.lock().unwrap().modifiers | extra_mods;
+        self.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": ty,
+                "x": x,
+                "y": y,
+                "button": button.as_cdp_str(),
+                "buttons": buttons,
+                "clickCount": click_count.max(1),
+                "modifiers": mods,
+            }),
+            timeout,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn dispatch_mouse_click(&self, x: f64, y: f64, opts: &ClickOptions, timeout: Duration) -> Result<()> {
+        self.mouse_move_with(x, y, 1, opts.modifiers, timeout).await?;
+        let count = opts.click_count.max(1);
+        for n in 1..=count {
+            self.mouse_button("mousePressed", opts.button, n, opts.modifiers, timeout).await?;
+            if let Some(d) = opts.delay.filter(|d| !d.is_zero()) {
+                sleep(d).await;
+            }
+            self.mouse_button("mouseReleased", opts.button, n, opts.modifiers, timeout).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn mouse_click(
+        &self,
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        click_count: u32,
+        delay: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let opts = ClickOptions { button, click_count, delay, ..Default::default() };
+        self.dispatch_mouse_click(x, y, &opts, timeout).await
+    }
+
+    pub async fn mouse_dblclick(
+        &self,
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        delay: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.mouse_click(x, y, button, 2, delay, timeout).await
+    }
+
+    pub async fn mouse_wheel(&self, delta_x: f64, delta_y: f64, timeout: Duration) -> Result<()> {
+        let (x, y) = {
+            let st = self.mouse.lock().unwrap();
+            (st.x, st.y)
+        };
+        let mods = self.keyboard.lock().unwrap().modifiers;
+        self.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseWheel",
+                "x": x,
+                "y": y,
+                "deltaX": delta_x,
+                "deltaY": delta_y,
+                "modifiers": mods,
+            }),
+            timeout,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn touchscreen_tap(&self, x: f64, y: f64, timeout: Duration) -> Result<()> {
+        self.touchscreen_tap_with(x, y, 0, timeout).await
+    }
+
+    async fn touchscreen_tap_with(&self, x: f64, y: f64, extra_mods: u8, timeout: Duration) -> Result<()> {
+        let mods = self.keyboard.lock().unwrap().modifiers | extra_mods;
+        let rx = x.round();
+        let ry = y.round();
+        self.call(
+            "Input.dispatchTouchEvent",
+            json!({
+                "type": "touchStart",
+                "touchPoints": [{ "x": rx, "y": ry }],
+                "modifiers": mods,
+            }),
+            timeout,
+        )
+        .await?;
+        self.call(
+            "Input.dispatchTouchEvent",
+            json!({
+                "type": "touchEnd",
+                "touchPoints": [],
+                "modifiers": mods,
+            }),
+            timeout,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn keyboard_down(&self, key: &str, timeout: Duration) -> Result<()> {
+        self.keyboard_down_in(None, key, timeout).await
+    }
+
+    pub async fn keyboard_up(&self, key: &str, timeout: Duration) -> Result<()> {
+        self.keyboard_up_in(None, key, timeout).await
+    }
+
+    pub async fn keyboard_press(&self, key: &str, delay: Option<Duration>, timeout: Duration) -> Result<()> {
+        self.keyboard_press_in(None, key, delay, timeout).await
+    }
+
+    pub async fn keyboard_type(&self, text: &str, delay: Option<Duration>, timeout: Duration) -> Result<()> {
+        self.keyboard_type_in(None, text, delay, timeout).await
+    }
+
+    pub async fn keyboard_insert_text(&self, text: &str, timeout: Duration) -> Result<()> {
+        self.call("Input.insertText", json!({ "text": text }), timeout)
+            .await
+            .map(|_| ())
+    }
+
+    async fn keyboard_down_in(&self, session: Option<&str>, key: &str, timeout: Duration) -> Result<()> {
+        let spec = resolve_key(key)?;
+        let mods = {
+            let mut kb = self.keyboard.lock().unwrap();
+            if let Some(bit) = spec.is_modifier {
+                kb.modifiers |= bit;
+            }
+            kb.modifiers
+        };
+        dispatch_key_event(&self.browser, session.unwrap_or(self.sid()), true, &spec, mods, timeout).await
+    }
+
+    async fn keyboard_up_in(&self, session: Option<&str>, key: &str, timeout: Duration) -> Result<()> {
+        let spec = resolve_key(key)?;
+        let mods = {
+            let mut kb = self.keyboard.lock().unwrap();
+            if let Some(bit) = spec.is_modifier {
+                kb.modifiers &= !bit;
+            }
+            kb.modifiers
+        };
+        dispatch_key_event(&self.browser, session.unwrap_or(self.sid()), false, &spec, mods, timeout).await
+    }
+
+    async fn keyboard_press_in(
+        &self,
+        session: Option<&str>,
+        combo: &str,
+        delay: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let (mods, main) = parse_chord(combo)?;
+        for m in &mods {
+            self.keyboard_down_in(session, m, timeout).await?;
+        }
+        let body = async {
+            self.keyboard_down_in(session, main, timeout).await?;
+            if let Some(d) = delay.filter(|d| !d.is_zero()) {
+                sleep(d).await;
+            }
+            self.keyboard_up_in(session, main, timeout).await
+        }
+        .await;
+        for m in mods.iter().rev() {
+            let _ = self.keyboard_up_in(session, m, timeout).await;
+        }
+        body
+    }
+
+    async fn keyboard_type_in(
+        &self,
+        session: Option<&str>,
+        text: &str,
+        delay: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let sid = session.unwrap_or(self.sid());
+        for ch in text.chars() {
+            if ch == '\r' || ch == '\n' {
+                self.keyboard_press_in(session, "Enter", None, timeout).await?;
+            } else if ch.is_ascii() && !ch.is_ascii_control() {
+                let s = ch.to_string();
+                self.keyboard_down_in(session, &s, timeout).await?;
+                self.keyboard_up_in(session, &s, timeout).await?;
+            } else {
+                self.session_call(sid, "Input.insertText", json!({ "text": ch.to_string() }), timeout)
+                    .await?;
+            }
+            if let Some(d) = delay.filter(|d| !d.is_zero()) {
+                sleep(d).await;
+            }
+        }
+        Ok(())
     }
 
     /// Blocks requests whose URL matches any pattern, in this page and its iframes.
@@ -1100,6 +1590,8 @@ pub(crate) struct ContextSetup {
     pub(crate) routes: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     /// Where dialogs go when the job answers them (`page.on('dialog')`).
     pub(crate) dialogs: Option<tokio::sync::mpsc::UnboundedSender<crate::events::Dialog>>,
+    /// Where intercepted file chooser dialogs go (`page.on('filechooser')`).
+    pub(crate) file_choosers: Option<tokio::sync::mpsc::UnboundedSender<crate::events::FileChooser>>,
     pub(crate) emulation: Option<Emulation>,
     pub(crate) init_scripts: Vec<String>,
     pub(crate) types: Vec<ResourceType>,
@@ -1129,6 +1621,14 @@ pub(crate) fn fetch_params(setup: &ContextSetup) -> Option<Value> {
         return None;
     }
     Some(json!({ "patterns": patterns, "handleAuthRequests": auth }))
+}
+
+fn point_arg(position: Option<(f64, f64)>, force: bool, require_enabled: bool) -> Value {
+    json!({
+        "position": position.map(|(x, y)| json!({ "x": x, "y": y })),
+        "force": force,
+        "requireEnabled": require_enabled,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

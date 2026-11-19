@@ -1717,3 +1717,224 @@ async fn alt_title_emulate_media_and_cookies() {
     page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rich_input_and_form_controls() {
+    use fluxwright::{
+        parse_modifiers, CheckOptions, ClickOptions, FileInput, FilePayload, HoverOptions,
+        MouseButton, SelectEntry,
+    };
+
+    let eng = engine(1, 1).await;
+    let mut opts = JobOptions::default();
+    opts.emulation.has_touch = true;
+    let page = eng.acquire_job(&opts).await.unwrap();
+    let html = concat!(
+        "<body style=\"margin:0;height:2000px\">",
+        "<button id=\"btn\" style=\"border:0;padding:0;position:relative;width:80px;height:40px\" ",
+        "oncontextmenu=\"event.preventDefault();window.__ctx=[event.button,event.shiftKey,Math.round(event.offsetX),Math.round(event.offsetY)]\" ",
+        "ondblclick=\"window.__dbl=(window.__dbl||0)+1\" ",
+        "onmouseenter=\"window.__hover=true\" ",
+        "ontouchstart=\"window.__tap=(window.__tap||0)+1\">Btn</button>",
+        "<div id=\"covered\" role=\"button\" aria-disabled=\"true\" onclick=\"window.__forced=true\" style=\"position:relative;width:40px;height:20px\">C</div>",
+        "<div id=\"dragsrc\" style=\"position:absolute;left:120px;top:20px;width:20px;height:20px\" onmousedown=\"window.__dragStart=true\"></div>",
+        "<div id=\"dragdst\" style=\"position:absolute;left:220px;top:20px;width:20px;height:20px\" onmouseup=\"window.__dragEnd=true\"></div>",
+        "<input id=\"inp\" value=\"old\" onfocus=\"window.__foc=true\" onblur=\"window.__foc=false\" onkeydown=\"window.__keys=(window.__keys||[]);window.__keys.push(event.key)\">",
+        "<iframe srcdoc='<input id=sub value=init>'></iframe>",
+        "<input id=\"chk\" type=\"checkbox\"><input id=\"rad\" type=\"radio\" name=\"r\">",
+        "<div id=\"sw\" role=\"switch\" tabindex=\"0\" aria-checked=\"false\" onclick=\"this.setAttribute('aria-checked',String(this.getAttribute('aria-checked')!=='true'))\">Sw</div>",
+        "<select id=\"sel\" multiple><option value=\"a\">Alpha</option><option value=\"b\">Beta</option><option value=\"c\">Gamma</option></select>",
+        "<input id=\"file\" type=\"file\" multiple>",
+        "<div id=\"below\" style=\"margin-top:1400px\">End</div>",
+        "<script>window.addEventListener('wheel',e=>{window.__wheel=e.deltaY;if(window.__resolveWheel)window.__resolveWheel(e.deltaY);},{passive:false});</script></body>",
+    );
+    page.goto(&format!("data:text/html,{html}")).await.unwrap();
+
+    // Pointer options: trial, right-click + Shift + position, dblclick, hover, force.
+    let shift = parse_modifiers(&["Shift".into()]).unwrap();
+    page.click_with(
+        "#btn",
+        &ClickOptions {
+            button: MouseButton::Right,
+            click_count: 1,
+            trial: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("window.__ctx ?? null").await.unwrap(), json!(null));
+
+    page.click_with(
+        "#btn",
+        &ClickOptions {
+            button: MouseButton::Right,
+            click_count: 1,
+            position: Some((10.0, 12.0)),
+            modifiers: shift,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("window.__ctx").await.unwrap(), json!([2, true, 10, 12]));
+
+    page.dblclick(
+        "#btn",
+        &ClickOptions {
+            click_count: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("window.__dbl").await.unwrap(), json!(1));
+
+    page.hover("#btn", &HoverOptions::default()).await.unwrap();
+    assert_eq!(page.evaluate("window.__hover").await.unwrap(), json!(true));
+
+    page.click_with(
+        "#covered",
+        &ClickOptions {
+            click_count: 1,
+            force: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("window.__forced").await.unwrap(), json!(true));
+
+    // Drag and scroll + mouse primitives.
+    page.drag_and_drop("#dragsrc", "#dragdst", false).await.unwrap();
+    assert_eq!(
+        page.evaluate("[window.__dragStart, window.__dragEnd]").await.unwrap(),
+        json!([true, true])
+    );
+    page.evaluate("window.__dragStart = false; window.__dragEnd = false;")
+        .await
+        .unwrap();
+    page.locator("#dragsrc")
+        .drag_to(&page.locator("#dragdst"))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.evaluate("[window.__dragStart, window.__dragEnd]").await.unwrap(),
+        json!([true, true])
+    );
+
+    page.scroll_into_view_if_needed("#below").await.unwrap();
+    assert!(page.evaluate("window.scrollY").await.unwrap().as_f64().unwrap() > 500.0);
+    page.evaluate("window.scrollTo(0, 0)").await.unwrap();
+    page.mouse_move(10.0, 10.0, 2).await.unwrap();
+    page.mouse_wheel(0.0, 120.0).await.unwrap();
+    assert_eq!(
+        page.evaluate(
+            "window.__wheel ?? new Promise((res, rej) => { window.__resolveWheel = res; setTimeout(() => rej(new Error('wheel timeout')), 3000); })"
+        )
+        .await
+        .unwrap(),
+        json!(120)
+    );
+
+    // Focus/blur, keyboard chords, clear, press_sequentially, low-level keyboard, and iframe locator.
+    page.focus("#inp").await.unwrap();
+    assert_eq!(page.evaluate("window.__foc").await.unwrap(), json!(true));
+    page.clear("#inp", false).await.unwrap();
+    assert_eq!(page.evaluate("inp.value").await.unwrap(), json!(""));
+    page.press_sequentially("#inp", "hello", None).await.unwrap();
+    page.press("#inp", "ControlOrMeta+a", None).await.unwrap();
+    page.press("#inp", "Backspace", None).await.unwrap();
+    page.keyboard_down("Shift").await.unwrap();
+    page.keyboard_press("KeyA", None).await.unwrap();
+    page.keyboard_up("Shift").await.unwrap();
+    page.keyboard_type("b", None).await.unwrap();
+    page.keyboard_insert_text("世").await.unwrap();
+    page.press("#inp", "Enter", None).await.unwrap();
+    assert_eq!(page.evaluate("inp.value").await.unwrap(), json!("Ab世"));
+    page.blur("#inp").await.unwrap();
+    assert_eq!(page.evaluate("window.__foc").await.unwrap(), json!(false));
+
+    let sub = page.frame_locator("iframe").locator("#sub");
+    sub.clear(false).await.unwrap();
+    sub.press_sequentially("in-iframe", None).await.unwrap();
+    assert_eq!(
+        sub.evaluate("el => el.value", None).await.unwrap(),
+        json!("in-iframe")
+    );
+
+    // Forms: checkbox, switch role, radio uncheck error, select_option.
+    page.check("#chk", &CheckOptions::default()).await.unwrap();
+    assert_eq!(page.evaluate("chk.checked").await.unwrap(), json!(true));
+    page.uncheck("#chk", &CheckOptions::default()).await.unwrap();
+    assert_eq!(page.evaluate("chk.checked").await.unwrap(), json!(false));
+    page.set_checked("#sw", true, &CheckOptions::default()).await.unwrap();
+    assert_eq!(
+        page.evaluate("sw.getAttribute('aria-checked')").await.unwrap(),
+        json!("true")
+    );
+    assert!(page.locator("#rad").uncheck().await.is_err());
+
+    let selected = page
+        .select_option(
+            "#sel",
+            &[SelectEntry::Label("Beta".into()), SelectEntry::Index(2)],
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected, vec!["b", "c"]);
+
+    // Uploads: local path, clear, inline payloads, and filechooser listener.
+    let tmp = std::env::temp_dir().join(format!("fluxwright-it-upload-{}.txt", std::process::id()));
+    std::fs::write(&tmp, b"rust-upload").unwrap();
+    page.set_input_files("#file", &FileInput::Paths(vec![tmp.clone()]))
+        .await
+        .unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    assert!(page
+        .evaluate("file.files[0]?.name")
+        .await
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .starts_with("fluxwright-it-upload-"));
+    page.set_input_files("#file", &FileInput::Paths(Vec::new())).await.unwrap();
+    assert_eq!(page.evaluate("file.files.length").await.unwrap(), json!(0));
+    page.set_input_files(
+        "#file",
+        &FileInput::Payloads(vec![FilePayload {
+            name: "mem.txt".into(),
+            mime_type: "text/plain".into(),
+            buffer: b"mem".to_vec(),
+        }]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("file.files[0]?.name").await.unwrap(), json!("mem.txt"));
+
+    let mut choosers = page.subscribe_file_choosers();
+    let (click_res, fc) = tokio::join!(page.click("#file"), choosers.recv());
+    click_res.unwrap();
+    let fc = fc.expect("filechooser event");
+    assert!(fc.is_multiple);
+    fc.set_files(
+        &FileInput::Payloads(vec![FilePayload {
+            name: "chosen.txt".into(),
+            mime_type: "text/plain".into(),
+            buffer: b"ok".to_vec(),
+        }]),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.evaluate("file.files[0]?.name").await.unwrap(), json!("chosen.txt"));
+
+    // Touch tap + raw touchscreen tap.
+    page.tap("#btn", &HoverOptions::default()).await.unwrap();
+    page.touchscreen_tap(15.0, 15.0).await.unwrap();
+    assert_eq!(page.evaluate("window.__tap").await.unwrap(), json!(2));
+
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+}

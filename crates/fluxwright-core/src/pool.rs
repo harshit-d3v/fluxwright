@@ -102,7 +102,9 @@ pub struct PageLease {
     /// Where this page's downloads land; removed when the lease ends.
     download_dir: std::path::PathBuf,
     /// Who answers this page's dialogs; with nobody, a dialog is dismissed as before.
-    dialog_listeners: DialogListeners,
+    dialog_listeners: Listeners<fluxwright_cdp::Dialog>,
+    /// Who receives intercepted file choosers on this page.
+    file_chooser_listeners: Listeners<fluxwright_cdp::FileChooser>,
     /// `set_default_timeout` and `set_default_navigation_timeout`, when called.
     default_timeouts: std::sync::Mutex<(Option<Duration>, Option<Duration>)>,
     /// This page's place on the host it navigated to, when hosts are limited.
@@ -125,20 +127,23 @@ pub async fn with_timeout<F: std::future::Future>(timeout: Option<Duration>, cal
     }
 }
 
-type DialogListeners = Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<fluxwright_cdp::Dialog>>>>;
+type Listeners<T> = Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<T>>>>;
 
-/// Routes a page's dialogs to its newest listener still there. A dialog nobody takes is dropped,
-/// which answers it (`beforeunload` accepted, the rest dismissed). Ends with the context.
-fn route_dialogs(mut dialogs: tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::Dialog>, listeners: DialogListeners) {
+/// Routes events (dialogs, file choosers) to the newest listener still subscribed; an
+/// unhandled event is dropped cleanly. Ends with the context.
+fn route_newest<T: Send + 'static>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<T>,
+    listeners: Listeners<T>,
+) {
     tokio::spawn(async move {
-        while let Some(dialog) = dialogs.recv().await {
-            let mut dialog = Some(dialog);
+        while let Some(item) = rx.recv().await {
+            let mut item = Some(item);
             let mut listeners = listeners.lock().unwrap();
-            while let (Some(tx), Some(d)) = (listeners.last(), dialog.take()) {
-                match tx.send(d) {
+            while let (Some(tx), Some(v)) = (listeners.last(), item.take()) {
+                match tx.send(v) {
                     Ok(()) => break,
                     Err(back) => {
-                        dialog = Some(back.0);
+                        item = Some(back.0);
                         listeners.pop();
                     }
                 }
@@ -700,8 +705,10 @@ impl Inner {
         let (log, downloads, log_task) = page.collect_logs(&download_dir);
         // Best effort: a Chrome that refuses only loses downloads.
         let _ = page.allow_downloads(&download_dir, Duration::from_secs(5)).await;
-        let dialog_listeners = DialogListeners::default();
-        route_dialogs(page.dialogs().await, dialog_listeners.clone());
+        let dialog_listeners = Listeners::default();
+        route_newest(page.dialogs().await, dialog_listeners.clone());
+        let file_chooser_listeners = Listeners::default();
+        route_newest(page.file_choosers().await, file_chooser_listeners.clone());
         Ok(PageLease {
             engine: self.clone(),
             browser,
@@ -715,6 +722,7 @@ impl Inner {
             downloads: Downloads(Arc::new(Mutex::new(downloads))),
             download_dir,
             dialog_listeners,
+            file_chooser_listeners,
             default_timeouts: Default::default(),
             host_slot: HostSlot::default(),
             base_url: Default::default(),
@@ -1055,11 +1063,262 @@ impl PageLease {
         Ok(())
     }
 
+    pub async fn click_with(
+        &self,
+        selector: impl Into<Selector>,
+        options: &fluxwright_cdp::ClickOptions,
+    ) -> Result<()> {
+        self.page
+            .click_with(&selector.into(), options, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn dblclick(
+        &self,
+        selector: impl Into<Selector>,
+        options: &fluxwright_cdp::ClickOptions,
+    ) -> Result<()> {
+        self.page
+            .dblclick(&selector.into(), options, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn hover(
+        &self,
+        selector: impl Into<Selector>,
+        options: &fluxwright_cdp::HoverOptions,
+    ) -> Result<()> {
+        self.page
+            .hover(&selector.into(), options, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn focus(&self, selector: impl Into<Selector>) -> Result<()> {
+        self.page.focus(&selector.into(), self.action_timeout()).await?;
+        Ok(())
+    }
+
+    pub async fn blur(&self, selector: impl Into<Selector>) -> Result<()> {
+        self.page.blur(&selector.into(), self.action_timeout()).await?;
+        Ok(())
+    }
+
+    pub async fn scroll_into_view_if_needed(&self, selector: impl Into<Selector>) -> Result<()> {
+        self.page
+            .scroll_into_view_if_needed(&selector.into(), self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn drag_and_drop(
+        &self,
+        source: impl Into<Selector>,
+        target: impl Into<Selector>,
+        force: bool,
+    ) -> Result<()> {
+        self.page
+            .drag_and_drop(&source.into(), &target.into(), force, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
     pub async fn fill(&self, selector: impl Into<Selector>, value: &str) -> Result<()> {
         self.page
             .fill(&selector.into(), value, self.action_timeout())
             .await?;
         Ok(())
+    }
+
+    pub async fn clear(&self, selector: impl Into<Selector>, force: bool) -> Result<()> {
+        self.page
+            .fill_with(&selector.into(), "", force, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn press(
+        &self,
+        selector: impl Into<Selector>,
+        key: &str,
+        delay: Option<Duration>,
+    ) -> Result<()> {
+        self.page
+            .press(&selector.into(), key, delay, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn press_sequentially(
+        &self,
+        selector: impl Into<Selector>,
+        text: &str,
+        delay: Option<Duration>,
+    ) -> Result<()> {
+        self.page
+            .press_sequentially(&selector.into(), text, delay, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_checked(
+        &self,
+        selector: impl Into<Selector>,
+        checked: bool,
+        options: &fluxwright_cdp::CheckOptions,
+    ) -> Result<()> {
+        self.page
+            .set_checked(&selector.into(), checked, options, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn check(
+        &self,
+        selector: impl Into<Selector>,
+        options: &fluxwright_cdp::CheckOptions,
+    ) -> Result<()> {
+        self.set_checked(selector, true, options).await
+    }
+
+    pub async fn uncheck(
+        &self,
+        selector: impl Into<Selector>,
+        options: &fluxwright_cdp::CheckOptions,
+    ) -> Result<()> {
+        self.set_checked(selector, false, options).await
+    }
+
+    pub async fn select_option(
+        &self,
+        selector: impl Into<Selector>,
+        items: &[fluxwright_cdp::SelectEntry],
+        force: bool,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .page
+            .select_option(&selector.into(), items, force, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn set_input_files(
+        &self,
+        selector: impl Into<Selector>,
+        files: &fluxwright_cdp::FileInput,
+    ) -> Result<()> {
+        self.page
+            .set_input_files(&selector.into(), files, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn tap(
+        &self,
+        selector: impl Into<Selector>,
+        options: &fluxwright_cdp::HoverOptions,
+    ) -> Result<()> {
+        self.page
+            .tap(&selector.into(), options, self.action_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mouse_move(&self, x: f64, y: f64, steps: u32) -> Result<()> {
+        Ok(self.page.mouse_move(x, y, steps, self.action_timeout()).await?)
+    }
+
+    pub async fn mouse_down(
+        &self,
+        button: fluxwright_cdp::MouseButton,
+        click_count: u32,
+    ) -> Result<()> {
+        Ok(self
+            .page
+            .mouse_down(button, click_count, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn mouse_up(
+        &self,
+        button: fluxwright_cdp::MouseButton,
+        click_count: u32,
+    ) -> Result<()> {
+        Ok(self
+            .page
+            .mouse_up(button, click_count, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn mouse_click(
+        &self,
+        x: f64,
+        y: f64,
+        button: fluxwright_cdp::MouseButton,
+        click_count: u32,
+        delay: Option<Duration>,
+    ) -> Result<()> {
+        Ok(self
+            .page
+            .mouse_click(x, y, button, click_count, delay, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn mouse_dblclick(
+        &self,
+        x: f64,
+        y: f64,
+        button: fluxwright_cdp::MouseButton,
+        delay: Option<Duration>,
+    ) -> Result<()> {
+        Ok(self
+            .page
+            .mouse_dblclick(x, y, button, delay, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn mouse_wheel(&self, delta_x: f64, delta_y: f64) -> Result<()> {
+        Ok(self
+            .page
+            .mouse_wheel(delta_x, delta_y, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn keyboard_down(&self, key: &str) -> Result<()> {
+        Ok(self.page.keyboard_down(key, self.action_timeout()).await?)
+    }
+
+    pub async fn keyboard_up(&self, key: &str) -> Result<()> {
+        Ok(self.page.keyboard_up(key, self.action_timeout()).await?)
+    }
+
+    pub async fn keyboard_press(&self, key: &str, delay: Option<Duration>) -> Result<()> {
+        Ok(self
+            .page
+            .keyboard_press(key, delay, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn keyboard_type(&self, text: &str, delay: Option<Duration>) -> Result<()> {
+        Ok(self
+            .page
+            .keyboard_type(text, delay, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn keyboard_insert_text(&self, text: &str) -> Result<()> {
+        Ok(self
+            .page
+            .keyboard_insert_text(text, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn touchscreen_tap(&self, x: f64, y: f64) -> Result<()> {
+        Ok(self
+            .page
+            .touchscreen_tap(x, y, self.action_timeout())
+            .await?)
     }
 
     pub async fn wait_for_selector(&self, selector: impl Into<Selector>) -> Result<()> {
@@ -1161,6 +1420,15 @@ impl PageLease {
     pub fn subscribe_dialogs(&self) -> tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::Dialog> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.dialog_listeners.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// File chooser dialogs intercepted on this page and its frames from now on.
+    pub fn subscribe_file_choosers(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::FileChooser> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.file_chooser_listeners.lock().unwrap().push(tx);
         rx
     }
 
@@ -1368,8 +1636,120 @@ impl<'a> Locator<'a> {
         self.lease.click(&self.selector).await
     }
 
+    pub async fn click_with(&self, options: &fluxwright_cdp::ClickOptions) -> Result<()> {
+        self.lease.click_with(&self.selector, options).await
+    }
+
+    pub async fn dblclick(&self) -> Result<()> {
+        self.lease
+            .dblclick(&self.selector, &fluxwright_cdp::ClickOptions::default())
+            .await
+    }
+
+    pub async fn dblclick_with(&self, options: &fluxwright_cdp::ClickOptions) -> Result<()> {
+        self.lease.dblclick(&self.selector, options).await
+    }
+
+    pub async fn hover(&self) -> Result<()> {
+        self.lease
+            .hover(&self.selector, &fluxwright_cdp::HoverOptions::default())
+            .await
+    }
+
+    pub async fn hover_with(&self, options: &fluxwright_cdp::HoverOptions) -> Result<()> {
+        self.lease.hover(&self.selector, options).await
+    }
+
+    pub async fn focus(&self) -> Result<()> {
+        self.lease.focus(&self.selector).await
+    }
+
+    pub async fn blur(&self) -> Result<()> {
+        self.lease.blur(&self.selector).await
+    }
+
+    pub async fn scroll_into_view_if_needed(&self) -> Result<()> {
+        self.lease.scroll_into_view_if_needed(&self.selector).await
+    }
+
+    pub async fn drag_to(&self, target: &Locator<'_>) -> Result<()> {
+        self.lease
+            .drag_and_drop(&self.selector, &target.selector, false)
+            .await
+    }
+
+    pub async fn drag_to_with(&self, target: &Locator<'_>, force: bool) -> Result<()> {
+        self.lease
+            .drag_and_drop(&self.selector, &target.selector, force)
+            .await
+    }
+
     pub async fn fill(&self, value: &str) -> Result<()> {
         self.lease.fill(&self.selector, value).await
+    }
+
+    pub async fn clear(&self, force: bool) -> Result<()> {
+        self.lease.clear(&self.selector, force).await
+    }
+
+    pub async fn press(&self, key: &str, delay: Option<Duration>) -> Result<()> {
+        self.lease.press(&self.selector, key, delay).await
+    }
+
+    pub async fn press_sequentially(&self, text: &str, delay: Option<Duration>) -> Result<()> {
+        self.lease
+            .press_sequentially(&self.selector, text, delay)
+            .await
+    }
+
+    pub async fn check(&self) -> Result<()> {
+        self.lease
+            .check(&self.selector, &fluxwright_cdp::CheckOptions::default())
+            .await
+    }
+
+    pub async fn check_with(&self, options: &fluxwright_cdp::CheckOptions) -> Result<()> {
+        self.lease.check(&self.selector, options).await
+    }
+
+    pub async fn uncheck(&self) -> Result<()> {
+        self.lease
+            .uncheck(&self.selector, &fluxwright_cdp::CheckOptions::default())
+            .await
+    }
+
+    pub async fn uncheck_with(&self, options: &fluxwright_cdp::CheckOptions) -> Result<()> {
+        self.lease.uncheck(&self.selector, options).await
+    }
+
+    pub async fn set_checked(
+        &self,
+        checked: bool,
+        options: &fluxwright_cdp::CheckOptions,
+    ) -> Result<()> {
+        self.lease.set_checked(&self.selector, checked, options).await
+    }
+
+    pub async fn select_option(
+        &self,
+        items: &[fluxwright_cdp::SelectEntry],
+        force: bool,
+    ) -> Result<Vec<String>> {
+        self.lease.select_option(&self.selector, items, force).await
+    }
+
+    pub async fn set_input_files(&self, files: &fluxwright_cdp::FileInput) -> Result<()> {
+        self.lease.set_input_files(&self.selector, files).await
+    }
+
+    pub async fn tap(&self) -> Result<()> {
+        self.lease
+            .tap(&self.selector, &fluxwright_cdp::HoverOptions::default())
+            .await
+    }
+
+    pub async fn tap_with(&self, options: &fluxwright_cdp::HoverOptions) -> Result<()> {
+        self.lease.tap(&self.selector, options).await
     }
 
     /// Waits until visible.

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyCFunction};
+use pyo3::types::{PyBool, PyBytes, PyCFunction, PyDict, PyString};
 use pyo3::IntoPyObjectExt;
 use serde::Deserialize;
 use tokio::runtime::Runtime;
@@ -271,6 +271,378 @@ fn bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         Ok(b) => Ok(b.as_bytes().to_vec()),
         Err(_) => Ok(value.extract::<String>()?.into_bytes()),
     }
+}
+
+#[derive(Deserialize)]
+struct Position {
+    x: f64,
+    y: f64,
+}
+
+fn opt_position(position: Option<&Bound<'_, PyAny>>) -> PyResult<Option<(f64, f64)>> {
+    position
+        .map(|p| options::<Position>(p, "position").map(|p| (p.x, p.y)))
+        .transpose()
+}
+
+fn opt_delay(ms: Option<f64>) -> PyResult<Option<Duration>> {
+    match ms {
+        None => Ok(None),
+        Some(ms) if ms == 0.0 => Ok(None),
+        Some(ms) if ms > 0.0 && ms.is_finite() => Ok(Some(
+            Duration::try_from_secs_f64(ms / 1000.0)
+                .map_err(|_| PyValueError::new_err("delay out of range"))?,
+        )),
+        Some(ms) => Err(PyValueError::new_err(format!("delay must be >= 0, got {ms}"))),
+    }
+}
+
+fn parse_button(button: Option<&str>) -> PyResult<fluxwright::MouseButton> {
+    match button {
+        None => Ok(fluxwright::MouseButton::Left),
+        Some(b) => b
+            .parse()
+            .map_err(|e: fluxwright_cdp::Error| PyValueError::new_err(e.to_string())),
+    }
+}
+
+fn to_modifiers(modifiers: Option<Vec<String>>) -> PyResult<u8> {
+    match modifiers {
+        None => Ok(0),
+        Some(m) => fluxwright::parse_modifiers(&m).map_err(|e| PyValueError::new_err(e.to_string())),
+    }
+}
+
+fn click_options(
+    button: Option<&str>,
+    click_count: u32,
+    delay: Option<f64>,
+    position: Option<&Bound<'_, PyAny>>,
+    modifiers: Option<Vec<String>>,
+    force: Option<bool>,
+    trial: Option<bool>,
+) -> PyResult<fluxwright::ClickOptions> {
+    Ok(fluxwright::ClickOptions {
+        button: parse_button(button)?,
+        click_count,
+        delay: opt_delay(delay)?,
+        position: opt_position(position)?,
+        modifiers: to_modifiers(modifiers)?,
+        force: force.unwrap_or(false),
+        trial: trial.unwrap_or(false),
+    })
+}
+
+fn hover_options(
+    position: Option<&Bound<'_, PyAny>>,
+    modifiers: Option<Vec<String>>,
+    force: Option<bool>,
+    trial: Option<bool>,
+) -> PyResult<fluxwright::HoverOptions> {
+    Ok(fluxwright::HoverOptions {
+        position: opt_position(position)?,
+        modifiers: to_modifiers(modifiers)?,
+        force: force.unwrap_or(false),
+        trial: trial.unwrap_or(false),
+    })
+}
+
+fn check_options(
+    position: Option<&Bound<'_, PyAny>>,
+    force: Option<bool>,
+    trial: Option<bool>,
+) -> PyResult<fluxwright::CheckOptions> {
+    Ok(fluxwright::CheckOptions {
+        position: opt_position(position)?,
+        force: force.unwrap_or(false),
+        trial: trial.unwrap_or(false),
+    })
+}
+
+fn extract_index(v: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if v.is_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err("select_option index must be an int"));
+    }
+    v.extract::<usize>()
+}
+
+fn parse_select_dict(d: &Bound<'_, PyDict>) -> PyResult<fluxwright::SelectEntry> {
+    if d.get_item("element")?.is_some_and(|v| !v.is_none()) {
+        return Err(PyValueError::new_err(
+            "select_option: element is not supported; pass value, label or index",
+        ));
+    }
+    if let Some(v) = d.get_item("value")?.filter(|v| !v.is_none()) {
+        return Ok(fluxwright::SelectEntry::Value(v.extract()?));
+    }
+    if let Some(l) = d.get_item("label")?.filter(|v| !v.is_none()) {
+        return Ok(fluxwright::SelectEntry::Label(l.extract()?));
+    }
+    if let Some(i) = d.get_item("index")?.filter(|v| !v.is_none()) {
+        return Ok(fluxwright::SelectEntry::Index(extract_index(&i)?));
+    }
+    Err(PyValueError::new_err(
+        "select_option item must specify value, label or index",
+    ))
+}
+
+fn parse_select_entries(
+    value: Option<&Bound<'_, PyAny>>,
+    index: Option<&Bound<'_, PyAny>>,
+    label: Option<&Bound<'_, PyAny>>,
+    element: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Vec<fluxwright::SelectEntry>> {
+    if element.is_some_and(|e| !e.is_none()) {
+        return Err(PyValueError::new_err(
+            "select_option: element is not supported; pass value, label or index",
+        ));
+    }
+    let mut out = Vec::new();
+    if let Some(v) = value.filter(|v| !v.is_none()) {
+        if let Ok(s) = v.cast::<PyString>() {
+            out.push(fluxwright::SelectEntry::Value(s.extract()?));
+        } else if let Ok(d) = v.cast::<PyDict>() {
+            out.push(parse_select_dict(d)?);
+        } else {
+            for item in v.try_iter()? {
+                let item = item?;
+                if let Ok(d) = item.cast::<PyDict>() {
+                    out.push(parse_select_dict(d)?);
+                } else {
+                    out.push(fluxwright::SelectEntry::Value(item.extract()?));
+                }
+            }
+        }
+    }
+    if let Some(l) = label.filter(|l| !l.is_none()) {
+        if let Ok(s) = l.cast::<PyString>() {
+            out.push(fluxwright::SelectEntry::Label(s.extract()?));
+        } else {
+            for item in l.try_iter()? {
+                out.push(fluxwright::SelectEntry::Label(item?.extract()?));
+            }
+        }
+    }
+    if let Some(idx) = index.filter(|i| !i.is_none()) {
+        if !idx.is_instance_of::<PyBool>() {
+            if let Ok(i) = idx.extract::<usize>() {
+                out.push(fluxwright::SelectEntry::Index(i));
+                return Ok(out);
+            }
+        }
+        if idx.is_instance_of::<PyBool>() || idx.extract::<isize>().is_ok() {
+            return Err(PyValueError::new_err(
+                "select_option index must be a non-negative int",
+            ));
+        }
+        for item in idx.try_iter()? {
+            out.push(fluxwright::SelectEntry::Index(extract_index(&item?)?));
+        }
+    }
+    Ok(out)
+}
+
+fn parse_file_payload(d: &Bound<'_, PyDict>) -> PyResult<fluxwright::FilePayload> {
+    let name: String = d
+        .get_item("name")?
+        .ok_or_else(|| PyValueError::new_err("FilePayload missing 'name'"))?
+        .extract()?;
+    let mime_type: String = match d.get_item("mimeType")? {
+        Some(m) if !m.is_none() => m.extract()?,
+        _ => match d.get_item("mime_type")? {
+            Some(m) if !m.is_none() => m.extract()?,
+            _ => String::new(),
+        },
+    };
+    let buf_any = d
+        .get_item("buffer")?
+        .ok_or_else(|| PyValueError::new_err("FilePayload missing 'buffer'"))?;
+    let buffer = bytes(&buf_any)?;
+    Ok(fluxwright::FilePayload {
+        name,
+        mime_type,
+        buffer,
+    })
+}
+
+fn is_path_like(v: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(v.is_instance_of::<PyString>() || v.hasattr("__fspath__")?)
+}
+
+fn parse_file_input(files: &Bound<'_, PyAny>) -> PyResult<fluxwright::FileInput> {
+    if is_path_like(files)? {
+        return Ok(fluxwright::FileInput::Paths(vec![files.extract::<PathBuf>()?]));
+    }
+    if let Ok(d) = files.cast::<PyDict>() {
+        return Ok(fluxwright::FileInput::Payloads(vec![parse_file_payload(d)?]));
+    }
+    let mut paths = Vec::new();
+    let mut payloads = Vec::new();
+    for item in files.try_iter()? {
+        let item = item?;
+        if let Ok(d) = item.cast::<PyDict>() {
+            if !paths.is_empty() {
+                return Err(PyValueError::new_err(
+                    "set_input_files cannot mix file paths and FilePayload dicts",
+                ));
+            }
+            payloads.push(parse_file_payload(d)?);
+        } else {
+            if !payloads.is_empty() {
+                return Err(PyValueError::new_err(
+                    "set_input_files cannot mix file paths and FilePayload dicts",
+                ));
+            }
+            paths.push(item.extract::<PathBuf>()?);
+        }
+    }
+    if !payloads.is_empty() {
+        Ok(fluxwright::FileInput::Payloads(payloads))
+    } else {
+        Ok(fluxwright::FileInput::Paths(paths))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_click<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    sel: fluxwright::Selector,
+    button: Option<&str>,
+    click_count: u32,
+    delay: Option<f64>,
+    position: Option<&Bound<'_, PyAny>>,
+    modifiers: Option<Vec<String>>,
+    force: Option<bool>,
+    trial: Option<bool>,
+    dbl: bool,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let opts = click_options(button, click_count, delay, position, modifiers, force, trial)?;
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move {
+            if dbl {
+                p.dblclick(&sel, &opts).await.map(none)
+            } else {
+                p.click_with(&sel, &opts).await.map(none)
+            }
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_hover_or_tap<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    sel: fluxwright::Selector,
+    position: Option<&Bound<'_, PyAny>>,
+    modifiers: Option<Vec<String>>,
+    force: Option<bool>,
+    trial: Option<bool>,
+    tap: bool,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let opts = hover_options(position, modifiers, force, trial)?;
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move {
+            if tap {
+                p.tap(&sel, &opts).await.map(none)
+            } else {
+                p.hover(&sel, &opts).await.map(none)
+            }
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_check<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    sel: fluxwright::Selector,
+    checked: bool,
+    position: Option<&Bound<'_, PyAny>>,
+    force: Option<bool>,
+    trial: Option<bool>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let opts = check_options(position, force, trial)?;
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move { p.set_checked(&sel, checked, &opts).await.map(none) })
+    })
+}
+
+fn do_drag<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    src: fluxwright::Selector,
+    dst: fluxwright::Selector,
+    force: Option<bool>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let force = force.unwrap_or(false);
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move { p.drag_and_drop(src, dst, force).await.map(none) })
+    })
+}
+
+fn do_press<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    sel: fluxwright::Selector,
+    key: String,
+    delay: Option<f64>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let delay = opt_delay(delay)?;
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move { p.press(&sel, &key, delay).await.map(none) })
+    })
+}
+
+fn do_type<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    sel: fluxwright::Selector,
+    text: String,
+    delay: Option<f64>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let delay = opt_delay(delay)?;
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move { p.press_sequentially(&sel, &text, delay).await.map(none) })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_select_option<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    sel: fluxwright::Selector,
+    value: Option<&Bound<'_, PyAny>>,
+    index: Option<&Bound<'_, PyAny>>,
+    label: Option<&Bound<'_, PyAny>>,
+    element: Option<&Bound<'_, PyAny>>,
+    force: Option<bool>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let entries = parse_select_entries(value, index, label, element)?;
+    let force = force.unwrap_or(false);
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move { p.select_option(&sel, &entries, force).await })
+    })
+}
+
+fn do_set_input_files<'py>(
+    py: Python<'py>,
+    lease: &LeaseSlot,
+    sel: fluxwright::Selector,
+    files: &Bound<'_, PyAny>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let input = parse_file_input(files)?;
+    run_in(py, lease, timeout, move |p| {
+        Box::pin(async move { p.set_input_files(&sel, &input).await.map(none) })
+    })
 }
 
 /// Writes `data`, creating missing folders, as Playwright does with `.auth/state.json`.
@@ -715,16 +1087,184 @@ impl Page {
         run(py, &self.lease, |p| Box::pin(p.content()))
     }
 
-    #[pyo3(signature = (selector, *, timeout=None))]
+    #[pyo3(signature = (
+        selector,
+        *,
+        button=None,
+        click_count=None,
+        delay=None,
+        position=None,
+        modifiers=None,
+        force=None,
+        trial=None,
+        timeout=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn click<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        button: Option<&str>,
+        click_count: Option<u32>,
+        delay: Option<f64>,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_click(
+            py,
+            &self.lease,
+            selector.into(),
+            button,
+            click_count.unwrap_or(1),
+            delay,
+            position,
+            modifiers,
+            force,
+            trial,
+            false,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (
+        selector,
+        *,
+        button=None,
+        delay=None,
+        position=None,
+        modifiers=None,
+        force=None,
+        trial=None,
+        timeout=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn dblclick<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        button: Option<&str>,
+        delay: Option<f64>,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_click(
+            py,
+            &self.lease,
+            selector.into(),
+            button,
+            2,
+            delay,
+            position,
+            modifiers,
+            force,
+            trial,
+            true,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (selector, *, position=None, modifiers=None, force=None, trial=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn hover<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_hover_or_tap(
+            py,
+            &self.lease,
+            selector.into(),
+            position,
+            modifiers,
+            force,
+            trial,
+            false,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (selector, *, position=None, modifiers=None, force=None, trial=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn tap<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_hover_or_tap(
+            py,
+            &self.lease,
+            selector.into(),
+            position,
+            modifiers,
+            force,
+            trial,
+            true,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (selector, *, timeout=None))]
+    fn focus<'py>(
         &self,
         py: Python<'py>,
         selector: String,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.click(selector.as_str()).await.map(none) })
+            Box::pin(async move { p.focus(selector.as_str()).await.map(none) })
         })
+    }
+
+    #[pyo3(signature = (selector, *, timeout=None))]
+    fn blur<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.blur(selector.as_str()).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (selector, *, timeout=None))]
+    fn scroll_into_view_if_needed<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.scroll_into_view_if_needed(selector.as_str()).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (source, target, *, force=None, timeout=None))]
+    fn drag_and_drop<'py>(
+        &self,
+        py: Python<'py>,
+        source: String,
+        target: String,
+        force: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_drag(py, &self.lease, source.into(), target.into(), force, timeout)
     }
 
     #[pyo3(signature = (selector, value, *, timeout=None))]
@@ -737,6 +1277,279 @@ impl Page {
     ) -> PyResult<Bound<'py, PyAny>> {
         run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.fill(selector.as_str(), &value).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (selector, *, force=None, timeout=None))]
+    fn clear<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        force: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let force = force.unwrap_or(false);
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.clear(selector.as_str(), force).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (selector, key, *, delay=None, timeout=None))]
+    fn press<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        key: String,
+        delay: Option<f64>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_press(py, &self.lease, selector.into(), key, delay, timeout)
+    }
+
+    #[pyo3(signature = (selector, text, *, delay=None, timeout=None))]
+    fn press_sequentially<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        text: String,
+        delay: Option<f64>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_type(py, &self.lease, selector.into(), text, delay, timeout)
+    }
+
+    #[pyo3(name = "type", signature = (selector, text, *, delay=None, timeout=None))]
+    fn r#type<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        text: String,
+        delay: Option<f64>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_type(py, &self.lease, selector.into(), text, delay, timeout)
+    }
+
+    #[pyo3(signature = (selector, *, position=None, force=None, trial=None, timeout=None))]
+    fn check<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        position: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_check(py, &self.lease, selector.into(), true, position, force, trial, timeout)
+    }
+
+    #[pyo3(signature = (selector, *, position=None, force=None, trial=None, timeout=None))]
+    fn uncheck<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        position: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_check(py, &self.lease, selector.into(), false, position, force, trial, timeout)
+    }
+
+    #[pyo3(signature = (selector, checked, *, position=None, force=None, trial=None, timeout=None))]
+    fn set_checked<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        checked: bool,
+        position: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_check(py, &self.lease, selector.into(), checked, position, force, trial, timeout)
+    }
+
+    #[pyo3(signature = (selector, value=None, *, index=None, label=None, element=None, force=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn select_option<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        value: Option<&Bound<'_, PyAny>>,
+        index: Option<&Bound<'_, PyAny>>,
+        label: Option<&Bound<'_, PyAny>>,
+        element: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_select_option(
+            py,
+            &self.lease,
+            selector.into(),
+            value,
+            index,
+            label,
+            element,
+            force,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (selector, files, *, timeout=None))]
+    fn set_input_files<'py>(
+        &self,
+        py: Python<'py>,
+        selector: String,
+        files: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_set_input_files(py, &self.lease, selector.into(), files, timeout)
+    }
+
+    #[pyo3(name = "_mouse_move", signature = (x, y, *, steps=None))]
+    fn mouse_move<'py>(
+        &self,
+        py: Python<'py>,
+        x: f64,
+        y: f64,
+        steps: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let steps = steps.unwrap_or(1);
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.mouse_move(x, y, steps).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_mouse_down", signature = (*, button=None, click_count=None))]
+    fn mouse_down<'py>(
+        &self,
+        py: Python<'py>,
+        button: Option<&str>,
+        click_count: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let button = parse_button(button)?;
+        let click_count = click_count.unwrap_or(1);
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.mouse_down(button, click_count).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_mouse_up", signature = (*, button=None, click_count=None))]
+    fn mouse_up<'py>(
+        &self,
+        py: Python<'py>,
+        button: Option<&str>,
+        click_count: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let button = parse_button(button)?;
+        let click_count = click_count.unwrap_or(1);
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.mouse_up(button, click_count).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_mouse_click", signature = (x, y, *, delay=None, button=None, click_count=None))]
+    fn mouse_click<'py>(
+        &self,
+        py: Python<'py>,
+        x: f64,
+        y: f64,
+        delay: Option<f64>,
+        button: Option<&str>,
+        click_count: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let button = parse_button(button)?;
+        let click_count = click_count.unwrap_or(1);
+        let delay = opt_delay(delay)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.mouse_click(x, y, button, click_count, delay).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_mouse_dblclick", signature = (x, y, *, delay=None, button=None))]
+    fn mouse_dblclick<'py>(
+        &self,
+        py: Python<'py>,
+        x: f64,
+        y: f64,
+        delay: Option<f64>,
+        button: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let button = parse_button(button)?;
+        let delay = opt_delay(delay)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.mouse_dblclick(x, y, button, delay).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_mouse_wheel")]
+    fn mouse_wheel<'py>(
+        &self,
+        py: Python<'py>,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.mouse_wheel(delta_x, delta_y).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_keyboard_down")]
+    fn keyboard_down<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.keyboard_down(&key).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_keyboard_up")]
+    fn keyboard_up<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.keyboard_up(&key).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_keyboard_press", signature = (key, *, delay=None))]
+    fn keyboard_press<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+        delay: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let delay = opt_delay(delay)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.keyboard_press(&key, delay).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_keyboard_type", signature = (text, *, delay=None))]
+    fn keyboard_type<'py>(
+        &self,
+        py: Python<'py>,
+        text: String,
+        delay: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let delay = opt_delay(delay)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.keyboard_type(&text, delay).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_keyboard_insert_text")]
+    fn keyboard_insert_text<'py>(
+        &self,
+        py: Python<'py>,
+        text: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.keyboard_insert_text(&text).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_touchscreen_tap")]
+    fn touchscreen_tap<'py>(&self, py: Python<'py>, x: f64, y: f64) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.touchscreen_tap(x, y).await.map(none) })
         })
     }
 
@@ -1058,6 +1871,11 @@ impl Page {
         self.now(|p| DialogStream(Arc::new(Mutex::new(p.subscribe_dialogs()))))
     }
 
+    #[pyo3(name = "_file_choosers")]
+    fn file_choosers(&self) -> PyResult<FileChooserStream> {
+        self.now(|p| FileChooserStream(Arc::new(Mutex::new(p.subscribe_file_choosers()))))
+    }
+
     /// Starts handing this page's requests over; resolves once interception is on, so a `goto`
     /// after it is covered.
     #[pyo3(name = "_intercept")]
@@ -1165,12 +1983,179 @@ struct Locator {
 
 #[pymethods]
 impl Locator {
+    #[pyo3(signature = (
+        *,
+        button=None,
+        click_count=None,
+        delay=None,
+        position=None,
+        modifiers=None,
+        force=None,
+        trial=None,
+        timeout=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn click<'py>(
+        &self,
+        py: Python<'py>,
+        button: Option<&str>,
+        click_count: Option<u32>,
+        delay: Option<f64>,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_click(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            button,
+            click_count.unwrap_or(1),
+            delay,
+            position,
+            modifiers,
+            force,
+            trial,
+            false,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (
+        *,
+        button=None,
+        delay=None,
+        position=None,
+        modifiers=None,
+        force=None,
+        trial=None,
+        timeout=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn dblclick<'py>(
+        &self,
+        py: Python<'py>,
+        button: Option<&str>,
+        delay: Option<f64>,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_click(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            button,
+            2,
+            delay,
+            position,
+            modifiers,
+            force,
+            trial,
+            true,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (*, position=None, modifiers=None, force=None, trial=None, timeout=None))]
+    fn hover<'py>(
+        &self,
+        py: Python<'py>,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_hover_or_tap(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            position,
+            modifiers,
+            force,
+            trial,
+            false,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (*, position=None, modifiers=None, force=None, trial=None, timeout=None))]
+    fn tap<'py>(
+        &self,
+        py: Python<'py>,
+        position: Option<&Bound<'_, PyAny>>,
+        modifiers: Option<Vec<String>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_hover_or_tap(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            position,
+            modifiers,
+            force,
+            trial,
+            true,
+            timeout,
+        )
+    }
+
     #[pyo3(signature = (*, timeout=None))]
-    fn click<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+    fn focus<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
         let sel = self.selector.clone();
         run_in(py, &self.lease, timeout, move |p| {
-            Box::pin(async move { p.click(&sel).await.map(none) })
+            Box::pin(async move { p.focus(&sel).await.map(none) })
         })
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn blur<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.blur(&sel).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (*, timeout=None))]
+    fn scroll_into_view_if_needed<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.scroll_into_view_if_needed(&sel).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (target, *, force=None, timeout=None))]
+    fn drag_to<'py>(
+        &self,
+        py: Python<'py>,
+        target: &Locator,
+        force: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !Arc::ptr_eq(&self.lease, &target.lease) {
+            return Err(PyValueError::new_err(
+                "drag_to target locator must belong to the same page",
+            ));
+        }
+        do_drag(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            target.selector.clone(),
+            force,
+            timeout,
+        )
     }
 
     #[pyo3(signature = (value, *, timeout=None))]
@@ -1184,6 +2169,152 @@ impl Locator {
         run_in(py, &self.lease, timeout, move |p| {
             Box::pin(async move { p.fill(&sel, &value).await.map(none) })
         })
+    }
+
+    #[pyo3(signature = (*, force=None, timeout=None))]
+    fn clear<'py>(
+        &self,
+        py: Python<'py>,
+        force: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let sel = self.selector.clone();
+        let force = force.unwrap_or(false);
+        run_in(py, &self.lease, timeout, move |p| {
+            Box::pin(async move { p.clear(&sel, force).await.map(none) })
+        })
+    }
+
+    #[pyo3(signature = (key, *, delay=None, timeout=None))]
+    fn press<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+        delay: Option<f64>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_press(py, &self.lease, self.selector.clone(), key, delay, timeout)
+    }
+
+    #[pyo3(signature = (text, *, delay=None, timeout=None))]
+    fn press_sequentially<'py>(
+        &self,
+        py: Python<'py>,
+        text: String,
+        delay: Option<f64>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_type(py, &self.lease, self.selector.clone(), text, delay, timeout)
+    }
+
+    #[pyo3(name = "type", signature = (text, *, delay=None, timeout=None))]
+    fn r#type<'py>(
+        &self,
+        py: Python<'py>,
+        text: String,
+        delay: Option<f64>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_type(py, &self.lease, self.selector.clone(), text, delay, timeout)
+    }
+
+    #[pyo3(signature = (*, position=None, force=None, trial=None, timeout=None))]
+    fn check<'py>(
+        &self,
+        py: Python<'py>,
+        position: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_check(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            true,
+            position,
+            force,
+            trial,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (*, position=None, force=None, trial=None, timeout=None))]
+    fn uncheck<'py>(
+        &self,
+        py: Python<'py>,
+        position: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_check(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            false,
+            position,
+            force,
+            trial,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (checked, *, position=None, force=None, trial=None, timeout=None))]
+    fn set_checked<'py>(
+        &self,
+        py: Python<'py>,
+        checked: bool,
+        position: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        trial: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_check(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            checked,
+            position,
+            force,
+            trial,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (value=None, *, index=None, label=None, element=None, force=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn select_option<'py>(
+        &self,
+        py: Python<'py>,
+        value: Option<&Bound<'_, PyAny>>,
+        index: Option<&Bound<'_, PyAny>>,
+        label: Option<&Bound<'_, PyAny>>,
+        element: Option<&Bound<'_, PyAny>>,
+        force: Option<bool>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_select_option(
+            py,
+            &self.lease,
+            self.selector.clone(),
+            value,
+            index,
+            label,
+            element,
+            force,
+            timeout,
+        )
+    }
+
+    #[pyo3(signature = (files, *, timeout=None))]
+    fn set_input_files<'py>(
+        &self,
+        py: Python<'py>,
+        files: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        do_set_input_files(py, &self.lease, self.selector.clone(), files, timeout)
     }
 
     /// Waits until visible.
@@ -1764,6 +2895,55 @@ impl DialogStream {
     }
 }
 
+/// A file chooser waiting for files; `fluxwright.async_api` wraps it in `FileChooser`.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct FileChooser {
+    inner: fluxwright::FileChooser,
+}
+
+impl FileChooser {
+    fn new(inner: fluxwright::FileChooser) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl FileChooser {
+    fn is_multiple(&self) -> bool {
+        self.inner.is_multiple
+    }
+
+    #[pyo3(signature = (files, *, timeout=None))]
+    fn set_files<'py>(
+        &self,
+        py: Python<'py>,
+        files: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let fc = self.inner.clone();
+        let input = parse_file_input(files)?;
+        let timeout = call_timeout(timeout).unwrap_or(Duration::from_secs(30));
+        future_into_py(py, async move {
+            fc.set_files(&input, timeout).await.map(none).map_err(error)
+        })
+    }
+}
+
+/// A page's file choosers, in order.
+#[pyclass(frozen, module = "fluxwright._native")]
+struct FileChooserStream(Arc<Mutex<UnboundedReceiver<fluxwright::FileChooser>>>);
+
+#[pymethods]
+impl FileChooserStream {
+    /// The next file chooser, or `None` once the page closed.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx.lock().await.recv().await.map(FileChooser::new))
+        })
+    }
+}
+
 /// Requests `page.route` intercepted, in order.
 #[pyclass(frozen, module = "fluxwright._native")]
 struct RouteStream(Arc<Mutex<UnboundedReceiver<fluxwright::InterceptedRequest>>>);
@@ -1918,6 +3098,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NetworkStream>()?;
     m.add_class::<Dialog>()?;
     m.add_class::<DialogStream>()?;
+    m.add_class::<FileChooser>()?;
+    m.add_class::<FileChooserStream>()?;
     m.py().import("atexit")?.call_method1("register", (wrap_pyfunction!(wait_for_hand_overs, m)?,))?;
     Ok(())
 }

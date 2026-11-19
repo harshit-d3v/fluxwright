@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { chmodSync, statSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -100,7 +100,9 @@ try {
   await assert.rejects(page.locator('p').waitFor({ timeout: 300 }))
   await page.evaluate(() => (document.querySelector('p').style.display = ''))
   assert.throws(() => page.locator('p', { hasText: 'x' }), TypeError)
-  await assert.rejects(page.click('p', { button: 'right' }), TypeError)
+  await assert.rejects(page.click('p', { noWaitAfter: true }), TypeError)
+  await assert.rejects(page.click('p', { button: 'fourth' }), TypeError)
+  await assert.rejects(page.click('p', { modifiers: ['Bogus'] }), TypeError)
   await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.gif') }), TypeError)
   await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.webp') }), TypeError)
   await assert.rejects(page.screenshot({ type: 'webp' }), TypeError)
@@ -475,6 +477,103 @@ try {
   assert.ok(inContext.isClosed())
   assert.deepEqual(context.pages(), [])
   await assert.rejects(context.newPage(), /context is closed/)
+
+  // Track 1: pointer options, mouse, keyboard, forms, file uploads, and touch.
+  const rich = await browser.newPage({ hasTouch: true })
+  await rich.goto(
+    'data:text/html,<body style="margin:0;height:2000px">' +
+      '<button id="btn" style="border:0;padding:0;position:relative;width:80px;height:40px" ' +
+      'oncontextmenu="event.preventDefault();window.__ctx=[event.button,event.shiftKey,Math.round(event.offsetX),Math.round(event.offsetY)]" ' +
+      'ondblclick="window.__dbl=(window.__dbl||0)+1" ' +
+      'onmouseenter="window.__hover=true" ' +
+      'ontouchstart="window.__tap=(window.__tap||0)+1">Btn</button>' +
+      '<div id="covered" role="button" aria-disabled="true" onclick="window.__forced=true" style="position:relative;width:40px;height:20px">C</div>' +
+      '<div id="dragsrc" style="position:absolute;left:120px;top:20px;width:20px;height:20px" onmousedown="window.__dragStart=true"></div>' +
+      '<div id="dragdst" style="position:absolute;left:220px;top:20px;width:20px;height:20px" onmouseup="window.__dragEnd=true"></div>' +
+      '<input id="inp" value="old" onfocus="window.__foc=true" onblur="window.__foc=false" onkeydown="window.__keys=(window.__keys||[]);window.__keys.push(event.key)">' +
+      '<input id="chk" type="checkbox"><input id="rad" type="radio" name="r">' +
+      '<div id="sw" role="switch" tabindex="0" aria-checked="false" onclick="this.setAttribute(\'aria-checked\', String(this.getAttribute(\'aria-checked\')!==\'true\'))">Sw</div>' +
+      '<select id="sel" multiple><option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option></select>' +
+      '<input id="file" type="file" multiple>' +
+      '<div id="below" style="margin-top:1400px">End</div>' +
+      '<script>window.addEventListener("wheel", e => { window.__wheel = e.deltaY; if (window.__resolveWheel) window.__resolveWheel(e.deltaY); }, { passive: false });</script></body>',
+  )
+  await rich.click('#btn', { trial: true, button: 'right' })
+  assert.equal(await rich.evaluate(() => window.__ctx), null)
+  await rich.click('#btn', { button: 'right', modifiers: ['Shift'], position: { x: 10, y: 12 } })
+  assert.deepEqual(await rich.evaluate(() => window.__ctx), [2, true, 10, 12])
+  await rich.dblclick('#btn')
+  assert.equal(await rich.evaluate(() => window.__dbl), 1)
+  await rich.hover('#btn')
+  assert.equal(await rich.evaluate(() => window.__hover), true)
+  await rich.click('#covered', { force: true })
+  assert.equal(await rich.evaluate(() => window.__forced), true)
+  await rich.dragAndDrop('#dragsrc', '#dragdst')
+  assert.deepEqual(await rich.evaluate(() => [window.__dragStart, window.__dragEnd]), [true, true])
+
+  await rich.locator('#below').scrollIntoViewIfNeeded()
+  assert.ok((await rich.evaluate(() => window.scrollY)) > 500)
+  await rich.evaluate(() => window.scrollTo(0, 0))
+  await rich.mouse.move(10, 10)
+  await rich.mouse.wheel(0, 120)
+  assert.equal(
+    await rich.evaluate(
+      () =>
+        window.__wheel ??
+        new Promise((res, rej) => {
+          window.__resolveWheel = res
+          setTimeout(() => rej(new Error('wheel timeout')), 3000)
+        }),
+    ),
+    120,
+  )
+
+  await rich.focus('#inp')
+  assert.equal(await rich.evaluate(() => window.__foc), true)
+  await rich.locator('#inp').clear()
+  assert.equal(await rich.evaluate(() => inp.value), '')
+  await rich.locator('#inp').pressSequentially('hello')
+  await rich.press('#inp', 'ControlOrMeta+a')
+  await rich.press('#inp', 'Backspace')
+  await rich.keyboard.insertText('世')
+  await rich.press('#inp', 'Enter')
+  assert.equal(await rich.evaluate(() => inp.value), '世')
+  assert.ok((await rich.evaluate(() => window.__keys)).includes('Enter'))
+  await rich.locator('#inp').blur()
+  assert.equal(await rich.evaluate(() => window.__foc), false)
+
+  await rich.check('#chk')
+  assert.equal(await rich.evaluate(() => chk.checked), true)
+  await rich.uncheck('#chk')
+  assert.equal(await rich.evaluate(() => chk.checked), false)
+  await rich.setChecked('#sw', true)
+  assert.equal(await rich.evaluate(() => sw.getAttribute('aria-checked')), 'true')
+  await assert.rejects(rich.locator('#rad').uncheck(), /cannot uncheck a radio/)
+
+  assert.deepEqual(await rich.selectOption('#sel', [{ label: 'Beta' }, { index: 2 }]), ['b', 'c'])
+  assert.deepEqual(
+    await rich.evaluate(() => [...sel.selectedOptions].map((o) => o.value)),
+    ['b', 'c'],
+  )
+
+  const uploadPath = join(tmpdir(), `fluxwright-upload-${process.pid}.txt`)
+  await writeFile(uploadPath, 'from-disk')
+  await rich.setInputFiles('#file', uploadPath)
+  assert.equal(await rich.evaluate(() => file.files[0]?.name), `fluxwright-upload-${process.pid}.txt`)
+  await rich.setInputFiles('#file', [])
+  assert.equal(await rich.evaluate(() => file.files.length), 0)
+  await rich.setInputFiles('#file', { name: 'mem.txt', mimeType: 'text/plain', buffer: Buffer.from('mem') })
+  assert.equal(await rich.evaluate(() => file.files[0]?.name), 'mem.txt')
+
+  const [fc] = await Promise.all([rich.waitForFileChooser(), rich.click('#file')])
+  assert.equal(fc.isMultiple(), true)
+  await fc.setFiles({ name: 'chosen.txt', mimeType: 'text/plain', buffer: Buffer.from('chosen') })
+  assert.equal(await rich.evaluate(() => file.files[0]?.name), 'chosen.txt')
+
+  await rich.tap('#btn')
+  await rich.touchscreen.tap(15, 15)
+  assert.equal(await rich.evaluate(() => window.__tap), 2)
+  await rich.close()
 
   // close() does not wait for calls still running on the page (this one would run until the
   // action timeout): they reject at once, and so do pending waits.

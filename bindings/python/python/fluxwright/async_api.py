@@ -33,16 +33,18 @@ from typing import (
     Literal,
     TypeVar,
 )
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from . import _native
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage, Download, FrameLocator, Locator
 from ._types import (
+    FilePayload,
     FloatRect,
     Geolocation,
     HttpCredentials,
     PdfMargins,
+    Position,
     ProxySettings,
     StorageState,
     URLMatch,
@@ -58,21 +60,27 @@ __all__ = [
     "Download",
     "Error",
     "EventInfo",
+    "FileChooser",
+    "FilePayload",
     "FloatRect",
     "FrameLocator",
     "Geolocation",
     "HttpCredentials",
+    "Keyboard",
     "Locator",
+    "Mouse",
     "Page",
     "PdfMargins",
     "Playwright",
     "PlaywrightContextManager",
+    "Position",
     "ProxySettings",
     "Request",
     "Response",
     "Route",
     "StorageState",
     "TimeoutError",
+    "Touchscreen",
     "ViewportSize",
     "async_playwright",
     "chromium",
@@ -247,6 +255,110 @@ class Dialog:
         return f"<Dialog type={self.type!r} message={self.message!r}>"
 
 
+class FileChooser:
+    """A native file chooser dialog, intercepted via ``page.on('filechooser')`` or
+    ``page.expect_file_chooser()``."""
+
+    def __init__(self, native: _native.FileChooser) -> None:
+        self._native = native
+
+    def is_multiple(self) -> bool:
+        return self._native.is_multiple()
+
+    async def set_files(
+        self,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        await self._native.set_files(files, timeout=timeout)
+
+    def __repr__(self) -> str:
+        return f"<FileChooser is_multiple={self.is_multiple()}>"
+
+
+class Mouse:
+    """Low-level pointer controls in viewport CSS pixels, accessed via ``page.mouse``."""
+
+    def __init__(self, page: Page) -> None:
+        self._page = page
+
+    async def move(self, x: float, y: float, *, steps: int | None = None) -> None:
+        await self._page._mouse_move(x, y, steps=steps)
+
+    async def down(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+    ) -> None:
+        await self._page._mouse_down(button=button, click_count=click_count)
+
+    async def up(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+    ) -> None:
+        await self._page._mouse_up(button=button, click_count=click_count)
+
+    async def click(
+        self,
+        x: float,
+        y: float,
+        *,
+        delay: float | None = None,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+    ) -> None:
+        await self._page._mouse_click(x, y, delay=delay, button=button, click_count=click_count)
+
+    async def dblclick(
+        self,
+        x: float,
+        y: float,
+        *,
+        delay: float | None = None,
+        button: Literal["left", "right", "middle"] | None = None,
+    ) -> None:
+        await self._page._mouse_dblclick(x, y, delay=delay, button=button)
+
+    async def wheel(self, delta_x: float, delta_y: float) -> None:
+        await self._page._mouse_wheel(delta_x, delta_y)
+
+
+class Keyboard:
+    """Low-level keyboard controls, accessed via ``page.keyboard``."""
+
+    def __init__(self, page: Page) -> None:
+        self._page = page
+
+    async def down(self, key: str) -> None:
+        await self._page._keyboard_down(key)
+
+    async def up(self, key: str) -> None:
+        await self._page._keyboard_up(key)
+
+    async def press(self, key: str, *, delay: float | None = None) -> None:
+        await self._page._keyboard_press(key, delay=delay)
+
+    async def type(self, text: str, *, delay: float | None = None) -> None:
+        await self._page._keyboard_type(text, delay=delay)
+
+    async def insert_text(self, text: str) -> None:
+        await self._page._keyboard_insert_text(text)
+
+
+class Touchscreen:
+    """Low-level touchscreen controls in viewport CSS pixels, accessed via ``page.touchscreen``."""
+
+    def __init__(self, page: Page) -> None:
+        self._page = page
+
+    async def tap(self, x: float, y: float) -> None:
+        await self._page._touchscreen_tap(x, y)
+
+
 class Route:
     """How a route handler answers a request, as Playwright's ``Route``. Each request takes one
     answer; the methods return awaitables."""
@@ -387,8 +499,21 @@ class Page(_native.Page):
         # Ends once no network listener is left; the next one starts another (see _serve_network).
         self._network_task: asyncio.Future[Any] | None = None
         self._answering_dialogs = False
+        self._serving_file_choosers = False
         self._tasks: set[asyncio.Future[Any]] = set()
         self._expects: set[asyncio.Future[Any]] = set()
+
+    @property
+    def mouse(self) -> Mouse:
+        return Mouse(self)
+
+    @property
+    def keyboard(self) -> Keyboard:
+        return Keyboard(self)
+
+    @property
+    def touchscreen(self) -> Touchscreen:
+        return Touchscreen(self)
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
         """Hands matching requests of this page, its popups and iframes to ``handler(route)``
@@ -430,6 +555,22 @@ class Page(_native.Page):
         _remove_listener(self._listeners, event, handler)
 
     off = remove_listener
+
+    @asynccontextmanager
+    async def expect_file_chooser(
+        self,
+        predicate: Callable[[FileChooser], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[EventInfo[FileChooser]]:
+        """Waits for the native file chooser opened by the code in the ``async with`` block."""
+        async with self._expect(
+            "filechooser",
+            predicate if predicate is not None else (lambda _: True),
+            timeout,
+            label="file_chooser",
+        ) as info:
+            yield info
 
     @asynccontextmanager
     async def expect_download(self, timeout: float | None = None) -> AsyncIterator[EventInfo[Download]]:
@@ -494,7 +635,14 @@ class Page(_native.Page):
         await self._emulate_media(media=m, color_scheme=cs)
 
     @asynccontextmanager
-    async def _expect(self, event: str, url_or_predicate: Any, timeout: float | None) -> AsyncIterator[EventInfo[Any]]:
+    async def _expect(
+        self,
+        event: str,
+        url_or_predicate: Any,
+        timeout: float | None,
+        *,
+        label: str | None = None,
+    ) -> AsyncIterator[EventInfo[Any]]:
         if self.is_closed():
             raise Error("page closed")
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
@@ -523,7 +671,7 @@ class Page(_native.Page):
             try:
                 await asyncio.wait_for(asyncio.shield(future), limit / 1000 if limit > 0 else None)
             except asyncio.TimeoutError:
-                raise TimeoutError(f"page.expect_{event}: timeout {limit:g}ms exceeded") from None
+                raise TimeoutError(f"page.expect_{label or event}: timeout {limit:g}ms exceeded") from None
         finally:
             self._expects.discard(future)
             self.remove_listener(event, listener)
@@ -538,6 +686,12 @@ class Page(_native.Page):
         elif event == "dialog" and not self._answering_dialogs:
             _keep(self._tasks, asyncio.ensure_future(_serve_dialogs(self._dialogs(), weakref.ref(self))))
             self._answering_dialogs = True
+        elif event == "filechooser" and not self._serving_file_choosers:
+            _keep(
+                self._tasks,
+                asyncio.ensure_future(_serve_file_choosers(self._file_choosers(), weakref.ref(self), self._tasks)),
+            )
+            self._serving_file_choosers = True
         elif event in _NETWORK_EVENTS and (self._network_task is None or self._network_task.done()):
             self._network_task = asyncio.ensure_future(_serve_network(self._network(), weakref.ref(self), self._tasks))
             _keep(self._tasks, self._network_task)
@@ -545,7 +699,7 @@ class Page(_native.Page):
 
 
 _NETWORK_EVENTS = ("request", "response", "requestfinished", "requestfailed")
-_EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog")
+_EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog", "filechooser")
 
 
 # The loops below run until the page closes (the network one also once nobody listens). They reach
@@ -635,6 +789,15 @@ def _emit_network(
 async def _serve_dialogs(stream: _native.DialogStream, page: PageRef) -> None:
     while (native := await stream.next()) is not None:
         await _answer_dialog(_listeners_of(page).get("dialog", []), Dialog(native))
+
+
+async def _serve_file_choosers(
+    stream: _native.FileChooserStream,
+    page: PageRef,
+    tasks: set[asyncio.Future[Any]],
+) -> None:
+    while (native := await stream.next()) is not None:
+        _emit(_listeners_of(page), "filechooser", FileChooser(native), tasks)
 
 
 async def _answer_dialog(listeners: list[tuple[Listener, Listener]], dialog: Dialog) -> None:

@@ -5,8 +5,8 @@
 //   label=... and placeholder=... (matched like text=)   testid="id" (data-testid, exact)
 // Parts joined by >> narrow the match: each part is searched inside the previous matches, or is
 // nth=N (0-based, negative from the end) or has-text="Foo"i (keeps matches containing the text).
-// Modes: attached | visible | click | box | rect | element | clear | changed.
-((sel, mode) => {
+// Modes: attached | visible | click | point | box | rect | element | clear | changed | focus | blur | scroll | check_state | select_options | check_file_input | set_files.
+((sel, mode, arg) => {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const box = (el) => el.getBoundingClientRect();
   const visible = (el) => {
@@ -283,11 +283,127 @@
   if (!el) return { ok: false, reason: 'no element matches selector' };
   if (mode === 'element') return el; // as a remote object, for locator.evaluate
   if (mode === 'attached') return { ok: true, text: el.textContent };
+  if (mode === 'focus') {
+    el.focus();
+    return { ok: true };
+  }
+  if (mode === 'blur') {
+    el.blur();
+    return { ok: true };
+  }
+  if (mode === 'scroll') {
+    el.scrollIntoViewIfNeeded(true);
+    return { ok: true };
+  }
+  if (mode === 'check_state') {
+    const opts = arg || {};
+    const isNative = el.tagName === 'INPUT' && /^(checkbox|radio)$/i.test(el.type);
+    const role = roleOf(el);
+    if (!isNative && !['checkbox', 'radio', 'switch'].includes(role)) {
+      return { ok: false, fatal: true, reason: 'not a checkbox, radio or switch element' };
+    }
+    if (
+      opts.want === false &&
+      ((el.tagName === 'INPUT' && el.type.toLowerCase() === 'radio') || role === 'radio')
+    ) {
+      return { ok: false, fatal: true, reason: 'cannot uncheck a radio button' };
+    }
+    const checked = isNative ? !!el.checked : el.getAttribute('aria-checked') === 'true';
+    return { ok: true, checked };
+  }
+  if (mode === 'select_options') {
+    const opts = arg || {};
+    if (el.tagName !== 'SELECT') {
+      return { ok: false, fatal: true, reason: 'element is not a <select>' };
+    }
+    if (!opts.force) {
+      if (!visible(el)) return { ok: false, reason: 'hidden' };
+      if (el.matches(':disabled') || el.closest('[aria-disabled="true"]')) {
+        return { ok: false, reason: 'disabled' };
+      }
+    }
+    const options = [...el.options];
+    const isDisabledOpt = (o) =>
+      o.disabled || (o.parentElement && o.parentElement.tagName === 'OPTGROUP' && o.parentElement.disabled);
+    const picked = [];
+    for (const item of opts.items || []) {
+      let match = null;
+      if (typeof item.index === 'number') {
+        const cand = options[item.index];
+        if (cand && !isDisabledOpt(cand)) match = cand;
+      } else if (typeof item.value === 'string') {
+        match = options.find((o) => !isDisabledOpt(o) && o.value === item.value) || null;
+      } else if (typeof item.label === 'string') {
+        const want = norm(item.label);
+        match =
+          options.find((o) => !isDisabledOpt(o) && (norm(o.label) === want || norm(o.textContent) === want)) ||
+          null;
+      }
+      if (!match) return { ok: false, reason: 'did not find option' };
+      picked.push(match);
+    }
+    if (!el.multiple) {
+      for (const o of options) o.selected = o === picked[0];
+    } else {
+      const set = new Set(picked);
+      for (const o of options) o.selected = set.has(o);
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true, values: [...el.selectedOptions].map((o) => o.value) };
+  }
+  if (mode === 'check_file_input' || mode === 'set_files') {
+    if (el.tagName !== 'INPUT' || el.type.toLowerCase() !== 'file') {
+      return { ok: false, fatal: true, reason: 'element is not an <input type="file">' };
+    }
+    const files = (arg && arg.files) || [];
+    const count = arg && typeof arg.count === 'number' ? arg.count : files.length;
+    if (count > 1 && !el.multiple) {
+      return { ok: false, fatal: true, reason: 'non-multiple file input can only accept single file' };
+    }
+    if (mode === 'check_file_input') return { ok: true };
+    const dt = new DataTransfer();
+    for (const f of files) {
+      const bin = atob(f.base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      dt.items.add(new File([bytes], f.name, { type: f.mimeType || '' }));
+    }
+    el.files = dt.files;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true };
+  }
   if (mode === 'rect') {
     // Playwright's boundingBox: no scrolling, null when not visible.
     if (!visible(el)) return { ok: true, box: null };
     const r = box(el);
     return { ok: true, box: { x: r.x, y: r.y, width: r.width, height: r.height } };
+  }
+  if (mode === 'point' || mode === 'click') {
+    const opts = mode === 'click' ? { requireEnabled: true } : arg || {};
+    if (!opts.force) {
+      if (!visible(el)) return { ok: false, reason: 'hidden' };
+      if (opts.requireEnabled && (el.matches(':disabled') || el.closest('[aria-disabled="true"]'))) {
+        return { ok: false, reason: 'disabled' };
+      }
+    }
+    el.scrollIntoViewIfNeeded(true);
+    const r = box(el);
+    if (r.width <= 0 || r.height <= 0) return { ok: false, reason: 'hidden' };
+    const x = opts.position ? r.x + opts.position.x : r.x + r.width / 2;
+    const y = opts.position ? r.y + opts.position.y : r.y + r.height / 2;
+    if (!opts.force) {
+      const hit = document.elementFromPoint(x, y);
+      if (!hit) return { ok: false, reason: 'centre is outside the viewport' };
+      const hitLabel = hit.closest('label');
+      const owns = hit === el || el.contains(hit) || (hitLabel && hitLabel.control === el);
+      if (!owns) {
+        return { ok: false, reason: 'obscured by <' + hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + '>' };
+      }
+    }
+    globalThis.__fluxwrightTarget = el; // isolated world: invisible to page scripts
+    return { ok: true, x, y };
   }
   if (!visible(el)) return { ok: false, reason: 'hidden' };
   if (mode === 'visible') return { ok: true, text: el.textContent };
@@ -296,20 +412,4 @@
     const r = box(el);
     return { ok: true, x: r.x, y: r.y, width: r.width, height: r.height };
   }
-  // click: enabled, scrolled into view, and the topmost element at its centre.
-  // :disabled covers <fieldset disabled> ancestors; aria-disabled applies to descendants.
-  if (el.matches(':disabled') || el.closest('[aria-disabled="true"]')) {
-    return { ok: false, reason: 'disabled' };
-  }
-  el.scrollIntoViewIfNeeded(true);
-  const r = box(el);
-  const x = r.x + r.width / 2;
-  const y = r.y + r.height / 2;
-  const hit = document.elementFromPoint(x, y);
-  if (!hit) return { ok: false, reason: 'centre is outside the viewport' };
-  if (hit !== el && !el.contains(hit)) {
-    return { ok: false, reason: 'obscured by <' + hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + '>' };
-  }
-  globalThis.__fluxwrightTarget = el; // isolated world: invisible to page scripts
-  return { ok: true, x, y };
 })
