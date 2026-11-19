@@ -1945,30 +1945,31 @@ async fn rich_input_and_form_controls() {
 #[tokio::test(flavor = "multi_thread")]
 async fn locator_reading_filtering_and_strictness() {
     let eng = engine(1, 1).await;
-    let page = eng.new_page(JobOptions::default()).await.unwrap();
-    page.set_content(
-        "<!doctype html><html><body>\
-        <h1>Top</h1>\
-        <h2 aria-level=\"2\">Sub Section</h2>\
-        <ul id=\"items\">\
-          <li class=\"row\"><b>Apple</b> <span class=\"tag\">fresh</span></li>\
-          <li class=\"row\"><span class=\"name\">Banana</span> <span class=\"tag\">ripe</span></li>\
-          <li class=\"row\" style=\"display:none\">HiddenFruit</li>\
-        </ul>\
-        <input id=\"ro\" readonly value=\"locked\" data-kind=\"text\">\
-        <input id=\"ed\" value=\"hello\">\
-        <input id=\"dis\" disabled value=\"nope\">\
-        <input id=\"cb\" type=\"checkbox\" checked>\
-        <div id=\"ce\" contenteditable=\"true\">Edit <em>me</em></div>\
-        <button id=\"tog\" aria-pressed=\"true\" aria-expanded=\"false\">Toggle</button>\
-        <button id=\"disbtn\" aria-disabled=\"true\">Blocked</button>\
-        <button id=\"hidbtn\" style=\"display:none\">Secret</button>\
-        <div role=\"tab\" aria-selected=\"true\">SelectedTab</div>\
-        <div role=\"tab\" aria-selected=\"false\">OtherTab</div>\
-        <div id=\"parent\"><span id=\"child\">Leaf</span></div>\
-        <span class=\"multi\">One</span><span class=\"multi\">Two</span>\
-        </body></html>",
-    )
+    let page = eng.acquire_job(&JobOptions::default()).await.unwrap();
+    page.goto(concat!(
+        "data:text/html,",
+        "<!doctype html><html><body>",
+        "<h1>Top</h1>",
+        "<h2 aria-level=\"2\">Sub Section</h2>",
+        "<ul id=\"items\">",
+        "<li class=\"row\"><b>Apple</b> <span class=\"tag\">fresh</span></li>",
+        "<li class=\"row\"><span class=\"name\">Banana</span> <span class=\"tag\">ripe</span></li>",
+        "<li class=\"row\" style=\"display:none\">HiddenFruit</li>",
+        "</ul>",
+        "<input id=\"ro\" readonly value=\"locked\" data-kind=\"text\">",
+        "<input id=\"ed\" value=\"hello\">",
+        "<input id=\"dis\" disabled value=\"nope\">",
+        "<input id=\"cb\" type=\"checkbox\" checked>",
+        "<div id=\"ce\" contenteditable=\"true\">Edit <em>me</em></div>",
+        "<button id=\"tog\" aria-pressed=\"true\" aria-expanded=\"false\">Toggle</button>",
+        "<button id=\"disbtn\" aria-disabled=\"true\">Blocked</button>",
+        "<button id=\"hidbtn\" style=\"display:none\">Secret</button>",
+        "<div role=\"tab\" aria-selected=\"true\">SelectedTab</div>",
+        "<div role=\"tab\" aria-selected=\"false\">OtherTab</div>",
+        "<div id=\"parent\"><span id=\"child\">Leaf</span></div>",
+        "<span class=\"multi\">One</span><span class=\"multi\">Two</span>",
+        "</body></html>",
+    ))
     .await
     .unwrap();
 
