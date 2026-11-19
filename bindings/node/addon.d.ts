@@ -334,6 +334,21 @@ declare module './index' {
     isDisabled(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
     isChecked(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
     isEditable(selector: string, options?: { strict?: boolean; timeout?: number }): Promise<boolean>
+    waitForLoadState(state?: 'load' | 'domcontentloaded' | 'networkidle', options?: { timeout?: number }): Promise<void>
+    waitForURL(
+      url: URLMatch,
+      options?: { waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit'; timeout?: number },
+    ): Promise<void>
+    waitForFunction<R, Arg = undefined>(
+      pageFunction: (arg: Arg) => R,
+      arg?: Arg,
+      options?: { polling?: 'raf' | number; timeout?: number },
+    ): Promise<Awaited<R>>
+    waitForFunction(
+      pageFunction: string,
+      arg?: unknown,
+      options?: { polling?: 'raf' | number; timeout?: number },
+    ): Promise<any>
   }
   interface Locator {
     locator(selector: string, options?: FilterOptions): Locator

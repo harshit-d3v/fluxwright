@@ -11,7 +11,36 @@ import fluxwright from '../addon.js'
 
 // Echoes the user agent and languages; /login sets a cookie; /report is a download; /hdr echoes
 // x-test; /api is the real API that routes stand in for.
+let navHits = 0
 const server = http.createServer((req, res) => {
+  if (req.url === '/nav-a') {
+    navHits += 1
+    res.setHeader('Content-Type', 'text/html')
+    return res.end(`<title>NavA-${navHits}</title><p id="p">A</p>`)
+  }
+  if (req.url === '/nav-redir') {
+    res.statusCode = 302
+    res.setHeader('Location', '/nav-b')
+    return res.end()
+  }
+  if (req.url === '/nav-b') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<title>NavB</title><div id="b">B</div>')
+  }
+  if (req.url === '/nav-slow') {
+    return setTimeout(() => {
+      res.setHeader('Content-Type', 'text/plain')
+      res.end('slow-ok')
+    }, 250)
+  }
+  if (req.url === '/nav-delayed') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<script>setTimeout(() => { location.href = "/nav-done" }, 80)</script>')
+  }
+  if (req.url === '/nav-done') {
+    res.setHeader('Content-Type', 'text/html')
+    return res.end('<title>NavDone</title>')
+  }
   if (req.url === '/report') {
     res.setHeader('Content-Disposition', 'attachment; filename="report.csv"')
     return res.end('a,b\n1,2\n')
@@ -698,6 +727,64 @@ try {
     assert.equal(await lr.getByRole('tab', { selected: true }).innerText(), 'TabA')
     assert.equal(await lr.frameLocator('#nope').locator('div').count(), 0)
     await lr.close()
+  }
+
+  // Navigation and wait helpers (url, reload, history, setContent, waitForLoadState, waitForURL, waitForFunction).
+  {
+    const nav = await browser.newPage({ baseURL: base })
+    assert.equal(nav.url(), 'about:blank')
+    await nav.goBack()
+    await nav.goForward()
+    await nav.goto('/nav-a')
+    assert.equal(nav.url(), `${base}/nav-a`)
+    assert.equal(await nav.title(), 'NavA-1')
+    await nav.reload()
+    assert.equal(await nav.title(), 'NavA-2')
+    await nav.goto('/nav-redir')
+    assert.equal(nav.url(), `${base}/nav-b`)
+    await nav.goBack()
+    assert.equal(nav.url(), `${base}/nav-a`)
+    await nav.goForward()
+    assert.equal(nav.url(), `${base}/nav-b`)
+    await nav.evaluate(() => history.pushState({}, '', '/nav-b#s'))
+    assert.equal(nav.url(), `${base}/nav-b#s`)
+    await nav.goBack()
+    assert.equal(nav.url(), `${base}/nav-b`)
+
+    await nav.setContent('<h1 id="sc">Set</h1><script>window.__sc = 12</script>')
+    assert.equal(await nav.innerText('#sc'), 'Set')
+    assert.equal(await nav.evaluate(() => window.__sc), 12)
+
+    await nav.goto('/nav-a')
+    await nav.waitForLoadState('load')
+    await nav.evaluate(() => {
+      window.__slowDone = false
+      fetch('/nav-slow').then(() => {
+        window.__slowDone = true
+      })
+    })
+    await nav.waitForLoadState('networkidle')
+    assert.equal(await nav.evaluate(() => window.__slowDone), true)
+
+    await nav.goto('/nav-delayed')
+    await nav.waitForURL('**/nav-done')
+    assert.equal(nav.url(), `${base}/nav-done`)
+    await nav.goto('/nav-delayed')
+    await nav.waitForURL(/\/nav-done$/)
+    await nav.goto('/nav-delayed')
+    await nav.waitForURL((u) => u.pathname === '/nav-done', { waitUntil: 'commit' })
+    await assert.rejects(() => nav.waitForURL('/never', { timeout: 300 }), /timed out/)
+
+    await nav.evaluate(() => setTimeout(() => { window.__fn = { n: 5 } }, 60))
+    assert.deepEqual(
+      await nav.waitForFunction((want) => window.__fn && window.__fn.n + want, 2, { polling: 20 }),
+      7,
+    )
+    assert.equal(await nav.waitForFunction('window.__fn && window.__fn.n'), 5)
+    await assert.rejects(() => nav.waitForFunction(() => { throw new Error('fn-boom') }), /fn-boom/)
+    await assert.rejects(() => nav.waitForFunction(() => false, undefined, { timeout: 250 }), /timed out/)
+    await assert.rejects(() => nav.waitForLoadState('bogus'), TypeError)
+    await nav.close()
   }
 
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).

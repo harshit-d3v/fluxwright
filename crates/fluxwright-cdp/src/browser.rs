@@ -58,12 +58,55 @@ impl Proxy {
     }
 }
 
+pub(crate) struct NetActivity {
+    pub(crate) inflight: HashSet<String>,
+    pub(crate) last_change: std::time::Instant,
+    pub(crate) idle_confirmed: bool,
+}
+
+impl Default for NetActivity {
+    fn default() -> Self {
+        Self {
+            inflight: HashSet::new(),
+            last_change: std::time::Instant::now(),
+            idle_confirmed: true,
+        }
+    }
+}
+
 pub(crate) struct TargetState {
     session_id: Option<String>,
     r#type: String,
     url: String,
+    url_tx: Arc<tokio::sync::watch::Sender<String>>,
+    net: Arc<std::sync::Mutex<NetActivity>>,
     browser_context_id: Option<String>,
     waiting: Vec<tokio::sync::oneshot::Sender<Result<String>>>,
+}
+
+impl TargetState {
+    fn new(r#type: String, url: String, browser_context_id: Option<String>) -> Self {
+        let initial = if url.is_empty() { "about:blank".into() } else { url.clone() };
+        Self {
+            session_id: None,
+            r#type,
+            url,
+            url_tx: Arc::new(tokio::sync::watch::Sender::new(initial)),
+            net: Default::default(),
+            browser_context_id,
+            waiting: Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn frame_url(frame: &Value) -> String {
+    let base = frame["url"].as_str().unwrap_or("");
+    let frag = frame["urlFragment"].as_str().unwrap_or("");
+    if !frag.is_empty() && !base.contains('#') {
+        format!("{base}{frag}")
+    } else {
+        base.to_string()
+    }
 }
 
 pub struct CdpBrowser {
@@ -311,15 +354,21 @@ impl CdpBrowser {
 
                 {
                     let mut targets = self.targets.lock().await;
-                    let state = targets.entry(target_id.clone()).or_insert(TargetState {
-                        session_id: None,
-                        r#type: ty.clone(),
-                        url: url.clone(),
-                        browser_context_id: ctx.clone(),
-                        waiting: Vec::new(),
+                    let state = targets.entry(target_id.clone()).or_insert_with(|| {
+                        TargetState::new(ty.clone(), url.clone(), ctx.clone())
                     });
                     state.r#type = ty.clone();
-                    state.url = url;
+                    if !url.is_empty() {
+                        state.url = url.clone();
+                        state.url_tx.send_if_modified(|cur| {
+                            if *cur != url {
+                                *cur = url;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
                     state.browser_context_id = ctx;
                 }
 
@@ -405,12 +454,12 @@ impl CdpBrowser {
                 let info = &ev.params["targetInfo"];
                 let target_id = info["targetId"].as_str().unwrap_or_default().to_string();
                 let mut targets = self.targets.lock().await;
-                targets.entry(target_id).or_insert(TargetState {
-                    session_id: None,
-                    r#type: info["type"].as_str().unwrap_or("").to_string(),
-                    url: info["url"].as_str().unwrap_or("").to_string(),
-                    browser_context_id: info["browserContextId"].as_str().map(|s| s.to_string()),
-                    waiting: Vec::new(),
+                targets.entry(target_id).or_insert_with(|| {
+                    TargetState::new(
+                        info["type"].as_str().unwrap_or("").to_string(),
+                        info["url"].as_str().unwrap_or("").to_string(),
+                        info["browserContextId"].as_str().map(|s| s.to_string()),
+                    )
                 });
             }
             "Target.targetDestroyed" => {
@@ -559,6 +608,98 @@ impl CdpBrowser {
                     }
                 }
             }
+            "Page.frameNavigated" if ev.params["frame"]["parentId"].is_null() => {
+                if let Some(frame_id) = ev.params["frame"]["id"].as_str() {
+                    let full = frame_url(&ev.params["frame"]);
+                    let bfcache = ev.params["type"].as_str() == Some("BackForwardCacheRestore");
+                    let mut targets = self.targets.lock().await;
+                    if let Some(t) = targets.get_mut(frame_id) {
+                        if !full.is_empty() {
+                            t.url = full.clone();
+                            t.url_tx.send_if_modified(|cur| {
+                                if *cur != full {
+                                    *cur = full;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        }
+                        if !bfcache {
+                            let mut net = t.net.lock().unwrap();
+                            net.idle_confirmed = false;
+                            net.last_change = std::time::Instant::now();
+                        }
+                    }
+                }
+            }
+            "Page.navigatedWithinDocument" => {
+                if let (Some(frame_id), Some(url)) = (
+                    ev.params["frameId"].as_str(),
+                    ev.params["url"].as_str(),
+                ) {
+                    if !url.is_empty() {
+                        let mut targets = self.targets.lock().await;
+                        if let Some(t) = targets.get_mut(frame_id) {
+                            t.url = url.to_string();
+                            t.url_tx.send_if_modified(|cur| {
+                                if cur.as_str() != url {
+                                    *cur = url.to_string();
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            "Network.requestWillBeSent" => {
+                if let (Some(sid), Some(req_id)) = (
+                    ev.session_id.as_deref(),
+                    ev.params["requestId"].as_str(),
+                ) {
+                    if !ev.params["request"]["url"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("data:")
+                    {
+                        let targets = self.targets.lock().await;
+                        if let Some(t) = targets.values().find(|t| t.session_id.as_deref() == Some(sid)) {
+                            let mut net = t.net.lock().unwrap();
+                            if net.inflight.len() < 1024 {
+                                net.inflight.insert(req_id.to_string());
+                            }
+                            net.idle_confirmed = false;
+                            net.last_change = std::time::Instant::now();
+                        }
+                    }
+                }
+            }
+            "Network.loadingFinished" | "Network.loadingFailed" => {
+                if let (Some(sid), Some(req_id)) = (
+                    ev.session_id.as_deref(),
+                    ev.params["requestId"].as_str(),
+                ) {
+                    let targets = self.targets.lock().await;
+                    if let Some(t) = targets.values().find(|t| t.session_id.as_deref() == Some(sid)) {
+                        let mut net = t.net.lock().unwrap();
+                        net.inflight.remove(req_id);
+                        net.last_change = std::time::Instant::now();
+                    }
+                }
+            }
+            "Page.lifecycleEvent" if ev.params["name"] == "networkIdle" => {
+                if let Some(frame_id) = ev.params["frameId"].as_str() {
+                    let targets = self.targets.lock().await;
+                    if let Some(t) = targets.get(frame_id) {
+                        let mut net = t.net.lock().unwrap();
+                        net.inflight.clear();
+                        net.idle_confirmed = true;
+                        net.last_change = std::time::Instant::now();
+                    }
+                }
+            }
             "Target.targetCrashed" => {
                 warn!(params = %ev.params, "target crashed");
             }
@@ -652,6 +793,16 @@ impl CdpBrowser {
 
         // Auto-attach prepares the session before announcing it; see on_event.
         let session_id = self.wait_for_session(&target_id, timeout).await?;
+        let (url, net) = {
+            let targets = self.targets.lock().await;
+            match targets.get(&target_id) {
+                Some(t) => (t.url_tx.clone(), t.net.clone()),
+                None => (
+                    Arc::new(tokio::sync::watch::Sender::new("about:blank".into())),
+                    Default::default(),
+                ),
+            }
+        };
         Ok(CdpPage {
             browser: self.conn.clone(),
             browser_pid: self.pid,
@@ -666,6 +817,8 @@ impl CdpBrowser {
             setups: self.setups.clone(),
             mouse: Default::default(),
             keyboard: Default::default(),
+            url,
+            net,
         })
     }
 
@@ -680,13 +833,7 @@ impl CdpBrowser {
             let (tx, rx) = tokio::sync::oneshot::channel();
             targets
                 .entry(target_id.to_string())
-                .or_insert(TargetState {
-                    session_id: None,
-                    r#type: "page".into(),
-                    url: String::new(),
-                    browser_context_id: None,
-                    waiting: Vec::new(),
-                })
+                .or_insert_with(|| TargetState::new("page".into(), String::new(), None))
                 .waiting
                 .push(tx);
             drop(targets);

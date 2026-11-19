@@ -1209,3 +1209,23 @@ async fn coordinator_release_requeues_without_counting_attempt() {
 
     server.shutdown(Duration::ZERO).await.unwrap();
 }
+
+#[tokio::test]
+async fn rejects_invalid_navigation_and_wait_steps() {
+    let server = server(2).await;
+    for payload in [
+        r#"{"steps":[{"action":"wait_for_url","url":"   "}]}"#,
+        r#"{"steps":[{"action":"wait_for_function","expression":"  "}]}"#,
+        r#"{"steps":[{"action":"wait_for_function","expression":"true","polling_ms":0}]}"#,
+        r#"{"steps":[{"action":"wait_for_function","expression":"true","polling_ms":60001}]}"#,
+        r#"{"steps":[{"action":"url","extra":true}]}"#,
+    ] {
+        let response = call(&server, "POST", "/v1/jobs", payload).await;
+        assert!(
+            matches!(response.status(), StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY),
+            "expected 400/422 for {payload}, got {}",
+            response.status()
+        );
+    }
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
