@@ -143,12 +143,30 @@ impl JobRequest {
                     validate_selector(selector)?;
                     values.validate()?;
                 }
+                Step::GetAttribute { selector, name, .. } => {
+                    validate_selector(selector)?;
+                    if name.trim().is_empty() {
+                        return Err("attribute name must not be empty".into());
+                    }
+                }
                 Step::Fill { selector, .. }
                 | Step::Focus { selector }
                 | Step::Blur { selector }
                 | Step::Clear { selector, .. }
                 | Step::WaitForSelector { selector }
-                | Step::TextContent { selector } => {
+                | Step::TextContent { selector, .. }
+                | Step::InnerText { selector, .. }
+                | Step::InnerHtml { selector, .. }
+                | Step::InputValue { selector, .. }
+                | Step::Count { selector }
+                | Step::AllTextContents { selector }
+                | Step::AllInnerTexts { selector }
+                | Step::IsVisible { selector, .. }
+                | Step::IsHidden { selector, .. }
+                | Step::IsEnabled { selector, .. }
+                | Step::IsDisabled { selector, .. }
+                | Step::IsChecked { selector, .. }
+                | Step::IsEditable { selector, .. } => {
                     validate_selector(selector)?;
                 }
                 Step::Evaluate { expression } if expression.trim().is_empty() => {
@@ -310,6 +328,68 @@ pub enum Step {
     },
     TextContent {
         selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    InnerText {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    InnerHtml {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    InputValue {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    GetAttribute {
+        selector: String,
+        name: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    Count {
+        selector: String,
+    },
+    AllTextContents {
+        selector: String,
+    },
+    AllInnerTexts {
+        selector: String,
+    },
+    IsVisible {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    IsHidden {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    IsEnabled {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    IsDisabled {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    IsChecked {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
+    },
+    IsEditable {
+        selector: String,
+        #[serde(default)]
+        strict: bool,
     },
     Evaluate {
         expression: String,
@@ -811,9 +891,58 @@ impl Step {
                 page.wait_for_selector(selector).await?;
                 Ok(Value::Null)
             }
-            Step::TextContent { selector } => {
-                Ok(serde_json::to_value(page.text_content(selector).await?)
-                    .expect("an optional string is JSON"))
+            Step::TextContent { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(serde_json::to_value(page.text_content(s).await?).expect("an optional string is JSON"))
+            }
+            Step::InnerText { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::String(page.inner_text(s).await?))
+            }
+            Step::InnerHtml { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::String(page.inner_html(s).await?))
+            }
+            Step::InputValue { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::String(page.input_value(s).await?))
+            }
+            Step::GetAttribute { selector, name, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(serde_json::to_value(page.get_attribute(s, name).await?).expect("an optional string is JSON"))
+            }
+            Step::Count { selector } => Ok(Value::from(page.count(selector.as_str()).await?)),
+            Step::AllTextContents { selector } => {
+                Ok(serde_json::to_value(page.all_text_contents(selector.as_str()).await?)
+                    .expect("a string vec is JSON"))
+            }
+            Step::AllInnerTexts { selector } => {
+                Ok(serde_json::to_value(page.all_inner_texts(selector.as_str()).await?)
+                    .expect("a string vec is JSON"))
+            }
+            Step::IsVisible { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::Bool(page.is_visible(s).await?))
+            }
+            Step::IsHidden { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::Bool(page.is_hidden(s).await?))
+            }
+            Step::IsEnabled { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::Bool(page.is_enabled(s).await?))
+            }
+            Step::IsDisabled { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::Bool(page.is_disabled(s).await?))
+            }
+            Step::IsChecked { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::Bool(page.is_checked(s).await?))
+            }
+            Step::IsEditable { selector, strict } => {
+                let s = fluxwright::Selector::from(selector.as_str()).strict(*strict);
+                Ok(Value::Bool(page.is_editable(s).await?))
             }
             Step::Evaluate { expression } => page.evaluate(expression).await,
             Step::Title {} => Ok(Value::String(page.title().await?)),
@@ -848,6 +977,19 @@ impl Step {
             Step::Fill { .. } => "fill",
             Step::WaitForSelector { .. } => "wait_for_selector",
             Step::TextContent { .. } => "text_content",
+            Step::InnerText { .. } => "inner_text",
+            Step::InnerHtml { .. } => "inner_html",
+            Step::InputValue { .. } => "input_value",
+            Step::GetAttribute { .. } => "get_attribute",
+            Step::Count { .. } => "count",
+            Step::AllTextContents { .. } => "all_text_contents",
+            Step::AllInnerTexts { .. } => "all_inner_texts",
+            Step::IsVisible { .. } => "is_visible",
+            Step::IsHidden { .. } => "is_hidden",
+            Step::IsEnabled { .. } => "is_enabled",
+            Step::IsDisabled { .. } => "is_disabled",
+            Step::IsChecked { .. } => "is_checked",
+            Step::IsEditable { .. } => "is_editable",
             Step::Evaluate { .. } => "evaluate",
             Step::Title {} => "title",
             Step::Content {} => "content",
@@ -1084,6 +1226,7 @@ mod tests {
             json!({ "steps": [{ "action": "press", "selector": "input", "key": "a", "delay_ms": 20000 }] }),
             json!({ "steps": [{ "action": "select_option", "selector": "select", "values": {} }] }),
             json!({ "steps": [{ "action": "select_option", "selector": "select", "values": { "value": "a", "label": "b" } }] }),
+            json!({ "steps": [{ "action": "get_attribute", "selector": "a", "name": " " }] }),
         ] {
             let job: JobRequest = serde_json::from_value(value).unwrap();
             assert!(job.validate().is_err());
@@ -1104,7 +1247,20 @@ mod tests {
                 { "action": "check", "selector": "#c" },
                 { "action": "uncheck", "selector": "#c" },
                 { "action": "select_option", "selector": "select", "values": [{ "label": "Two" }, { "index": 2 }] },
-                { "action": "tap", "selector": "#t" }
+                { "action": "tap", "selector": "#t" },
+                { "action": "inner_text", "selector": "p", "strict": true },
+                { "action": "inner_html", "selector": "p" },
+                { "action": "input_value", "selector": "input" },
+                { "action": "get_attribute", "selector": "a", "name": "href" },
+                { "action": "count", "selector": "li" },
+                { "action": "all_text_contents", "selector": "li" },
+                { "action": "all_inner_texts", "selector": "li" },
+                { "action": "is_visible", "selector": "#v" },
+                { "action": "is_hidden", "selector": "#v" },
+                { "action": "is_enabled", "selector": "#v" },
+                { "action": "is_disabled", "selector": "#v" },
+                { "action": "is_checked", "selector": "#c" },
+                { "action": "is_editable", "selector": "#i" }
             ]
         }))
         .unwrap()

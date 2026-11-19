@@ -1348,10 +1348,98 @@ impl PageLease {
             .await?)
     }
 
+    pub async fn inner_text(&self, selector: impl Into<Selector>) -> Result<String> {
+        Ok(self
+            .page
+            .inner_text(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn inner_html(&self, selector: impl Into<Selector>) -> Result<String> {
+        Ok(self
+            .page
+            .inner_html(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn input_value(&self, selector: impl Into<Selector>) -> Result<String> {
+        Ok(self
+            .page
+            .input_value(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn get_attribute(&self, selector: impl Into<Selector>, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .page
+            .get_attribute(&selector.into(), name, self.action_timeout())
+            .await?)
+    }
+
+    pub async fn count(&self, selector: impl Into<Selector>) -> Result<usize> {
+        Ok(self.page.count(&selector.into(), self.action_timeout()).await?)
+    }
+
+    pub async fn all_text_contents(&self, selector: impl Into<Selector>) -> Result<Vec<String>> {
+        Ok(self
+            .page
+            .all_text_contents(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn all_inner_texts(&self, selector: impl Into<Selector>) -> Result<Vec<String>> {
+        Ok(self
+            .page
+            .all_inner_texts(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn is_visible(&self, selector: impl Into<Selector>) -> Result<bool> {
+        Ok(self
+            .page
+            .is_visible(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn is_hidden(&self, selector: impl Into<Selector>) -> Result<bool> {
+        Ok(self
+            .page
+            .is_hidden(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn is_enabled(&self, selector: impl Into<Selector>) -> Result<bool> {
+        Ok(self
+            .page
+            .is_enabled(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn is_disabled(&self, selector: impl Into<Selector>) -> Result<bool> {
+        Ok(self
+            .page
+            .is_disabled(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn is_checked(&self, selector: impl Into<Selector>) -> Result<bool> {
+        Ok(self
+            .page
+            .is_checked(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
+    pub async fn is_editable(&self, selector: impl Into<Selector>) -> Result<bool> {
+        Ok(self
+            .page
+            .is_editable(&selector.into(), self.action_timeout())
+            .await?)
+    }
+
     pub fn locator(&self, selector: impl Into<String>) -> Locator<'_> {
         Locator {
             lease: self,
-            selector: Selector::from(selector.into()),
+            selector: Selector::new(selector.into()).strict(true),
         }
     }
 
@@ -1364,6 +1452,10 @@ impl PageLease {
     /// case-insensitive substring, or exact. Hidden elements never match.
     pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'_> {
         self.locator(Selector::role(role, name, exact))
+    }
+
+    pub fn get_by_role_with(&self, role: &str, opts: &fluxwright_cdp::RoleOptions) -> Locator<'_> {
+        self.locator(Selector::role_with(role, opts))
     }
 
     /// Like Playwright's `getByLabel`: the text of a `<label>`, `aria-labelledby` or `aria-label`.
@@ -1580,6 +1672,34 @@ impl<'a> Locator<'a> {
         self.then(&Selector::has_text(text))
     }
 
+    pub fn filter_has_text_regex(&self, pattern: &str, flags: &str) -> Locator<'a> {
+        self.then(&Selector::has_text_regex(pattern, flags))
+    }
+
+    pub fn filter_has_not_text(&self, text: &str) -> Locator<'a> {
+        self.then(&Selector::has_not_text(text))
+    }
+
+    pub fn filter_has_not_text_regex(&self, pattern: &str, flags: &str) -> Locator<'a> {
+        self.then(&Selector::has_not_text_regex(pattern, flags))
+    }
+
+    pub fn filter_has(&self, inner: &Locator<'_>) -> Locator<'a> {
+        Locator { lease: self.lease, selector: self.selector.has(&inner.selector) }
+    }
+
+    pub fn filter_has_not(&self, inner: &Locator<'_>) -> Locator<'a> {
+        Locator { lease: self.lease, selector: self.selector.has_not(&inner.selector) }
+    }
+
+    pub fn and(&self, other: &Locator<'_>) -> Locator<'a> {
+        Locator { lease: self.lease, selector: self.selector.and(&other.selector) }
+    }
+
+    pub fn or(&self, other: &Locator<'_>) -> Locator<'a> {
+        Locator { lease: self.lease, selector: self.selector.or(&other.selector) }
+    }
+
     /// Searches inside this locator's matches.
     pub fn locator(&self, query: &str) -> Locator<'a> {
         self.then(query)
@@ -1591,6 +1711,10 @@ impl<'a> Locator<'a> {
 
     pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'a> {
         self.then(&Selector::role(role, name, exact))
+    }
+
+    pub fn get_by_role_with(&self, role: &str, opts: &fluxwright_cdp::RoleOptions) -> Locator<'a> {
+        self.then(&Selector::role_with(role, opts))
     }
 
     pub fn get_by_label(&self, text: &str, exact: bool) -> Locator<'a> {
@@ -1760,6 +1884,63 @@ impl<'a> Locator<'a> {
     pub async fn text_content(&self) -> Result<Option<String>> {
         self.lease.text_content(&self.selector).await
     }
+
+    pub async fn inner_text(&self) -> Result<String> {
+        self.lease.inner_text(&self.selector).await
+    }
+
+    pub async fn inner_html(&self) -> Result<String> {
+        self.lease.inner_html(&self.selector).await
+    }
+
+    pub async fn input_value(&self) -> Result<String> {
+        self.lease.input_value(&self.selector).await
+    }
+
+    pub async fn get_attribute(&self, name: &str) -> Result<Option<String>> {
+        self.lease.get_attribute(&self.selector, name).await
+    }
+
+    pub async fn count(&self) -> Result<usize> {
+        self.lease.count(&self.selector).await
+    }
+
+    pub async fn all(&self) -> Result<Vec<Locator<'a>>> {
+        let n = self.count().await?;
+        Ok((0..n).map(|i| self.nth(i as isize)).collect())
+    }
+
+    pub async fn all_text_contents(&self) -> Result<Vec<String>> {
+        self.lease.all_text_contents(&self.selector).await
+    }
+
+    pub async fn all_inner_texts(&self) -> Result<Vec<String>> {
+        self.lease.all_inner_texts(&self.selector).await
+    }
+
+    pub async fn is_visible(&self) -> Result<bool> {
+        self.lease.is_visible(&self.selector).await
+    }
+
+    pub async fn is_hidden(&self) -> Result<bool> {
+        self.lease.is_hidden(&self.selector).await
+    }
+
+    pub async fn is_enabled(&self) -> Result<bool> {
+        self.lease.is_enabled(&self.selector).await
+    }
+
+    pub async fn is_disabled(&self) -> Result<bool> {
+        self.lease.is_disabled(&self.selector).await
+    }
+
+    pub async fn is_checked(&self) -> Result<bool> {
+        self.lease.is_checked(&self.selector).await
+    }
+
+    pub async fn is_editable(&self) -> Result<bool> {
+        self.lease.is_editable(&self.selector).await
+    }
 }
 
 /// An iframe (or a chain of nested ones) to find elements in. Cross-origin frames work too.
@@ -1775,6 +1956,7 @@ impl<'a> FrameLocator<'a> {
             selector: Selector {
                 frames: self.frames.clone(),
                 query: query.into(),
+                strict: true,
             },
         }
     }
@@ -1785,6 +1967,10 @@ impl<'a> FrameLocator<'a> {
 
     pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'a> {
         self.locator(Selector::role(role, name, exact))
+    }
+
+    pub fn get_by_role_with(&self, role: &str, opts: &fluxwright_cdp::RoleOptions) -> Locator<'a> {
+        self.locator(Selector::role_with(role, opts))
     }
 
     pub fn get_by_label(&self, text: &str, exact: bool) -> Locator<'a> {
