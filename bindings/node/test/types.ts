@@ -82,7 +82,28 @@ export async function typed(): Promise<void> {
   const name: string = download.suggestedFilename()
   await download.saveAs(`out/${name}`)
   // @ts-expect-error not an event Fluxwright emits
-  page.on('popup', () => {})
+  page.on('worker', () => {})
+  page.on('popup', (p) => void p.url())
+  const pop: Promise<typeof page> = page.waitForPopup({ predicate: (p) => p.url().includes('popup'), timeout: 1000 })
+  const openedBy = await page.opener()
+  await page.bringToFront()
+  const mainFr = page.mainFrame()
+  const allFr = page.frames()
+  const byName = page.frame('f')
+  const byUrl = page.frame({ url: /iframe/ })
+  if (byName) {
+    await byName.goto('https://example.com', { waitUntil: 'domcontentloaded' })
+    const ft: string = await byName.title()
+    const fc: string = await byName.content()
+    const fv: number = await byName.evaluate((n: number) => n + 1, 2)
+    const fd: boolean = byName.isDetached()
+    const fp = byName.parentFrame()
+    const fkids = byName.childFrames()
+    const fchild = byName.locator('#btn').or(byName.getByRole('button', { name: 'Go' }))
+    const fnested = byName.frameLocator('iframe')
+    void [ft, fc, fv, fd, fp, fkids, fchild, fnested]
+  }
+  void [pop, openedBy, mainFr, allFr, byUrl]
   page.on('response', (r) => void r.status()).on('requestfailed', (r) => void r.failure()?.errorText)
   page.on('dialog', (d) => d.accept(d.defaultValue()))
   const resp = await page.waitForResponse('**/api', { timeout: 1000 })

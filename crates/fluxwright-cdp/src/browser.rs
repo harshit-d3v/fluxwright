@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,9 +11,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::connection::{CdpEvent, Connection};
+use crate::context::{permission_types, Cookie, Emulation, StorageState};
 use crate::error::{Error, LaunchOptions, Result};
 use crate::launch::{launch_chrome, Launched, Transport};
-use crate::page::{fetch_params, CdpPage, ContextSetup};
+use crate::page::{fetch_params_combined, CdpPage, ContextSetup, ResourceType};
 use crate::route::InterceptedRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,26 +77,309 @@ impl Default for NetActivity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameInfo {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FrameEntry {
+    pub(crate) id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) session_id: String,
+    pub(crate) default_context_id: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FrameTree {
+    order: Vec<String>,
+    frames: HashMap<String, FrameEntry>,
+}
+
+impl FrameTree {
+    pub(crate) fn new(main_id: String, session_id: String, url: String) -> Self {
+        let mut tree = Self::default();
+        let initial_url = if url.is_empty() { "about:blank".into() } else { url };
+        tree.order.push(main_id.clone());
+        tree.frames.insert(
+            main_id.clone(),
+            FrameEntry {
+                id: main_id,
+                parent_id: None,
+                name: String::new(),
+                url: initial_url,
+                session_id,
+                default_context_id: None,
+            },
+        );
+        tree
+    }
+
+    pub(crate) fn list(&self) -> Vec<FrameInfo> {
+        self.order
+            .iter()
+            .filter_map(|id| self.frames.get(id))
+            .map(|f| FrameInfo {
+                id: f.id.clone(),
+                parent_id: f.parent_id.clone(),
+                name: f.name.clone(),
+                url: f.url.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<&FrameEntry> {
+        self.frames.get(id)
+    }
+
+    pub(crate) fn set_root_session(&mut self, main_id: &str, session_id: String, url: &str) {
+        if let Some(entry) = self.frames.get_mut(main_id) {
+            entry.session_id = session_id;
+            if !url.is_empty() {
+                entry.url = url.to_owned();
+            }
+        } else {
+            *self = Self::new(main_id.to_owned(), session_id, url.to_owned());
+        }
+    }
+
+    pub(crate) fn ancestors(&self, id: &str) -> Option<Vec<(String, String)>> {
+        if !self.frames.contains_key(id) {
+            return None;
+        }
+        let mut hops = Vec::new();
+        let mut cur = id;
+        for _ in 0..=self.frames.len() {
+            let entry = self.frames.get(cur)?;
+            match &entry.parent_id {
+                Some(parent) => {
+                    if !self.frames.contains_key(parent) {
+                        return None;
+                    }
+                    hops.push((parent.clone(), cur.to_string()));
+                    cur = parent.as_str();
+                }
+                None => {
+                    hops.reverse();
+                    return Some(hops);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn attach(&mut self, id: String, parent_id: String, session_id: String) {
+        if let Some(entry) = self.frames.get_mut(&id) {
+            if entry.parent_id.is_none() {
+                entry.parent_id = Some(parent_id);
+            }
+            if entry.session_id.is_empty() {
+                entry.session_id = session_id;
+            }
+            return;
+        }
+        self.order.push(id.clone());
+        self.frames.insert(
+            id.clone(),
+            FrameEntry {
+                id,
+                parent_id: Some(parent_id),
+                name: String::new(),
+                url: "about:blank".into(),
+                session_id,
+                default_context_id: None,
+            },
+        );
+    }
+
+    pub(crate) fn navigate(
+        &mut self,
+        id: String,
+        parent_id: Option<String>,
+        name: Option<String>,
+        url: String,
+        session_id: String,
+        main_id: &str,
+    ) {
+        let resolved_parent = if id == main_id { None } else { parent_id };
+        if let Some(entry) = self.frames.get_mut(&id) {
+            if !url.is_empty() {
+                entry.url = url;
+            }
+            if let Some(n) = name {
+                entry.name = n;
+            }
+            // OOPIF sessions emit Page.frameNavigated with parentId = null; never overwrite a known parent.
+            if let Some(p) = resolved_parent {
+                entry.parent_id = Some(p);
+            }
+            entry.session_id = session_id;
+            return;
+        }
+        self.order.push(id.clone());
+        self.frames.insert(
+            id.clone(),
+            FrameEntry {
+                id,
+                parent_id: resolved_parent,
+                name: name.unwrap_or_default(),
+                url: if url.is_empty() { "about:blank".into() } else { url },
+                session_id,
+                default_context_id: None,
+            },
+        );
+    }
+
+    pub(crate) fn update_url(&mut self, id: &str, url: String) {
+        if !url.is_empty() {
+            if let Some(entry) = self.frames.get_mut(id) {
+                entry.url = url;
+            }
+        }
+    }
+
+    pub(crate) fn set_session(
+        &mut self,
+        id: String,
+        session_id: String,
+        fallback_parent: Option<String>,
+        url: Option<String>,
+    ) {
+        if let Some(entry) = self.frames.get_mut(&id) {
+            entry.session_id = session_id;
+            entry.default_context_id = None;
+            if entry.parent_id.is_none() {
+                entry.parent_id = fallback_parent;
+            }
+            if let Some(u) = url.filter(|s| !s.is_empty()) {
+                entry.url = u;
+            }
+            return;
+        }
+        self.order.push(id.clone());
+        self.frames.insert(
+            id.clone(),
+            FrameEntry {
+                id,
+                parent_id: fallback_parent,
+                name: String::new(),
+                url: url.filter(|s| !s.is_empty()).unwrap_or_else(|| "about:blank".into()),
+                session_id,
+                default_context_id: None,
+            },
+        );
+    }
+
+    pub(crate) fn detach(&mut self, id: &str) {
+        let mut dead = HashSet::from([id.to_string()]);
+        loop {
+            let mut added = false;
+            for (fid, entry) in &self.frames {
+                if !dead.contains(fid)
+                    && entry.parent_id.as_ref().is_some_and(|p| dead.contains(p))
+                {
+                    dead.insert(fid.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        for fid in &dead {
+            self.frames.remove(fid);
+        }
+        self.order.retain(|fid| !dead.contains(fid));
+    }
+
+    pub(crate) fn set_default_context(&mut self, frame_id: &str, session_id: &str, ctx_id: i64) {
+        if let Some(entry) = self.frames.get_mut(frame_id) {
+            if entry.session_id == session_id || entry.session_id.is_empty() {
+                entry.default_context_id = Some(ctx_id);
+            }
+        }
+    }
+
+    pub(crate) fn remove_context(&mut self, ctx_id: i64) {
+        for entry in self.frames.values_mut() {
+            if entry.default_context_id == Some(ctx_id) {
+                entry.default_context_id = None;
+            }
+        }
+    }
+
+    pub(crate) fn clear_session_contexts(&mut self, session_id: &str) {
+        for entry in self.frames.values_mut() {
+            if entry.session_id == session_id {
+                entry.default_context_id = None;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PageSetup {
+    pub(crate) routes: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub(crate) dialogs: Option<tokio::sync::mpsc::UnboundedSender<crate::events::Dialog>>,
+    pub(crate) file_choosers: Option<tokio::sync::mpsc::UnboundedSender<crate::events::FileChooser>>,
+    pub(crate) bindings: Option<tokio::sync::mpsc::UnboundedSender<crate::events::BindingCall>>,
+    pub(crate) bindings_enabled: bool,
+    pub(crate) exposed_bindings: HashSet<String>,
+    pub(crate) init_scripts: Vec<String>,
+    pub(crate) popups: Option<tokio::sync::mpsc::UnboundedSender<CdpPage>>,
+}
+
 pub(crate) struct TargetState {
     session_id: Option<String>,
+    /// Populated immediately on Target.attachedToTarget so events emitted during prepare_session see this session.
+    active_session_id: Option<String>,
     r#type: String,
     url: String,
     url_tx: Arc<tokio::sync::watch::Sender<String>>,
     net: Arc<std::sync::Mutex<NetActivity>>,
     browser_context_id: Option<String>,
+    opener_id: Option<String>,
+    owner_page: Option<String>,
+    frames: Arc<std::sync::Mutex<FrameTree>>,
+    closed: Arc<AtomicBool>,
     waiting: Vec<tokio::sync::oneshot::Sender<Result<String>>>,
 }
 
 impl TargetState {
-    fn new(r#type: String, url: String, browser_context_id: Option<String>) -> Self {
+    fn new(
+        target_id: &str,
+        r#type: String,
+        url: String,
+        browser_context_id: Option<String>,
+        opener_id: Option<String>,
+        owner_page: Option<String>,
+        frames: Option<Arc<std::sync::Mutex<FrameTree>>>,
+    ) -> Self {
         let initial = if url.is_empty() { "about:blank".into() } else { url.clone() };
+        let frames = frames.unwrap_or_else(|| {
+            Arc::new(std::sync::Mutex::new(if r#type == "page" {
+                FrameTree::new(target_id.to_owned(), String::new(), initial.clone())
+            } else {
+                FrameTree::default()
+            }))
+        });
         Self {
             session_id: None,
+            active_session_id: None,
             r#type,
             url,
             url_tx: Arc::new(tokio::sync::watch::Sender::new(initial)),
             net: Default::default(),
             browser_context_id,
+            opener_id,
+            owner_page,
+            frames,
+            closed: Arc::new(AtomicBool::new(false)),
             waiting: Vec::new(),
         }
     }
@@ -118,9 +404,11 @@ pub struct CdpBrowser {
     _child: Mutex<Option<Child>>,
     _profile: Option<tempfile::TempDir>,
     targets: Arc<Mutex<HashMap<String, TargetState>>>,
-    /// Blocking and proxy credentials per browser context, so iframes that attach later
+    /// Blocking and proxy credentials per browser context, so iframes and tabs that attach later
     /// get them too.
     setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
+    /// Per-page setup (routes, dialogs, file choosers, popups, page-scoped bindings/init scripts).
+    page_setups: Arc<Mutex<HashMap<String, PageSetup>>>,
     /// Browser contexts this connection created. On a remote browser (`connect`), targets in
     /// any other context belong to someone else: attaching prepares their pages and our dialog
     /// and route handlers then answer theirs.
@@ -173,6 +461,7 @@ impl CdpBrowser {
             _profile: Some(launched.user_data_dir),
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            page_setups: Default::default(),
             contexts: Default::default(),
         });
 
@@ -269,6 +558,7 @@ impl CdpBrowser {
             _profile: None,
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            page_setups: Default::default(),
             contexts: Default::default(),
         });
 
@@ -340,6 +630,8 @@ impl CdpBrowser {
                 let ty = info["type"].as_str().unwrap_or("").to_string();
                 let url = info["url"].as_str().unwrap_or("").to_string();
                 let ctx = info["browserContextId"].as_str().map(|s| s.to_string());
+                let opener_from_info = info["openerId"].as_str().map(|s| s.to_string());
+                let opener_frame = info["openerFrameId"].as_str().map(|s| s.to_string());
                 // Pages and out-of-process iframes count only in a context this connection
                 // created; anything else on a remote browser belongs to its owner.
                 let ours = match &ctx {
@@ -347,17 +639,76 @@ impl CdpBrowser {
                     None => false,
                 };
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
-                let setup = match &ctx {
-                    Some(c) => self.setups.lock().await.get(c).cloned(),
-                    None => None,
-                };
 
-                {
+                let (owner_page, effective_opener, url_tx, net, frames, closed) = {
                     let mut targets = self.targets.lock().await;
+                    let (detected_owner, owner_frames, fallback_parent) = if ty == "page" {
+                        (Some(target_id.clone()), None, None)
+                    } else if ty == "iframe" {
+                        let parent_by_sid = ev.session_id.as_deref().and_then(|psid| {
+                            targets.iter().find_map(|(pid, pt)| {
+                                (pt.active_session_id.as_deref() == Some(psid)
+                                    || pt.session_id.as_deref() == Some(psid))
+                                .then(|| (pt.owner_page.clone(), pt.frames.clone(), opener_frame.clone().or_else(|| Some(pid.clone()))))
+                            })
+                        });
+                        if let Some((owner, fr, par)) = parent_by_sid {
+                            (owner, Some(fr), par)
+                        } else {
+                            let by_frame_tree = targets.iter().find_map(|(tid, pt)| {
+                                (pt.r#type == "page"
+                                    && pt.browser_context_id == ctx
+                                    && pt.frames.lock().unwrap().get(&target_id).is_some())
+                                .then(|| (Some(tid.clone()), pt.frames.clone(), opener_frame.clone()))
+                            });
+                            if let Some((owner, fr, par)) = by_frame_tree {
+                                (owner, Some(fr), par)
+                            } else {
+                                targets
+                                    .iter()
+                                    .find_map(|(tid, pt)| {
+                                        (pt.r#type == "page" && pt.browser_context_id == ctx)
+                                            .then(|| (Some(tid.clone()), Some(pt.frames.clone()), opener_frame.clone().or_else(|| Some(tid.clone()))))
+                                    })
+                                    .unwrap_or((None, None, opener_frame.clone()))
+                            }
+                        }
+                    } else {
+                        (None, None, None)
+                    };
+
                     let state = targets.entry(target_id.clone()).or_insert_with(|| {
-                        TargetState::new(ty.clone(), url.clone(), ctx.clone())
+                        TargetState::new(
+                            &target_id,
+                            ty.clone(),
+                            url.clone(),
+                            ctx.clone(),
+                            opener_from_info.clone(),
+                            detected_owner.clone(),
+                            owner_frames.clone(),
+                        )
                     });
                     state.r#type = ty.clone();
+                    state.active_session_id = Some(session_id.clone());
+                    if state.opener_id.is_none() {
+                        state.opener_id = opener_from_info;
+                    }
+                    if state.owner_page.is_none() {
+                        state.owner_page = detected_owner;
+                    }
+                    if let Some(fr) = owner_frames {
+                        state.frames = fr;
+                    }
+                    if ty == "page" {
+                        state.frames.lock().unwrap().set_root_session(&target_id, session_id.clone(), &url);
+                    } else if ty == "iframe" {
+                        state.frames.lock().unwrap().set_session(
+                            target_id.clone(),
+                            session_id.clone(),
+                            fallback_parent,
+                            (!url.is_empty()).then(|| url.clone()),
+                        );
+                    }
                     if !url.is_empty() {
                         state.url = url.clone();
                         state.url_tx.send_if_modified(|cur| {
@@ -369,8 +720,34 @@ impl CdpBrowser {
                             }
                         });
                     }
-                    state.browser_context_id = ctx;
-                }
+                    state.browser_context_id = ctx.clone();
+                    (
+                        state.owner_page.clone(),
+                        state.opener_id.clone(),
+                        state.url_tx.clone(),
+                        state.net.clone(),
+                        state.frames.clone(),
+                        state.closed.clone(),
+                    )
+                };
+
+                let setup = match &ctx {
+                    Some(c) => self.setups.lock().await.get(c).cloned(),
+                    None => None,
+                };
+                let page_setup = {
+                    let ps = self.page_setups.lock().await;
+                    if ty == "iframe" {
+                        owner_page.as_deref().and_then(|op| ps.get(op).cloned())
+                    } else if ty == "page" {
+                        // A popup without its own route handler can still match its opener's routes.
+                        effective_opener
+                            .as_deref()
+                            .and_then(|op| ps.get(op).filter(|p| p.routes.is_some()).map(|p| PageSetup { routes: p.routes.clone(), ..Default::default() }))
+                    } else {
+                        None
+                    }
+                };
 
                 // Do not await CDP on this task: it is the only consumer of
                 // attachedToTarget and must stay ahead of createTarget.
@@ -407,7 +784,7 @@ impl CdpBrowser {
                 // page never reaches a caller with its domains still being enabled.
                 let me = self.clone();
                 tokio::spawn(async move {
-                    match prepare_session(&me.conn, &session_id, &ty, waiting, setup).await {
+                    match prepare_session(&me.conn, &session_id, &ty, waiting, setup, page_setup).await {
                         Ok(()) => {
                             let waiters = match me.targets.lock().await.get_mut(&target_id) {
                                 Some(t) => {
@@ -418,6 +795,40 @@ impl CdpBrowser {
                             };
                             for w in waiters {
                                 let _ = w.send(Ok(session_id.clone()));
+                            }
+                            if ty == "page" {
+                                if let (Some(opener), Some(ctx_id)) = (effective_opener, ctx) {
+                                    let popup_tx = me
+                                        .page_setups
+                                        .lock()
+                                        .await
+                                        .get(&opener)
+                                        .and_then(|p| p.popups.clone());
+                                    if let Some(tx) = popup_tx {
+                                        let page = CdpPage {
+                                            browser: me.conn.clone(),
+                                            browser_pid: me.pid,
+                                            browser_id: me.id,
+                                            headless: me.headless,
+                                            is_remote: me.is_remote(),
+                                            context_id: ContextId(ctx_id),
+                                            target_id: TargetId(target_id),
+                                            opener_id: Some(TargetId(opener)),
+                                            session_id: SessionId(session_id),
+                                            targets: me.targets.clone(),
+                                            worlds: Default::default(),
+                                            setups: me.setups.clone(),
+                                            page_setups: me.page_setups.clone(),
+                                            frames,
+                                            closed,
+                                            mouse: Default::default(),
+                                            keyboard: Default::default(),
+                                            url: url_tx,
+                                            net,
+                                        };
+                                        let _ = tx.send(page);
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -453,27 +864,49 @@ impl CdpBrowser {
             "Target.targetCreated" => {
                 let info = &ev.params["targetInfo"];
                 let target_id = info["targetId"].as_str().unwrap_or_default().to_string();
+                let ty = info["type"].as_str().unwrap_or("").to_string();
+                let ctx = info["browserContextId"].as_str().map(|s| s.to_string());
+                let opener = info["openerId"].as_str().map(|s| s.to_string());
+                let owner = if ty == "page" { Some(target_id.clone()) } else { None };
                 let mut targets = self.targets.lock().await;
-                targets.entry(target_id).or_insert_with(|| {
+                targets.entry(target_id.clone()).or_insert_with(|| {
                     TargetState::new(
-                        info["type"].as_str().unwrap_or("").to_string(),
+                        &target_id,
+                        ty,
                         info["url"].as_str().unwrap_or("").to_string(),
-                        info["browserContextId"].as_str().map(|s| s.to_string()),
+                        ctx,
+                        opener,
+                        owner,
+                        None,
                     )
                 });
             }
             "Target.targetDestroyed" => {
                 if let Some(id) = ev.params["targetId"].as_str() {
-                    self.targets.lock().await.remove(id);
+                    if let Some(t) = self.targets.lock().await.remove(id) {
+                        t.closed.store(true, Ordering::SeqCst);
+                    }
+                    self.page_setups.lock().await.remove(id);
                 }
             }
             "Target.detachedFromTarget" => {
                 if let Some(sid) = ev.params["sessionId"].as_str() {
-                    let mut targets = self.targets.lock().await;
-                    for t in targets.values_mut() {
-                        if t.session_id.as_deref() == Some(sid) {
-                            t.session_id = None;
+                    let frames_to_clear: Vec<Arc<std::sync::Mutex<FrameTree>>> = {
+                        let mut targets = self.targets.lock().await;
+                        let mut list = Vec::new();
+                        for t in targets.values_mut() {
+                            if t.session_id.as_deref() == Some(sid)
+                                || t.active_session_id.as_deref() == Some(sid)
+                            {
+                                t.session_id = None;
+                                t.active_session_id = None;
+                                list.push(t.frames.clone());
+                            }
                         }
+                        list
+                    };
+                    for fr in frames_to_clear {
+                        fr.lock().unwrap().clear_session_contexts(sid);
                     }
                 }
             }
@@ -487,15 +920,31 @@ impl CdpBrowser {
                 else {
                     return;
                 };
-                let setup = self.setup_for_session(&sid).await;
-                // Paused because its type is blocked, or because everything is paused (proxy
-                // credentials, interception). No setup means the context is gone.
-                let ty = ev.params["resourceType"].as_str().unwrap_or("");
-                let block = setup
-                    .as_ref()
-                    .is_none_or(|s| s.types.iter().any(|t| t.as_str() == ty));
+                let (ctx, owner_page, opener_id) = self.session_owner_context(&sid).await;
+                let (block, ctx_routes) = match ctx {
+                    Some(ref c) => match self.setups.lock().await.get(c) {
+                        Some(s) => {
+                            let ty = ev.params["resourceType"].as_str().unwrap_or("");
+                            (s.types.iter().any(|t| t.as_str() == ty), s.routes.clone())
+                        }
+                        None => (true, None),
+                    },
+                    None => (true, None),
+                };
                 if !block {
-                    if let Some(routes) = setup.as_ref().and_then(|s| s.routes.as_ref()) {
+                    let route_tx = {
+                        let ps = self.page_setups.lock().await;
+                        owner_page
+                            .as_deref()
+                            .and_then(|op| ps.get(op).and_then(|p| p.routes.clone()))
+                            .or_else(|| {
+                                opener_id
+                                    .as_deref()
+                                    .and_then(|op| ps.get(op).and_then(|p| p.routes.clone()))
+                            })
+                            .or(ctx_routes)
+                    };
+                    if let Some(routes) = route_tx {
                         // The job answers it; if it can't (gone), dropping it continues it.
                         if let Some(req) = InterceptedRequest::from_paused(
                             &ev.params,
@@ -527,9 +976,21 @@ impl CdpBrowser {
             // on, dismiss alert/confirm/prompt.
             "Page.javascriptDialogOpening" => {
                 if let Some(sid) = ev.session_id.clone() {
+                    let (_, owner_page, opener_id) = self.session_owner_context(&sid).await;
+                    let dialog_tx = {
+                        let ps = self.page_setups.lock().await;
+                        owner_page
+                            .as_deref()
+                            .and_then(|op| ps.get(op).and_then(|p| p.dialogs.clone()))
+                            .or_else(|| {
+                                opener_id
+                                    .as_deref()
+                                    .and_then(|op| ps.get(op).and_then(|p| p.dialogs.clone()))
+                            })
+                    };
                     // The job answers it (page.on('dialog')). A dialog it cannot take is
                     // dropped, which answers it as below.
-                    if let Some(tx) = self.setup_for_session(&sid).await.and_then(|s| s.dialogs) {
+                    if let Some(tx) = dialog_tx {
                         let _ = tx.send(crate::events::Dialog::new(
                             &ev.params,
                             self.conn.clone(),
@@ -594,11 +1055,12 @@ impl CdpBrowser {
             }
             "Page.fileChooserOpened" => {
                 if let Some(sid) = ev.session_id.clone() {
-                    if let Some(tx) = self
-                        .setup_for_session(&sid)
-                        .await
-                        .and_then(|s| s.file_choosers)
-                    {
+                    let (_, owner_page, _) = self.session_owner_context(&sid).await;
+                    let fc_tx = match owner_page.as_deref() {
+                        Some(op) => self.page_setups.lock().await.get(op).and_then(|p| p.file_choosers.clone()),
+                        None => None,
+                    };
+                    if let Some(tx) = fc_tx {
                         let _ = tx.send(crate::events::FileChooser::new(
                             &ev.params,
                             self.conn.clone(),
@@ -614,45 +1076,101 @@ impl CdpBrowser {
                     ev.params["payload"].as_str(),
                     ev.params["executionContextId"].as_i64(),
                 ) {
-                    if let (Some(tx), Ok(v)) = (
-                        self.setup_for_session(&sid).await.and_then(|s| s.bindings),
-                        serde_json::from_str::<Value>(raw),
-                    ) {
+                    if let Ok(v) = serde_json::from_str::<Value>(raw) {
                         if let (Some(name), Some(seq)) = (v["name"].as_str(), v["seq"].as_u64()) {
-                            let args = v["args"].as_array().cloned().unwrap_or_default();
-                            let _ = tx.send(crate::events::BindingCall::new(
-                                name.to_owned(),
-                                seq,
-                                args,
-                                self.conn.clone(),
-                                sid,
-                                ctx_id,
-                            ));
+                            let (ctx, owner_page, _) = self.session_owner_context(&sid).await;
+                            let (page_has, page_tx) = match owner_page.as_deref() {
+                                Some(op) => match self.page_setups.lock().await.get(op) {
+                                    Some(p) => (p.exposed_bindings.contains(name), p.bindings.clone()),
+                                    None => (false, None),
+                                },
+                                None => (false, None),
+                            };
+                            let (ctx_has, ctx_tx) = match ctx.as_deref() {
+                                Some(c) => match self.setups.lock().await.get(c) {
+                                    Some(s) => (s.exposed_bindings.contains(name), s.bindings.clone()),
+                                    None => (false, None),
+                                },
+                                None => (false, None),
+                            };
+                            let tx = if page_has {
+                                page_tx
+                            } else if ctx_has {
+                                ctx_tx
+                            } else {
+                                page_tx.or(ctx_tx)
+                            };
+                            if let Some(tx) = tx {
+                                let args = v["args"].as_array().cloned().unwrap_or_default();
+                                let _ = tx.send(crate::events::BindingCall::new(
+                                    name.to_owned(),
+                                    seq,
+                                    args,
+                                    self.conn.clone(),
+                                    sid,
+                                    ctx_id,
+                                ));
+                            }
                         }
                     }
                 }
             }
-            "Page.frameNavigated" if ev.params["frame"]["parentId"].is_null() => {
+            "Page.frameAttached" => {
+                if let (Some(sid), Some(frame_id), Some(parent_id)) = (
+                    ev.session_id.as_deref(),
+                    ev.params["frameId"].as_str(),
+                    ev.params["parentFrameId"].as_str(),
+                ) {
+                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                        frames.lock().unwrap().attach(
+                            frame_id.to_owned(),
+                            parent_id.to_owned(),
+                            sid.to_owned(),
+                        );
+                    }
+                }
+            }
+            "Page.frameNavigated" => {
                 if let Some(frame_id) = ev.params["frame"]["id"].as_str() {
                     let full = frame_url(&ev.params["frame"]);
+                    let parent_id = ev.params["frame"]["parentId"].as_str().map(str::to_owned);
+                    let name = ev.params["frame"]["name"].as_str().map(str::to_owned);
                     let bfcache = ev.params["type"].as_str() == Some("BackForwardCacheRestore");
-                    let mut targets = self.targets.lock().await;
-                    if let Some(t) = targets.get_mut(frame_id) {
-                        if !full.is_empty() {
-                            t.url = full.clone();
-                            t.url_tx.send_if_modified(|cur| {
-                                if *cur != full {
-                                    *cur = full;
-                                    true
-                                } else {
-                                    false
-                                }
-                            });
-                        }
-                        if !bfcache {
-                            let mut net = t.net.lock().unwrap();
-                            net.idle_confirmed = false;
-                            net.last_change = std::time::Instant::now();
+                    let sid = ev.session_id.clone().unwrap_or_default();
+                    let info = if !sid.is_empty() {
+                        self.session_frame_tree(&sid).await
+                    } else {
+                        None
+                    };
+                    if let Some((main_id, frames)) = info {
+                        frames.lock().unwrap().navigate(
+                            frame_id.to_owned(),
+                            parent_id.clone(),
+                            name,
+                            full.clone(),
+                            sid,
+                            &main_id,
+                        );
+                    }
+                    if parent_id.is_none() {
+                        let mut targets = self.targets.lock().await;
+                        if let Some(t) = targets.get_mut(frame_id) {
+                            if !full.is_empty() {
+                                t.url = full.clone();
+                                t.url_tx.send_if_modified(|cur| {
+                                    if *cur != full {
+                                        *cur = full;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            }
+                            if !bfcache {
+                                let mut net = t.net.lock().unwrap();
+                                net.idle_confirmed = false;
+                                net.last_change = std::time::Instant::now();
+                            }
                         }
                     }
                 }
@@ -663,6 +1181,11 @@ impl CdpBrowser {
                     ev.params["url"].as_str(),
                 ) {
                     if !url.is_empty() {
+                        if let Some(sid) = ev.session_id.as_deref() {
+                            if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                                frames.lock().unwrap().update_url(frame_id, url.to_string());
+                            }
+                        }
                         let mut targets = self.targets.lock().await;
                         if let Some(t) = targets.get_mut(frame_id) {
                             t.url = url.to_string();
@@ -678,6 +1201,47 @@ impl CdpBrowser {
                     }
                 }
             }
+            "Page.frameDetached" if ev.params["reason"] != "swap" => {
+                if let (Some(sid), Some(frame_id)) = (
+                    ev.session_id.as_deref(),
+                    ev.params["frameId"].as_str(),
+                ) {
+                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                        frames.lock().unwrap().detach(frame_id);
+                    }
+                }
+            }
+            "Runtime.executionContextCreated" => {
+                let aux = &ev.params["context"]["auxData"];
+                if aux["isDefault"].as_bool() == Some(true) {
+                    if let (Some(sid), Some(frame_id), Some(ctx_id)) = (
+                        ev.session_id.as_deref(),
+                        aux["frameId"].as_str(),
+                        ev.params["context"]["id"].as_i64(),
+                    ) {
+                        if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                            frames.lock().unwrap().set_default_context(frame_id, sid, ctx_id);
+                        }
+                    }
+                }
+            }
+            "Runtime.executionContextDestroyed" => {
+                if let (Some(sid), Some(ctx_id)) = (
+                    ev.session_id.as_deref(),
+                    ev.params["executionContextId"].as_i64(),
+                ) {
+                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                        frames.lock().unwrap().remove_context(ctx_id);
+                    }
+                }
+            }
+            "Runtime.executionContextsCleared" => {
+                if let Some(sid) = ev.session_id.as_deref() {
+                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                        frames.lock().unwrap().clear_session_contexts(sid);
+                    }
+                }
+            }
             "Network.requestWillBeSent" => {
                 if let (Some(sid), Some(req_id)) = (
                     ev.session_id.as_deref(),
@@ -689,7 +1253,7 @@ impl CdpBrowser {
                         .starts_with("data:")
                     {
                         let targets = self.targets.lock().await;
-                        if let Some(t) = targets.values().find(|t| t.session_id.as_deref() == Some(sid)) {
+                        if let Some(t) = targets.values().find(|t| t.active_session_id.as_deref() == Some(sid)) {
                             let mut net = t.net.lock().unwrap();
                             if net.inflight.len() < 1024 {
                                 net.inflight.insert(req_id.to_string());
@@ -706,7 +1270,7 @@ impl CdpBrowser {
                     ev.params["requestId"].as_str(),
                 ) {
                     let targets = self.targets.lock().await;
-                    if let Some(t) = targets.values().find(|t| t.session_id.as_deref() == Some(sid)) {
+                    if let Some(t) = targets.values().find(|t| t.active_session_id.as_deref() == Some(sid)) {
                         let mut net = t.net.lock().unwrap();
                         net.inflight.remove(req_id);
                         net.last_change = std::time::Instant::now();
@@ -787,12 +1351,48 @@ impl CdpBrowser {
     pub async fn dispose_context(&self, id: &ContextId) -> Result<()> {
         self.contexts.lock().await.remove(&id.0);
         self.setups.lock().await.remove(&id.0);
+        let removed_targets: Vec<String> = {
+            let mut targets = self.targets.lock().await;
+            let keys: Vec<String> = targets
+                .iter()
+                .filter(|(_, t)| t.browser_context_id.as_deref() == Some(&id.0))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &keys {
+                if let Some(t) = targets.remove(k) {
+                    t.closed.store(true, Ordering::SeqCst);
+                }
+            }
+            keys
+        };
+        if !removed_targets.is_empty() {
+            let mut ps = self.page_setups.lock().await;
+            for k in removed_targets {
+                ps.remove(&k);
+            }
+        }
         let _ = self
             .call(
                 "Target.disposeBrowserContext",
                 json!({ "browserContextId": id.0 }),
                 None,
                 Duration::from_secs(10),
+            )
+            .await;
+        Ok(())
+    }
+
+    pub async fn close_target(&self, target_id: &TargetId) -> Result<()> {
+        if let Some(t) = self.targets.lock().await.remove(&target_id.0) {
+            t.closed.store(true, Ordering::SeqCst);
+        }
+        self.page_setups.lock().await.remove(&target_id.0);
+        let _ = self
+            .call(
+                "Target.closeTarget",
+                json!({ "targetId": target_id.0 }),
+                None,
+                Duration::from_secs(5),
             )
             .await;
         Ok(())
@@ -817,13 +1417,29 @@ impl CdpBrowser {
 
         // Auto-attach prepares the session before announcing it; see on_event.
         let session_id = self.wait_for_session(&target_id, timeout).await?;
-        let (url, net) = {
-            let targets = self.targets.lock().await;
-            match targets.get(&target_id) {
-                Some(t) => (t.url_tx.clone(), t.net.clone()),
+        let (url, net, frames, closed, opener_id) = {
+            let mut targets = self.targets.lock().await;
+            match targets.get_mut(&target_id) {
+                Some(t) => {
+                    t.owner_page.get_or_insert_with(|| target_id.clone());
+                    (
+                        t.url_tx.clone(),
+                        t.net.clone(),
+                        t.frames.clone(),
+                        t.closed.clone(),
+                        t.opener_id.clone().map(TargetId),
+                    )
+                }
                 None => (
                     Arc::new(tokio::sync::watch::Sender::new("about:blank".into())),
                     Default::default(),
+                    Arc::new(std::sync::Mutex::new(FrameTree::new(
+                        target_id.clone(),
+                        session_id.clone(),
+                        "about:blank".into(),
+                    ))),
+                    Default::default(),
+                    None,
                 ),
             }
         };
@@ -835,10 +1451,14 @@ impl CdpBrowser {
             is_remote: self.is_remote(),
             context_id: ctx.clone(),
             target_id: TargetId(target_id),
+            opener_id,
             session_id: SessionId(session_id),
             targets: self.targets.clone(),
             worlds: Default::default(),
             setups: self.setups.clone(),
+            page_setups: self.page_setups.clone(),
+            frames,
+            closed,
             mouse: Default::default(),
             keyboard: Default::default(),
             url,
@@ -857,7 +1477,9 @@ impl CdpBrowser {
             let (tx, rx) = tokio::sync::oneshot::channel();
             targets
                 .entry(target_id.to_string())
-                .or_insert_with(|| TargetState::new("page".into(), String::new(), None))
+                .or_insert_with(|| {
+                    TargetState::new(target_id, "page".into(), String::new(), None, None, Some(target_id.to_string()), None)
+                })
                 .waiting
                 .push(tx);
             drop(targets);
@@ -873,18 +1495,32 @@ impl CdpBrowser {
         }
     }
 
+    async fn session_owner_context(&self, sid: &str) -> (Option<String>, Option<String>, Option<String>) {
+        self.targets
+            .lock()
+            .await
+            .values()
+            .find(|t| t.active_session_id.as_deref() == Some(sid) || t.session_id.as_deref() == Some(sid))
+            .map(|t| (t.browser_context_id.clone(), t.owner_page.clone(), t.opener_id.clone()))
+            .unwrap_or((None, None, None))
+    }
+
+    async fn session_frame_tree(&self, sid: &str) -> Option<(String, Arc<std::sync::Mutex<FrameTree>>)> {
+        let targets = self.targets.lock().await;
+        let t = targets.values().find(|t| {
+            t.active_session_id.as_deref() == Some(sid) || t.session_id.as_deref() == Some(sid)
+        })?;
+        let main_id = t.owner_page.clone()?;
+        Some((main_id, t.frames.clone()))
+    }
+
     async fn context_of_session(&self, sid: &str) -> Option<String> {
         self.targets
             .lock()
             .await
             .values()
-            .find(|t| t.session_id.as_deref() == Some(sid))
+            .find(|t| t.active_session_id.as_deref() == Some(sid) || t.session_id.as_deref() == Some(sid))
             .and_then(|t| t.browser_context_id.clone())
-    }
-
-    async fn setup_for_session(&self, sid: &str) -> Option<ContextSetup> {
-        let ctx = self.context_of_session(sid).await?;
-        self.setups.lock().await.get(&ctx).cloned()
     }
 
     pub(crate) async fn session_for_target(
@@ -898,7 +1534,7 @@ impl CdpBrowser {
             .and_then(|t| t.session_id.clone())
     }
 
-    /// Sessions of every target in a browser context.
+    /// Sessions of every target in a browser context (with page type flag).
     pub(crate) async fn sessions_in_context(
         targets: &Mutex<HashMap<String, TargetState>>,
         context: &str,
@@ -910,6 +1546,279 @@ impl CdpBrowser {
             .filter(|t| t.browser_context_id.as_deref() == Some(context))
             .filter_map(|t| t.session_id.clone())
             .collect()
+    }
+
+    /// Sessions belonging to one top-level page and its out-of-process child frames.
+    pub(crate) async fn sessions_for_page(
+        targets: &Mutex<HashMap<String, TargetState>>,
+        page_target_id: &str,
+    ) -> Vec<String> {
+        targets
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.owner_page.as_deref() == Some(page_target_id))
+            .filter_map(|t| t.session_id.clone())
+            .collect()
+    }
+
+    /// Sessions in `context` annotated with their owning top-level page id and whether they are a page session.
+    async fn context_session_details(&self, context: &str) -> Vec<(String, String, bool)> {
+        self.targets
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.browser_context_id.as_deref() == Some(context))
+            .filter_map(|t| {
+                Some((
+                    t.session_id.clone()?,
+                    t.owner_page.clone().unwrap_or_default(),
+                    t.r#type == "page",
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn context_allow_downloads(&self, ctx: &ContextId, dir: &Path, timeout: Duration) -> Result<()> {
+        let params = json!({
+            "behavior": "allowAndName",
+            "browserContextId": ctx.0,
+            "downloadPath": dir.to_string_lossy(),
+            "eventsEnabled": true
+        });
+        self.call("Browser.setDownloadBehavior", params, None, timeout).await?;
+        Ok(())
+    }
+
+    pub async fn context_emulate(&self, ctx: &ContextId, e: &Emulation, timeout: Duration) -> Result<()> {
+        if e.is_empty() {
+            return Ok(());
+        }
+        let mut e = e.clone();
+        if e.locale.is_some() && e.user_agent.is_none() {
+            let v = self.call("Browser.getVersion", json!({}), None, timeout).await?;
+            e.user_agent = v["userAgent"].as_str().map(str::to_owned);
+        }
+        self.setups.lock().await.entry(ctx.0.clone()).or_default().emulation = Some(e.clone());
+        let sessions = self.context_session_details(&ctx.0).await;
+        for (sid, _, is_page) in sessions {
+            let calls = e.calls(is_page);
+            let _ = futures_util::future::join_all(
+                calls.into_iter().map(|(m, p)| self.call(m, p, Some(&sid), timeout)),
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    pub async fn context_grant_permissions(&self, ctx: &ContextId, names: &[String], timeout: Duration) -> Result<()> {
+        let permissions = permission_types(names)?;
+        if permissions.is_empty() {
+            return Ok(());
+        }
+        self.call(
+            "Browser.grantPermissions",
+            json!({ "permissions": permissions, "browserContextId": ctx.0 }),
+            None,
+            timeout,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn context_cookies(&self, ctx: &ContextId, timeout: Duration) -> Result<Vec<Cookie>> {
+        let res = self
+            .call(
+                "Storage.getCookies",
+                json!({ "browserContextId": ctx.0 }),
+                None,
+                timeout,
+            )
+            .await?;
+        Ok(res["cookies"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Cookie::from_cdp).collect())
+            .unwrap_or_default())
+    }
+
+    pub async fn context_add_cookies(&self, ctx: &ContextId, cookies: &[Cookie], timeout: Duration) -> Result<()> {
+        if cookies.is_empty() {
+            return Ok(());
+        }
+        let cookies: Vec<Value> = cookies.iter().map(Cookie::to_cdp).collect();
+        self.call(
+            "Storage.setCookies",
+            json!({ "cookies": cookies, "browserContextId": ctx.0 }),
+            None,
+            timeout,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn context_clear_cookies(&self, ctx: &ContextId, timeout: Duration) -> Result<()> {
+        self.call(
+            "Storage.clearCookies",
+            json!({ "browserContextId": ctx.0 }),
+            None,
+            timeout,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn context_set_http_credentials(
+        &self,
+        ctx: &ContextId,
+        credentials: &(String, String),
+        timeout: Duration,
+    ) -> Result<()> {
+        let fetch = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(ctx.0.clone()).or_default();
+            setup.http_auth = Some(credentials.clone());
+            fetch_params_combined(Some(setup), None)
+        };
+        if let Some(params) = fetch {
+            for (sid, _, _) in self.context_session_details(&ctx.0).await {
+                let _ = self.call("Fetch.enable", params.clone(), Some(&sid), timeout).await;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn context_set_storage_state(&self, ctx: &ContextId, state: &StorageState, timeout: Duration) -> Result<()> {
+        self.context_add_cookies(ctx, &state.cookies, timeout).await?;
+        if let Some(source) = state.restore_script() {
+            self.context_add_init_script(ctx, &source, timeout).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn context_set_blocked_urls(&self, ctx: &ContextId, urls: &[String], timeout: Duration) -> Result<()> {
+        self.setups.lock().await.entry(ctx.0.clone()).or_default().urls = urls.to_vec();
+        for (sid, _, _) in self.context_session_details(&ctx.0).await {
+            let _ = self.call("Network.enable", json!({}), Some(&sid), timeout).await;
+            let _ = self
+                .call("Network.setBlockedURLs", json!({ "urls": urls }), Some(&sid), timeout)
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn context_block_resource_types(&self, ctx: &ContextId, types: &[ResourceType], timeout: Duration) -> Result<()> {
+        if types.is_empty() {
+            return Ok(());
+        }
+        let ctx_setup = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(ctx.0.clone()).or_default();
+            setup.types = types.to_vec();
+            setup.clone()
+        };
+        let sessions = self.context_session_details(&ctx.0).await;
+        if !sessions.is_empty() {
+            let ps = self.page_setups.lock().await;
+            for (sid, page_id, _) in sessions {
+                if let Some(params) = fetch_params_combined(Some(&ctx_setup), ps.get(&page_id)) {
+                    let _ = self.call("Fetch.enable", params, Some(&sid), timeout).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn context_add_init_script(&self, ctx: &ContextId, source: &str, timeout: Duration) -> Result<()> {
+        self.setups
+            .lock()
+            .await
+            .entry(ctx.0.clone())
+            .or_default()
+            .init_scripts
+            .push(source.to_string());
+        for sid in Self::sessions_in_context(&self.targets, &ctx.0).await {
+            let _ = self
+                .call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": source }),
+                    Some(&sid),
+                    timeout,
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn context_bindings(&self, ctx: &ContextId) -> tokio::sync::mpsc::UnboundedReceiver<crate::events::BindingCall> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.setups
+            .lock()
+            .await
+            .entry(ctx.0.clone())
+            .or_default()
+            .bindings = Some(tx);
+        rx
+    }
+
+    pub async fn context_expose_binding(&self, ctx: &ContextId, name: &str, timeout: Duration) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Other("exposeFunction: name must not be empty".into()));
+        }
+        let (shim, eval_shim) = crate::page::binding_shims(name);
+        {
+            let page_ids: Vec<String> = self
+                .targets
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, t)| t.r#type == "page" && t.browser_context_id.as_deref() == Some(&ctx.0))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let ps = self.page_setups.lock().await;
+            if page_ids
+                .iter()
+                .any(|id| ps.get(id).is_some_and(|p| p.exposed_bindings.contains(name)))
+            {
+                return Err(Error::Other(format!(
+                    "Function \"{name}\" has been already registered"
+                )));
+            }
+        }
+        let need_binding = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(ctx.0.clone()).or_default();
+            if !setup.exposed_bindings.insert(name.to_string()) {
+                return Err(Error::Other(format!(
+                    "Function \"{name}\" has been already registered"
+                )));
+            }
+            let first = !setup.bindings_enabled;
+            setup.bindings_enabled = true;
+            setup.init_scripts.push(shim.clone());
+            first
+        };
+        let sessions = Self::sessions_in_context(&self.targets, &ctx.0).await;
+        install_binding_on_sessions(&self.conn, &sessions, None, need_binding, &shim, &eval_shim, timeout).await
+    }
+
+    pub async fn context_intercept(
+        &self,
+        ctx: &ContextId,
+        timeout: Duration,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let params = {
+            let mut setups = self.setups.lock().await;
+            let setup = setups.entry(ctx.0.clone()).or_default();
+            setup.routes = Some(tx);
+            fetch_params_combined(Some(setup), None)
+        };
+        if let Some(params) = params {
+            for sid in Self::sessions_in_context(&self.targets, &ctx.0).await {
+                let _ = self.call("Fetch.enable", params.clone(), Some(&sid), timeout).await;
+            }
+        }
+        Ok(rx)
     }
 
     /// A launched browser is closed and its process ended. A remote one is left running for its
@@ -1111,12 +2020,63 @@ async fn resolve_ws_endpoint(endpoint: &str) -> Result<String> {
     )))
 }
 
+pub(crate) async fn install_binding_on_sessions(
+    conn: &Connection,
+    sessions: &[String],
+    primary_session: Option<&str>,
+    need_binding: bool,
+    shim: &str,
+    eval_shim: &str,
+    timeout: Duration,
+) -> Result<()> {
+    for s in sessions {
+        let is_primary = primary_session == Some(s.as_str());
+        if need_binding {
+            let r = conn
+                .call(
+                    "Runtime.addBinding",
+                    json!({ "name": "__fluxwright_binding" }),
+                    Some(s),
+                    timeout,
+                )
+                .await;
+            if is_primary {
+                r?;
+            }
+        }
+        let r1 = conn
+            .call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": shim }),
+                Some(s),
+                timeout,
+            )
+            .await;
+        if is_primary {
+            r1?;
+        }
+        let r2 = conn
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": eval_shim, "returnByValue": true }),
+                Some(s),
+                timeout,
+            )
+            .await;
+        if is_primary {
+            r2?;
+        }
+    }
+    Ok(())
+}
+
 async fn prepare_session(
     conn: &Connection,
     session_id: &str,
     ty: &str,
     waiting_for_debugger: bool,
     setup: Option<ContextSetup>,
+    page_setup: Option<PageSetup>,
 ) -> Result<()> {
     let mut calls = vec![(
         "Target.setAutoAttach",
@@ -1131,25 +2091,35 @@ async fn prepare_session(
     if ty == "page" {
         calls.push(("Page.setInterceptFileChooserDialog", json!({ "enabled": true })));
     }
-    if let Some(setup) = setup.filter(|_| ty == "page" || ty == "iframe") {
-        if let Some(e) = &setup.emulation {
-            calls.extend(e.calls(ty == "page"));
+    if ty == "page" || ty == "iframe" {
+        if let Some(ref s) = setup {
+            if let Some(e) = &s.emulation {
+                calls.extend(e.calls(ty == "page"));
+            }
         }
-        if setup.bindings_enabled {
+        let bindings_enabled = setup.as_ref().is_some_and(|s| s.bindings_enabled)
+            || page_setup.as_ref().is_some_and(|p| p.bindings_enabled);
+        if bindings_enabled {
             calls.push(("Runtime.addBinding", json!({ "name": "__fluxwright_binding" })));
         }
-        for source in &setup.init_scripts {
+        for source in setup
+            .iter()
+            .flat_map(|s| s.init_scripts.iter())
+            .chain(page_setup.iter().flat_map(|p| p.init_scripts.iter()))
+        {
             calls.push((
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({ "source": source }),
             ));
         }
-        if let Some(params) = fetch_params(&setup) {
+        if let Some(params) = fetch_params_combined(setup.as_ref(), page_setup.as_ref()) {
             calls.push(("Fetch.enable", params));
         }
-        if !setup.urls.is_empty() {
-            calls.push(("Network.enable", json!({})));
-            calls.push(("Network.setBlockedURLs", json!({ "urls": setup.urls })));
+        if let Some(ref s) = setup {
+            if !s.urls.is_empty() {
+                calls.push(("Network.enable", json!({})));
+                calls.push(("Network.setBlockedURLs", json!({ "urls": s.urls })));
+            }
         }
     }
     if waiting_for_debugger {
@@ -1404,6 +2374,7 @@ mod tests {
             _profile: None,
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            page_setups: Default::default(),
             contexts: Default::default(),
         };
 
@@ -1499,6 +2470,7 @@ mod tests {
             _profile: None,
             targets: Arc::new(Mutex::new(HashMap::new())),
             setups: Default::default(),
+            page_setups: Default::default(),
             contexts: Default::default(),
         });
         let b = browser.clone();

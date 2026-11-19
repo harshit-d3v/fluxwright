@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,10 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-use crate::browser::{BrowserId, CdpBrowser, ContextId, NetActivity, SessionId, TargetId, TargetState};
+use crate::browser::{
+    install_binding_on_sessions, BrowserId, CdpBrowser, ContextId, FrameInfo, FrameTree,
+    NetActivity, PageSetup, SessionId, TargetId, TargetState,
+};
 use crate::connection::Connection;
 use crate::context::{permission_types, Cookie, Emulation, OriginStorage, StorageState, LOCAL_STORAGE_JS};
 use crate::input::{
@@ -398,10 +402,23 @@ impl From<&Selector> for Selector {
     }
 }
 
+/// Sentinel prefix in `Selector.frames[0]` identifying a target frame by CDP frame ID.
+pub const FRAME_ID_PREFIX: &str = "\0fw-frame:";
+
+impl Selector {
+    pub fn frame_id_hop(id: &str) -> String {
+        format!("{FRAME_ID_PREFIX}{id}")
+    }
+}
+
 impl fmt::Display for Selector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for frame in &self.frames {
-            write!(f, "{frame} >> ")?;
+            if let Some(id) = frame.strip_prefix(FRAME_ID_PREFIX) {
+                write!(f, "frame({id}) >> ")?;
+            } else {
+                write!(f, "{frame} >> ")?;
+            }
         }
         f.write_str(&self.query)
     }
@@ -583,11 +600,15 @@ pub struct CdpPage {
     pub is_remote: bool,
     pub context_id: ContextId,
     pub target_id: TargetId,
+    pub opener_id: Option<TargetId>,
     pub session_id: SessionId,
     pub(crate) targets: Arc<Mutex<HashMap<String, TargetState>>>,
     /// Isolated worlds made for same-process iframes, by frame id.
     pub(crate) worlds: Arc<Mutex<HashMap<String, i64>>>,
     pub(crate) setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
+    pub(crate) page_setups: Arc<Mutex<HashMap<String, PageSetup>>>,
+    pub(crate) frames: Arc<std::sync::Mutex<FrameTree>>,
+    pub(crate) closed: Arc<AtomicBool>,
     pub(crate) mouse: Arc<std::sync::Mutex<MouseState>>,
     pub(crate) keyboard: Arc<std::sync::Mutex<KeyboardState>>,
     pub(crate) url: Arc<tokio::sync::watch::Sender<String>>,
@@ -597,6 +618,43 @@ pub struct CdpPage {
 impl CdpPage {
     fn sid(&self) -> &str {
         &self.session_id.0
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub fn target_id(&self) -> &str {
+        &self.target_id.0
+    }
+
+    pub fn opener_id(&self) -> Option<&str> {
+        self.opener_id.as_ref().map(|t| t.0.as_str())
+    }
+
+    pub fn main_frame_id(&self) -> &str {
+        &self.target_id.0
+    }
+
+    pub fn frames(&self) -> Vec<FrameInfo> {
+        self.frames.lock().unwrap().list()
+    }
+
+    pub async fn bring_to_front(&self, timeout: Duration) -> Result<()> {
+        self.call("Page.bringToFront", json!({}), timeout).await?;
+        Ok(())
+    }
+
+    /// Fires for each popup window opened from this page (`window.open` / `target=_blank`).
+    pub async fn popups(&self) -> tokio::sync::mpsc::UnboundedReceiver<CdpPage> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.page_setups
+            .lock()
+            .await
+            .entry(self.target_id.0.clone())
+            .or_default()
+            .popups = Some(tx);
+        rx
     }
 
     pub fn url(&self) -> String {
@@ -1371,6 +1429,286 @@ impl CdpPage {
         Ok(res["value"].clone())
     }
 
+    pub async fn frame_evaluate(&self, frame_id: &str, expression: &str, timeout: Duration) -> Result<Value> {
+        if frame_id == self.target_id.0 {
+            return self.evaluate(expression, timeout).await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let eval_once = |session: &str, ctx_id: Option<i64>, step_timeout: Duration| {
+            let mut params = json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            });
+            if let Some(id) = ctx_id {
+                params["contextId"] = json!(id);
+            }
+            self.session_call(session, "Runtime.evaluate", params, step_timeout)
+        };
+
+        for attempt in 0..2 {
+            let entry = {
+                let mut entry = self
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .get(frame_id)
+                    .cloned()
+                    .ok_or_else(|| Error::Other("frame was detached".into()))?;
+                if entry.session_id == self.sid() && entry.default_context_id.is_none() {
+                    drop(entry);
+                    let wait_cap = deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(Duration::from_secs(2));
+                    let wait_until = tokio::time::Instant::now() + wait_cap;
+                    loop {
+                        let cur = self
+                            .frames
+                            .lock()
+                            .unwrap()
+                            .get(frame_id)
+                            .cloned()
+                            .ok_or_else(|| Error::Other("frame was detached".into()))?;
+                        if cur.default_context_id.is_some() || cur.session_id != self.sid() {
+                            entry = cur;
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= wait_until {
+                            entry = cur;
+                            break;
+                        }
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                } else {
+                    entry
+                }
+            };
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() {
+                return Err(Error::timeout("frame_evaluate", timeout.as_millis() as u64));
+            }
+            let ctx_opt = if entry.session_id != self.sid() && entry.default_context_id.is_none() {
+                None
+            } else {
+                entry.default_context_id
+            };
+            match eval_once(&entry.session_id, ctx_opt, rem).await {
+                Ok(res) => {
+                    return match js_error(&res) {
+                        Some(e) => Err(e),
+                        None => Ok(res["result"]["value"].clone()),
+                    };
+                }
+                Err(Error::Command { ref message, .. })
+                    if attempt == 0
+                        && (message.contains("Cannot find context")
+                            || message.contains("Execution context was destroyed")) =>
+                {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Other("frame execution context not available".into()))
+    }
+
+    pub async fn frame_goto(
+        &self,
+        frame_id: &str,
+        url: &str,
+        wait_until: WaitUntil,
+        timeout: Duration,
+    ) -> Result<()> {
+        if frame_id == self.target_id.0 {
+            return self.goto(url, wait_until, timeout).await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut events = self.browser.subscribe_unbounded();
+        let mut res = None;
+        for attempt in 0..2 {
+            let entry = self
+                .frames
+                .lock()
+                .unwrap()
+                .get(frame_id)
+                .cloned()
+                .ok_or_else(|| Error::Other("frame was detached".into()))?;
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() {
+                return Err(Error::timeout("frame_goto", timeout.as_millis() as u64));
+            }
+            match self
+                .session_call(
+                    &entry.session_id,
+                    "Page.navigate",
+                    json!({ "url": url, "frameId": frame_id }),
+                    rem,
+                )
+                .await
+            {
+                Ok(v) => {
+                    res = Some(v);
+                    break;
+                }
+                Err(Error::Command { ref message, .. })
+                    if attempt == 0 && (message.contains("No frame") || message.contains("Cannot find")) =>
+                {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => {
+                    return Err(match e {
+                        Error::Command { method, message } => {
+                            Error::Command { method, message: format!("{message}: {url}") }
+                        }
+                        other => other,
+                    });
+                }
+            }
+        }
+        let res = res.ok_or_else(|| Error::Other("frame was detached".into()))?;
+        if let Some(err) = res["errorText"].as_str().filter(|s| !s.is_empty()) {
+            return Err(Error::Command {
+                method: "Page.navigate".into(),
+                message: format!("{err} at {url}"),
+            });
+        }
+        let Some(loader_val) = res["loaderId"].as_str() else {
+            return Ok(());
+        };
+        let mut loader = Some(loader_val.to_string());
+        let mut committed = false;
+        let mut saw_load = false;
+        let mut saw_idle = false;
+        let ready_states: &[&str] = match wait_until {
+            WaitUntil::Commit => &[],
+            WaitUntil::DomContentLoaded => &["interactive", "complete"],
+            WaitUntil::Load | WaitUntil::NetworkIdle => &["complete"],
+        };
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(250),
+            Duration::from_millis(250),
+        );
+        loop {
+            while let Ok(ev) = events.try_recv() {
+                if ev.method == "Fluxwright.disconnected" {
+                    return Err(Error::BrowserDead { pid: self.browser_pid });
+                }
+                match ev.method.as_str() {
+                    "Page.frameNavigated" if ev.params["frame"]["id"] == frame_id => {
+                        committed = true;
+                        loader = ev.params["frame"]["loaderId"].as_str().map(str::to_owned).or(loader);
+                        if wait_until == WaitUntil::Commit {
+                            return Ok(());
+                        }
+                    }
+                    "Page.navigatedWithinDocument" if ev.params["frameId"] == frame_id => {
+                        return Ok(());
+                    }
+                    "Page.frameDetached"
+                        if ev.params["frameId"] == frame_id && ev.params["reason"] != "swap" =>
+                    {
+                        return Err(Error::Other("frame was detached".into()));
+                    }
+                    "Page.lifecycleEvent" if ev.params["frameId"] == frame_id => {
+                        let name = ev.params["name"].as_str().unwrap_or("");
+                        let ev_loader = ev.params["loaderId"].as_str();
+                        if loader.as_deref() == ev_loader {
+                            if name == "DOMContentLoaded" && wait_until == WaitUntil::DomContentLoaded {
+                                return Ok(());
+                            }
+                            if name == "load" {
+                                if matches!(wait_until, WaitUntil::DomContentLoaded | WaitUntil::Load) {
+                                    return Ok(());
+                                }
+                                saw_load = true;
+                                if saw_idle {
+                                    return Ok(());
+                                }
+                            }
+                            if name == "networkIdle" {
+                                saw_idle = true;
+                                if wait_until == WaitUntil::NetworkIdle {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            tokio::select! {
+                ev = events.recv() => {
+                    let Some(ev) = ev else {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    };
+                    if ev.method == "Fluxwright.disconnected" {
+                        return Err(Error::BrowserDead { pid: self.browser_pid });
+                    }
+                    match ev.method.as_str() {
+                        "Page.frameNavigated" if ev.params["frame"]["id"] == frame_id => {
+                            committed = true;
+                            loader = ev.params["frame"]["loaderId"].as_str().map(str::to_owned).or(loader);
+                            if wait_until == WaitUntil::Commit {
+                                return Ok(());
+                            }
+                        }
+                        "Page.navigatedWithinDocument" if ev.params["frameId"] == frame_id => {
+                            return Ok(());
+                        }
+                        "Page.frameDetached"
+                            if ev.params["frameId"] == frame_id && ev.params["reason"] != "swap" =>
+                        {
+                            return Err(Error::Other("frame was detached".into()));
+                        }
+                        "Page.lifecycleEvent" if ev.params["frameId"] == frame_id => {
+                            let name = ev.params["name"].as_str().unwrap_or("");
+                            let ev_loader = ev.params["loaderId"].as_str();
+                            if loader.as_deref() == ev_loader {
+                                if name == "DOMContentLoaded" && wait_until == WaitUntil::DomContentLoaded {
+                                    return Ok(());
+                                }
+                                if name == "load" {
+                                    if matches!(wait_until, WaitUntil::DomContentLoaded | WaitUntil::Load) {
+                                        return Ok(());
+                                    }
+                                    saw_load = true;
+                                    if saw_idle {
+                                        return Ok(());
+                                    }
+                                }
+                                if name == "networkIdle" {
+                                    saw_idle = true;
+                                    if wait_until == WaitUntil::NetworkIdle {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tick.tick() => {
+                    if self.frames.lock().unwrap().get(frame_id).is_none() {
+                        return Err(Error::Other("frame was detached".into()));
+                    }
+                    if committed && !ready_states.is_empty() && wait_until != WaitUntil::NetworkIdle {
+                        if let Ok(v) = self.frame_evaluate(frame_id, "document.readyState", Duration::from_secs(2)).await {
+                            if ready_states.contains(&v.as_str().unwrap_or("")) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(Error::timeout(
+                        format!("frame navigation to {url} ({wait_until:?})"),
+                        timeout.as_millis() as u64,
+                    ));
+                }
+            }
+        }
+    }
+
     fn main_scope(&self) -> Scope {
         Scope { session: self.sid().into(), context: None, world_of: None, map: Affine::ID, root: Affine::ID }
     }
@@ -1395,23 +1733,143 @@ impl CdpPage {
         }
     }
 
+#[derive(Clone)]
+enum Hop {
+    Css(String),
+    BackendNode(i64),
+}
+
+impl CdpPage {
+    async fn frame_owner_node(&self, session: &str, frame_id: &str, timeout: Duration) -> Result<i64> {
+        for attempt in 0..2 {
+            match self
+                .session_call(session, "DOM.getFrameOwner", json!({ "frameId": frame_id }), timeout)
+                .await
+            {
+                Ok(res) => {
+                    if let Some(id) = res["backendNodeId"].as_i64() {
+                        return Ok(id);
+                    }
+                    return Err(Error::Other(format!("frame {frame_id} has no owner node")));
+                }
+                Err(Error::Command { ref message, .. })
+                    if attempt == 0 && message.contains("DOM") =>
+                {
+                    let _ = self.session_call(session, "DOM.enable", json!({}), timeout).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Other(format!("frame {frame_id} has no owner node")))
+    }
+
+    async fn resolve_frame_hop(
+        &self,
+        parent: &Scope,
+        obj: &str,
+        frame_id: &str,
+        timeout: Duration,
+    ) -> std::result::Result<Scope, String> {
+        let s = parent.session.clone();
+        let size = self
+            .session_call(
+                &s,
+                "Runtime.callFunctionOn",
+                json!({ "objectId": obj, "returnByValue": true, "functionDeclaration": FRAME_BOX_JS }),
+                timeout,
+            )
+            .await;
+        let model = self
+            .session_call(&s, "DOM.getBoxModel", json!({ "objectId": obj }), timeout)
+            .await;
+        let Ok(size) = size else {
+            return Err("iframe went away".into());
+        };
+        let b = &size["result"]["value"];
+        let b = |i: usize| b[i].as_f64().unwrap_or(0.0);
+        let quad: Vec<f64> = model
+            .ok()
+            .and_then(|m| m["model"]["content"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_f64)
+            .collect();
+        let map = if quad.len() == 8 && b(0) > 0.0 && b(1) > 0.0 {
+            let pt = |i: usize| parent.root.apply(quad[2 * i], quad[2 * i + 1]);
+            Affine::onto([pt(0), pt(1), pt(2), pt(3)], b(0), b(1))
+        } else {
+            parent.map.shifted(b(2), b(3))
+        };
+        let (session, root) = match CdpBrowser::session_for_target(&self.targets, frame_id).await {
+            Some(own) => (own, map),
+            None => (s, parent.root),
+        };
+        self.world(&session, frame_id, map, root, timeout)
+            .await
+            .ok_or_else(|| "frame not ready".into())
+    }
+
     /// Enters `frames` one by one. `Ok(Err(reason))` means not there yet, so the caller retries.
     /// `scroll` brings each iframe into view first, which a click inside it needs.
     /// Element code always runs in an isolated world, where page scripts cannot patch what it
     /// calls (`querySelector`, `getBoundingClientRect`, ...). `evaluate` stays in the page's world.
-    /// Also returns each iframe hop as (parent scope, iframe selector), for [`Self::covered`].
+    /// Also returns each iframe hop for [`Self::covered`].
     async fn scope(
         &self,
         frames: &[String],
         scroll: bool,
         timeout: Duration,
-    ) -> Result<std::result::Result<(Scope, Vec<(Scope, String)>), String>> {
+    ) -> Result<std::result::Result<(Scope, Vec<(Scope, Hop)>), String>> {
         // A page target's main frame id is its target id.
         let Some(mut scope) = self.world(self.sid(), &self.target_id.0, Affine::ID, Affine::ID, timeout).await else {
             return Ok(Err("page not ready".into()));
         };
         let mut hops = Vec::new();
-        for css in frames {
+        let mut rest = frames;
+        if let Some(target_fid) = frames.first().and_then(|s| s.strip_prefix(FRAME_ID_PREFIX)) {
+            rest = &frames[1..];
+            if target_fid != self.target_id.0 {
+                let Some(path) = self.frames.lock().unwrap().ancestors(target_fid) else {
+                    return Err(Error::Other("frame was detached".into()));
+                };
+                for (_parent_fid, child_fid) in path {
+                    let backend_node_id = self.frame_owner_node(&scope.session, &child_fid, timeout).await?;
+                    let resolved = self
+                        .session_call(
+                            &scope.session,
+                            "DOM.resolveNode",
+                            json!({ "backendNodeId": backend_node_id }),
+                            timeout,
+                        )
+                        .await;
+                    let Ok(resolved) = resolved else {
+                        return Ok(Err(format!("frame {child_fid} went away")));
+                    };
+                    let Some(obj) = resolved["object"]["objectId"].as_str().map(String::from) else {
+                        return Ok(Err(format!("frame {child_fid} went away")));
+                    };
+                    if scroll {
+                        let _ = self
+                            .session_call(
+                                &scope.session,
+                                "Runtime.callFunctionOn",
+                                json!({ "objectId": obj, "functionDeclaration": "function() { this.scrollIntoViewIfNeeded(true); }" }),
+                                timeout,
+                            )
+                            .await;
+                    }
+                    let next = self.resolve_frame_hop(&scope, &obj, &child_fid, timeout).await;
+                    let _ = self
+                        .session_call(&scope.session, "Runtime.releaseObject", json!({ "objectId": obj }), timeout)
+                        .await;
+                    match next {
+                        Ok(next) => hops.push((std::mem::replace(&mut scope, next), Hop::BackendNode(backend_node_id))),
+                        Err(reason) => return Ok(Err(format!("frame {child_fid}: {reason}"))),
+                    }
+                }
+            }
+        }
+        for css in rest {
             let find = format!(
                 "(() => {{ const f = document.querySelector({}); if (f && {scroll}) f.scrollIntoViewIfNeeded(true); return f; }})()",
                 serde_json::to_string(css).unwrap()
@@ -1431,41 +1889,22 @@ impl CdpPage {
                 return Ok(Err(format!("no iframe matches {css}")));
             };
             let s = scope.session.clone();
-            let size = self
-                .session_call(&s, "Runtime.callFunctionOn",
-                    json!({ "objectId": obj, "returnByValue": true, "functionDeclaration": FRAME_BOX_JS }), timeout)
-                .await;
             let node = self.session_call(&s, "DOM.describeNode", json!({ "objectId": obj }), timeout).await;
-            // The content box as drawn, transforms included, in the session root's viewport.
-            let model = self.session_call(&s, "DOM.getBoxModel", json!({ "objectId": obj }), timeout).await;
-            let _ = self.session_call(&s, "Runtime.releaseObject", json!({ "objectId": obj }), timeout).await;
-            let (Ok(size), Ok(node)) = (size, node) else {
-                return Ok(Err(format!("{css} went away")));
+            let frame_id = node
+                .as_ref()
+                .ok()
+                .and_then(|n| n["node"]["frameId"].as_str().map(String::from));
+            let next = match frame_id {
+                Some(ref fid) => self.resolve_frame_hop(&scope, &obj, fid, timeout).await,
+                None => Err("is not an iframe, or has not loaded".into()),
             };
-            let Some(frame_id) = node["node"]["frameId"].as_str().map(String::from) else {
+            let _ = self.session_call(&s, "Runtime.releaseObject", json!({ "objectId": obj }), timeout).await;
+            let Some(fid) = frame_id else {
                 return Ok(Err(format!("{css} is not an iframe, or has not loaded")));
             };
-            let b = &size["result"]["value"];
-            let b = |i: usize| b[i].as_f64().unwrap_or(0.0);
-            let quad: Vec<f64> = model.ok().and_then(|m| m["model"]["content"].as_array().cloned())
-                .unwrap_or_default().iter().filter_map(Value::as_f64).collect();
-            let map = if quad.len() == 8 && b(0) > 0.0 && b(1) > 0.0 {
-                let pt = |i: usize| scope.root.apply(quad[2 * i], quad[2 * i + 1]);
-                Affine::onto([pt(0), pt(1), pt(2), pt(3)], b(0), b(1))
-            } else {
-                // No box (display: none, zero size): what is inside can still be read.
-                scope.map.shifted(b(2), b(3))
-            };
-            // A cross-site iframe runs in its own process: its own target and session, whose
-            // root frame it is.
-            let (session, root) = match CdpBrowser::session_for_target(&self.targets, &frame_id).await {
-                Some(own) => (own, map),
-                None => (s, scope.root),
-            };
-            match self.world(&session, &frame_id, map, root, timeout).await {
-                Some(next) => hops.push((std::mem::replace(&mut scope, next), css.clone())),
-                // Still loading, or a cross-site frame whose session is not attached yet.
-                None => return Ok(Err(format!("{css}: frame not ready"))),
+            match next {
+                Ok(next) => hops.push((std::mem::replace(&mut scope, next), Hop::Css(css.clone()))),
+                Err(reason) => return Ok(Err(format!("{css} ({fid}): {reason}"))),
             }
         }
         Ok(Ok((scope, hops)))
@@ -1473,18 +1912,59 @@ impl CdpPage {
 
     /// A click inside an iframe lands only if nothing in a parent document covers the iframe
     /// at that point: the element's own hit test cannot see a parent's overlay.
-    async fn covered(&self, hops: &[(Scope, String)], x: f64, y: f64, timeout: Duration) -> Option<String> {
-        for (parent, css) in hops {
-            let css = serde_json::to_string(css).unwrap();
+    async fn covered(&self, hops: &[(Scope, Hop)], x: f64, y: f64, timeout: Duration) -> Option<String> {
+        for (parent, hop) in hops {
             let (px, py) = parent.map.invert(x, y);
-            let expr = format!(
-                "(() => {{ const f = document.querySelector({css}); const h = document.elementFromPoint({px}, {py}); \
-                 return f && h === f ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over ' + {css}; }})()"
-            );
-            match self.eval_in(parent, &expr, true, timeout).await {
-                Ok(v) if v["value"] == "" => {}
-                Ok(v) => return Some(v["value"].as_str().unwrap_or("frame hit test failed").to_string()),
-                Err(e) => return Some(e.to_string()),
+            match hop {
+                Hop::Css(css) => {
+                    let css = serde_json::to_string(css).unwrap();
+                    let expr = format!(
+                        "(() => {{ const f = document.querySelector({css}); const h = document.elementFromPoint({px}, {py}); \
+                         return f && h === f ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over ' + {css}; }})()"
+                    );
+                    match self.eval_in(parent, &expr, true, timeout).await {
+                        Ok(v) if v["value"] == "" => {}
+                        Ok(v) => return Some(v["value"].as_str().unwrap_or("frame hit test failed").to_string()),
+                        Err(e) => return Some(e.to_string()),
+                    }
+                }
+                Hop::BackendNode(backend_node_id) => {
+                    let Ok(resolved) = self
+                        .session_call(
+                            &parent.session,
+                            "DOM.resolveNode",
+                            json!({ "backendNodeId": backend_node_id }),
+                            timeout,
+                        )
+                        .await
+                    else {
+                        return Some("iframe went away".into());
+                    };
+                    let Some(obj) = resolved["object"]["objectId"].as_str().map(String::from) else {
+                        return Some("iframe went away".into());
+                    };
+                    let res = self
+                        .session_call(
+                            &parent.session,
+                            "Runtime.callFunctionOn",
+                            json!({
+                                "objectId": obj,
+                                "returnByValue": true,
+                                "arguments": [{ "value": px }, { "value": py }],
+                                "functionDeclaration": "function(x, y) { const h = this.ownerDocument.elementFromPoint(x, y); return h === this ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over iframe'; }"
+                            }),
+                            timeout,
+                        )
+                        .await;
+                    let _ = self
+                        .session_call(&parent.session, "Runtime.releaseObject", json!({ "objectId": obj }), timeout)
+                        .await;
+                    match res {
+                        Ok(v) if v["result"]["value"] == "" => {}
+                        Ok(v) => return Some(v["result"]["value"].as_str().unwrap_or("frame hit test failed").to_string()),
+                        Err(e) => return Some(e.to_string()),
+                    }
+                }
             }
         }
         None
@@ -1612,11 +2092,12 @@ impl CdpPage {
         credentials: &(String, String),
         timeout: Duration,
     ) -> Result<()> {
+        let page_setup = self.page_setups.lock().await.get(&self.target_id.0).cloned();
         let fetch = {
             let mut setups = self.setups.lock().await;
             let setup = setups.entry(self.context_id.0.clone()).or_default();
             setup.http_auth = Some(credentials.clone());
-            fetch_params(setup)
+            fetch_params_combined(Some(setup), page_setup.as_ref())
         };
         if let Some(params) = fetch {
             self.call("Fetch.enable", params, timeout).await?;
@@ -1629,22 +2110,45 @@ impl CdpPage {
     pub async fn set_storage_state(&self, state: &StorageState, timeout: Duration) -> Result<()> {
         self.add_cookies(&state.cookies, timeout).await?;
         if let Some(source) = state.restore_script() {
-            self.add_init_script(&source, timeout).await?;
+            self.setups
+                .lock()
+                .await
+                .entry(self.context_id.0.clone())
+                .or_default()
+                .init_scripts
+                .push(source.clone());
+            let mut sessions = CdpBrowser::sessions_in_context(&self.targets, &self.context_id.0).await;
+            if !sessions.iter().any(|s| s == self.sid()) {
+                sessions.push(self.sid().to_string());
+            }
+            for s in sessions {
+                let res = self
+                    .session_call(
+                        &s,
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        json!({ "source": &source }),
+                        timeout,
+                    )
+                    .await;
+                if s == self.sid() {
+                    res?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// Registers `source` to run before any page script on every navigation in this context
-    /// (including iframes and popups).
+    /// Registers `source` to run before any page script on every navigation in this page
+    /// and its iframes.
     pub async fn add_init_script(&self, source: &str, timeout: Duration) -> Result<()> {
-        self.setups
+        self.page_setups
             .lock()
             .await
-            .entry(self.context_id.0.clone())
+            .entry(self.target_id.0.clone())
             .or_default()
             .init_scripts
             .push(source.to_string());
-        let mut sessions = CdpBrowser::sessions_in_context(&self.targets, &self.context_id.0).await;
+        let mut sessions = CdpBrowser::sessions_for_page(&self.targets, &self.target_id.0).await;
         if !sessions.iter().any(|s| s == self.sid()) {
             sessions.push(self.sid().to_string());
         }
@@ -1667,10 +2171,10 @@ impl CdpPage {
     /// Invocations of functions exposed via `expose_binding` on this page and its frames.
     pub async fn bindings(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::events::BindingCall> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.setups
+        self.page_setups
             .lock()
             .await
-            .entry(self.context_id.0.clone())
+            .entry(self.target_id.0.clone())
             .or_default()
             .bindings = Some(tx);
         rx
@@ -1682,39 +2186,21 @@ impl CdpPage {
         if name.trim().is_empty() {
             return Err(Error::Other("exposeFunction: name must not be empty".into()));
         }
-        let name_json = serde_json::to_string(name).unwrap();
-        let install = format!(
-            r#"const name = {name_json};
-            const install = (w) => {{
-                const root = w.__fwBindings || (w.__fwBindings = {{ seq: 0, pending: new w.Map() }});
-                if (typeof w.__fwBindingResolve !== 'function') {{
-                    w.__fwBindingResolve = (seq, ok, value, errMsg) => {{
-                        const entry = root.pending.get(seq);
-                        if (!entry) return;
-                        root.pending.delete(seq);
-                        if (ok) entry.resolve(value);
-                        else entry.reject(new w.Error(errMsg || 'exposed function failed'));
-                    }};
-                }}
-                w[name] = (...args) => new w.Promise((resolve, reject) => {{
-                    const seq = ++root.seq;
-                    root.pending.set(seq, {{ resolve, reject }});
-                    try {{
-                        w.__fluxwright_binding(JSON.stringify({{ name, seq, args }}));
-                    }} catch (e) {{
-                        root.pending.delete(seq);
-                        reject(e);
-                    }}
-                }});
-            }};"#
-        );
-        let shim = format!("(() => {{ {install} install(globalThis); }})()");
-        let eval_shim = format!(
-            "(() => {{ {install} const walk = (w) => {{ install(w); for (let i = 0; i < w.frames.length; i++) {{ try {{ if (w.frames[i].document) walk(w.frames[i]); }} catch {{}} }} }}; walk(globalThis); }})()"
-        );
+        let (shim, eval_shim) = binding_shims(name);
+        if self
+            .setups
+            .lock()
+            .await
+            .get(&self.context_id.0)
+            .is_some_and(|s| s.exposed_bindings.contains(name))
+        {
+            return Err(Error::Other(format!(
+                "Function \"{name}\" has been already registered"
+            )));
+        }
         let need_binding = {
-            let mut setups = self.setups.lock().await;
-            let setup = setups.entry(self.context_id.0.clone()).or_default();
+            let mut ps = self.page_setups.lock().await;
+            let setup = ps.entry(self.target_id.0.clone()).or_default();
             if !setup.exposed_bindings.insert(name.to_string()) {
                 return Err(Error::Other(format!(
                     "Function \"{name}\" has been already registered"
@@ -1725,48 +2211,20 @@ impl CdpPage {
             setup.init_scripts.push(shim.clone());
             first
         };
-        let mut sessions = CdpBrowser::sessions_in_context(&self.targets, &self.context_id.0).await;
+        let mut sessions = CdpBrowser::sessions_for_page(&self.targets, &self.target_id.0).await;
         if !sessions.iter().any(|s| s == self.sid()) {
             sessions.push(self.sid().to_string());
         }
-        for s in sessions {
-            if need_binding {
-                let r = self
-                    .session_call(
-                        &s,
-                        "Runtime.addBinding",
-                        json!({ "name": "__fluxwright_binding" }),
-                        timeout,
-                    )
-                    .await;
-                if s == self.sid() {
-                    r?;
-                }
-            }
-            let r1 = self
-                .session_call(
-                    &s,
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    json!({ "source": &shim }),
-                    timeout,
-                )
-                .await;
-            if s == self.sid() {
-                r1?;
-            }
-            let r2 = self
-                .session_call(
-                    &s,
-                    "Runtime.evaluate",
-                    json!({ "expression": &eval_shim, "returnByValue": true }),
-                    timeout,
-                )
-                .await;
-            if s == self.sid() {
-                r2?;
-            }
-        }
-        Ok(())
+        install_binding_on_sessions(
+            &self.browser,
+            &sessions,
+            Some(self.sid()),
+            need_binding,
+            &shim,
+            &eval_shim,
+            timeout,
+        )
+        .await
     }
 
     /// Injects a `<script>` element into the page by external URL or inline content.
@@ -1967,20 +2425,20 @@ impl CdpPage {
         }
     }
 
-    /// Hands every request of this page, its popups and iframes to the returned channel, as
+    /// Hands every request of this page and its iframes to the returned channel, as
     /// Playwright's `page.route` does. Resource blocking still applies first. Call it before
     /// navigating; a request dropped unanswered continues.
     pub async fn intercept(&self, timeout: Duration) -> Result<tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let params = {
-            let mut setups = self.setups.lock().await;
-            let setup = setups.entry(self.context_id.0.clone()).or_default();
-            setup.routes = Some(tx);
-            fetch_params(setup)
+            let mut ps = self.page_setups.lock().await;
+            let page_setup = ps.entry(self.target_id.0.clone()).or_default();
+            page_setup.routes = Some(tx);
+            let ctx_setup = self.setups.lock().await.get(&self.context_id.0).cloned();
+            fetch_params_combined(ctx_setup.as_ref(), Some(page_setup))
         };
         if let Some(params) = params {
-            // Sessions already open in this context too: iframes in other processes, popups.
-            let mut sessions = CdpBrowser::sessions_in_context(&self.targets, &self.context_id.0).await;
+            let mut sessions = CdpBrowser::sessions_for_page(&self.targets, &self.target_id.0).await;
             if !sessions.iter().any(|s| s == self.sid()) {
                 sessions.push(self.sid().to_string());
             }
@@ -2008,18 +2466,28 @@ impl CdpPage {
         (log, rx, task)
     }
 
-    /// Hands dialogs of this page, its popups and iframes to the returned queue instead of
+    /// Hands dialogs of this page and its iframes to the returned queue instead of
     /// answering them; one the queue drops is answered as before (see [`Dialog`](crate::Dialog)).
     pub async fn dialogs(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::events::Dialog> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.setups.lock().await.entry(self.context_id.0.clone()).or_default().dialogs = Some(tx);
+        self.page_setups
+            .lock()
+            .await
+            .entry(self.target_id.0.clone())
+            .or_default()
+            .dialogs = Some(tx);
         rx
     }
 
     /// Hands intercepted file chooser dialogs of this page and its frames to the returned queue.
     pub async fn file_choosers(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::events::FileChooser> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.setups.lock().await.entry(self.context_id.0.clone()).or_default().file_choosers = Some(tx);
+        self.page_setups
+            .lock()
+            .await
+            .entry(self.target_id.0.clone())
+            .or_default()
+            .file_choosers = Some(tx);
         rx
     }
 
@@ -2827,11 +3295,12 @@ impl CdpPage {
         if types.is_empty() {
             return Ok(());
         }
+        let page_setup = self.page_setups.lock().await.get(&self.target_id.0).cloned();
         let fetch = {
             let mut setups = self.setups.lock().await;
             let setup = setups.entry(self.context_id.0.clone()).or_default();
             setup.types = types.to_vec();
-            fetch_params(setup)
+            fetch_params_combined(Some(setup), page_setup.as_ref())
         };
         if let Some(params) = fetch {
             self.call("Fetch.enable", params, timeout).await?;
@@ -2841,16 +3310,12 @@ impl CdpPage {
 }
 
 /// Per-context setup, applied to each of the context's sessions as they attach (iframes in
-/// other processes, popups): resource blocking, proxy credentials, emulation, init scripts.
+/// other processes, popups, tabs): resource blocking, proxy credentials, emulation, init scripts.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextSetup {
-    /// Where paused requests go when the job intercepts them (`page.route`).
+    /// Where paused requests go when the job intercepts them (`context.route`).
     pub(crate) routes: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
-    /// Where dialogs go when the job answers them (`page.on('dialog')`).
-    pub(crate) dialogs: Option<tokio::sync::mpsc::UnboundedSender<crate::events::Dialog>>,
-    /// Where intercepted file chooser dialogs go (`page.on('filechooser')`).
-    pub(crate) file_choosers: Option<tokio::sync::mpsc::UnboundedSender<crate::events::FileChooser>>,
-    /// Where invocations from `expose_binding` / `expose_function` go.
+    /// Where invocations from `context.expose_binding` / `expose_function` go.
     pub(crate) bindings: Option<tokio::sync::mpsc::UnboundedSender<crate::events::BindingCall>>,
     pub(crate) bindings_enabled: bool,
     pub(crate) exposed_bindings: std::collections::HashSet<String>,
@@ -2864,20 +3329,55 @@ pub(crate) struct ContextSetup {
     pub(crate) answered: std::collections::HashSet<String>,
 }
 
-/// `Fetch.enable` for a context, or `None` when it needs no Fetch at all. Credentials
-/// need every request paused: Chrome only reports auth challenges for paused requests (and
-/// rejects an empty pattern list with `handleAuthRequests`). So does interception, which hands
-/// each request to the job.
-pub(crate) fn fetch_params(setup: &ContextSetup) -> Option<Value> {
-    let auth = setup.proxy_auth.is_some() || setup.http_auth.is_some();
-    let patterns: Vec<Value> = if auth || setup.routes.is_some() {
+pub(crate) fn binding_shims(name: &str) -> (String, String) {
+    let name_json = serde_json::to_string(name).unwrap();
+    let install = format!(
+        r#"const name = {name_json};
+        const install = (w) => {{
+            const root = w.__fwBindings || (w.__fwBindings = {{ seq: 0, pending: new w.Map() }});
+            if (typeof w.__fwBindingResolve !== 'function') {{
+                w.__fwBindingResolve = (seq, ok, value, errMsg) => {{
+                    const entry = root.pending.get(seq);
+                    if (!entry) return;
+                    root.pending.delete(seq);
+                    if (ok) entry.resolve(value);
+                    else entry.reject(new w.Error(errMsg || 'exposed function failed'));
+                }};
+            }}
+            w[name] = (...args) => new w.Promise((resolve, reject) => {{
+                const seq = ++root.seq;
+                root.pending.set(seq, {{ resolve, reject }});
+                try {{
+                    w.__fluxwright_binding(JSON.stringify({{ name, seq, args }}));
+                }} catch (e) {{
+                    root.pending.delete(seq);
+                    reject(e);
+                }}
+            }});
+        }};"#
+    );
+    let shim = format!("(() => {{ {install} install(globalThis); }})()");
+    let eval_shim = format!(
+        "(() => {{ {install} const walk = (w) => {{ install(w); for (let i = 0; i < w.frames.length; i++) {{ try {{ if (w.frames[i].document) walk(w.frames[i]); }} catch {{}} }} }}; walk(globalThis); }})()"
+    );
+    (shim, eval_shim)
+}
+
+/// `Fetch.enable` for a context/page pair, or `None` when it needs no Fetch at all.
+pub(crate) fn fetch_params_combined(setup: Option<&ContextSetup>, page: Option<&PageSetup>) -> Option<Value> {
+    let auth = setup.is_some_and(|s| s.proxy_auth.is_some() || s.http_auth.is_some());
+    let has_routes = setup.is_some_and(|s| s.routes.is_some()) || page.is_some_and(|p| p.routes.is_some());
+    let patterns: Vec<Value> = if auth || has_routes {
         vec![json!({ "urlPattern": "*", "requestStage": "Request" })]
     } else {
         setup
-            .types
-            .iter()
-            .map(|t| json!({ "urlPattern": "*", "resourceType": t.as_str(), "requestStage": "Request" }))
-            .collect()
+            .map(|s| {
+                s.types
+                    .iter()
+                    .map(|t| json!({ "urlPattern": "*", "resourceType": t.as_str(), "requestStage": "Request" }))
+                    .collect()
+            })
+            .unwrap_or_default()
     };
     if patterns.is_empty() {
         return None;

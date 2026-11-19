@@ -217,11 +217,18 @@ pub(crate) async fn collect(
         let str_of = |k: &str| e.params[k].as_str().unwrap_or("").to_string();
         match e.method.as_str() {
             "Target.attachedToTarget" if e.params["targetInfo"]["browserContextId"] == context.as_str() => {
-                if let Some(s) = e.params["sessionId"].as_str() {
-                    sessions.insert(s.to_string());
-                }
-                if let Some(t) = e.params["targetInfo"]["targetId"].as_str() {
-                    frames.insert(t.to_string());
+                let ty = e.params["targetInfo"]["type"].as_str().unwrap_or("");
+                let is_child_iframe = ty != "page" && e.session_id.as_ref().is_some_and(|s| sessions.contains(s));
+                let is_popup_of_ours = ty == "page" && e.params["targetInfo"]["openerId"].as_str() == Some(watch.main_frame.as_str());
+                if is_child_iframe || is_popup_of_ours {
+                    if let Some(s) = e.params["sessionId"].as_str() {
+                        sessions.insert(s.to_string());
+                    }
+                    if is_child_iframe {
+                        if let Some(t) = e.params["targetInfo"]["targetId"].as_str() {
+                            frames.insert(t.to_string());
+                        }
+                    }
                 }
             }
             "Page.frameAttached" if ours => {

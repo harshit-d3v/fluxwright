@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fluxwright_cdp::{
-    BoundingBox, CdpBrowser, CdpPage, ConsoleMessage, ContextId, Download, DownloadQueue, InterceptedRequest, LogEntry,
-    PageError, PageLog, PdfOptions, Proxy,
-    ResourceType, ScreenshotOptions, Selector,
+    BoundingBox, CdpBrowser, CdpPage, ConsoleMessage, ContextId, Download, DownloadQueue,
+    FrameInfo, InterceptedRequest, LogEntry, PageError, PageLog, PdfOptions, Proxy, ResourceType,
+    ScreenshotOptions, Selector,
 };
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -83,13 +83,76 @@ struct Waiter {
     priority: Priority,
     proxy: Option<Proxy>,
     queued_at: Instant,
-    tx: tokio::sync::oneshot::Sender<Result<PageLease>>,
+    tx: tokio::sync::oneshot::Sender<Result<Arc<ContextGuard>>>,
+}
+
+struct ContextGuard {
+    engine: Arc<Inner>,
+    browser: Arc<CdpBrowser>,
+    context: ContextId,
+    download_dir: std::path::PathBuf,
+    runtime: tokio::runtime::Handle,
+    disposed: AtomicBool,
+}
+
+impl ContextGuard {
+    fn is_disposed(&self) -> bool {
+        self.disposed.load(Ordering::SeqCst)
+    }
+
+    async fn dispose(&self, completed: bool) {
+        let _ = std::fs::remove_dir_all(&self.download_dir);
+        if self.disposed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.browser.dispose_context(&self.context).await;
+        self.engine.release_slot(&self.browser, completed).await;
+    }
+
+    fn dispose_in_background(self: &Arc<Self>, completed: bool) {
+        let _ = std::fs::remove_dir_all(&self.download_dir);
+        if self.disposed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let guard = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let _ = guard.browser.dispose_context(&guard.context).await;
+            guard.engine.release_slot(&guard.browser, completed).await;
+        });
+    }
+}
+
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.download_dir);
+        if self.disposed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let browser = self.browser.clone();
+        let ctx = self.context.clone();
+        let engine = self.engine.clone();
+        self.runtime.spawn(async move {
+            let _ = browser.dispose_context(&ctx).await;
+            engine.release_slot(&browser, true).await;
+        });
+    }
+}
+
+/// An isolated browser context leased from the pool; may hold multiple pages and popups.
+pub struct ContextLease {
+    guard: Arc<ContextGuard>,
+    base_url: Option<String>,
+    action_timeout: Option<Duration>,
+    navigation_timeout: Option<Duration>,
+    binding_listeners: Listeners<fluxwright_cdp::BindingCall>,
+    binding_handlers: Arc<std::sync::Mutex<HashMap<String, BindingHandler>>>,
+    binding_dispatch_started: AtomicBool,
 }
 
 pub struct PageLease {
     engine: Arc<Inner>,
-    browser: Arc<CdpBrowser>,
-    context: ContextId,
+    context: Arc<ContextGuard>,
+    owns_context: bool,
     page: CdpPage,
     lease_id: Uuid,
     released: bool,
@@ -98,9 +161,8 @@ pub struct PageLease {
     runtime: tokio::runtime::Handle,
     log: Arc<std::sync::Mutex<PageLog>>,
     log_task: tokio::task::JoinHandle<()>,
+    popup_task: tokio::task::JoinHandle<()>,
     downloads: Downloads,
-    /// Where this page's downloads land; removed when the lease ends.
-    download_dir: std::path::PathBuf,
     /// Who answers this page's dialogs; with nobody, a dialog is dismissed as before.
     dialog_listeners: Listeners<fluxwright_cdp::Dialog>,
     /// Who receives intercepted file choosers on this page.
@@ -109,6 +171,8 @@ pub struct PageLease {
     binding_listeners: Listeners<fluxwright_cdp::BindingCall>,
     binding_handlers: Arc<std::sync::Mutex<HashMap<String, BindingHandler>>>,
     binding_dispatch_started: AtomicBool,
+    /// Popups opened from this page (`window.open` / `target=_blank`).
+    popup_listeners: Listeners<PageLease>,
     /// `set_default_timeout` and `set_default_navigation_timeout`, when called.
     default_timeouts: std::sync::Mutex<(Option<Duration>, Option<Duration>)>,
     /// This page's place on the host it navigated to, when hosts are limited.
@@ -228,32 +292,104 @@ impl Engine {
     }
 
     pub async fn acquire_with(&self, priority: Priority, timeout: Duration) -> Result<PageLease> {
-        self.acquire_inner(priority, None, timeout).await
+        let guard = self.acquire_context_guard(priority, None, timeout).await?;
+        let ctx = ContextLease {
+            guard,
+            base_url: None,
+            action_timeout: None,
+            navigation_timeout: None,
+            binding_listeners: Listeners::default(),
+            binding_handlers: Default::default(),
+            binding_dispatch_started: AtomicBool::new(false),
+        };
+        let mut page = match ctx.new_page().await {
+            Ok(p) => p,
+            Err(e) => {
+                ctx.dispose_failed().await;
+                return Err(e);
+            }
+        };
+        page.owns_context = true;
+        Ok(page)
+    }
+
+    pub async fn acquire_context(&self) -> Result<ContextLease> {
+        self.acquire_context_with(&JobOptions::default()).await
+    }
+
+    /// Acquires an isolated browser context configured with `opts`; open tabs via [`ContextLease::new_page`].
+    pub async fn acquire_context_with(&self, opts: &JobOptions) -> Result<ContextLease> {
+        let timeout_budget = opts.timeout.unwrap_or(self.inner.config.acquire_timeout);
+        let guard = self
+            .acquire_context_guard(opts.priority, opts.proxy.clone(), timeout_budget)
+            .await?;
+        let setup_res = async {
+            apply_context_blocking(&guard, opts).await?;
+            let timeout = Duration::from_secs(5);
+            if let Some(creds) = &opts.http_credentials {
+                guard
+                    .browser
+                    .context_set_http_credentials(&guard.context, creds, timeout)
+                    .await?;
+            }
+            guard
+                .browser
+                .context_grant_permissions(&guard.context, &opts.permissions, timeout)
+                .await?;
+            if let Some(state) = &opts.storage_state {
+                guard
+                    .browser
+                    .context_set_storage_state(&guard.context, state, timeout)
+                    .await?;
+            }
+            guard
+                .browser
+                .context_emulate(&guard.context, &opts.emulation, timeout)
+                .await?;
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(e) = setup_res {
+            guard.dispose(false).await;
+            return Err(e);
+        }
+        let binding_listeners = Listeners::default();
+        route_newest(
+            guard.browser.context_bindings(&guard.context).await,
+            binding_listeners.clone(),
+        );
+        Ok(ContextLease {
+            guard,
+            base_url: opts.base_url.clone(),
+            action_timeout: None,
+            navigation_timeout: None,
+            binding_listeners,
+            binding_handlers: Default::default(),
+            binding_dispatch_started: AtomicBool::new(false),
+        })
     }
 
     /// A lease set up for `opts`: priority, proxy, resource blocking, permissions, saved
     /// storage and emulation.
     pub async fn acquire_job(&self, opts: &JobOptions) -> Result<PageLease> {
-        let page = self
-            .acquire_inner(opts.priority, opts.proxy.clone(), self.inner.config.acquire_timeout)
-            .await?;
-        apply_blocking(&page, opts).await?;
-        let timeout = Duration::from_secs(5);
-        if let Some(base) = &opts.base_url {
-            *page.base_url.lock().unwrap() = Some(base.clone());
-        }
-        if let Some(creds) = &opts.http_credentials {
-            page.page.set_http_credentials(creds, timeout).await?;
-        }
-        page.page.grant_permissions(&opts.permissions, timeout).await?;
-        if let Some(state) = &opts.storage_state {
-            page.page.set_storage_state(state, timeout).await?;
-        }
-        page.page.emulate(&opts.emulation, timeout).await?;
+        let ctx = self.acquire_context_with(opts).await?;
+        let mut page = match ctx.new_page().await {
+            Ok(p) => p,
+            Err(e) => {
+                ctx.dispose_failed().await;
+                return Err(e);
+            }
+        };
+        page.owns_context = true;
         Ok(page)
     }
 
-    async fn acquire_inner(&self, priority: Priority, proxy: Option<Proxy>, timeout: Duration) -> Result<PageLease> {
+    async fn acquire_context_guard(
+        &self,
+        priority: Priority,
+        proxy: Option<Proxy>,
+        timeout: Duration,
+    ) -> Result<Arc<ContextGuard>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut st = self.inner.state.lock().await;
@@ -572,7 +708,7 @@ impl Inner {
         let inner = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let res = inner.prepare_lease(waiter.proxy.as_ref(), reservation).await;
+            let res = inner.prepare_context(waiter.proxy.as_ref(), reservation).await;
             let _ = waiter.tx.send(res);
             inner.admit.notify_waiters();
         });
@@ -637,11 +773,11 @@ impl Inner {
         total
     }
 
-    async fn prepare_lease(
+    async fn prepare_context(
         self: &Arc<Self>,
         proxy: Option<&Proxy>,
         reservation: Reservation,
-    ) -> Result<PageLease> {
+    ) -> Result<Arc<ContextGuard>> {
         let browser = match reservation {
             Reservation::Reuse(b) => {
                 if self.state.lock().await.shutting_down {
@@ -691,56 +827,24 @@ impl Inner {
                 return Err(e.into());
             }
         };
-        let page = match browser
-            .create_page(&ctx, self.config.navigation_timeout)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = browser.dispose_context(&ctx).await;
-                self.release_slot(&browser, false).await;
-                return Err(e.into());
-            }
-        };
 
-        info!(
-            browser = %browser.id.0,
-            context = %ctx.0,
-            "lease granted"
-        );
+        info!(browser = %browser.id.0, context = %ctx.0, "context lease granted");
 
         // Named like profile folders, so the sweep after a crash finds it: `fluxwright-<pid>-…`.
         let download_dir = std::env::temp_dir().join(format!("fluxwright-{}-dl-{}", std::process::id(), ctx.0));
-        let (log, downloads, log_task) = page.collect_logs(&download_dir);
         // Best effort: a Chrome that refuses only loses downloads.
-        let _ = page.allow_downloads(&download_dir, Duration::from_secs(5)).await;
-        let dialog_listeners = Listeners::default();
-        route_newest(page.dialogs().await, dialog_listeners.clone());
-        let file_chooser_listeners = Listeners::default();
-        route_newest(page.file_choosers().await, file_chooser_listeners.clone());
-        let binding_listeners = Listeners::default();
-        route_newest(page.bindings().await, binding_listeners.clone());
-        Ok(PageLease {
+        let _ = browser
+            .context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5))
+            .await;
+
+        Ok(Arc::new(ContextGuard {
             engine: self.clone(),
             browser,
             context: ctx,
-            page,
-            lease_id: Uuid::new_v4(),
-            released: false,
-            runtime: tokio::runtime::Handle::current(),
-            log,
-            log_task,
-            downloads: Downloads(Arc::new(Mutex::new(downloads))),
             download_dir,
-            dialog_listeners,
-            file_chooser_listeners,
-            binding_listeners,
-            binding_handlers: Default::default(),
-            binding_dispatch_started: AtomicBool::new(false),
-            default_timeouts: Default::default(),
-            host_slot: HostSlot::default(),
-            base_url: Default::default(),
-        })
+            runtime: tokio::runtime::Handle::current(),
+            disposed: AtomicBool::new(false),
+        }))
     }
 
     async fn release_slot(self: &Arc<Self>, browser: &CdpBrowser, completed: bool) {
@@ -901,7 +1005,7 @@ fn drop_abandoned(queue: &mut VecDeque<Waiter>) {
     queue.retain(|w| !w.tx.is_closed());
 }
 
-async fn apply_blocking(page: &PageLease, opts: &JobOptions) -> Result<()> {
+async fn apply_context_blocking(guard: &ContextGuard, opts: &JobOptions) -> Result<()> {
     let mut types = Vec::new();
     if opts.block_images {
         types.push(ResourceType::Image);
@@ -913,16 +1017,281 @@ async fn apply_blocking(page: &PageLease, opts: &JobOptions) -> Result<()> {
         types.push(ResourceType::Media);
     }
     if !types.is_empty() {
-        page.page
-            .block_resource_types(&types, Duration::from_secs(5))
+        guard
+            .browser
+            .context_block_resource_types(&guard.context, &types, Duration::from_secs(5))
             .await?;
     }
     if !opts.block_url_patterns.is_empty() {
-        page.page
-            .set_blocked_urls(&opts.block_url_patterns, Duration::from_secs(5))
+        guard
+            .browser
+            .context_set_blocked_urls(&guard.context, &opts.block_url_patterns, Duration::from_secs(5))
             .await?;
     }
     Ok(())
+}
+
+async fn build_page_lease(
+    engine: Arc<Inner>,
+    context: Arc<ContextGuard>,
+    owns_context: bool,
+    page: CdpPage,
+    base_url: Option<String>,
+    default_timeouts: (Option<Duration>, Option<Duration>),
+) -> PageLease {
+    let (log, downloads, log_task) = page.collect_logs(&context.download_dir);
+    let dialog_listeners = Listeners::default();
+    route_newest(page.dialogs().await, dialog_listeners.clone());
+    let file_chooser_listeners = Listeners::default();
+    route_newest(page.file_choosers().await, file_chooser_listeners.clone());
+    let binding_listeners = Listeners::default();
+    route_newest(page.bindings().await, binding_listeners.clone());
+
+    let popup_listeners: Listeners<PageLease> = Listeners::default();
+    let mut popups_rx = page.popups().await;
+    let popup_task = tokio::spawn({
+        let popup_listeners = popup_listeners.clone();
+        let context = context.clone();
+        let engine = engine.clone();
+        let base_url = base_url.clone();
+        async move {
+            while let Some(raw_popup) = popups_rx.recv().await {
+                let has_listener = {
+                    let mut g = popup_listeners.lock().unwrap();
+                    g.retain(|tx| !tx.is_closed());
+                    !g.is_empty()
+                };
+                if !has_listener {
+                    drop(raw_popup);
+                    continue;
+                }
+                let lease = Box::pin(build_page_lease(
+                    engine.clone(),
+                    context.clone(),
+                    false,
+                    raw_popup,
+                    base_url.clone(),
+                    default_timeouts,
+                ))
+                .await;
+                let mut g = popup_listeners.lock().unwrap();
+                g.retain(|tx| !tx.is_closed());
+                if let Some(tx) = g.last() {
+                    let _ = tx.send(lease);
+                }
+            }
+        }
+    });
+
+    PageLease {
+        engine,
+        context,
+        owns_context,
+        page,
+        lease_id: Uuid::new_v4(),
+        released: false,
+        runtime: tokio::runtime::Handle::current(),
+        log,
+        log_task,
+        popup_task,
+        downloads: Downloads(Arc::new(Mutex::new(downloads))),
+        dialog_listeners,
+        file_chooser_listeners,
+        binding_listeners,
+        binding_handlers: Default::default(),
+        binding_dispatch_started: AtomicBool::new(false),
+        popup_listeners,
+        default_timeouts: std::sync::Mutex::new(default_timeouts),
+        host_slot: HostSlot::default(),
+        base_url: std::sync::Mutex::new(base_url),
+    }
+}
+
+fn spawn_binding_dispatcher(
+    started: &AtomicBool,
+    handlers: Arc<std::sync::Mutex<HashMap<String, BindingHandler>>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::BindingCall>,
+) {
+    if started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        tokio::spawn(async move {
+            while let Some(call) = rx.recv().await {
+                let h = handlers.lock().unwrap().get(&call.name).cloned();
+                tokio::spawn(async move {
+                    match h {
+                        Some(handler) => match handler(call.args.clone()).await {
+                            Ok(val) => {
+                                let _ = call.resolve(&val).await;
+                            }
+                            Err(msg) => {
+                                let _ = call.reject(&msg).await;
+                            }
+                        },
+                        None => {
+                            let _ = call
+                                .reject(&format!("Function \"{}\" is not registered", call.name))
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+    }
+}
+
+impl ContextLease {
+    fn timeout(&self) -> Duration {
+        self.action_timeout
+            .unwrap_or(self.guard.engine.config.action_timeout)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.guard.is_disposed()
+    }
+
+    /// Opens a new tab in this context sharing cookies, routes, emulation, and storage.
+    pub async fn new_page(&self) -> Result<PageLease> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        let page = self
+            .guard
+            .browser
+            .create_page(
+                &self.guard.context,
+                self.navigation_timeout
+                    .or(self.action_timeout)
+                    .unwrap_or(self.guard.engine.config.navigation_timeout),
+            )
+            .await?;
+        Ok(build_page_lease(
+            self.guard.engine.clone(),
+            self.guard.clone(),
+            false,
+            page,
+            self.base_url.clone(),
+            (self.action_timeout, self.navigation_timeout),
+        )
+        .await)
+    }
+
+    pub async fn cookies(&self) -> Result<Vec<fluxwright_cdp::Cookie>> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_cookies(&self.guard.context, self.timeout())
+            .await?)
+    }
+
+    pub async fn add_cookies(&self, cookies: &[fluxwright_cdp::Cookie]) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_add_cookies(&self.guard.context, cookies, self.timeout())
+            .await?)
+    }
+
+    pub async fn clear_cookies(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_clear_cookies(&self.guard.context, self.timeout())
+            .await?)
+    }
+
+    pub async fn add_init_script(&self, source: &str) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_add_init_script(&self.guard.context, source, self.timeout())
+            .await?)
+    }
+
+    pub fn subscribe_bindings(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::BindingCall> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.binding_listeners.lock().unwrap().push(tx);
+        rx
+    }
+
+    pub async fn expose_binding(&self, name: &str) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_expose_binding(&self.guard.context, name, self.timeout())
+            .await?)
+    }
+
+    pub async fn expose_function<F, Fut>(&self, name: &str, handler: F) -> Result<()>
+    where
+        F: Fn(Vec<serde_json::Value>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<serde_json::Value, String>>
+            + Send
+            + 'static,
+    {
+        if !self.binding_dispatch_started.load(Ordering::SeqCst) {
+            spawn_binding_dispatcher(
+                &self.binding_dispatch_started,
+                self.binding_handlers.clone(),
+                self.subscribe_bindings(),
+            );
+        }
+        let handler: BindingHandler = Arc::new(move |args| Box::pin(handler(args)));
+        {
+            let mut handlers = self.binding_handlers.lock().unwrap();
+            if handlers.contains_key(name) {
+                return Err(Error::Other(format!(
+                    "Function \"{name}\" has been already registered"
+                )));
+            }
+            handlers.insert(name.to_string(), handler);
+        }
+        if let Err(err) = self.expose_binding(name).await {
+            self.binding_handlers.lock().unwrap().remove(name);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub async fn intercept(
+        &self,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        Ok(self
+            .guard
+            .browser
+            .context_intercept(&self.guard.context, self.timeout())
+            .await?)
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        self.guard.dispose(true).await;
+        Ok(())
+    }
+
+    async fn dispose_failed(&self) {
+        self.guard.dispose(false).await;
+    }
 }
 
 impl PageLease {
@@ -960,21 +1329,107 @@ impl PageLease {
     }
 
     pub fn browser_pid(&self) -> u32 {
-        self.browser.pid
+        self.context.browser.pid
     }
 
     /// WebSocket endpoint URL if connected over CDP or local WebSocket transport.
     pub fn ws_endpoint(&self) -> Option<&str> {
-        self.browser.ws_endpoint()
+        self.context.browser.ws_endpoint()
     }
 
     /// Returns `true` if connected to a remote browser rather than a locally spawned OS child process.
     pub fn is_remote(&self) -> bool {
-        self.browser.is_remote()
+        self.context.browser.is_remote()
     }
 
     pub fn lease_id(&self) -> Uuid {
         self.lease_id
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.released || self.context.is_disposed() || self.page.is_closed()
+    }
+
+    pub fn target_id(&self) -> &str {
+        self.page.target_id()
+    }
+
+    pub fn opener_target_id(&self) -> Option<&str> {
+        self.page.opener_id()
+    }
+
+    pub async fn bring_to_front(&self) -> Result<()> {
+        Ok(self.page.bring_to_front(self.action_timeout()).await?)
+    }
+
+    pub fn subscribe_popups(&self) -> tokio::sync::mpsc::UnboundedReceiver<PageLease> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.popup_listeners.lock().unwrap().push(tx);
+        rx
+    }
+
+    pub fn frame_infos(&self) -> Vec<FrameInfo> {
+        self.page.frames()
+    }
+
+    pub fn main_frame_id(&self) -> &str {
+        self.page.main_frame_id()
+    }
+
+    pub fn frames(&self) -> Vec<Frame<'_>> {
+        self.page
+            .frames()
+            .into_iter()
+            .map(|info| Frame { lease: self, info })
+            .collect()
+    }
+
+    pub fn main_frame(&self) -> Frame<'_> {
+        let id = self.main_frame_id();
+        let info = self
+            .frame_infos()
+            .into_iter()
+            .find(|f| f.id == id)
+            .unwrap_or_else(|| FrameInfo {
+                id: id.to_owned(),
+                parent_id: None,
+                name: String::new(),
+                url: self.url(),
+            });
+        Frame { lease: self, info }
+    }
+
+    pub async fn frame_goto(&self, frame_id: &str, url: &str) -> Result<()> {
+        self.frame_goto_with(frame_id, url, fluxwright_cdp::WaitUntil::Load).await
+    }
+
+    pub async fn frame_goto_with(
+        &self,
+        frame_id: &str,
+        url: &str,
+        wait_until: fluxwright_cdp::WaitUntil,
+    ) -> Result<()> {
+        let base = self.base_url.lock().unwrap().clone();
+        let url = resolve_url(base.as_deref(), url);
+        self.engine.hosts.enter(&url, &self.host_slot).await;
+        self.page
+            .frame_goto(frame_id, &url, wait_until, self.navigation_timeout())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn frame_evaluate(&self, frame_id: &str, expression: &str) -> Result<serde_json::Value> {
+        Ok(self
+            .page
+            .frame_evaluate(frame_id, expression, self.action_timeout())
+            .await?)
+    }
+
+    pub fn frame_locator_by_id(&self, frame_id: &str) -> FrameLocator<'_> {
+        FrameLocator {
+            lease: self,
+            frames: vec![Selector::frame_id_hop(frame_id)],
+        }
     }
 
     /// Every cookie in this page's context plus localStorage of the current origin, in
@@ -1677,35 +2132,12 @@ impl PageLease {
             + Send
             + 'static,
     {
-        if self
-            .binding_dispatch_started
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let mut rx = self.subscribe_bindings();
-            let handlers = self.binding_handlers.clone();
-            tokio::spawn(async move {
-                while let Some(call) = rx.recv().await {
-                    let h = handlers.lock().unwrap().get(&call.name).cloned();
-                    tokio::spawn(async move {
-                        match h {
-                            Some(handler) => match handler(call.args.clone()).await {
-                                Ok(val) => {
-                                    let _ = call.resolve(&val).await;
-                                }
-                                Err(msg) => {
-                                    let _ = call.reject(&msg).await;
-                                }
-                            },
-                            None => {
-                                let _ = call
-                                    .reject(&format!("Function \"{}\" is not registered", call.name))
-                                    .await;
-                            }
-                        }
-                    });
-                }
-            });
+        if !self.binding_dispatch_started.load(Ordering::SeqCst) {
+            spawn_binding_dispatcher(
+                &self.binding_dispatch_started,
+                self.binding_handlers.clone(),
+                self.subscribe_bindings(),
+            );
         }
         let handler: BindingHandler = Arc::new(move |args| Box::pin(handler(args)));
         {
@@ -1824,31 +2256,36 @@ impl PageLease {
 
     async fn release(&mut self, completed: bool) {
         self.log_task.abort();
-        let _ = std::fs::remove_dir_all(&self.download_dir);
+        self.popup_task.abort();
         if self.released {
             return;
         }
         self.released = true;
-        let _ = self.browser.dispose_context(&self.context).await;
-        self.engine.release_slot(&self.browser, completed).await;
+        if self.owns_context {
+            self.context.dispose(completed).await;
+        } else if !self.context.is_disposed() {
+            let _ = self.context.browser.close_target(&self.page.target_id).await;
+        }
     }
 }
 
 impl Drop for PageLease {
     fn drop(&mut self) {
         self.log_task.abort();
-        let _ = std::fs::remove_dir_all(&self.download_dir);
+        self.popup_task.abort();
         if self.released {
             return;
         }
         self.released = true;
-        let browser = self.browser.clone();
-        let ctx = self.context.clone();
-        let engine = self.engine.clone();
-        self.runtime.spawn(async move {
-            let _ = browser.dispose_context(&ctx).await;
-            engine.release_slot(&browser, true).await;
-        });
+        if self.owns_context {
+            self.context.dispose_in_background(true);
+        } else if !self.context.is_disposed() {
+            let browser = self.context.browser.clone();
+            let target_id = self.page.target_id.clone();
+            self.runtime.spawn(async move {
+                let _ = browser.close_target(&target_id).await;
+            });
+        }
     }
 }
 
@@ -2240,6 +2677,121 @@ impl<'a> FrameLocator<'a> {
             lease: self.lease,
             frames,
         }
+    }
+}
+
+/// An imperative handle to a main frame or iframe on a page.
+pub struct Frame<'a> {
+    lease: &'a PageLease,
+    info: FrameInfo,
+}
+
+impl<'a> Frame<'a> {
+    pub fn page(&self) -> &'a PageLease {
+        self.lease
+    }
+
+    pub fn id(&self) -> &str {
+        &self.info.id
+    }
+
+    pub fn url(&self) -> &str {
+        &self.info.url
+    }
+
+    pub fn name(&self) -> &str {
+        &self.info.name
+    }
+
+    pub fn is_detached(&self) -> bool {
+        !self.lease.frame_infos().iter().any(|f| f.id == self.info.id)
+    }
+
+    pub fn parent_frame(&self) -> Option<Frame<'a>> {
+        let parent_id = self.info.parent_id.as_deref()?;
+        self.lease
+            .frame_infos()
+            .into_iter()
+            .find(|f| f.id == parent_id)
+            .map(|info| Frame { lease: self.lease, info })
+    }
+
+    pub fn child_frames(&self) -> Vec<Frame<'a>> {
+        self.lease
+            .frame_infos()
+            .into_iter()
+            .filter(|f| f.parent_id.as_deref() == Some(self.info.id.as_str()))
+            .map(|info| Frame { lease: self.lease, info })
+            .collect()
+    }
+
+    pub async fn goto(&self, url: &str) -> Result<()> {
+        self.lease.frame_goto(&self.info.id, url).await
+    }
+
+    pub async fn goto_with(&self, url: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
+        self.lease.frame_goto_with(&self.info.id, url, wait_until).await
+    }
+
+    pub async fn evaluate(&self, expression: &str) -> Result<serde_json::Value> {
+        self.lease.frame_evaluate(&self.info.id, expression).await
+    }
+
+    pub async fn title(&self) -> Result<String> {
+        Ok(self.evaluate("document.title").await?.as_str().unwrap_or("").to_owned())
+    }
+
+    pub async fn content(&self) -> Result<String> {
+        Ok(self
+            .evaluate("document.documentElement ? document.documentElement.outerHTML : ''")
+            .await?
+            .as_str()
+            .unwrap_or("")
+            .to_owned())
+    }
+
+    fn root(&self) -> FrameLocator<'a> {
+        self.lease.frame_locator_by_id(&self.info.id)
+    }
+
+    pub fn locator(&self, query: impl Into<String>) -> Locator<'a> {
+        self.root().locator(query)
+    }
+
+    pub fn get_by_text(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.root().get_by_text(text, exact)
+    }
+
+    pub fn get_by_role(&self, role: &str, name: Option<&str>, exact: bool) -> Locator<'a> {
+        self.root().get_by_role(role, name, exact)
+    }
+
+    pub fn get_by_role_with(&self, role: &str, opts: &fluxwright_cdp::RoleOptions) -> Locator<'a> {
+        self.root().get_by_role_with(role, opts)
+    }
+
+    pub fn get_by_label(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.root().get_by_label(text, exact)
+    }
+
+    pub fn get_by_placeholder(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.root().get_by_placeholder(text, exact)
+    }
+
+    pub fn get_by_alt_text(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.root().get_by_alt_text(text, exact)
+    }
+
+    pub fn get_by_title(&self, text: &str, exact: bool) -> Locator<'a> {
+        self.root().get_by_title(text, exact)
+    }
+
+    pub fn get_by_test_id(&self, id: &str) -> Locator<'a> {
+        self.root().get_by_test_id(id)
+    }
+
+    pub fn frame_locator(&self, iframe: &str) -> FrameLocator<'a> {
+        self.root().frame_locator(iframe)
     }
 }
 
