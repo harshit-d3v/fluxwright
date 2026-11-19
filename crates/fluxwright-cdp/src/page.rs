@@ -1301,7 +1301,7 @@ impl CdpPage {
                         }
                     }
                 }
-                ("Network.loadingFinished" | "Network.loadingFailed") if wait_until == WaitUntil::NetworkIdle => {
+                "Network.loadingFinished" | "Network.loadingFailed" if wait_until == WaitUntil::NetworkIdle => {
                     if let Some(req_id) = ev.params["requestId"].as_str() {
                         inflight.remove(req_id);
                         if *saw_load && inflight.is_empty() {
@@ -1447,42 +1447,37 @@ impl CdpPage {
         };
 
         for attempt in 0..2 {
-            let entry = {
-                let mut entry = self
-                    .frames
-                    .lock()
-                    .unwrap()
-                    .get(frame_id)
-                    .cloned()
-                    .ok_or_else(|| Error::Other("frame was detached".into()))?;
-                if entry.session_id == self.sid() && entry.default_context_id.is_none() {
-                    drop(entry);
-                    let wait_cap = deadline
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        .min(Duration::from_secs(2));
-                    let wait_until = tokio::time::Instant::now() + wait_cap;
-                    loop {
-                        let cur = self
-                            .frames
-                            .lock()
-                            .unwrap()
-                            .get(frame_id)
-                            .cloned()
-                            .ok_or_else(|| Error::Other("frame was detached".into()))?;
-                        if cur.default_context_id.is_some() || cur.session_id != self.sid() {
-                            entry = cur;
-                            break;
-                        }
-                        if tokio::time::Instant::now() >= wait_until {
-                            entry = cur;
-                            break;
-                        }
-                        sleep(Duration::from_millis(20)).await;
+            let mut entry = self
+                .frames
+                .lock()
+                .unwrap()
+                .get(frame_id)
+                .cloned()
+                .ok_or_else(|| Error::Other("frame was detached".into()))?;
+            if entry.session_id == self.sid() && entry.default_context_id.is_none() {
+                let wait_cap = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(Duration::from_secs(2));
+                let wait_until = tokio::time::Instant::now() + wait_cap;
+                loop {
+                    let cur = self
+                        .frames
+                        .lock()
+                        .unwrap()
+                        .get(frame_id)
+                        .cloned()
+                        .ok_or_else(|| Error::Other("frame was detached".into()))?;
+                    if cur.default_context_id.is_some() || cur.session_id != self.sid() {
+                        entry = cur;
+                        break;
                     }
-                } else {
-                    entry
+                    if tokio::time::Instant::now() >= wait_until {
+                        entry = cur;
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
                 }
-            };
+            }
             let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
             if rem.is_zero() {
                 return Err(Error::timeout("frame_evaluate", timeout.as_millis() as u64));
@@ -1577,7 +1572,6 @@ impl CdpPage {
         };
         let mut loader = Some(loader_val.to_string());
         let mut committed = false;
-        let mut saw_load = false;
         let mut saw_idle = false;
         let ready_states: &[&str] = match wait_until {
             WaitUntil::Commit => &[],
@@ -1620,7 +1614,6 @@ impl CdpPage {
                                 if matches!(wait_until, WaitUntil::DomContentLoaded | WaitUntil::Load) {
                                     return Ok(());
                                 }
-                                saw_load = true;
                                 if saw_idle {
                                     return Ok(());
                                 }
@@ -1671,7 +1664,6 @@ impl CdpPage {
                                     if matches!(wait_until, WaitUntil::DomContentLoaded | WaitUntil::Load) {
                                         return Ok(());
                                     }
-                                    saw_load = true;
                                     if saw_idle {
                                         return Ok(());
                                     }
