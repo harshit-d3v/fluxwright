@@ -921,29 +921,30 @@ impl CdpBrowser {
                     return;
                 };
                 let (ctx, owner_page, opener_id) = self.session_owner_context(&sid).await;
-                let (block, ctx_routes) = match ctx {
-                    Some(ref c) => match self.setups.lock().await.get(c) {
-                        Some(s) => {
-                            let ty = ev.params["resourceType"].as_str().unwrap_or("");
-                            (s.types.iter().any(|t| t.as_str() == ty), s.routes.clone())
-                        }
-                        None => (true, None),
-                    },
-                    None => (true, None),
+                let ctx_setup = match ctx.as_deref() {
+                    Some(c) => self.setups.lock().await.get(c).cloned(),
+                    None => None,
+                };
+                let route_tx = {
+                    let ps = self.page_setups.lock().await;
+                    owner_page
+                        .as_deref()
+                        .and_then(|op| ps.get(op).and_then(|p| p.routes.clone()))
+                        .or_else(|| {
+                            opener_id
+                                .as_deref()
+                                .and_then(|op| ps.get(op).and_then(|p| p.routes.clone()))
+                        })
+                        .or_else(|| ctx_setup.as_ref().and_then(|s| s.routes.clone()))
+                };
+                // Paused because its type is blocked, or because everything is paused (proxy
+                // credentials, interception). No context or page setup means the context is gone.
+                let ty = ev.params["resourceType"].as_str().unwrap_or("");
+                let block = match ctx_setup.as_ref() {
+                    Some(s) => s.types.iter().any(|t| t.as_str() == ty),
+                    None => route_tx.is_none(),
                 };
                 if !block {
-                    let route_tx = {
-                        let ps = self.page_setups.lock().await;
-                        owner_page
-                            .as_deref()
-                            .and_then(|op| ps.get(op).and_then(|p| p.routes.clone()))
-                            .or_else(|| {
-                                opener_id
-                                    .as_deref()
-                                    .and_then(|op| ps.get(op).and_then(|p| p.routes.clone()))
-                            })
-                            .or(ctx_routes)
-                    };
                     if let Some(routes) = route_tx {
                         // The job answers it; if it can't (gone), dropping it continues it.
                         if let Some(req) = InterceptedRequest::from_paused(
