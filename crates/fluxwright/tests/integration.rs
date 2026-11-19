@@ -1290,7 +1290,7 @@ async fn actionability_edge_cases() {
     .unwrap();
 
     // text= finds matches in DOM order, input buttons included.
-    page.get_by_text("save", false).click().await.unwrap();
+    page.get_by_text("save", false).first().click().await.unwrap();
     assert_eq!(page.title().await.unwrap(), "input");
     // A button named by its image's alt text.
     page.get_by_role("button", Some("Upload"), true).click().await.unwrap();
