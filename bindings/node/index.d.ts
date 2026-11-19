@@ -112,7 +112,6 @@ export declare class Locator {
   getByText(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByRole(role: string, options?: GetByRoleOptions | undefined | null): Locator
   _getByRoleRegex(role: string, pattern: string, flags: string, options?: GetByRoleOptions | undefined | null): Locator
-  _getByRoleRegex(role: string, pattern: string, flags: string, options?: GetByRoleOptions | undefined | null): Locator
   getByLabel(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByPlaceholder(text: string, options?: GetByTextOptions | undefined | null): Locator
   getByAltText(text: string, options?: GetByTextOptions | undefined | null): Locator

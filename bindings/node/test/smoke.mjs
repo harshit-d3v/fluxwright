@@ -642,7 +642,7 @@ try {
   // Locator reading, filtering, combinators, XPath, extended getByRole, and strict mode.
   {
     const lr = await browser.newPage()
-    await lr.setContent(`<!doctype html>
+    await lr.goto('data:text/html,' + encodeURIComponent(`<!doctype html>
       <h2 aria-level="2">Sub Header</h2>
       <ul id="list">
         <li><b>Apple</b> <span>red</span></li>
@@ -658,7 +658,7 @@ try {
       <button id="hid" style="display:none">Secret</button>
       <div role="tab" aria-selected="true">TabA</div>
       <div id="parent"><span id="child">Kid</span></div>
-      <p class="m">First</p><p class="m">Second</p>`)
+      <p class="m">First</p><p class="m">Second</p>`))
     const list = lr.locator('#list li')
     assert.equal(await list.count(), 3)
     const all = await list.all()

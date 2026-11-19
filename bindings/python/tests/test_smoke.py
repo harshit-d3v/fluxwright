@@ -14,7 +14,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import pytest
 
@@ -274,24 +274,27 @@ async def async_smoke(base: str, tmp: Path) -> None:
 
         # Locator reading, filtering, combinators, XPath, extended get_by_role, and strict mode (async).
         lr = await browser.new_page()
-        await lr.set_content(
-            """<!doctype html>
-            <h2 aria-level="2">Sub Header</h2>
-            <ul id="list">
-              <li><b>Apple</b> <span>red</span></li>
-              <li><em>Pear</em> <span>green</span></li>
-              <li style="display:none">HiddenItem</li>
-            </ul>
-            <input id="ro" readonly value="locked" data-kind="ro">
-            <input id="ed" value="ok">
-            <input id="dis" disabled>
-            <input id="chk" type="checkbox" checked>
-            <div id="ce" contenteditable="true">Hi <b>there</b></div>
-            <button id="tog" aria-pressed="true" aria-expanded="false">Toggle</button>
-            <button id="hid" style="display:none">Secret</button>
-            <div role="tab" aria-selected="true">TabA</div>
-            <div id="parent"><span id="child">Kid</span></div>
-            <p class="m">First</p><p class="m">Second</p>"""
+        await lr.goto(
+            "data:text/html,"
+            + quote(
+                """<!doctype html>
+                <h2 aria-level="2">Sub Header</h2>
+                <ul id="list">
+                  <li><b>Apple</b> <span>red</span></li>
+                  <li><em>Pear</em> <span>green</span></li>
+                  <li style="display:none">HiddenItem</li>
+                </ul>
+                <input id="ro" readonly value="locked" data-kind="ro">
+                <input id="ed" value="ok">
+                <input id="dis" disabled>
+                <input id="chk" type="checkbox" checked>
+                <div id="ce" contenteditable="true">Hi <b>there</b></div>
+                <button id="tog" aria-pressed="true" aria-expanded="false">Toggle</button>
+                <button id="hid" style="display:none">Secret</button>
+                <div role="tab" aria-selected="true">TabA</div>
+                <div id="parent"><span id="child">Kid</span></div>
+                <p class="m">First</p><p class="m">Second</p>"""
+            )
         )
         items = lr.locator("#list li")
         assert await items.count() == 3
@@ -946,12 +949,15 @@ def test_sync_api(base, tmp_path):
 
         # Sync locator reading, filtering, combinators, XPath, extended get_by_role, and strict mode.
         lr_sync = browser.new_page()
-        lr_sync.set_content(
-            """<!doctype html>
-            <ul><li>One</li><li>Two</li></ul>
-            <input id="inp" value="v"><input id="dis" disabled>
-            <button aria-pressed="true">Tog</button>
-            <span class="m">A</span><span class="m">B</span>"""
+        lr_sync.goto(
+            "data:text/html,"
+            + quote(
+                """<!doctype html>
+                <ul><li>One</li><li>Two</li></ul>
+                <input id="inp" value="v"><input id="dis" disabled>
+                <button aria-pressed="true">Tog</button>
+                <span class="m">A</span><span class="m">B</span>"""
+            )
         )
         assert lr_sync.locator("li").count() == 2
         assert [x.inner_text() for x in lr_sync.locator("li").all()] == ["One", "Two"]
