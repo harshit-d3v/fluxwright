@@ -1480,3 +1480,210 @@ def test_cdp_session(base):
                 assert page.evaluate("1 + 2") == 3
         finally:
             browser.close()
+
+
+def test_api_request_cookies_indexeddb(base):
+    import json as _py_json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    class ApiHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            qs = parse_qs(u.query)
+            if u.path == "/idb":
+                self._send(200, "text/html", b"<p id='idb'>ok</p>")
+            elif u.path == "/api/echo":
+                payload = _py_json.dumps(
+                    {
+                        "cookie": self.headers.get("Cookie", ""),
+                        "xCtx": self.headers.get("X-Ctx", ""),
+                        "q": qs.get("q", [""])[0],
+                    }
+                ).encode()
+                self._send(200, "application/json", payload)
+            elif u.path == "/api/redir":
+                self.send_response(302)
+                self.send_header("Location", "/api/echo?q=redir")
+                self.end_headers()
+            elif u.path == "/api/fail":
+                self._send(404, "text/plain", b"not found")
+            elif u.path == "/api/data":
+                self._send(200, "application/json", _py_json.dumps({"items": ["real"]}).encode())
+            else:
+                self._send(200, "text/plain", b"ok")
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8", errors="replace")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", "api_tok=py99; Path=/; HttpOnly")
+            self.send_header("Set-Cookie", "vis=yes; Path=/")
+            self.end_headers()
+            self.wfile.write(
+                _py_json.dumps(
+                    {
+                        "ctype": self.headers.get("Content-Type", ""),
+                        "body": raw,
+                        "xCtx": self.headers.get("X-Ctx", ""),
+                    }
+                ).encode()
+            )
+
+        def _send(self, code: int, ctype: str, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    api_base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    async def run_async():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(max_browsers=1)
+            try:
+                async with await browser.new_context(
+                    base_url=api_base, extra_http_headers={"X-Ctx": "py-ctx"}
+                ) as ctx:
+                    await ctx.add_cookies(
+                        [
+                            {"name": "root_c", "value": "1", "domain": "127.0.0.1", "path": "/"},
+                            {"name": "app_c", "value": "2", "domain": "127.0.0.1", "path": "/app"},
+                            {"name": "loc_c", "value": "3", "domain": "localhost", "path": "/"},
+                        ]
+                    )
+                    assert sorted(c["name"] for c in await ctx.cookies(f"{api_base}/app/sub")) == [
+                        "app_c",
+                        "root_c",
+                    ]
+                    assert [c["name"] for c in await ctx.cookies([f"{api_base}/apple"])] == ["root_c"]
+                    await ctx.clear_cookies(name=re.compile(r"^app_"))
+                    await ctx.clear_cookies(domain="localhost")
+                    assert [c["name"] for c in await ctx.cookies()] == ["root_c"]
+                    await ctx.clear_cookies()
+
+                    page = await ctx.new_page()
+                    await page.goto("/idb")
+                    await page.evaluate(
+                        """async () => {
+                            localStorage.setItem('lsPy', 'ok');
+                            await new Promise((resolve, reject) => {
+                                const req = indexedDB.open('pyDb', 1);
+                                req.onupgradeneeded = () => {
+                                    req.result.createObjectStore('store', { keyPath: 'id' });
+                                };
+                                req.onsuccess = () => {
+                                    const db = req.result;
+                                    const tx = db.transaction('store', 'readwrite');
+                                    tx.objectStore('store').put({
+                                        id: 'k1',
+                                        ts: new Date('2026-03-04T05:06:07.000Z'),
+                                        token: 'idb-py',
+                                    });
+                                    tx.oncomplete = () => { db.close(); resolve(); };
+                                    tx.onerror = () => reject(tx.error);
+                                };
+                            });
+                        }"""
+                    )
+                    idb_state = await ctx.storage_state(indexed_db=True)
+                    assert any(
+                        any(d["name"] == "pyDb" for d in (orig.get("indexedDB") or []))
+                        for orig in idb_state["origins"]
+                    )
+
+                    async with await browser.new_context(storage_state=idb_state) as restored_ctx:
+                        rp = await restored_ctx.new_page()
+                        await rp.goto(f"{api_base}/idb")
+                        got = await rp.evaluate(
+                            """() => new Promise((resolve, reject) => {
+                                const req = indexedDB.open('pyDb', 1);
+                                req.onsuccess = () => {
+                                    const db = req.result;
+                                    const tx = db.transaction('store', 'readonly');
+                                    const g = tx.objectStore('store').get('k1');
+                                    tx.oncomplete = () => {
+                                        const r = g.result;
+                                        db.close();
+                                        resolve({
+                                            ls: localStorage.getItem('lsPy'),
+                                            token: r && r.token,
+                                            isDate: r && (r.ts instanceof Date),
+                                        });
+                                    };
+                                    tx.onerror = () => reject(tx.error);
+                                };
+                            })"""
+                        )
+                        assert got == {"ls": "ok", "token": "idb-py", "isDate": True}
+
+                    login = await ctx.request.post("/api/login", data={"hello": 1})
+                    assert login.ok
+                    lj = await login.json()
+                    assert lj["xCtx"] == "py-ctx"
+                    assert "application/json" in lj["ctype"]
+                    assert await page.evaluate("document.cookie") == "vis=yes"
+                    await page.evaluate("document.cookie = 'from_pg=p1; Path=/'")
+
+                    echo = await page.request.get("/api/echo", params={"q": "hi py"})
+                    ej = await echo.json()
+                    assert "api_tok=py99" in ej["cookie"] and "from_pg=p1" in ej["cookie"]
+                    assert ej["q"] == "hi py"
+
+                    mp = await ctx.request.post(
+                        "/api/login",
+                        multipart={"file": {"name": "a.txt", "mimeType": "text/plain", "buffer": b"pybytes"}},
+                    )
+                    mj = await mp.json()
+                    assert mj["ctype"].startswith("multipart/form-data")
+                    assert 'filename="a.txt"' in mj["body"] and "pybytes" in mj["body"]
+
+                    no_redir = await ctx.request.get("/api/redir", max_redirects=0)
+                    assert no_redir.status == 302
+                    with pytest.raises(Error, match="404"):
+                        await ctx.request.get("/api/fail", fail_on_status_code=True)
+
+                    async def patch_route(route):
+                        upstream = await route.fetch()
+                        data = await upstream.json()
+                        data["items"].append("patched")
+                        await route.fulfill(response=upstream, json=data)
+
+                    await page.route("**/api/data", patch_route)
+                    patched = await page.evaluate("(async () => (await fetch('/api/data')).json())()")
+                    assert patched["items"] == ["real", "patched"]
+            finally:
+                await browser.close()
+
+    try:
+        asyncio.run(run_async())
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(max_browsers=1)
+            try:
+                with browser.new_context(base_url=api_base) as ctx:
+                    page = ctx.new_page()
+                    page.goto("/idb")
+                    res = ctx.request.get("/api/echo", params={"q": "sync"})
+                    assert res.ok and res.json()["q"] == "sync"
+
+                    def sync_patch(route):
+                        upstream = route.fetch()
+                        data = upstream.json()
+                        data["items"].append("sync-patched")
+                        route.fulfill(response=upstream, json=data)
+
+                    page.route("**/api/data", sync_patch)
+                    patched = page.evaluate("(async () => (await fetch('/api/data')).json())()")
+                    assert patched["items"] == ["real", "sync-patched"]
+            finally:
+                browser.close()
+    finally:
+        srv.shutdown()

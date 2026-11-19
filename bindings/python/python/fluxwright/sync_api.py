@@ -46,6 +46,8 @@ from ._types import (
 )
 
 __all__ = [
+    "APIRequestContext",
+    "APIResponse",
     "Browser",
     "BrowserContext",
     "BrowserType",
@@ -941,6 +943,109 @@ class Touchscreen:
         _run(self._impl.tap, x, y)
 
 
+class APIResponse:
+    """HTTP response returned by ``APIRequestContext`` and ``route.fetch()``."""
+
+    def __init__(self, impl: _a.APIResponse) -> None:
+        self._impl = impl
+
+    @property
+    def url(self) -> str:
+        return self._impl.url
+
+    @property
+    def status(self) -> int:
+        return self._impl.status
+
+    @property
+    def status_text(self) -> str:
+        return self._impl.status_text
+
+    @property
+    def ok(self) -> bool:
+        return self._impl.ok
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return self._impl.headers
+
+    def headers_array(self) -> list[dict[str, str]]:
+        return self._impl.headers_array()
+
+    def body(self) -> bytes:
+        return _run(self._impl.body)
+
+    def text(self) -> str:
+        return _run(self._impl.text)
+
+    def json(self) -> Any:
+        return _run(self._impl.json)
+
+    def dispose(self) -> None:
+        _run(self._impl.dispose)
+
+
+class APIRequestContext:
+    """HTTP client sharing cookies and defaults with a ``BrowserContext`` or ``Page``."""
+
+    def __init__(self, impl: _a.APIRequestContext) -> None:
+        self._impl = impl
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, Any] | Sequence[tuple[str, Any]] | str | None = None,
+        method: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        data: Any = None,
+        form: Mapping[str, Any] | None = None,
+        multipart: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+        fail_on_status_code: bool = False,
+        max_redirects: int | None = None,
+    ) -> APIResponse:
+        return APIResponse(
+            _run(
+                self._impl.fetch,
+                url,
+                params=params,
+                method=method,
+                headers=headers,
+                data=data,
+                form=form,
+                multipart=multipart,
+                timeout=timeout,
+                fail_on_status_code=fail_on_status_code,
+                max_redirects=max_redirects,
+            )
+        )
+
+    def get(self, url: str, **kwargs: Any) -> APIResponse:
+        return APIResponse(_run(self._impl.get, url, **kwargs))
+
+    def post(self, url: str, **kwargs: Any) -> APIResponse:
+        return APIResponse(_run(self._impl.post, url, **kwargs))
+
+    def put(self, url: str, **kwargs: Any) -> APIResponse:
+        return APIResponse(_run(self._impl.put, url, **kwargs))
+
+    def patch(self, url: str, **kwargs: Any) -> APIResponse:
+        return APIResponse(_run(self._impl.patch, url, **kwargs))
+
+    def delete(self, url: str, **kwargs: Any) -> APIResponse:
+        return APIResponse(_run(self._impl.delete, url, **kwargs))
+
+    def head(self, url: str, **kwargs: Any) -> APIResponse:
+        return APIResponse(_run(self._impl.head, url, **kwargs))
+
+    def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
+        return _run(self._impl.storage_state, path=path)
+
+    def dispose(self) -> None:
+        _run(self._impl.dispose)
+
+
 class Route:
     """How a route handler answers a request, as Playwright's ``Route``. Each request takes one
     answer."""
@@ -952,6 +1057,28 @@ class Route:
     def request(self) -> Request:
         return Request(self._impl.request)
 
+    def fetch(
+        self,
+        *,
+        url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        post_data: Any = None,
+        max_redirects: int | None = None,
+        timeout: float | None = None,
+    ) -> APIResponse:
+        return APIResponse(
+            _run(
+                self._impl.fetch,
+                url=url,
+                method=method,
+                headers=headers,
+                post_data=post_data,
+                max_redirects=max_redirects,
+                timeout=timeout,
+            )
+        )
+
     def fulfill(
         self,
         *,
@@ -961,6 +1088,7 @@ class Route:
         json: Any = None,
         path: str | PathLike[str] | None = None,
         content_type: str | None = None,
+        response: APIResponse | None = None,
     ) -> None:
         """A made-up response. ``json`` is serialized and sets the content type; ``path`` is a
         file to send."""
@@ -972,6 +1100,7 @@ class Route:
             json=json,
             path=path,
             content_type=content_type,
+            response=response._impl if response is not None else None,
         )
 
     def continue_(
@@ -1468,10 +1597,16 @@ class Page(_Finders):
         """Changes CSS ``media`` and/or ``prefers-color-scheme``; ``None`` resets either."""
         _run(self._impl.emulate_media, media=media, color_scheme=color_scheme)
 
-    def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
-        """Every cookie in this page's context plus localStorage of the current origin; with
+    def storage_state(
+        self, *, path: str | PathLike[str] | None = None, indexed_db: bool = False
+    ) -> StorageState:
+        """Every cookie in this page's context plus localStorage (and optionally IndexedDB) of the current origin; with
         ``path``, also saved as JSON for ``new_page(storage_state=path)``."""
-        return _run(self._impl.storage_state, path=path)
+        return _run(self._impl.storage_state, path=path, indexed_db=indexed_db)
+
+    @property
+    def request(self) -> APIRequestContext:
+        return APIRequestContext(self._impl.request)
 
     def console_messages(self) -> list[ConsoleMessage]:
         """What the page, its popups and iframes logged so far (the last 1000)."""
@@ -1844,21 +1979,33 @@ class BrowserContext:
         """``page.expose_function`` for all pages and popups in this context."""
         _bridge_expose(self._impl, "browser_context.expose_function", name, callback)
 
-    def storage_state(self, *, path: str | PathLike[str] | None = None) -> StorageState:
-        """The cookies and localStorage of this context, usable before or after ``new_page()``."""
-        return _run(self._impl.storage_state, path=path)
+    @property
+    def request(self) -> APIRequestContext:
+        return APIRequestContext(self._impl.request)
 
-    def cookies(self) -> list[dict[str, Any]]:
-        """Every cookie in this context."""
-        return _run(self._impl.cookies)
+    def storage_state(
+        self, *, path: str | PathLike[str] | None = None, indexed_db: bool = False
+    ) -> StorageState:
+        """The cookies, localStorage, and optionally IndexedDB of this context, usable before or after ``new_page()``."""
+        return _run(self._impl.storage_state, path=path, indexed_db=indexed_db)
+
+    def cookies(self, urls: str | Sequence[str] | None = None) -> list[dict[str, Any]]:
+        """Cookies in this context (all, or matching ``urls``)."""
+        return _run(self._impl.cookies, urls)
 
     def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
         """Adds cookies to this context."""
         _run(self._impl.add_cookies, cookies)
 
-    def clear_cookies(self) -> None:
-        """Clears every cookie in this context."""
-        _run(self._impl.clear_cookies)
+    def clear_cookies(
+        self,
+        *,
+        name: str | re.Pattern[str] | None = None,
+        domain: str | re.Pattern[str] | None = None,
+        path: str | re.Pattern[str] | None = None,
+    ) -> None:
+        """Clears cookies in this context, optionally filtered by name, domain, and/or path."""
+        _run(self._impl.clear_cookies, name=name, domain=domain, path=path)
 
     def new_cdp_session(self, page: Page | Frame) -> CDPSession:
         """Attaches a raw Chrome DevTools Protocol session to ``page`` or an out-of-process ``Frame``."""

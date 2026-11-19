@@ -15,7 +15,7 @@ napi would silently ignore an option the binding does not implement, so it throw
 - Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and WebP (see `docs/DECISIONS.md`)
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)
 - `newPage` / `newContext` options the README does not list (`recordVideo`, ...), and `launch` options other than the supported ones (`args`; for `proxy`, give `newPage` one)
-- `page.route(url, handler, { times })`, `route.fallback(overrides)`, `route.fulfill({ response })`, `context.cookies(urls)`, `context.clearCookies({ name, domain, path })`, `page.close({ runBeforeUnload })`
+- `page.route(url, handler, { times })`, `route.fallback(overrides)`, `page.close({ runBeforeUnload })`
 
 ## Out of scope
 
