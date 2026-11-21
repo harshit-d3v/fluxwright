@@ -19,6 +19,7 @@ Each ``new_page`` is a fresh browser context on a pooled Chrome. Close pages whe
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json as _json
 import logging
@@ -90,6 +91,8 @@ __all__ = [
     "TimeoutError",
     "Touchscreen",
     "ViewportSize",
+    "WebSocket",
+    "Worker",
     "async_playwright",
     "chromium",
 ]
@@ -783,6 +786,389 @@ class EventInfo(Generic[T]):
         return self._future.done()
 
 
+@asynccontextmanager
+async def _expect_emitter_event(
+    target: Any,
+    label: str,
+    is_closed_fn: Callable[[], bool],
+    expects: set[asyncio.Future[Any]],
+    allowed: tuple[str, ...],
+    event: str,
+    predicate: Callable[[Any], bool] | None,
+    timeout: float | None,
+) -> AsyncIterator[EventInfo[Any]]:
+    if event not in allowed:
+        raise ValueError(f"{label}.expect_event: {event!r} is not supported ({', '.join(allowed)})")
+    if is_closed_fn():
+        raise Error(f"{label}.expect_event: target closed")
+    future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    expects.add(future)
+    pred = predicate if predicate is not None else (lambda _: True)
+
+    def listener(arg: Any) -> None:
+        if future.done():
+            return
+        try:
+            if pred(arg):
+                future.set_result(arg)
+        except Exception as e:
+            future.set_exception(e)
+
+    target.on(event, listener)
+    try:
+        yield EventInfo(future)
+        limit = 30_000 if timeout is None else timeout
+        try:
+            await asyncio.wait_for(asyncio.shield(future), limit / 1000 if limit > 0 else None)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"{label}.expect_event({event!r}): timeout {limit:g}ms exceeded") from None
+    finally:
+        expects.discard(future)
+        target.remove_listener(event, listener)
+
+
+_WS_EVENTS = ("framesent", "framereceived", "socketerror", "close")
+_WORKER_EVENTS = ("close", "console")
+
+
+class WebSocket:
+    """A WebSocket opened by a page, emitted via ``page.on('websocket')``."""
+
+    def __init__(self, page: Page, url: str) -> None:
+        self._page = weakref.ref(page)
+        self._url = url
+        self._closed = False
+        self._listeners: dict[str, list[tuple[Listener, Listener]]] = {}
+        self._expects: set[asyncio.Future[Any]] = set()
+        self._tasks = page._tasks
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def _emit(self, event: str, arg: Any) -> None:
+        _emit(self._listeners, event, arg, self._tasks)
+
+    def _mark_closed(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        _emit(self._listeners, "close", self, self._tasks)
+        for future in list(self._expects):
+            if not future.done():
+                future.set_exception(Error("websocket closed"))
+
+    def on(self, event: str, handler: Listener) -> None:
+        if event not in _WS_EVENTS:
+            raise ValueError(f"web_socket.on: {event!r} is not supported ({', '.join(_WS_EVENTS)})")
+        self._listeners.setdefault(event, []).append((handler, handler))
+
+    def once(self, event: str, handler: Listener) -> None:
+        if event not in _WS_EVENTS:
+            raise ValueError(f"web_socket.once: {event!r} is not supported ({', '.join(_WS_EVENTS)})")
+        listeners = self._listeners
+
+        def call(arg: Any) -> Any:
+            with suppress(ValueError):
+                listeners[event].remove((handler, call))
+            return handler(arg)
+
+        self._listeners.setdefault(event, []).append((handler, call))
+
+    def remove_listener(self, event: str, handler: Listener) -> None:
+        _remove_listener(self._listeners, event, handler)
+
+    off = remove_listener
+
+    @asynccontextmanager
+    async def expect_event(
+        self,
+        event: str,
+        predicate: Callable[[Any], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[EventInfo[Any]]:
+        async with _expect_emitter_event(
+            self,
+            "web_socket",
+            self.is_closed,
+            self._expects,
+            _WS_EVENTS,
+            event,
+            predicate,
+            timeout,
+        ) as info:
+            yield info
+
+    def __repr__(self) -> str:
+        return f"<WebSocket url={self._url!r}>"
+
+
+class Worker:
+    """A dedicated Web Worker running on a page."""
+
+    def __init__(self, page: Page, worker_id: str, url: str) -> None:
+        self._page = weakref.ref(page)
+        self._id = worker_id
+        self._url = url
+        self._closed = False
+        self._listeners: dict[str, list[tuple[Listener, Listener]]] = {}
+        self._expects: set[asyncio.Future[Any]] = set()
+        self._tasks = page._tasks
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    async def evaluate(self, expression: str, arg: Any = None) -> Any:
+        p = self._page()
+        if self._closed or p is None or p.is_closed():
+            raise Error("worker.evaluate: worker is closed")
+        return await p._worker_evaluate(self._id, expression, arg)
+
+    def _emit(self, event: str, arg: Any) -> None:
+        _emit(self._listeners, event, arg, self._tasks)
+
+    def _mark_closed(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        _emit(self._listeners, "close", self, self._tasks)
+        for future in list(self._expects):
+            if not future.done():
+                future.set_exception(Error("worker closed"))
+
+    def on(self, event: str, handler: Listener) -> None:
+        if event not in _WORKER_EVENTS:
+            raise ValueError(f"worker.on: {event!r} is not supported ({', '.join(_WORKER_EVENTS)})")
+        if (p := self._page()) is not None and not p.is_closed():
+            p._ensure_worker_subscription()
+        self._listeners.setdefault(event, []).append((handler, handler))
+
+    def once(self, event: str, handler: Listener) -> None:
+        if event not in _WORKER_EVENTS:
+            raise ValueError(f"worker.once: {event!r} is not supported ({', '.join(_WORKER_EVENTS)})")
+        if (p := self._page()) is not None and not p.is_closed():
+            p._ensure_worker_subscription()
+        listeners = self._listeners
+
+        def call(arg: Any) -> Any:
+            with suppress(ValueError):
+                listeners[event].remove((handler, call))
+            return handler(arg)
+
+        self._listeners.setdefault(event, []).append((handler, call))
+
+    def remove_listener(self, event: str, handler: Listener) -> None:
+        _remove_listener(self._listeners, event, handler)
+
+    off = remove_listener
+
+    @asynccontextmanager
+    async def expect_event(
+        self,
+        event: str,
+        predicate: Callable[[Any], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[EventInfo[Any]]:
+        async with _expect_emitter_event(
+            self,
+            "worker",
+            lambda: self._closed,
+            self._expects,
+            _WORKER_EVENTS,
+            event,
+            predicate,
+            timeout,
+        ) as info:
+            yield info
+
+    def __repr__(self) -> str:
+        return f"<Worker url={self._url!r}>"
+
+
+def _strip_fragment(url: str) -> str:
+    idx = url.find("#")
+    return url if idx == -1 else url[:idx]
+
+
+def _header_list_ci(headers: Sequence[Mapping[str, Any]] | None, name: str) -> str | None:
+    lower = name.lower()
+    for h in headers or ():
+        if str(h.get("name", "")).lower() == lower:
+            v = h.get("value")
+            return str(v) if v is not None else None
+    return None
+
+
+def _create_har_matcher(har_json: Mapping[str, Any]) -> Callable[[Request], dict[str, Any] | None]:
+    raw_entries = (har_json.get("log") or {}).get("entries")
+    entries: list[Any] = raw_entries if isinstance(raw_entries, list) else []
+    served = [False] * len(entries)
+    skip = {"connection", "content-encoding", "content-length", "transfer-encoding"}
+
+    def match(request: Request) -> dict[str, Any] | None:
+        target_url = _strip_fragment(request.url)
+        target_method = request.method.upper()
+        req_headers = request.headers
+        req_post = request.post_data
+        max_score = -1
+        candidates: list[int] = []
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, Mapping):
+                continue
+            ereq = entry.get("request")
+            if not isinstance(ereq, Mapping):
+                continue
+            eurl = ereq.get("url")
+            if not isinstance(eurl, str) or _strip_fragment(eurl) != target_url:
+                continue
+            if str(ereq.get("method") or "GET").upper() != target_method:
+                continue
+            score = 0
+            epost = ereq.get("postData")
+            if req_post is not None and isinstance(epost, Mapping) and epost.get("text") == req_post:
+                score += 100
+            for name in ("content-type", "accept"):
+                hv = _header_list_ci(ereq.get("headers"), name)
+                if hv is not None and req_headers.get(name, "").lower() == hv.lower():
+                    score += 10
+            if score > max_score:
+                max_score = score
+                candidates = [idx]
+            elif score == max_score:
+                candidates.append(idx)
+        if not candidates:
+            return None
+        chosen = next((i for i in candidates if not served[i]), None)
+        if chosen is None:
+            chosen = candidates[-1]
+        else:
+            served[chosen] = True
+        chosen_entry = entries[chosen]
+        eresp = chosen_entry.get("response") if isinstance(chosen_entry, Mapping) else None
+        if not isinstance(eresp, Mapping):
+            eresp = {}
+        headers: dict[str, str] = {}
+        for h in eresp.get("headers") or ():
+            if not isinstance(h, Mapping):
+                continue
+            k = str(h.get("name", "")).lower()
+            if not k or k in skip:
+                continue
+            val = "" if h.get("value") is None else str(h["value"])
+            if k in headers:
+                headers[k] += ("\n" if k == "set-cookie" else ", ") + val
+            else:
+                headers[k] = val
+        body: str | bytes | None = None
+        content = eresp.get("content")
+        if isinstance(content, Mapping) and content.get("text") is not None:
+            text = str(content["text"])
+            if str(content.get("encoding") or "").lower() == "base64":
+                body = base64.b64decode(text)
+            else:
+                body = text
+        raw_status = eresp.get("status")
+        status = int(raw_status) if raw_status else 200
+        return {"status": status, "headers": headers, "body": body}
+
+    return match
+
+
+def _filter_har_file(path: Path, regex: re.Pattern[str]) -> None:
+    har = _json.loads(path.read_text(encoding="utf-8"))
+    log = har.get("log") if isinstance(har, dict) else None
+    if isinstance(log, dict) and isinstance(log.get("entries"), list):
+        log["entries"] = [
+            e
+            for e in log["entries"]
+            if isinstance(e, Mapping)
+            and isinstance((e.get("request") or {}).get("url"), str)
+            and regex.search(e["request"]["url"]) is not None
+        ]
+        _save_storage_json_private(path, har)
+
+
+async def _flush_har_filters(filters: list[tuple[Path, re.Pattern[str]]]) -> None:
+    pending = list(filters)
+    filters.clear()
+    for path, regex in pending:
+        if path.exists():
+            _filter_har_file(path, regex)
+
+
+def _split_har_url_filter(
+    har_path: str | PathLike[str] | None,
+    url_filter: str | re.Pattern[str] | None,
+) -> tuple[str | None, tuple[Path, re.Pattern[str]] | None]:
+    if url_filter is None:
+        return None, None
+    if isinstance(url_filter, str):
+        return url_filter, None
+    if isinstance(url_filter, re.Pattern):
+        pending = (Path(har_path), url_filter) if har_path is not None else None
+        return None, pending
+    raise TypeError("record_har_url_filter must be a str or re.Pattern")
+
+
+async def _apply_route_from_har(
+    target: Any,
+    label: str,
+    start_update_fn: Callable[..., Awaitable[None]],
+    pending_filters: list[tuple[Path, re.Pattern[str]]],
+    har: str | PathLike[str],
+    *,
+    url: URLMatch | None = None,
+    not_found: Literal["abort", "fallback"] | None = None,
+    update: bool | None = None,
+    update_mode: Literal["full", "minimal"] | None = None,
+    update_content: Literal["embed", "omit"] | None = None,
+) -> None:
+    if not isinstance(har, (str, PathLike)) or not str(har):
+        raise TypeError(f"{label}.route_from_har: har must be a non-empty file path")
+    if url is not None and not isinstance(url, (str, re.Pattern)) and not callable(url):
+        raise TypeError(f"{label}.route_from_har: url must be a str, re.Pattern, or callable")
+    if not_found not in (None, "abort", "fallback"):
+        raise ValueError(f"{label}.route_from_har: not_found must be 'abort' or 'fallback', not {not_found!r}")
+    if update_mode not in (None, "full", "minimal"):
+        raise ValueError(f"{label}.route_from_har: update_mode must be 'full' or 'minimal', not {update_mode!r}")
+    if update_content not in (None, "embed", "omit"):
+        raise ValueError(f"{label}.route_from_har: update_content must be 'embed' or 'omit', not {update_content!r}")
+    har_path = Path(har)
+    if update:
+        if callable(url):
+            raise TypeError(f"{label}.route_from_har: url cannot be a callable when update=True")
+        await start_update_fn(
+            har_path,
+            content=update_content or "embed",
+            mode=update_mode or "minimal",
+            url_filter=url if isinstance(url, str) else None,
+        )
+        if isinstance(url, re.Pattern):
+            pending_filters.append((har_path, url))
+        return
+    har_json = _json.loads(har_path.read_text(encoding="utf-8"))
+    match = _create_har_matcher(har_json)
+    fallback = not_found == "fallback"
+
+    async def handler(route: Route, request: Request) -> None:
+        hit = match(request)
+        if hit is not None:
+            await route.fulfill(status=hit["status"], headers=hit["headers"], body=hit["body"])
+            return
+        if fallback:
+            await route.fallback()
+        else:
+            await route.abort("failed")
+
+    await target.route("**/*" if url is None else url, handler)
+
+
 Listener = Callable[[Any], Any]
 _UNSET: Any = object()
 _pages_by_target: weakref.WeakValueDictionary[str, Page] = weakref.WeakValueDictionary()
@@ -956,6 +1342,11 @@ class Page(_native.Page):
         self._answering_dialogs = False
         self._serving_file_choosers = False
         self._serving_popups = False
+        self._serving_websockets = False
+        self._websockets_live: dict[str, WebSocket] = {}
+        self._serving_workers = False
+        self._worker_map: dict[str, Worker] = {}
+        self._pending_har_filters: list[tuple[Path, re.Pattern[str]]] = []
         self._bindings: dict[str, Callable[..., Any]] = {}
         self._serving_bindings = False
         self._tasks: set[asyncio.Future[Any]] = set()
@@ -1057,6 +1448,32 @@ class Page(_native.Page):
     async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         """Removes the handlers added for ``url`` (only ``handler``, when given)."""
         self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
+
+    async def route_from_har(
+        self,
+        har: str | PathLike[str],
+        *,
+        url: URLMatch | None = None,
+        not_found: Literal["abort", "fallback"] | None = None,
+        update: bool | None = None,
+        update_mode: Literal["full", "minimal"] | None = None,
+        update_content: Literal["embed", "omit"] | None = None,
+    ) -> None:
+        """Serves matching requests from a HAR 1.2 file, or records into ``har`` when ``update=True``."""
+        if self.is_closed():
+            raise Error("page.route_from_har: page closed")
+        await _apply_route_from_har(
+            self,
+            "page",
+            self._start_har_recording,
+            self._pending_har_filters,
+            har,
+            url=url,
+            not_found=not_found,
+            update=update,
+            update_mode=update_mode,
+            update_content=update_content,
+        )
 
     async def add_init_script(
         self, script: str | None = None, *, path: str | PathLike[str] | None = None
@@ -1259,11 +1676,80 @@ class Page(_native.Page):
         async with self._expect("request", url_or_predicate, timeout) as info:
             yield info
 
+    @asynccontextmanager
+    async def expect_websocket(
+        self,
+        predicate: Callable[[WebSocket], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[EventInfo[WebSocket]]:
+        """Waits for a WebSocket opened by the code in the ``async with`` block."""
+        async with self._expect(
+            "websocket",
+            predicate if predicate is not None else (lambda _: True),
+            timeout,
+            label="websocket",
+        ) as info:
+            yield info
+
+    @asynccontextmanager
+    async def expect_worker(
+        self,
+        predicate: Callable[[Worker], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[EventInfo[Worker]]:
+        """Waits for a dedicated Web Worker created by the code in the ``async with`` block."""
+        async with self._expect(
+            "worker",
+            predicate if predicate is not None else (lambda _: True),
+            timeout,
+            label="worker",
+        ) as info:
+            yield info
+
+    @asynccontextmanager
+    async def expect_event(
+        self,
+        event: str,
+        predicate: Callable[[Any], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AsyncIterator[EventInfo[Any]]:
+        """Waits for ``event`` to fire on this page."""
+        async with self._expect(
+            event,
+            predicate if predicate is not None else (lambda _: True),
+            timeout,
+            label="event",
+        ) as info:
+            yield info
+
+    @property
+    def workers(self) -> list[Worker]:
+        """Dedicated Web Workers currently active on this page."""
+        if not self.is_closed():
+            self._ensure_worker_subscription()
+        out: list[Worker] = []
+        for info in self._workers():
+            w = self._worker_map.get(info.id)
+            if w is None:
+                w = Worker(self, info.id, info.url)
+                self._worker_map[info.id] = w
+            out.append(w)
+        return out
+
     async def close(self) -> None:
         """Closes the page and rejects any pending ``expect_*`` waiters."""
         for future in list(self._expects):
             if not future.done():
                 future.set_exception(Error("page closed"))
+        for ws in list(self._websockets_live.values()):
+            ws._mark_closed()
+        self._websockets_live.clear()
+        for w in list(self._worker_map.values()):
+            w._mark_closed()
+        self._worker_map.clear()
         _pages_by_target.pop(self._target_id(), None)
         ctx = self._context_ref() if self._context_ref is not None else None
         if ctx is not None:
@@ -1272,6 +1758,7 @@ class Page(_native.Page):
         self._listeners.clear()
         self._bindings.clear()
         await super().close()
+        await _flush_har_filters(self._pending_har_filters)
 
     async def emulate_media(
         self,
@@ -1331,6 +1818,15 @@ class Page(_native.Page):
             _keep(self._tasks, asyncio.ensure_future(_serve_popups(self._popups(), weakref.ref(self), self._tasks)))
             self._serving_popups = True
 
+    def _ensure_worker_subscription(self) -> None:
+        if self._serving_workers:
+            return
+        self._serving_workers = True
+        for info in self._workers():
+            if info.id not in self._worker_map:
+                self._worker_map[info.id] = Worker(self, info.id, info.url)
+        _keep(self._tasks, asyncio.ensure_future(_serve_workers(self._worker_events(), weakref.ref(self), self._tasks)))
+
     def _add_listener(self, method: str, event: str, added: Listener, call: Listener) -> None:
         if event not in _EVENTS:
             raise ValueError(f"page.{method}: {event!r} is not supported ({', '.join(_EVENTS)})")
@@ -1349,6 +1845,14 @@ class Page(_native.Page):
             self._serving_file_choosers = True
         elif event == "popup":
             self._ensure_popup_subscription()
+        elif event == "websocket" and not self._serving_websockets:
+            _keep(
+                self._tasks,
+                asyncio.ensure_future(_serve_websockets(self._websockets(), weakref.ref(self), self._tasks)),
+            )
+            self._serving_websockets = True
+        elif event == "worker":
+            self._ensure_worker_subscription()
         elif event in _NETWORK_EVENTS and (self._network_task is None or self._network_task.done()):
             self._network_task = asyncio.ensure_future(_serve_network(self._network(), weakref.ref(self), self._tasks))
             _keep(self._tasks, self._network_task)
@@ -1356,7 +1860,7 @@ class Page(_native.Page):
 
 
 _NETWORK_EVENTS = ("request", "response", "requestfinished", "requestfailed")
-_EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog", "filechooser", "popup")
+_EVENTS = ("console", "pageerror", *_NETWORK_EVENTS, "dialog", "filechooser", "popup", "websocket", "worker")
 
 
 # The loops below run until the page closes (the network one also once nobody listens). They reach
@@ -1542,6 +2046,54 @@ async def _serve_popups(stream: _native.PopupStream, page: PageRef, tasks: set[a
             _emit(opener._listeners, "popup", popup, tasks)
 
 
+async def _serve_websockets(
+    stream: _native.WebSocketStream, page: PageRef, tasks: set[asyncio.Future[Any]]
+) -> None:
+    while (ev := await stream.next()) is not None:
+        p = page()
+        if p is None:
+            return
+        if ev.event == "created":
+            ws = WebSocket(p, ev.url or "")
+            p._websockets_live[ev.request_id] = ws
+            _emit(p._listeners, "websocket", ws, tasks)
+        else:
+            ws = p._websockets_live.get(ev.request_id)
+            if ws is None:
+                continue
+            if ev.event in ("framesent", "framereceived"):
+                payload = ev.payload_bytes if ev.payload_bytes is not None else (ev.payload_text or "")
+                ws._emit(ev.event, payload)
+            elif ev.event == "socketerror":
+                ws._emit("socketerror", ev.error_message or "")
+            elif ev.event == "close":
+                p._websockets_live.pop(ev.request_id, None)
+                ws._mark_closed()
+
+
+async def _serve_workers(
+    stream: _native.WorkerStream, page: PageRef, tasks: set[asyncio.Future[Any]]
+) -> None:
+    while (ev := await stream.next()) is not None:
+        p = page()
+        if p is None:
+            return
+        if ev.event == "created":
+            w = p._worker_map.get(ev.id)
+            if w is None:
+                w = Worker(p, ev.id, ev.url or "")
+                p._worker_map[ev.id] = w
+            _emit(p._listeners, "worker", w, tasks)
+        elif ev.event == "console":
+            w = p._worker_map.get(ev.id)
+            if w is not None and ev.message is not None:
+                w._emit("console", ev.message)
+        elif ev.event == "close":
+            w = p._worker_map.pop(ev.id, None)
+            if w is not None:
+                w._mark_closed()
+
+
 async def _serve_bindings(
     stream: _native.BindingStream,
     owner: Callable[[], Any],
@@ -1679,12 +2231,18 @@ class Browser:
         http_credentials: HttpCredentials | None = None,
         bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
+        record_har_path: str | PathLike[str] | None = None,
+        record_har_omit_content: bool | None = None,
+        record_har_content: Literal["embed", "omit"] | None = None,
+        record_har_mode: Literal["full", "minimal"] | None = None,
+        record_har_url_filter: str | re.Pattern[str] | None = None,
     ) -> Page:
         """A page in a fresh browser context; every option applies to this page only, with
         Playwright's names. ``locale`` is BCP 47 (``de-DE``), ``timezone_id`` IANA
         (``Asia/Tokyo``), ``color_scheme`` ``light``, ``dark`` or ``no-preference``;
         ``geolocation`` also needs ``permissions=["geolocation"]``; ``storage_state`` is what
         ``page.storage_state()`` returned, or the JSON file it saved."""
+        native_url_filter, pending_filter = _split_har_url_filter(record_har_path, record_har_url_filter)
         lease = await self._engine.new_page(
             proxy=proxy,
             user_agent=user_agent,
@@ -1705,8 +2263,16 @@ class Browser:
             http_credentials=http_credentials,
             bypass_csp=bypass_csp,
             storage_state=storage_state,
+            record_har_path=record_har_path,
+            record_har_omit_content=record_har_omit_content,
+            record_har_content=record_har_content,
+            record_har_mode=record_har_mode,
+            record_har_url_filter=native_url_filter,
         )
-        return Page(lease)
+        page = Page(lease)
+        if pending_filter is not None:
+            page._pending_har_filters.append(pending_filter)
+        return page
 
     async def new_context(
         self,
@@ -1730,9 +2296,15 @@ class Browser:
         http_credentials: HttpCredentials | None = None,
         bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
+        record_har_path: str | PathLike[str] | None = None,
+        record_har_omit_content: bool | None = None,
+        record_har_content: Literal["embed", "omit"] | None = None,
+        record_har_mode: Literal["full", "minimal"] | None = None,
+        record_har_url_filter: str | re.Pattern[str] | None = None,
     ) -> BrowserContext:
         """A browser context with ``new_page``'s options, as Playwright's ``new_context``; see ``BrowserContext``."""
-        ctx = await self._engine.new_context(
+        native_url_filter, pending_filter = _split_har_url_filter(record_har_path, record_har_url_filter)
+        native_ctx = await self._engine.new_context(
             proxy=proxy,
             user_agent=user_agent,
             locale=locale,
@@ -1752,8 +2324,16 @@ class Browser:
             http_credentials=http_credentials,
             bypass_csp=bypass_csp,
             storage_state=storage_state,
+            record_har_path=record_har_path,
+            record_har_omit_content=record_har_omit_content,
+            record_har_content=record_har_content,
+            record_har_mode=record_har_mode,
+            record_har_url_filter=native_url_filter,
         )
-        return BrowserContext(self, ctx)
+        ctx = BrowserContext(self, native_ctx)
+        if pending_filter is not None:
+            ctx._pending_har_filters.append(pending_filter)
+        return ctx
 
     async def close(self) -> None:
         """Shuts the engine down, and with it every page and Chrome process it started."""
@@ -1784,6 +2364,7 @@ class BrowserContext:
         self._bindings: dict[str, Callable[..., Any]] = {}
         self._serving_bindings = False
         self._tasks: set[asyncio.Future[Any]] = set()
+        self._pending_har_filters: list[tuple[Path, re.Pattern[str]]] = []
         self._request: APIRequestContext | None = None
 
     @property
@@ -1850,6 +2431,32 @@ class BrowserContext:
 
     async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
+
+    async def route_from_har(
+        self,
+        har: str | PathLike[str],
+        *,
+        url: URLMatch | None = None,
+        not_found: Literal["abort", "fallback"] | None = None,
+        update: bool | None = None,
+        update_mode: Literal["full", "minimal"] | None = None,
+        update_content: Literal["embed", "omit"] | None = None,
+    ) -> None:
+        """Serves matching requests on this context from a HAR 1.2 file, or records when ``update=True``."""
+        if self._closed:
+            raise Error("browser_context.route_from_har: the context is closed")
+        await _apply_route_from_har(
+            self,
+            "browser_context",
+            self._ctx._start_har_recording,
+            self._pending_har_filters,
+            har,
+            url=url,
+            not_found=not_found,
+            update=update,
+            update_mode=update_mode,
+            update_content=update_content,
+        )
 
     async def add_init_script(
         self, script: str | None = None, *, path: str | PathLike[str] | None = None
@@ -1976,6 +2583,7 @@ class BrowserContext:
         self._pages.clear()
         with suppress(Error):
             await self._ctx.close()
+        await _flush_har_filters(self._pending_har_filters)
 
     async def __aenter__(self) -> BrowserContext:
         return self

@@ -9,8 +9,11 @@ mod source;
 
 pub use fluxwright_cdp::{
     filter_cookies, ApiRequestOptions, ApiResponse, CdpSession, CdpSessionEvent, CookieFilter,
-    IndexedDbDatabase, IndexedDbIndex, IndexedDbRecord, IndexedDbStore, RouteFetchHandle,
-    RouteFetchOptions,
+    Har, HarBrowser, HarContent, HarContentPolicy, HarCreator, HarEntry, HarHeader, HarLog,
+    HarMode, HarNotFound, HarPostData, HarQueryParam, HarRecorder, HarRequest, HarResponse,
+    HarRouteOptions, HarRouter, HarTimings, IndexedDbDatabase, IndexedDbIndex, IndexedDbRecord,
+    IndexedDbStore, RecordHarOptions, RouteFetchHandle, RouteFetchOptions, WebSocketEvent, Worker,
+    WorkerEvent,
 };
 pub use config::{EngineConfig, JobOptions, Priority, QueueFullMode};
 pub use error::{Error, Result};

@@ -22,4 +22,3 @@ napi would silently ignore an option the binding does not implement, so it throw
 - Firefox and WebKit
 - Playwright Test: the runner, fixtures and `expect`
 - Tracing, the trace viewer, codegen and video recording
-- WebSocket and worker APIs

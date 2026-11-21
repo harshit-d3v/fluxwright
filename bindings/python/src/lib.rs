@@ -1079,6 +1079,41 @@ fn queue_wait(ms: Option<f64>) -> Duration {
     }
 }
 
+fn build_record_har_options(
+    path: PathBuf,
+    omit_content: Option<bool>,
+    content: Option<String>,
+    mode: Option<String>,
+    url_filter: Option<String>,
+) -> PyResult<fluxwright::RecordHarOptions> {
+    let content = match content.as_deref() {
+        None => None,
+        Some("embed") => Some(fluxwright::HarContentPolicy::Embed),
+        Some("omit") => Some(fluxwright::HarContentPolicy::Omit),
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "record_har_content must be 'embed' or 'omit', not {other:?}"
+            )))
+        }
+    };
+    let mode = match mode.as_deref() {
+        None | Some("full") => fluxwright::HarMode::Full,
+        Some("minimal") => fluxwright::HarMode::Minimal,
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "record_har_mode must be 'full' or 'minimal', not {other:?}"
+            )))
+        }
+    };
+    Ok(fluxwright::RecordHarOptions {
+        path,
+        omit_content: omit_content.unwrap_or(false),
+        content,
+        mode,
+        url_filter,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_job_options<'py>(
     proxy: Option<Bound<'py, PyAny>>,
@@ -1100,6 +1135,11 @@ fn parse_job_options<'py>(
     http_credentials: Option<Bound<'py, PyAny>>,
     bypass_csp: Option<bool>,
     storage_state: Option<Bound<'py, PyAny>>,
+    record_har_path: Option<PathBuf>,
+    record_har_omit_content: Option<bool>,
+    record_har_content: Option<String>,
+    record_har_mode: Option<String>,
+    record_har_url_filter: Option<String>,
 ) -> PyResult<fluxwright::JobOptions> {
     let color_scheme = match color_scheme {
         None => None,
@@ -1117,6 +1157,16 @@ fn parse_job_options<'py>(
     let http_credentials: Option<Credentials> = http_credentials
         .map(|c| options(&c, "http_credentials"))
         .transpose()?;
+    let record_har = match record_har_path {
+        Some(path) => Some(build_record_har_options(
+            path,
+            record_har_omit_content,
+            record_har_content,
+            record_har_mode,
+            record_har_url_filter,
+        )?),
+        None => None,
+    };
     Ok(fluxwright::JobOptions {
         proxy: proxy.map(|p| fluxwright::Proxy {
             server: p.server,
@@ -1148,6 +1198,7 @@ fn parse_job_options<'py>(
         storage_state: storage_state.map(|s| storage(&s)).transpose()?,
         base_url,
         http_credentials: http_credentials.map(|c| (c.username, c.password)),
+        record_har,
         ..Default::default()
     })
 }
@@ -1228,7 +1279,9 @@ impl Engine {
                         permissions=None, viewport=None, device_scale_factor=None, color_scheme=None,
                         is_mobile=None, has_touch=None, extra_http_headers=None, ignore_https_errors=None,
                         java_script_enabled=None, offline=None, base_url=None, http_credentials=None,
-                        bypass_csp=None, storage_state=None))]
+                        bypass_csp=None, storage_state=None,
+                        record_har_path=None, record_har_omit_content=None, record_har_content=None,
+                        record_har_mode=None, record_har_url_filter=None))]
     fn new_page<'py>(
         &self,
         py: Python<'py>,
@@ -1251,6 +1304,11 @@ impl Engine {
         http_credentials: Option<Bound<'py, PyAny>>,
         bypass_csp: Option<bool>,
         storage_state: Option<Bound<'py, PyAny>>,
+        record_har_path: Option<PathBuf>,
+        record_har_omit_content: Option<bool>,
+        record_har_content: Option<String>,
+        record_har_mode: Option<String>,
+        record_har_url_filter: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = parse_job_options(
             proxy,
@@ -1272,6 +1330,11 @@ impl Engine {
             http_credentials,
             bypass_csp,
             storage_state,
+            record_har_path,
+            record_har_omit_content,
+            record_har_content,
+            record_har_mode,
+            record_har_url_filter,
         )?;
         let engine = self.inner.clone();
         future_into_py(py, async move {
@@ -1285,7 +1348,9 @@ impl Engine {
                         permissions=None, viewport=None, device_scale_factor=None, color_scheme=None,
                         is_mobile=None, has_touch=None, extra_http_headers=None, ignore_https_errors=None,
                         java_script_enabled=None, offline=None, base_url=None, http_credentials=None,
-                        bypass_csp=None, storage_state=None))]
+                        bypass_csp=None, storage_state=None,
+                        record_har_path=None, record_har_omit_content=None, record_har_content=None,
+                        record_har_mode=None, record_har_url_filter=None))]
     fn new_context<'py>(
         &self,
         py: Python<'py>,
@@ -1308,6 +1373,11 @@ impl Engine {
         http_credentials: Option<Bound<'py, PyAny>>,
         bypass_csp: Option<bool>,
         storage_state: Option<Bound<'py, PyAny>>,
+        record_har_path: Option<PathBuf>,
+        record_har_omit_content: Option<bool>,
+        record_har_content: Option<String>,
+        record_har_mode: Option<String>,
+        record_har_url_filter: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = parse_job_options(
             proxy,
@@ -1329,6 +1399,11 @@ impl Engine {
             http_credentials,
             bypass_csp,
             storage_state,
+            record_har_path,
+            record_har_omit_content,
+            record_har_content,
+            record_har_mode,
+            record_har_url_filter,
         )?;
         let engine = self.inner.clone();
         future_into_py(py, async move {
@@ -1481,6 +1556,23 @@ impl Context {
             let cookies = ctx.cookies().await.map_err(error)?;
             let json = serde_json::json!({ "cookies": cookies, "origins": [] });
             save_storage_json(json, path).await
+        })
+    }
+
+    #[pyo3(name = "_start_har_recording", signature = (path, *, omit_content=None, content=None, mode=None, url_filter=None))]
+    fn start_har_recording<'py>(
+        &self,
+        py: Python<'py>,
+        path: PathBuf,
+        omit_content: Option<bool>,
+        content: Option<String>,
+        mode: Option<String>,
+        url_filter: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = build_record_har_options(path, omit_content, content, mode, url_filter)?;
+        let ctx = self.inner.clone();
+        future_into_py(py, async move {
+            ctx.start_har_recording(opts).await.map(none).map_err(error)
         })
     }
 
@@ -2883,6 +2975,71 @@ impl Page {
                     default_timeout,
                 })
             })
+        })
+    }
+
+    #[pyo3(name = "_websockets")]
+    fn websockets(&self) -> PyResult<WebSocketStream> {
+        self.now(|p| WebSocketStream(Arc::new(Mutex::new(p.subscribe_websockets()))))
+    }
+
+    #[pyo3(name = "_workers")]
+    fn workers(&self) -> Vec<WorkerInfo> {
+        if *self.lease.closing.borrow() {
+            return Vec::new();
+        }
+        let Ok(page) = self.lease.page.try_read() else {
+            return Vec::new();
+        };
+        let Some(p) = page.as_ref().filter(|p| !p.is_closed()) else {
+            return Vec::new();
+        };
+        p.workers()
+            .into_iter()
+            .map(|w| WorkerInfo {
+                id: w.target_id().to_owned(),
+                url: w.url().to_owned(),
+            })
+            .collect()
+    }
+
+    #[pyo3(name = "_worker_evaluate", signature = (worker_id, expression, arg=None))]
+    fn worker_evaluate<'py>(
+        &self,
+        py: Python<'py>,
+        worker_id: String,
+        expression: String,
+        arg: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let script = eval_script(&expression, arg)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move {
+                let w = p
+                    .worker(&worker_id)
+                    .ok_or_else(|| fluxwright::Error::Other("worker is closed".into()))?;
+                Ok(Json(w.evaluate(&script, p.navigation_timeout()).await?))
+            })
+        })
+    }
+
+    #[pyo3(name = "_worker_events")]
+    fn worker_events(&self) -> PyResult<WorkerStream> {
+        self.now(|p| WorkerStream(Arc::new(Mutex::new(p.subscribe_workers()))))
+    }
+
+    #[pyo3(name = "_start_har_recording", signature = (path, *, omit_content=None, content=None, mode=None, url_filter=None))]
+    fn start_har_recording<'py>(
+        &self,
+        py: Python<'py>,
+        path: PathBuf,
+        omit_content: Option<bool>,
+        content: Option<String>,
+        mode: Option<String>,
+        url_filter: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = build_record_har_options(path, omit_content, content, mode, url_filter)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.start_har_recording(opts).await.map(none) })
         })
     }
 }
@@ -4379,6 +4536,169 @@ impl CdpSession {
     }
 }
 
+#[pyclass(frozen, module = "fluxwright._native")]
+struct WebSocketEvent {
+    #[pyo3(get)]
+    event: String,
+    #[pyo3(get)]
+    request_id: String,
+    #[pyo3(get)]
+    url: Option<String>,
+    #[pyo3(get)]
+    payload_text: Option<String>,
+    payload_bytes: Option<Vec<u8>>,
+    #[pyo3(get)]
+    error_message: Option<String>,
+}
+
+#[pymethods]
+impl WebSocketEvent {
+    #[getter]
+    fn payload_bytes<'py>(&self, py: Python<'py>) -> Option<Py<PyBytes>> {
+        self.payload_bytes
+            .as_deref()
+            .map(|b| PyBytes::new(py, b).unbind())
+    }
+}
+
+impl From<fluxwright::WebSocketEvent> for WebSocketEvent {
+    fn from(ev: fluxwright::WebSocketEvent) -> Self {
+        match ev {
+            fluxwright::WebSocketEvent::Created { request_id, url } => WebSocketEvent {
+                event: "created".into(),
+                request_id,
+                url: Some(url),
+                payload_text: None,
+                payload_bytes: None,
+                error_message: None,
+            },
+            fluxwright::WebSocketEvent::FrameSent {
+                request_id,
+                payload,
+                is_text,
+                ..
+            } => WebSocketEvent {
+                event: "framesent".into(),
+                request_id,
+                url: None,
+                payload_text: is_text.then(|| String::from_utf8_lossy(&payload).into_owned()),
+                payload_bytes: (!is_text).then_some(payload),
+                error_message: None,
+            },
+            fluxwright::WebSocketEvent::FrameReceived {
+                request_id,
+                payload,
+                is_text,
+                ..
+            } => WebSocketEvent {
+                event: "framereceived".into(),
+                request_id,
+                url: None,
+                payload_text: is_text.then(|| String::from_utf8_lossy(&payload).into_owned()),
+                payload_bytes: (!is_text).then_some(payload),
+                error_message: None,
+            },
+            fluxwright::WebSocketEvent::Error {
+                request_id,
+                error_message,
+            } => WebSocketEvent {
+                event: "socketerror".into(),
+                request_id,
+                url: None,
+                payload_text: None,
+                payload_bytes: None,
+                error_message: Some(error_message),
+            },
+            fluxwright::WebSocketEvent::Closed { request_id } => WebSocketEvent {
+                event: "close".into(),
+                request_id,
+                url: None,
+                payload_text: None,
+                payload_bytes: None,
+                error_message: None,
+            },
+        }
+    }
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct WebSocketStream(Arc<Mutex<UnboundedReceiver<fluxwright::WebSocketEvent>>>);
+
+#[pymethods]
+impl WebSocketStream {
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx.lock().await.recv().await.map(WebSocketEvent::from))
+        })
+    }
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct WorkerInfo {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    url: String,
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct WorkerEvent {
+    #[pyo3(get)]
+    event: String,
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    url: Option<String>,
+    message: Option<fluxwright::ConsoleMessage>,
+}
+
+#[pymethods]
+impl WorkerEvent {
+    #[getter]
+    fn message(&self) -> Option<ConsoleMessage> {
+        self.message.clone().map(ConsoleMessage::from)
+    }
+}
+
+impl From<fluxwright::WorkerEvent> for WorkerEvent {
+    fn from(ev: fluxwright::WorkerEvent) -> Self {
+        match ev {
+            fluxwright::WorkerEvent::Created(w) => WorkerEvent {
+                event: "created".into(),
+                id: w.target_id().to_owned(),
+                url: Some(w.url().to_owned()),
+                message: None,
+            },
+            fluxwright::WorkerEvent::Closed { target_id, url } => WorkerEvent {
+                event: "close".into(),
+                id: target_id,
+                url: Some(url),
+                message: None,
+            },
+            fluxwright::WorkerEvent::Console { target_id, message } => WorkerEvent {
+                event: "console".into(),
+                id: target_id,
+                url: None,
+                message: Some(message),
+            },
+        }
+    }
+}
+
+#[pyclass(frozen, module = "fluxwright._native")]
+struct WorkerStream(Arc<Mutex<UnboundedReceiver<fluxwright::WorkerEvent>>>);
+
+#[pymethods]
+impl WorkerStream {
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.0.clone();
+        future_into_py(py, async move {
+            Ok(rx.lock().await.recv().await.map(WorkerEvent::from))
+        })
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ApiResponse>()?;
@@ -4408,6 +4728,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BindingCall>()?;
     m.add_class::<BindingStream>()?;
     m.add_class::<PopupStream>()?;
+    m.add_class::<WebSocketEvent>()?;
+    m.add_class::<WebSocketStream>()?;
+    m.add_class::<WorkerInfo>()?;
+    m.add_class::<WorkerEvent>()?;
+    m.add_class::<WorkerStream>()?;
     m.py().import("atexit")?.call_method1("register", (wrap_pyfunction!(wait_for_hand_overs, m)?,))?;
     Ok(())
 }
