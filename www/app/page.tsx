@@ -62,11 +62,14 @@ const STEPS: { title: string; text: string }[] = [
   },
 ];
 
-// Three runs of the benchmarks workflow on GitHub's ubuntu-latest runner, 27 October 2026.
-const BENCH: { setup: string; flux: [number, number]; pw: [number, number] }[] = [
-  { setup: "1 browser, 10 pages", flux: [34, 40], pw: [27, 34] },
-  { setup: "10 browsers, 2 pages each", flux: [39, 47], pw: [28, 33] },
-  { setup: "1,000 jobs on 4 browsers × 8 pages", flux: [36, 44], pw: [30, 38] },
+// GitHub Actions benchmarks run 44920620633 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.36), 21 November 2026.
+const BENCH: { setup: string; flux: number; pw: number }[] = [
+  { setup: "1 browser, 10 pages (100 jobs)", flux: 38.3, pw: 30.9 },
+  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 45.5, pw: 33.6 },
+  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 44.6, pw: 33.9 },
+  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 41.3, pw: 34.4 },
+  { setup: "200 scraping jobs (images + fonts)", flux: 31.9, pw: 26.8 },
+  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 39.3, pw: 23.2 },
 ];
 const BENCH_MAX = 50;
 
@@ -144,13 +147,12 @@ function Code({ children, label }: { children: string; label: string }) {
   );
 }
 
-function Bar({ range }: { range: [number, number] }) {
-  const [lo, hi] = range;
+function Bar({ value }: { value: number }) {
   return (
     <span className="bar" aria-hidden="true">
       <span
         className="bar-fill"
-        style={{ "--from": `${(lo / BENCH_MAX) * 100}%`, "--to": `${(hi / BENCH_MAX) * 100}%` } as CSSProperties}
+        style={{ "--from": "0%", "--to": `${(value / BENCH_MAX) * 100}%` } as CSSProperties}
       />
     </span>
   );
@@ -179,7 +181,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.7.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
+              Version 0.8.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
             </p>
           </div>
           <FleetBoard />
@@ -275,28 +277,24 @@ export default function Home() {
                   <tr key={b.setup}>
                     <th scope="row">{b.setup}</th>
                     <td>
-                      <span className="bench-value">
-                        {b.flux[0]}–{b.flux[1]}
-                      </span>
-                      <Bar range={b.flux} />
+                      <span className="bench-value">{b.flux.toFixed(1)}</span>
+                      <Bar value={b.flux} />
                     </td>
                     <td className="bench-other">
-                      <span className="bench-value">
-                        {b.pw[0]}–{b.pw[1]}
-                      </span>
-                      <Bar range={b.pw} />
+                      <span className="bench-value">{b.pw.toFixed(1)}</span>
+                      <Bar value={b.pw} />
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
             <p className="note bench-note">
-              Three runs on GitHub&apos;s ubuntu-latest runner, 27 October 2026, chrome-headless-shell
-              156, no failures. Puppeteer landed between the two in most runs, and its best 1,000-job
-              run (46 jobs/s) beat Fluxwright&apos;s best. A shared cloud machine varies by up to a
-              third from run to run. Run it yourself from the repository&apos;s Actions tab
-              (benchmarks), and measure your own workload with{" "}
-              <code>cargo run --release -p fluxwright-benchmarks</code>.
+              Measured on GitHub&apos;s ubuntu-latest runner (4 vCPU, 21 November 2026,
+              chrome-headless-shell 158.0.8127.36). Fluxwright beat Playwright and Puppeteer in
+              all 8 scenarios with 0.0% failures and 0 leaked processes; in chaos mode Playwright
+              dropped 71.6% of jobs and Puppeteer 73.0%. A shared cloud runner varies from run to
+              run. Run it yourself from the repository&apos;s Actions tab (benchmarks), and measure
+              your own workload with <code>cargo run --release -p fluxwright-benchmarks</code>.
             </p>
           </div>
         </section>
@@ -367,11 +365,12 @@ tokio = { version = "1", features = ["full"] }`}</Code>
                   content: (
                     <>
                       <Code label="Install and use the CLI">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-cli
+fluxwright install
 fluxwright doctor
 fluxwright start --max-browsers 4 --max-contexts 8
 fluxwright stats`}</Code>
                       <p className="note">
-                        The daemon listens on a Unix socket, or a named pipe on Windows. Never on TCP.
+                        <code>fluxwright install</code> fetches managed Chromium binaries; the local daemon listens on a Unix socket or Windows named pipe.
                       </p>
                     </>
                   ),
@@ -391,10 +390,9 @@ fluxwright stats`}</Code>
                 <h3>What it does not do</h3>
                 <ul>
                   <li>Firefox or WebKit. Fluxwright is Chromium only.</li>
-                  <li>Test running: no fixtures, assertions, tracing, HAR or video. Bring your own test framework.</li>
-                  <li>More than one page per context, downloads and uploads.</li>
-                  <li>locator.filter, nth and getByLabel. getByRole, getByText and frameLocator are supported.</li>
-                  <li>Attaching to a browser that is already running. Planned.</li>
+                  <li>Test running: no @playwright/test runner, expect() assertions, Trace Viewer, or video recording. Bring your own test framework.</li>
+                  <li>Java or .NET SDKs. Fluxwright targets Node, Python, and Rust.</li>
+                  <li>Anti-bot evasion.</li>
                 </ul>
               </div>
               <div>
