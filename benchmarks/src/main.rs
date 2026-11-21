@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use fluxwright::{BrowserEngine, JobOptions, PdfOptions, QueueFullMode};
+use fluxwright::{BrowserEngine, JobOptions, PdfOptions, QueueFullMode, ResourcePreset};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -205,6 +205,7 @@ async fn main() -> Result<()> {
         ("500-concurrent", 10, 20, 500, false),
         ("1000-queued", 4, 8, 1000, false),
         ("100-pdfs", 4, 8, 100, false),
+        ("scraping-200", 4, 8, 200, false),
     ];
     if args.chaos {
         scenarios.push(("chaos-1000-queued", 4, 8, 1000, true));
@@ -217,8 +218,22 @@ async fn main() -> Result<()> {
                 continue;
             }
         }
+        let scenario_url = if name == "scraping-200" {
+            format!("{}/scraping", server.base_url)
+        } else {
+            url.clone()
+        };
         eprintln!("scenario {name} jobs={jobs} browsers={browsers} ctx={ctx}");
-        let rec = run_fluxwright(&url, name, browsers, ctx, jobs, chaos, chrome.as_ref()).await?;
+        let rec = run_fluxwright(
+            &scenario_url,
+            name,
+            browsers,
+            ctx,
+            jobs,
+            chaos,
+            chrome.as_ref(),
+        )
+        .await?;
         records.push(rec);
         let tools: &[&str] = if name.ends_with("-pdfs") {
             &["playwright"]
@@ -226,7 +241,16 @@ async fn main() -> Result<()> {
             &["playwright", "puppeteer"]
         };
         for &tool in tools {
-            if let Some(rec) = run_node_tool(tool, name, jobs, browsers, ctx, chaos, &url, chrome.as_ref()) {
+            if let Some(rec) = run_node_tool(
+                tool,
+                name,
+                jobs,
+                browsers,
+                ctx,
+                chaos,
+                &scenario_url,
+                chrome.as_ref(),
+            ) {
                 records.push(rec);
             } else {
                 eprintln!("skip {tool} {name}: node adapter not installed, or it did not finish");
@@ -273,11 +297,11 @@ fn print_table(records: &[Record]) {
     }
     println!();
     println!(
-        "Same Chrome, fresh context per job, same job counts. Playwright/Puppeteer in-flight contexts capped at 24 so \
-         Chrome does not deadlock on Windows. Memory is the driver plus every process it started, summed as RSS, so \
-         memory Chrome's processes share is counted more than once, the same for every tool. In the chaos scenario the \
-         Playwright and Puppeteer runners have no relaunch code: it shows what each tool does by itself when a browser \
-         dies, not what a script written around that could do. Not a ranking."
+        "Same Chrome, fresh context per job, same job counts. Fluxwright enables prewarm_contexts(2) per browser, \
+         and `scraping-200` uses Fluxwright's built-in `ResourcePreset::Scraping` against `/scraping` (images, font, \
+         CSS, JS) while Playwright and Puppeteer run default navigation. Playwright/Puppeteer in-flight contexts are \
+         capped at 24 so Chrome does not deadlock on Windows. Memory is the driver plus every process it started, \
+         summed as RSS. In the chaos scenario the Playwright and Puppeteer runners have no relaunch code."
     );
 }
 
@@ -296,6 +320,7 @@ async fn run_fluxwright(
         .max_browsers(max_browsers)
         .min_browsers(max_browsers)
         .max_contexts_per_browser(max_ctx)
+        .prewarm_contexts(2.min(max_ctx))
         .memory_ceiling_mb(32_768)
         .queue_capacity(jobs as usize + 32)
         .queue_full_mode(QueueFullMode::Wait)
@@ -319,6 +344,7 @@ async fn run_fluxwright(
     }
 
     let is_pdf = scenario.ends_with("-pdfs");
+    let is_scraping = scenario == "scraping-200";
     let watch = Watch::start(std::process::id(), chaos);
     // As node-runner.mjs does: min(jobs, slots, 24) workers, each timing only its own job. Spawning
     // every job at once timed the queue too, so these latencies were not comparable.
@@ -333,8 +359,12 @@ async fn run_fluxwright(
             while next.fetch_add(1, Ordering::Relaxed) < jobs {
                 let url = url.clone();
                 let t0 = Instant::now();
+                let mut opts = JobOptions::default().timeout(Duration::from_secs(180));
+                if is_scraping {
+                    opts = opts.resource_preset(ResourcePreset::Scraping);
+                }
                 let r = engine
-                    .run(JobOptions::default().timeout(Duration::from_secs(180)), move |page| {
+                    .run(opts, move |page| {
                         let url = url.clone();
                         async move {
                             page.goto(&url).await?;
