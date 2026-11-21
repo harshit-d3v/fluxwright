@@ -61,7 +61,7 @@ enum Cmd {
         #[arg(long)]
         channel: Option<String>,
         /// Extra CLI flags passed to Chromium on launch (repeatable).
-        #[arg(long = "chromium-arg")]
+        #[arg(long = "chromium-arg", allow_hyphen_values = true)]
         chromium_args: Vec<String>,
     },
     /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
