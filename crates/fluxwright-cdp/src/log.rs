@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::connection::{CdpEvent, Connection};
-use crate::events::{BodySource, Loaded, NetEvent, NetRequest, NetResponse};
+use crate::events::{decode_ws_frame, BodySource, Loaded, NetEvent, NetRequest, NetResponse, WebSocketEvent};
 
 /// Per kind; older entries are dropped first.
 const KEEP: usize = 1000;
@@ -87,6 +87,8 @@ pub struct PageLog {
     live: Vec<UnboundedSender<LogEntry>>,
     /// The same for network events; requests are tracked only while one is listening.
     net_live: Vec<UnboundedSender<NetEvent>>,
+    /// WebSocket lifecycle and frame events.
+    ws_live: Vec<UnboundedSender<WebSocketEvent>>,
 }
 
 impl PageLog {
@@ -110,6 +112,17 @@ impl PageLog {
 
     fn tell_net(&mut self, event: NetEvent) {
         self.net_live.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+
+    /// Every WebSocket lifecycle and frame event from now on, for `page.on('websocket')`.
+    pub fn subscribe_websockets(&mut self) -> UnboundedReceiver<WebSocketEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.ws_live.push(tx);
+        rx
+    }
+
+    fn tell_ws(&mut self, event: WebSocketEvent) {
+        self.ws_live.retain(|tx| tx.send(event.clone()).is_ok());
     }
 }
 
@@ -155,6 +168,16 @@ fn arg_text(o: &Value) -> String {
             .or_else(|| o["type"].as_str())
             .unwrap_or("")
             .to_string(),
+    }
+}
+
+pub(crate) fn console_message_from_cdp(params: &Value) -> ConsoleMessage {
+    let text = params["args"]
+        .as_array()
+        .map(|a| a.iter().map(arg_text).collect::<Vec<_>>().join(" "));
+    ConsoleMessage {
+        kind: params["type"].as_str().unwrap_or("log").to_string(),
+        text: capped(text.unwrap_or_default()),
     }
 }
 
@@ -272,14 +295,59 @@ pub(crate) async fn collect(
                 _ => {}
             },
             "Runtime.consoleAPICalled" if ours => {
-                let text = e.params["args"].as_array().map(|a| a.iter().map(arg_text).collect::<Vec<_>>().join(" "));
-                let msg = ConsoleMessage {
-                    kind: e.params["type"].as_str().unwrap_or("log").to_string(),
-                    text: capped(text.unwrap_or_default()),
-                };
+                let msg = console_message_from_cdp(&e.params);
                 let mut log = log.lock().unwrap();
                 log.tell(LogEntry::Console(msg.clone()));
                 keep(&mut log.console, msg);
+            }
+            "Network.webSocketCreated"
+            | "Network.webSocketFrameSent"
+            | "Network.webSocketFrameReceived"
+            | "Network.webSocketFrameError"
+            | "Network.webSocketClosed"
+                if ours =>
+            {
+                let mut log = log.lock().unwrap();
+                if log.ws_live.is_empty() {
+                    continue;
+                }
+                let sid = e.session_id.as_deref().unwrap_or("");
+                let request_id = format!("{sid}:{}", str_of("requestId"));
+                match e.method.as_str() {
+                    "Network.webSocketCreated" => {
+                        log.tell_ws(WebSocketEvent::Created {
+                            request_id,
+                            url: str_of("url"),
+                        });
+                    }
+                    "Network.webSocketFrameSent" => {
+                        let (opcode, payload, is_text) = decode_ws_frame(&e.params);
+                        log.tell_ws(WebSocketEvent::FrameSent {
+                            request_id,
+                            opcode,
+                            payload,
+                            is_text,
+                        });
+                    }
+                    "Network.webSocketFrameReceived" => {
+                        let (opcode, payload, is_text) = decode_ws_frame(&e.params);
+                        log.tell_ws(WebSocketEvent::FrameReceived {
+                            request_id,
+                            opcode,
+                            payload,
+                            is_text,
+                        });
+                    }
+                    "Network.webSocketFrameError" => {
+                        log.tell_ws(WebSocketEvent::Error {
+                            request_id,
+                            error_message: str_of("errorMessage"),
+                        });
+                    }
+                    _ => {
+                        log.tell_ws(WebSocketEvent::Closed { request_id });
+                    }
+                }
             }
             "Network.requestWillBeSent" | "Network.responseReceived" | "Network.loadingFinished" | "Network.loadingFailed"
                 if ours =>
@@ -479,5 +547,66 @@ mod tests {
             finished_downloads.push(dl.suggested_filename);
         }
         assert_eq!(finished_downloads, vec!["file-5.bin"]);
+    }
+
+    #[tokio::test]
+    async fn collect_emits_websocket_text_binary_error_and_close() {
+        use base64::Engine;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = tokio_tungstenite::accept_async(stream).await;
+            }
+        });
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = Arc::new(Mutex::new(PageLog::default()));
+        let mut ws_rx = log.lock().unwrap().subscribe_websockets();
+        let (dl_tx, _dl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = Watch {
+            session: "s1".into(),
+            main_frame: "f1".into(),
+            context: "c1".into(),
+            download_dir: PathBuf::from("downloads"),
+        };
+        let handle = tokio::spawn(collect(events_rx, watch, log, dl_tx, conn));
+
+        let send = |method: &str, params: Value| {
+            events_tx
+                .send(Arc::new(CdpEvent {
+                    method: method.into(),
+                    params,
+                    session_id: Some("s1".into()),
+                }))
+                .unwrap();
+        };
+
+        send("Network.webSocketCreated", json!({ "requestId": "ws1", "url": "ws://127.0.0.1/ws" }));
+        send("Network.webSocketFrameSent", json!({ "requestId": "ws1", "response": { "opcode": 1, "payloadData": "hello" } }));
+        let bin_b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 255]);
+        send("Network.webSocketFrameReceived", json!({ "requestId": "ws1", "response": { "opcode": 2, "payloadData": bin_b64 } }));
+        send("Network.webSocketFrameError", json!({ "requestId": "ws1", "errorMessage": "reset" }));
+        send("Network.webSocketClosed", json!({ "requestId": "ws1" }));
+
+        drop(events_tx);
+        handle.await.unwrap();
+
+        let mut received = Vec::new();
+        while let Ok(ev) = ws_rx.try_recv() {
+            received.push(ev);
+        }
+        assert_eq!(
+            received,
+            vec![
+                WebSocketEvent::Created { request_id: "s1:ws1".into(), url: "ws://127.0.0.1/ws".into() },
+                WebSocketEvent::FrameSent { request_id: "s1:ws1".into(), opcode: 1, payload: b"hello".to_vec(), is_text: true },
+                WebSocketEvent::FrameReceived { request_id: "s1:ws1".into(), opcode: 2, payload: vec![1, 2, 3, 255], is_text: false },
+                WebSocketEvent::Error { request_id: "s1:ws1".into(), error_message: "reset".into() },
+                WebSocketEvent::Closed { request_id: "s1:ws1".into() },
+            ]
+        );
     }
 }

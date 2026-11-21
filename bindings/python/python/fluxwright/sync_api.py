@@ -80,6 +80,8 @@ __all__ = [
     "TimeoutError",
     "Touchscreen",
     "ViewportSize",
+    "WebSocket",
+    "Worker",
     "chromium",
     "sync_playwright",
 ]
@@ -138,6 +140,8 @@ async def _await(awaitable: Awaitable[T]) -> T:
 
 
 _sync_pages: weakref.WeakKeyDictionary[_a.Page, Page] = weakref.WeakKeyDictionary()
+_sync_websockets: weakref.WeakKeyDictionary[_a.WebSocket, WebSocket] = weakref.WeakKeyDictionary()
+_sync_workers: weakref.WeakKeyDictionary[_a.Worker, Worker] = weakref.WeakKeyDictionary()
 
 
 def _wrap_page(impl: _a.Page) -> Page:
@@ -145,10 +149,31 @@ def _wrap_page(impl: _a.Page) -> Page:
     return page if page is not None else Page(impl)
 
 
+def _page_listener_thread(async_page: _a.Page | None) -> concurrent.futures.ThreadPoolExecutor | None:
+    if async_page is None:
+        return None
+    sync_page = _sync_pages.get(async_page)
+    return sync_page._listener_thread if sync_page is not None else None
+
+
+def _wrap_websocket(impl: _a.WebSocket) -> WebSocket:
+    ws = _sync_websockets.get(impl)
+    return ws if ws is not None else WebSocket(impl)
+
+
+def _wrap_worker(impl: _a.Worker) -> Worker:
+    w = _sync_workers.get(impl)
+    return w if w is not None else Worker(impl)
+
+
 def _to_sync(arg: Any) -> Any:
     """An async API object as its blocking counterpart, for a listener or predicate."""
     if isinstance(arg, _a.Page):
         return _wrap_page(arg)
+    if isinstance(arg, _a.WebSocket):
+        return _wrap_websocket(arg)
+    if isinstance(arg, _a.Worker):
+        return _wrap_worker(arg)
     if isinstance(arg, _a.Response):
         return Response(arg)
     if isinstance(arg, _a.Request):
@@ -158,6 +183,31 @@ def _to_sync(arg: Any) -> Any:
     if isinstance(arg, _a.FileChooser):
         return FileChooser(arg)
     return arg
+
+
+@contextmanager
+def _sync_expect(
+    start: Callable[..., Any], url_or_predicate: Any, timeout: float | None, wrap: Callable[[Any], T]
+) -> Iterator[EventInfo[T]]:
+    if callable(url_or_predicate):
+        predicate = url_or_predicate
+
+        def matcher(r: Any) -> bool:
+            return bool(predicate(_to_sync(r)))
+    else:
+        matcher = url_or_predicate
+    manager = start(matcher, timeout=timeout)
+    info = _run(manager.__aenter__)
+    future = asyncio.run_coroutine_threadsafe(_await(info.value), _event_loop())
+    try:
+        yield EventInfo(future, wrap)
+    except BaseException as e:
+        try:
+            _run(manager.__aexit__, type(e), e, e.__traceback__)
+        finally:
+            future.cancel()
+        raise
+    _run(manager.__aexit__, None, None, None)
 
 
 def _bridge_route(
@@ -696,6 +746,126 @@ class CDPSession:
             with suppress(ValueError):
                 bridges.remove(entry)
             raise
+
+
+class _SyncChildEmitter:
+    """Shared listener bridging for sync ``WebSocket`` and ``Worker``."""
+
+    _impl: Any
+    _listener_bridges: list[tuple[str, Callable[[Any], Any], Callable[[Any], Any]]]
+
+    def on(self, event: str, handler: Callable[[Any], Any]) -> None:
+        self._listen("on", event, handler)
+
+    def once(self, event: str, handler: Callable[[Any], Any]) -> None:
+        self._listen("once", event, handler)
+
+    def remove_listener(self, event: str, handler: Callable[[Any], Any]) -> None:
+        for entry in list(self._listener_bridges):
+            if entry[0] == event and entry[1] == handler:
+                with suppress(ValueError):
+                    self._listener_bridges.remove(entry)
+                _run(_on_loop, self._impl.remove_listener, event, entry[2])
+                return
+
+    off = remove_listener
+
+    def _listen(self, method: str, event: str, handler: Callable[[Any], Any]) -> None:
+        loop = _event_loop()
+        bridges = self._listener_bridges
+        executor = _page_listener_thread(self._impl._page())
+
+        def bridge(arg: Any) -> Any:
+            if method == "once":
+                with suppress(ValueError):
+                    bridges.remove(entry)
+            try:
+                return loop.run_in_executor(executor, _listen, handler, _to_sync(arg))
+            except RuntimeError:
+                return None
+
+        entry = (event, handler, bridge)
+        bridges.append(entry)
+        try:
+            _run(_on_loop, getattr(self._impl, method), event, bridge)
+        except BaseException:
+            with suppress(ValueError):
+                bridges.remove(entry)
+            raise
+
+
+class WebSocket(_SyncChildEmitter):
+    """A WebSocket opened by a page, emitted via ``page.on("websocket")``."""
+
+    _impl: _a.WebSocket
+
+    def __init__(self, impl: _a.WebSocket) -> None:
+        self._impl = impl
+        _sync_websockets[impl] = self
+        self._listener_bridges: list[tuple[str, Callable[[Any], Any], Callable[[Any], Any]]] = []
+
+    def __repr__(self) -> str:
+        return repr(self._impl)
+
+    @property
+    def url(self) -> str:
+        return self._impl.url
+
+    def is_closed(self) -> bool:
+        return self._impl.is_closed()
+
+    @contextmanager
+    def expect_event(
+        self,
+        event: str,
+        predicate: Callable[[Any], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Iterator[EventInfo[Any]]:
+        with _sync_expect(
+            lambda p, timeout=None: self._impl.expect_event(event, p, timeout=timeout),
+            predicate,
+            timeout,
+            _to_sync,
+        ) as info:
+            yield info
+
+
+class Worker(_SyncChildEmitter):
+    """A dedicated Web Worker running on a page."""
+
+    _impl: _a.Worker
+
+    def __init__(self, impl: _a.Worker) -> None:
+        self._impl = impl
+        _sync_workers[impl] = self
+        self._listener_bridges: list[tuple[str, Callable[[Any], Any], Callable[[Any], Any]]] = []
+
+    def __repr__(self) -> str:
+        return repr(self._impl)
+
+    @property
+    def url(self) -> str:
+        return self._impl.url
+
+    def evaluate(self, expression: str, arg: Any = None) -> Any:
+        return _run(self._impl.evaluate, expression, arg)
+
+    @contextmanager
+    def expect_event(
+        self,
+        event: str,
+        predicate: Callable[[Any], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Iterator[EventInfo[Any]]:
+        with _sync_expect(
+            lambda p, timeout=None: self._impl.expect_event(event, p, timeout=timeout),
+            predicate,
+            timeout,
+            _to_sync,
+        ) as info:
+            yield info
 
 
 class Download:
@@ -1659,6 +1829,27 @@ class Page(_Finders):
         """Removes the handlers added for ``url`` (only ``handler``, when given)."""
         _unbridge_route(self._route_bridges, self._impl, url, handler)
 
+    def route_from_har(
+        self,
+        har: str | PathLike[str],
+        *,
+        url: URLMatch | None = None,
+        not_found: Literal["abort", "fallback"] | None = None,
+        update: bool | None = None,
+        update_mode: Literal["full", "minimal"] | None = None,
+        update_content: Literal["embed", "omit"] | None = None,
+    ) -> None:
+        """Serves matching requests from a HAR 1.2 file, or records into ``har`` when ``update=True``."""
+        _run(
+            self._impl.route_from_har,
+            har,
+            url=url,
+            not_found=not_found,
+            update=update,
+            update_mode=update_mode,
+            update_content=update_content,
+        )
+
     def add_init_script(self, script: str | None = None, *, path: str | PathLike[str] | None = None) -> None:
         """Adds a script evaluated whenever the page navigates or reloads."""
         _run(self._impl.add_init_script, script, path=path)
@@ -1763,28 +1954,55 @@ class Page(_Finders):
             yield info
 
     @contextmanager
+    def expect_websocket(
+        self,
+        predicate: Callable[[WebSocket], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Iterator[EventInfo[WebSocket]]:
+        """Waits for a WebSocket opened by the code in the ``with`` block."""
+        with self._expect(self._impl.expect_websocket, predicate, timeout, _wrap_websocket) as info:
+            yield info
+
+    @contextmanager
+    def expect_worker(
+        self,
+        predicate: Callable[[Worker], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Iterator[EventInfo[Worker]]:
+        """Waits for a dedicated Web Worker created by the code in the ``with`` block."""
+        with self._expect(self._impl.expect_worker, predicate, timeout, _wrap_worker) as info:
+            yield info
+
+    @contextmanager
+    def expect_event(
+        self,
+        event: str,
+        predicate: Callable[[Any], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Iterator[EventInfo[Any]]:
+        """Waits for ``event`` to fire on this page."""
+        with _sync_expect(
+            lambda p, timeout=None: self._impl.expect_event(event, p, timeout=timeout),
+            predicate,
+            timeout,
+            _to_sync,
+        ) as info:
+            yield info
+
+    @property
+    def workers(self) -> list[Worker]:
+        """Dedicated Web Workers currently active on this page."""
+        return [_wrap_worker(w) for w in _run(_on_loop, lambda: self._impl.workers)]
+
+    @contextmanager
     def _expect(
         self, start: Callable[..., Any], url_or_predicate: Any, timeout: float | None, wrap: Callable[[Any], T]
     ) -> Iterator[EventInfo[T]]:
-        if callable(url_or_predicate):
-            predicate = url_or_predicate
-
-            def matcher(r: Any) -> bool:
-                return bool(predicate(_to_sync(r)))
-        else:
-            matcher = url_or_predicate
-        manager = start(matcher, timeout=timeout)
-        info = _run(manager.__aenter__)
-        future = asyncio.run_coroutine_threadsafe(_await(info.value), _event_loop())
-        try:
-            yield EventInfo(future, wrap)
-        except BaseException as e:
-            try:
-                _run(manager.__aexit__, type(e), e, e.__traceback__)
-            finally:
-                future.cancel()
-            raise
-        _run(manager.__aexit__, None, None, None)
+        with _sync_expect(start, url_or_predicate, timeout, wrap) as info:
+            yield info
 
     def wait_for_download(self, *, timeout: float | None = None) -> Download:
         """The next download this page finished; ones that finished earlier queue up."""
@@ -1855,6 +2073,11 @@ class Browser:
         http_credentials: HttpCredentials | None = None,
         bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
+        record_har_path: str | PathLike[str] | None = None,
+        record_har_omit_content: bool | None = None,
+        record_har_content: Literal["embed", "omit"] | None = None,
+        record_har_mode: Literal["full", "minimal"] | None = None,
+        record_har_url_filter: str | re.Pattern[str] | None = None,
     ) -> Page:
         """A page in a fresh browser context; every option applies to this page only, with
         Playwright's names."""
@@ -1880,6 +2103,11 @@ class Browser:
                 http_credentials=http_credentials,
                 bypass_csp=bypass_csp,
                 storage_state=storage_state,
+                record_har_path=record_har_path,
+                record_har_omit_content=record_har_omit_content,
+                record_har_content=record_har_content,
+                record_har_mode=record_har_mode,
+                record_har_url_filter=record_har_url_filter,
             )
         )
 
@@ -1905,6 +2133,11 @@ class Browser:
         http_credentials: HttpCredentials | None = None,
         bypass_csp: bool | None = None,
         storage_state: StorageState | str | PathLike[str] | None = None,
+        record_har_path: str | PathLike[str] | None = None,
+        record_har_omit_content: bool | None = None,
+        record_har_content: Literal["embed", "omit"] | None = None,
+        record_har_mode: Literal["full", "minimal"] | None = None,
+        record_har_url_filter: str | re.Pattern[str] | None = None,
     ) -> BrowserContext:
         """A browser context with ``new_page``'s options, as Playwright's ``new_context``; see ``BrowserContext``."""
         impl = _run(
@@ -1928,6 +2161,11 @@ class Browser:
             http_credentials=http_credentials,
             bypass_csp=bypass_csp,
             storage_state=storage_state,
+            record_har_path=record_har_path,
+            record_har_omit_content=record_har_omit_content,
+            record_har_content=record_har_content,
+            record_har_mode=record_har_mode,
+            record_har_url_filter=record_har_url_filter,
         )
         return BrowserContext(self, impl)
 
@@ -1970,6 +2208,27 @@ class BrowserContext:
 
     def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         _unbridge_route(self._route_bridges, self._impl, url, handler)
+
+    def route_from_har(
+        self,
+        har: str | PathLike[str],
+        *,
+        url: URLMatch | None = None,
+        not_found: Literal["abort", "fallback"] | None = None,
+        update: bool | None = None,
+        update_mode: Literal["full", "minimal"] | None = None,
+        update_content: Literal["embed", "omit"] | None = None,
+    ) -> None:
+        """Serves matching requests on this context from a HAR 1.2 file, or records when ``update=True``."""
+        _run(
+            self._impl.route_from_har,
+            har,
+            url=url,
+            not_found=not_found,
+            update=update,
+            update_mode=update_mode,
+            update_content=update_content,
+        )
 
     def add_init_script(self, script: str | None = None, *, path: str | PathLike[str] | None = None) -> None:
         """``page.add_init_script`` for all pages and popups in this context."""

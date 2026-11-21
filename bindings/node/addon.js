@@ -60,6 +60,20 @@ const LAUNCH = {
   maxConcurrencyPerHost: true,
   minDelayPerHost: true,
 }
+const RECORD_HAR = {
+  path: true,
+  omitContent: true,
+  content: ['embed', 'omit'],
+  mode: ['full', 'minimal'],
+  urlFilter: true,
+}
+const HAR_ROUTE = {
+  notFound: ['abort', 'fallback'],
+  update: true,
+  updateContent: ['embed', 'omit'],
+  updateMode: ['full', 'minimal'],
+  url: true,
+}
 const PAGE = {
   proxy: true,
   userAgent: true,
@@ -80,6 +94,7 @@ const PAGE = {
   httpCredentials: { username: true, password: true },
   bypassCSP: true,
   storageState: true,
+  recordHar: RECORD_HAR,
 }
 const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true, response: true }
 const CONTINUE = { url: true, method: true, headers: true, postData: true }
@@ -310,9 +325,351 @@ const contextRegistry = new FinalizationRegistry(({ browser, id }) => {
   browser._dropContext(id)
 })
 const frameIds = new WeakMap()
+const pendingHarFilters = new WeakMap()
 const cdpSessionRegistry = new FinalizationRegistry(({ page, id }) => {
   page._cdpDrop(id)
 })
+
+function awaitEmitterEvent(em, waits, event, timeout, pred, closedMessage, timeoutMessage) {
+  return new Promise((resolve, reject) => {
+    let timer = null
+    let settled = false
+    const done = () => {
+      em.off(event, listener)
+      clearTimeout(timer)
+      waits.delete(closed)
+    }
+    const fail = (err) => {
+      if (settled) return
+      settled = true
+      done()
+      reject(err)
+    }
+    const succeed = (arg) => {
+      if (settled) return
+      settled = true
+      done()
+      resolve(arg)
+    }
+    const closed = () => fail(new Error(closedMessage))
+    const listener = (arg) => {
+      try {
+        const out = pred(arg)
+        if (typeof out?.then === 'function') {
+          out.then((matched) => {
+            if (matched) succeed(arg)
+          }, fail)
+          return
+        }
+        if (out) succeed(arg)
+      } catch (err) {
+        fail(err)
+      }
+    }
+    em.on(event, listener)
+    waits.add(closed)
+    if (timeout > 0) timer = setTimeout(() => fail(new Error(timeoutMessage)), timeout)
+  })
+}
+
+function waitForEmitterEvent(emitter, isClosedFn, waits, label, event, allowedEvents, optionsOrPredicate) {
+  if (!allowedEvents.includes(event)) {
+    throw new Error(`${label}.waitForEvent: '${event}' is not supported (${allowedEvents.join(', ')})`)
+  }
+  const options = typeof optionsOrPredicate === 'function' ? { predicate: optionsOrPredicate } : optionsOrPredicate
+  checkOptions(`${label}.waitForEvent`, options, { predicate: true, timeout: true })
+  if (options?.predicate != null && typeof options.predicate !== 'function') {
+    throw new TypeError(`${label}.waitForEvent: predicate must be a function`)
+  }
+  if (isClosedFn()) {
+    return Promise.reject(new Error(`${label}.waitForEvent: target closed`))
+  }
+  const pred = options?.predicate ?? (() => true)
+  const timeout = options?.timeout ?? 30000
+  return awaitEmitterEvent(
+    emitter,
+    waits,
+    event,
+    timeout,
+    pred,
+    `${label}.waitForEvent: target closed`,
+    `${label}.waitForEvent: timeout ${timeout}ms exceeded`,
+  )
+}
+
+class WebSocket {
+  #url
+  #closed = false
+  #emitter = new EventEmitter()
+  #waits = new Set()
+
+  constructor(url) {
+    this.#url = url
+    this.#emitter.setMaxListeners(0)
+  }
+
+  url() {
+    return this.#url
+  }
+
+  isClosed() {
+    return this.#closed
+  }
+
+  _emit(event, arg) {
+    emitSafely(this.#emitter, event, arg)
+  }
+
+  _markClosed() {
+    if (this.#closed) return
+    this.#closed = true
+    this._emit('close', this)
+    for (const closed of [...this.#waits]) closed()
+  }
+
+  on(event, handler) {
+    if (!['framesent', 'framereceived', 'socketerror', 'close'].includes(event)) {
+      throw new Error(`webSocket.on: '${event}' is not supported`)
+    }
+    this.#emitter.on(event, handler)
+    return this
+  }
+
+  once(event, handler) {
+    if (!['framesent', 'framereceived', 'socketerror', 'close'].includes(event)) {
+      throw new Error(`webSocket.once: '${event}' is not supported`)
+    }
+    this.#emitter.once(event, handler)
+    return this
+  }
+
+  addListener(event, handler) {
+    return this.on(event, handler)
+  }
+
+  off(event, handler) {
+    this.#emitter.off(event, handler)
+    return this
+  }
+
+  removeListener(event, handler) {
+    return this.off(event, handler)
+  }
+
+  waitForEvent(event, optionsOrPredicate) {
+    return waitForEmitterEvent(
+      this.#emitter,
+      () => this.#closed,
+      this.#waits,
+      'webSocket',
+      event,
+      ['framesent', 'framereceived', 'socketerror', 'close'],
+      optionsOrPredicate,
+    )
+  }
+}
+
+class Worker {
+  #page
+  #id
+  #url
+  #closed = false
+  #emitter = new EventEmitter()
+  #waits = new Set()
+
+  constructor(page, id, url) {
+    this.#page = page
+    this.#id = id
+    this.#url = url
+    this.#emitter.setMaxListeners(0)
+  }
+
+  url() {
+    return this.#url
+  }
+
+  async evaluate(pageFunction, arg) {
+    if (this.#closed) throw new Error('worker.evaluate: worker is closed')
+    return this.#page._workerEvaluate(this.#id, toExpression(pageFunction, arg))
+  }
+
+  _emit(event, arg) {
+    emitSafely(this.#emitter, event, arg)
+  }
+
+  _markClosed() {
+    if (this.#closed) return
+    this.#closed = true
+    this._emit('close', this)
+    for (const closed of [...this.#waits]) closed()
+  }
+
+  on(event, handler) {
+    if (!['close', 'console'].includes(event)) {
+      throw new Error(`worker.on: '${event}' is not supported`)
+    }
+    this.#emitter.on(event, handler)
+    return this
+  }
+
+  once(event, handler) {
+    if (!['close', 'console'].includes(event)) {
+      throw new Error(`worker.once: '${event}' is not supported`)
+    }
+    this.#emitter.once(event, handler)
+    return this
+  }
+
+  addListener(event, handler) {
+    return this.on(event, handler)
+  }
+
+  off(event, handler) {
+    this.#emitter.off(event, handler)
+    return this
+  }
+
+  removeListener(event, handler) {
+    return this.off(event, handler)
+  }
+
+  waitForEvent(event, optionsOrPredicate) {
+    return waitForEmitterEvent(
+      this.#emitter,
+      () => this.#closed,
+      this.#waits,
+      'worker',
+      event,
+      ['close', 'console'],
+      optionsOrPredicate,
+    )
+  }
+}
+
+function stripFragment(url) {
+  const idx = url.indexOf('#')
+  return idx === -1 ? url : url.slice(0, idx)
+}
+
+function headerListCI(headers, name) {
+  const lower = name.toLowerCase()
+  for (const h of headers ?? []) {
+    if (String(h.name).toLowerCase() === lower) return h.value
+  }
+  return undefined
+}
+
+function createHarMatcher(harJson) {
+  const entries = Array.isArray(harJson?.log?.entries) ? harJson.log.entries : []
+  const served = new Array(entries.length).fill(false)
+  const skip = new Set(['connection', 'content-encoding', 'content-length', 'transfer-encoding'])
+  return (request) => {
+    const targetUrl = stripFragment(request.url())
+    const targetMethod = request.method().toUpperCase()
+    const reqHeaders = request.headers()
+    const reqPost = request.postData()
+    let maxScore = -1
+    const candidates = []
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i]
+      if (!e?.request?.url || stripFragment(e.request.url) !== targetUrl) continue
+      if ((e.request.method || 'GET').toUpperCase() !== targetMethod) continue
+      let score = 0
+      if (reqPost != null && e.request.postData?.text === reqPost) score += 100
+      for (const name of ['content-type', 'accept']) {
+        const hv = headerListCI(e.request.headers, name)
+        if (hv != null && reqHeaders[name]?.toLowerCase() === hv.toLowerCase()) score += 10
+      }
+      if (score > maxScore) {
+        maxScore = score
+        candidates.length = 0
+        candidates.push(i)
+      } else if (score === maxScore) {
+        candidates.push(i)
+      }
+    }
+    if (!candidates.length) return null
+    let chosen = candidates.find((idx) => !served[idx])
+    if (chosen === undefined) chosen = candidates[candidates.length - 1]
+    else served[chosen] = true
+    const entry = entries[chosen]
+    const headers = new Map()
+    for (const h of entry.response?.headers ?? []) {
+      const k = String(h.name).toLowerCase()
+      if (skip.has(k)) continue
+      headers.set(k, headers.has(k) ? `${headers.get(k)}${k === 'set-cookie' ? '\n' : ', '}${h.value}` : String(h.value ?? ''))
+    }
+    let body
+    if (entry.response?.content?.text != null) {
+      body =
+        entry.response.content.encoding?.toLowerCase() === 'base64'
+          ? Buffer.from(entry.response.content.text, 'base64')
+          : entry.response.content.text
+    }
+    return {
+      status: entry.response?.status || 200,
+      headers: Object.fromEntries(headers),
+      body,
+    }
+  }
+}
+
+async function filterHarFile(harPath, regex) {
+  const re = new RegExp(regex.source, regex.flags.replace(/[gy]/g, ''))
+  const raw = await fs.readFile(harPath, 'utf8')
+  const har = JSON.parse(raw)
+  if (Array.isArray(har?.log?.entries)) {
+    har.log.entries = har.log.entries.filter((e) => typeof e?.request?.url === 'string' && re.test(e.request.url))
+    await savePrivate(harPath, JSON.stringify(har, null, 2))
+  }
+}
+
+function addPendingHarFilter(target, path, regex) {
+  let list = pendingHarFilters.get(target)
+  if (!list) {
+    list = []
+    pendingHarFilters.set(target, list)
+  }
+  list.push({ path, regex })
+}
+
+async function flushPendingHarFilters(target) {
+  const list = pendingHarFilters.get(target)
+  if (!list?.length) return
+  pendingHarFilters.delete(target)
+  for (const { path, regex } of list) {
+    await filterHarFile(path, regex)
+  }
+}
+
+async function applyRouteFromHar(target, label, startUpdateFn, har, options) {
+  checkOptions(`${label}.routeFromHAR`, options, HAR_ROUTE)
+  if (typeof har !== 'string' || !har) {
+    throw new TypeError(`${label}.routeFromHAR: har must be a non-empty file path string`)
+  }
+  if (options?.url != null && typeof options.url !== 'string' && !(options.url instanceof RegExp)) {
+    throw new TypeError(`${label}.routeFromHAR: url must be a string or RegExp`)
+  }
+  if (options?.update) {
+    const nativeOpts = {
+      path: har,
+      content: options.updateContent ?? 'embed',
+      mode: options.updateMode ?? 'minimal',
+      urlFilter: typeof options.url === 'string' ? options.url : undefined,
+    }
+    await startUpdateFn(nativeOpts)
+    if (options.url instanceof RegExp) addPendingHarFilter(target, har, options.url)
+    return
+  }
+  const harJson = JSON.parse(await fs.readFile(har, 'utf8'))
+  const match = createHarMatcher(harJson)
+  const fallback = options?.notFound === 'fallback'
+  await target.route(options?.url ?? '**/*', async (route, request) => {
+    const hit = match(request)
+    if (hit) return route.fulfill(hit)
+    return fallback ? route.fallback() : route.abort('failed')
+  })
+}
 
 class CDPSession {
   #page
@@ -396,6 +753,8 @@ function trackTarget(page) {
 // dialogs, file choosers and popups. Each source starts with its first listener.
 function installEvents(Page) {
   const emitters = new WeakMap()
+  const workerMaps = new WeakMap()
+  const workerWired = new WeakSet()
   const sources = {
     console: 'log',
     pageerror: 'log',
@@ -406,10 +765,66 @@ function installEvents(Page) {
     dialog: 'dialog',
     filechooser: 'filechooser',
     popup: 'popup',
+    websocket: 'websocket',
+    worker: 'worker',
   }
   const events = Object.keys(sources)
   // Pages whose close() was called: the native flag goes up only once napi runs the call.
   const closing = new WeakSet()
+
+  function getWorkerMap(page) {
+    let map = workerMaps.get(page)
+    if (!map) {
+      map = new Map()
+      workerMaps.set(page, map)
+    }
+    return map
+  }
+
+  function ensureWorkerSubscription(page) {
+    if (workerWired.has(page)) return
+    workerWired.add(page)
+    const ref = new WeakRef(page)
+    const map = getWorkerMap(page)
+    for (const info of page._workers()) {
+      if (!map.has(info.id)) map.set(info.id, new Worker(page, info.id, info.url))
+    }
+    page._onWorker((ev) => {
+      const p = ref.deref()
+      if (!p) return
+      const em = emitters.get(p)?.em
+      if (ev.event === 'created') {
+        let w = map.get(ev.id)
+        if (!w) {
+          w = new Worker(p, ev.id, ev.url ?? '')
+          map.set(ev.id, w)
+        }
+        emitSafely(em, 'worker', w)
+      } else if (ev.event === 'console') {
+        const w = map.get(ev.id)
+        if (w && ev.message) w._emit('console', ev.message)
+      } else if (ev.event === 'close') {
+        const w = map.get(ev.id)
+        if (w) {
+          map.delete(ev.id)
+          w._markClosed()
+        }
+      }
+    })
+  }
+
+  Page.prototype.workers = function () {
+    if (!closing.has(this) && !origIsClosed.call(this)) ensureWorkerSubscription(this)
+    const map = getWorkerMap(this)
+    return this._workers().map((info) => {
+      let w = map.get(info.id)
+      if (!w) {
+        w = new Worker(this, info.id, info.url)
+        map.set(info.id, w)
+      }
+      return w
+    })
+  }
 
   function ensurePopupSubscription(page) {
     trackTarget(page)
@@ -475,6 +890,34 @@ function installEvents(Page) {
       })
     } else if (source === 'popup') {
       ensurePopupSubscription(page)
+    } else if (source === 'worker') {
+      ensureWorkerSubscription(page)
+    } else if (source === 'websocket') {
+      const sockets = new Map()
+      const closeAll = () => {
+        for (const ws of sockets.values()) ws._markClosed()
+        sockets.clear()
+      }
+      emitters.get(page).closeSockets = closeAll
+      page._onWebSocket((ev) => {
+        if (ev.event === 'created') {
+          const ws = new WebSocket(ev.url ?? '')
+          sockets.set(ev.requestId, ws)
+          emitSafely(em(), 'websocket', ws)
+        } else {
+          const ws = sockets.get(ev.requestId)
+          if (!ws) return
+          if (ev.event === 'framesent' || ev.event === 'framereceived') {
+            const payload = ev.payloadBytes != null ? ev.payloadBytes : (ev.payloadText ?? '')
+            ws._emit(ev.event, { payload })
+          } else if (ev.event === 'socketerror') {
+            ws._emit('socketerror', ev.errorMessage ?? '')
+          } else if (ev.event === 'close') {
+            sockets.delete(ev.requestId)
+            ws._markClosed()
+          }
+        }
+      })
     } else {
       page._onDialog((native) => answerDialog(em()?.rawListeners('dialog') ?? [], native))
     }
@@ -485,7 +928,7 @@ function installEvents(Page) {
     if (!state) {
       const em = new EventEmitter()
       em.setMaxListeners(0) // waitForResponse adds one per call
-      state = { em, started: new Set(), waits: new Set() }
+      state = { em, started: new Set(), waits: new Set(), closeSockets: null }
       emitters.set(page, state)
     }
     const source = sources[event]
@@ -509,38 +952,24 @@ function installEvents(Page) {
     }
   }
   function waitForEvent(page, method, event, allowed, options, makeMatch) {
-    return new Promise((resolve, reject) => {
+    try {
       checkOptions(`page.${method}`, options, allowed)
       const matches = makeMatch()
       if (closing.has(page) || page.isClosed()) throw new Error(`page.${method}: the page is closed`)
       const timeout = options?.timeout ?? 30000
       const { em, waits } = stateOf(page, event)
-      let timer = null
-      const fail = (err) => {
-        done()
-        reject(err)
-      }
-      const closed = () => fail(new Error(`page.${method}: the page closed`))
-      const done = () => {
-        em.off(event, listener)
-        clearTimeout(timer)
-        waits.delete(closed)
-      }
-      const listener = async (r) => {
-        try {
-          if (!(await matches(r))) return
-        } catch (err) {
-          return fail(err)
-        }
-        done()
-        resolve(r)
-      }
-      em.on(event, listener)
-      waits.add(closed)
-      if (timeout > 0) {
-        timer = setTimeout(() => fail(new Error(`page.${method}: timeout ${timeout}ms exceeded`)), timeout)
-      }
-    })
+      return awaitEmitterEvent(
+        em,
+        waits,
+        event,
+        timeout,
+        matches,
+        `page.${method}: the page closed`,
+        `page.${method}: timeout ${timeout}ms exceeded`,
+      )
+    } catch (err) {
+      return Promise.reject(err)
+    }
   }
   // page.waitForResponse / waitForRequest / waitForFileChooser: the first match from now on, within
   // `timeout` ms (default 30 s, 0 for none). Closing the page rejects it.
@@ -572,6 +1001,18 @@ function installEvents(Page) {
       return options?.predicate ?? (() => true)
     })
   }
+  Page.prototype.waitForEvent = function (event, optionsOrPredicate) {
+    if (!events.includes(event)) {
+      throw new Error(`page.waitForEvent: '${event}' is not supported (${events.join(', ')})`)
+    }
+    const options = typeof optionsOrPredicate === 'function' ? { predicate: optionsOrPredicate } : optionsOrPredicate
+    return waitForEvent(this, 'waitForEvent', event, { predicate: true, timeout: true }, options, () => {
+      if (options?.predicate != null && typeof options.predicate !== 'function') {
+        throw new TypeError('page.waitForEvent: predicate must be a function')
+      }
+      return options?.predicate ?? (() => true)
+    })
+  }
   Page.prototype.opener = async function () {
     const id = this._openerTargetId()
     if (!id) return null
@@ -590,8 +1031,16 @@ function installEvents(Page) {
     closing.add(this)
     pagesByTarget.delete(this._targetId())
     pageContext.get(this)?.deref()?._removePage(this)
-    for (const closed of emitters.get(this)?.waits ?? []) closed()
-    return close.call(this)
+    const st = emitters.get(this)
+    st?.closeSockets?.()
+    const wmap = workerMaps.get(this)
+    if (wmap) {
+      for (const w of wmap.values()) w._markClosed()
+      wmap.clear()
+    }
+    for (const closed of st?.waits ?? []) closed()
+    await close.call(this)
+    await flushPendingHarFilters(this)
   }
   return ensurePopupSubscription
 }
@@ -794,6 +1243,9 @@ function installRoutes(Page) {
     for (let i = list.length - 1; i >= 0; i--) {
       if (list[i].url === url && (!handler || list[i].handler === handler)) list.splice(i, 1)
     }
+  }
+  Page.prototype.routeFromHAR = function (har, options) {
+    return applyRouteFromHar(this, 'page', (o) => this._startHarRecording(o), har, options)
   }
 }
 
@@ -1267,6 +1719,16 @@ class BrowserContext {
     return new CDPSession(targetPage, id)
   }
 
+  async routeFromHAR(har, options) {
+    return applyRouteFromHar(
+      this,
+      'browserContext',
+      (o) => this.#browser._contextStartHarRecording(this.#id, o),
+      har,
+      options,
+    )
+  }
+
   async close(options) {
     checkOptions('browserContext.close', options, NONE)
     if (this.#closed) return
@@ -1275,6 +1737,7 @@ class BrowserContext {
     await Promise.allSettled([...this.#pages].map((p) => (p.isClosed() ? Promise.resolve() : p.close())))
     this.#pages.clear()
     await this.#browser._closeContext(this.#id)
+    await flushPendingHarFilters(this)
   }
 }
 
@@ -1644,15 +2107,31 @@ try {
   // As in Playwright, saved storage can live in a JSON file.
   async function normalizeContextOptions(method, options) {
     checkOptions(method, options, PAGE)
-    if (typeof options?.storageState === 'string') {
-      return { ...options, storageState: JSON.parse(await fs.readFile(options.storageState, 'utf8')) }
+    let out = options
+    let regexHar = null
+    if (options?.recordHar) {
+      if (typeof options.recordHar.path !== 'string' || !options.recordHar.path) {
+        throw new TypeError(`${method}: recordHar.path must be a non-empty string`)
+      }
+      const uf = options.recordHar.urlFilter
+      if (uf !== undefined && typeof uf !== 'string' && !(uf instanceof RegExp)) {
+        throw new TypeError(`${method}: recordHar.urlFilter must be a string or RegExp`)
+      }
+      if (uf instanceof RegExp) {
+        regexHar = { path: options.recordHar.path, regex: uf }
+        out = { ...out, recordHar: { ...options.recordHar, urlFilter: undefined } }
+      }
     }
-    return options
+    if (typeof options?.storageState === 'string') {
+      out = { ...out, storageState: JSON.parse(await fs.readFile(options.storageState, 'utf8')) }
+    }
+    return { opts: out, regexHar }
   }
   const newPage = native.Browser.prototype.newPage
   native.Browser.prototype.newPage = async function (options) {
-    const opts = await normalizeContextOptions('browser.newPage', options)
+    const { opts, regexHar } = await normalizeContextOptions('browser.newPage', options)
     const page = await newPage.call(this, opts)
+    if (regexHar) addPendingHarFilter(page, regexHar.path, regexHar.regex)
     trackTarget(page)
     return page
   }
@@ -2047,9 +2526,11 @@ function applyFilter(loc, options, label) {
   }
   const ensurePopup = installEvents(native.Page)
   native.Browser.prototype.newContext = async function (options) {
-    const opts = await normalizeContextOptions('browser.newContext', options)
+    const { opts, regexHar } = await normalizeContextOptions('browser.newContext', options)
     const id = await this._newContext(opts)
-    return new BrowserContext(this, id, ensurePopup)
+    const ctx = new BrowserContext(this, id, ensurePopup)
+    if (regexHar) addPendingHarFilter(ctx, regexHar.path, regexHar.regex)
+    return ctx
   }
   installRoutes(native.Page)
   installDownloads(native.Page)

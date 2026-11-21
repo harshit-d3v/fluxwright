@@ -82,7 +82,25 @@ export async function typed(): Promise<void> {
   const name: string = download.suggestedFilename()
   await download.saveAs(`out/${name}`)
   // @ts-expect-error not an event Fluxwright emits
-  page.on('worker', () => {})
+  page.on('crash', () => {})
+  page.on('websocket', (ws) => {
+    void ws.url()
+    void ws.isClosed()
+    ws.on('framesent', ({ payload }) => void payload)
+    ws.on('framereceived', ({ payload }) => void payload)
+    ws.on('socketerror', (err) => void err)
+    ws.on('close', (s) => void s.isClosed())
+  })
+  page.on('worker', (w) => {
+    void w.url()
+    void w.evaluate((n: number) => n + 1, 1)
+    w.on('console', (m) => void m.text)
+    w.on('close', () => {})
+  })
+  const _workers = page.workers()
+  const _wsPromise = page.waitForEvent('websocket')
+  const _wkPromise = page.waitForEvent('worker', (w) => w.url().includes('worker'))
+  void [_workers.length, _wsPromise, _wkPromise]
   page.on('popup', (p) => void p.url())
   const pop: Promise<typeof page> = page.waitForPopup({ predicate: (p) => p.url().includes('popup'), timeout: 1000 })
   const openedBy = await page.opener()
@@ -179,6 +197,10 @@ export async function typed(): Promise<void> {
     const upstream = await r.fetch()
     await r.fulfill({ response: upstream, json: { patched: true } })
   })
+  await page.routeFromHAR('out.har', { url: '**/api/*', notFound: 'fallback' })
+  await context.routeFromHAR('ctx.har', { update: true, updateMode: 'full', updateContent: 'embed' })
+  const harPage = await browser.newPage({ recordHar: { path: 'p.har', mode: 'minimal', content: 'omit', urlFilter: /api/ } })
+  await harPage.close()
   void [closed, currentUrl, wf1, wf2, wf3, cookies, idbState, apiBody, pageReq.headersArray(), cdpEval, context.pages().length, context.browser()]
   await context.close()
   await browser.close()

@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use fluxwright_cdp::{ColorScheme, Emulation, Geolocation, LaunchOptions, Proxy, StorageState};
+use fluxwright_cdp::{
+    ColorScheme, Emulation, Geolocation, LaunchOptions, Proxy, RecordHarOptions, StorageState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Priority {
@@ -128,6 +130,8 @@ pub struct JobOptions {
     pub base_url: Option<String>,
     /// HTTP Basic/Digest authentication credentials.
     pub http_credentials: Option<(String, String)>,
+    /// HAR 1.2 recording options for this browser context.
+    pub record_har: Option<RecordHarOptions>,
 }
 
 impl Default for JobOptions {
@@ -146,6 +150,7 @@ impl Default for JobOptions {
             storage_state: None,
             base_url: None,
             http_credentials: None,
+            record_har: None,
         }
     }
 }
@@ -220,6 +225,11 @@ impl JobOptions {
 
     pub fn storage_state(mut self, state: StorageState) -> Self {
         self.storage_state = Some(state);
+        self
+    }
+
+    pub fn record_har(mut self, opts: RecordHarOptions) -> Self {
+        self.record_har = Some(opts);
         self
     }
 }

@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use fluxwright_cdp::{
     http_client::HttpContextDefaults, ApiRequestOptions, ApiResponse, BoundingBox, CdpBrowser,
     CdpPage, CdpSession, ConsoleMessage, ContextId, CookieFilter, Download, DownloadQueue,
-    FrameInfo, InterceptedRequest, LogEntry, PageError, PageLog, PdfOptions, Proxy, ResourceType,
-    ScreenshotOptions, Selector,
+    FrameInfo, HarNotFound, HarRecorder, HarRouteOptions, HarRouter, InterceptedRequest, LogEntry,
+    PageError, PageLog, PdfOptions, Proxy, RecordHarOptions, ResourceType, ScreenshotOptions,
+    Selector, WebSocketEvent, Worker, WorkerEvent,
 };
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -93,6 +94,8 @@ struct ContextGuard {
     context: ContextId,
     download_dir: std::path::PathBuf,
     http_defaults: std::sync::Mutex<HttpContextDefaults>,
+    har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
+    har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     runtime: tokio::runtime::Handle,
     disposed: AtomicBool,
 }
@@ -107,6 +110,13 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
+        for rec in recorders {
+            let _ = rec.finish().await;
+        }
         let _ = self.browser.dispose_context(&self.context).await;
         self.engine.release_slot(&self.browser, completed).await;
     }
@@ -116,8 +126,15 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
         let guard = Arc::clone(self);
         self.runtime.spawn(async move {
+            for rec in recorders {
+                let _ = rec.finish().await;
+            }
             let _ = guard.browser.dispose_context(&guard.context).await;
             guard.engine.release_slot(&guard.browser, completed).await;
         });
@@ -130,10 +147,17 @@ impl Drop for ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
         let browser = self.browser.clone();
         let ctx = self.context.clone();
         let engine = self.engine.clone();
         self.runtime.spawn(async move {
+            for rec in recorders {
+                let _ = rec.finish().await;
+            }
             let _ = browser.dispose_context(&ctx).await;
             engine.release_slot(&browser, true).await;
         });
@@ -257,6 +281,8 @@ pub struct PageLease {
     host_slot: HostSlot,
     /// Base URL for relative `goto` calls.
     base_url: std::sync::Mutex<Option<String>>,
+    har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
+    har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 tokio::task_local! {
@@ -438,6 +464,13 @@ impl Engine {
         if let Err(e) = setup_res {
             guard.dispose(false).await;
             return Err(e);
+        }
+        if let Some(ref har_opts) = opts.record_har {
+            let rec = guard
+                .browser
+                .start_har_recording(&guard.context, None, har_opts.clone())
+                .await;
+            guard.har_recorders.lock().unwrap().push(rec);
         }
         let binding_listeners = Listeners::default();
         route_newest(
@@ -929,6 +962,8 @@ impl Inner {
             context: ctx,
             download_dir,
             http_defaults: std::sync::Mutex::new(HttpContextDefaults::default()),
+            har_recorders: Default::default(),
+            har_route_tasks: Default::default(),
             runtime: tokio::runtime::Handle::current(),
             disposed: AtomicBool::new(false),
         }))
@@ -1192,6 +1227,39 @@ fn build_page_lease(
             default_timeouts: std::sync::Mutex::new(default_timeouts),
             host_slot: HostSlot::default(),
             base_url: std::sync::Mutex::new(base_url),
+            har_recorders: Default::default(),
+            har_route_tasks: Default::default(),
+        }
+    })
+}
+
+fn spawn_har_route_handler(
+    router: Arc<HarRouter>,
+    url_filter: Option<String>,
+    not_found: HarNotFound,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let matches = url_filter
+                .as_deref()
+                .is_none_or(|pat| fluxwright_cdp::url_glob_matches(pat, &req.url));
+            if !matches {
+                let _ = req.continue_with(Default::default()).await;
+                continue;
+            }
+            if let Some(fulfill) = router.match_request(
+                &req.url,
+                &req.method,
+                &req.headers,
+                req.post_data.as_deref(),
+            ) {
+                let _ = req.fulfill(fulfill).await;
+            } else if not_found == HarNotFound::Fallback {
+                let _ = req.continue_with(Default::default()).await;
+            } else {
+                let _ = req.abort("failed").await;
+            }
         }
     })
 }
@@ -1421,6 +1489,45 @@ impl ContextLease {
             return Err(Error::Other("page does not belong to this context".into()));
         }
         page.new_cdp_session().await
+    }
+
+    pub async fn start_har_recording(&self, opts: RecordHarOptions) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        let rec = self
+            .guard
+            .browser
+            .start_har_recording(&self.guard.context, None, opts)
+            .await;
+        self.guard.har_recorders.lock().unwrap().push(rec);
+        Ok(())
+    }
+
+    pub async fn route_from_har(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        opts: &HarRouteOptions,
+    ) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        if opts.update {
+            return self
+                .start_har_recording(RecordHarOptions {
+                    path: path.as_ref().to_path_buf(),
+                    omit_content: false,
+                    content: Some(opts.update_content),
+                    mode: opts.update_mode,
+                    url_filter: opts.url.clone(),
+                })
+                .await;
+        }
+        let router = Arc::new(HarRouter::from_file(path)?);
+        let rx = self.intercept().await?;
+        let task = spawn_har_route_handler(router, opts.url.clone(), opts.not_found, rx);
+        self.guard.har_route_tasks.lock().unwrap().push(task);
+        Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -2256,6 +2363,71 @@ impl PageLease {
         self.log.lock().unwrap().subscribe_network()
     }
 
+    /// WebSocket creation, frame, error, and close events from this page and its frames.
+    pub fn subscribe_websockets(&self) -> tokio::sync::mpsc::UnboundedReceiver<WebSocketEvent> {
+        self.log.lock().unwrap().subscribe_websockets()
+    }
+
+    /// Dedicated Web Workers currently active on this page.
+    pub fn workers(&self) -> Vec<Worker> {
+        self.page.workers()
+    }
+
+    /// Looks up a dedicated Web Worker on this page by its CDP target ID.
+    pub fn worker(&self, target_id: &str) -> Option<Worker> {
+        self.page.worker(target_id)
+    }
+
+    /// Lifecycle and console events for dedicated Web Workers on this page.
+    pub fn subscribe_workers(&self) -> tokio::sync::mpsc::UnboundedReceiver<WorkerEvent> {
+        self.page.subscribe_workers()
+    }
+
+    /// Starts recording HTTP traffic on this page (and its frames) to `opts.path`, flushed on close.
+    pub async fn start_har_recording(&self, opts: RecordHarOptions) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("page is closed".into()));
+        }
+        let rec = self
+            .context
+            .browser
+            .start_har_recording(
+                &self.context.context,
+                Some(self.page.target_id.0.clone()),
+                opts,
+            )
+            .await;
+        self.har_recorders.lock().unwrap().push(rec);
+        Ok(())
+    }
+
+    /// Serves matching requests on this page from a HAR 1.2 file (or records/updates it when `opts.update` is true).
+    pub async fn route_from_har(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        opts: &HarRouteOptions,
+    ) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Other("page is closed".into()));
+        }
+        if opts.update {
+            return self
+                .start_har_recording(RecordHarOptions {
+                    path: path.as_ref().to_path_buf(),
+                    omit_content: false,
+                    content: Some(opts.update_content),
+                    mode: opts.update_mode,
+                    url_filter: opts.url.clone(),
+                })
+                .await;
+        }
+        let router = Arc::new(HarRouter::from_file(path)?);
+        let rx = self.intercept().await?;
+        let task = spawn_har_route_handler(router, opts.url.clone(), opts.not_found, rx);
+        self.har_route_tasks.lock().unwrap().push(task);
+        Ok(())
+    }
+
     /// Dialogs of this page, its popups and iframes from now on, for the job to answer instead
     /// of the engine dismissing them. The newest subscriber gets each one.
     pub fn subscribe_dialogs(&self) -> tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::Dialog> {
@@ -2430,10 +2602,17 @@ impl PageLease {
     async fn release(&mut self, completed: bool) {
         self.log_task.abort();
         self.popup_task.abort();
+        for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
         if self.released {
             return;
         }
         self.released = true;
+        let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
+        for rec in recorders {
+            let _ = rec.finish().await;
+        }
         if self.owns_context {
             self.context.dispose(completed).await;
         } else if !self.context.is_disposed() {
@@ -2446,17 +2625,29 @@ impl Drop for PageLease {
     fn drop(&mut self) {
         self.log_task.abort();
         self.popup_task.abort();
+        for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
         if self.released {
             return;
         }
         self.released = true;
-        if self.owns_context {
+        let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
+        if self.owns_context && recorders.is_empty() {
             self.context.dispose_in_background(true);
-        } else if !self.context.is_disposed() {
-            let browser = self.context.browser.clone();
+        } else {
+            let owns = self.owns_context;
+            let ctx = Arc::clone(&self.context);
             let target_id = self.page.target_id.clone();
             self.runtime.spawn(async move {
-                let _ = browser.close_target(&target_id).await;
+                for rec in recorders {
+                    let _ = rec.finish().await;
+                }
+                if owns {
+                    ctx.dispose(true).await;
+                } else if !ctx.is_disposed() {
+                    let _ = ctx.browser.close_target(&target_id).await;
+                }
             });
         }
     }
