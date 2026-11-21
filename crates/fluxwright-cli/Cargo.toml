@@ -3,7 +3,13 @@ name = "fluxwright-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Fluxwright daemon and control CLI"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 default-run = "fluxwright"
 
 [[bin]]
@@ -12,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 fluxwright.workspace = true
-fluxwright-server = { path = "../fluxwright-server" }
+fluxwright-server.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
