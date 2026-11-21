@@ -201,6 +201,27 @@ export async function typed(): Promise<void> {
   await context.routeFromHAR('ctx.har', { update: true, updateMode: 'full', updateContent: 'embed' })
   const harPage = await browser.newPage({ recordHar: { path: 'p.har', mode: 'minimal', content: 'omit', urlFilter: /api/ } })
   await harPage.close()
+  if (false) {
+    const customBrowser = await chromium.launch({
+      args: ['--disable-gpu'],
+      ignoreDefaultArgs: ['--mute-audio'],
+      channel: 'chrome',
+      prewarmContexts: 2,
+    })
+    const customCtx = await customBrowser.newContext({
+      resourcePreset: 'scraping',
+      blockResources: ['image', 'stylesheet'],
+      blockUrlPatterns: ['**/ads/**'],
+    })
+    const customPage = await customBrowser.newPage({ resourcePreset: 'minimal' })
+    // @ts-expect-error not a valid resource preset
+    await customBrowser.newPage({ resourcePreset: 'all' })
+    // @ts-expect-error not a valid resource type
+    await customBrowser.newPage({ blockResources: ['websocket'] })
+    // @ts-expect-error prewarmContexts must be a number
+    await chromium.launch({ prewarmContexts: 'two' })
+    void [customCtx, customPage]
+  }
   void [closed, currentUrl, wf1, wf2, wf3, cookies, idbState, apiBody, pageReq.headersArray(), cdpEval, context.pages().length, context.browser()]
   await context.close()
   await browser.close()

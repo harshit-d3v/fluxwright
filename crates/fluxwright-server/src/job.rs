@@ -3,8 +3,8 @@ use std::time::Duration;
 use base64::Engine;
 use fluxwright::{
     netguard, parse_modifiers, CheckOptions, ClickOptions, Clip, HoverOptions, ImageFormat,
-    JobOptions, MouseButton, PageLease, PdfMargin, PdfOptions, Priority, ScreenshotOptions,
-    SelectEntry, WaitUntil,
+    JobOptions, MouseButton, PageLease, PdfMargin, PdfOptions, Priority, ResourcePreset,
+    ResourceType, ScreenshotOptions, SelectEntry, WaitUntil,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +34,53 @@ pub struct JobRequest {
     pub retries: u32,
     #[serde(default)]
     pub priority: JobPriority,
+    #[serde(default)]
+    pub resource_preset: Option<ServerResourcePreset>,
+    #[serde(default)]
+    pub block_resources: Vec<ServerResourceType>,
+    #[serde(default)]
+    pub block_url_patterns: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerResourcePreset {
+    Scraping,
+    Minimal,
+    #[serde(alias = "no-media")]
+    NoMedia,
+}
+
+impl ServerResourcePreset {
+    fn into_core(self) -> ResourcePreset {
+        match self {
+            Self::Scraping => ResourcePreset::Scraping,
+            Self::Minimal => ResourcePreset::Minimal,
+            Self::NoMedia => ResourcePreset::NoMedia,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerResourceType {
+    Image,
+    Font,
+    Media,
+    Stylesheet,
+    Script,
+}
+
+impl ServerResourceType {
+    fn into_core(self) -> ResourceType {
+        match self {
+            Self::Image => ResourceType::Image,
+            Self::Font => ResourceType::Font,
+            Self::Media => ResourceType::Media,
+            Self::Stylesheet => ResourceType::Stylesheet,
+            Self::Script => ResourceType::Script,
+        }
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -61,6 +108,19 @@ impl JobRequest {
         }
         if self.retries > 3 {
             return Err("retries must be between 0 and 3; retries replay the whole job".into());
+        }
+        if self.block_url_patterns.len() > 64 {
+            return Err("block_url_patterns must contain at most 64 patterns".into());
+        }
+        for pat in &self.block_url_patterns {
+            if pat.trim().is_empty()
+                || pat.len() > 512
+                || pat.chars().any(char::is_control)
+            {
+                return Err(
+                    "block_url_patterns entries must be 1-512 non-control characters".into(),
+                );
+            }
         }
         for step in &self.steps {
             match step {
@@ -210,10 +270,20 @@ impl JobRequest {
             JobPriority::Normal => Priority::Normal,
             JobPriority::High => Priority::High,
         };
-        JobOptions::default()
+        let mut opts = JobOptions::default()
             .priority(priority)
             .retries(self.retries)
-            .timeout(Duration::from_millis(self.timeout_ms))
+            .timeout(Duration::from_millis(self.timeout_ms));
+        if let Some(preset) = self.resource_preset {
+            opts = opts.resource_preset(preset.into_core());
+        }
+        if !self.block_resources.is_empty() {
+            opts = opts.block_resources(self.block_resources.iter().copied().map(ServerResourceType::into_core));
+        }
+        if !self.block_url_patterns.is_empty() {
+            opts = opts.block_url_patterns(self.block_url_patterns.iter().cloned());
+        }
+        opts
     }
 }
 

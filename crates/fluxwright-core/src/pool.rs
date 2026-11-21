@@ -65,15 +65,26 @@ impl Drop for Inner {
     fn drop(&mut self) {
         if let Ok(st) = self.state.try_lock() {
             for s in &st.browsers {
+                for w in &s.warm {
+                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                }
                 s.browser.start_kill();
             }
         }
     }
 }
 
+struct WarmContext {
+    context: ContextId,
+    download_dir: std::path::PathBuf,
+    blank_page: CdpPage,
+}
+
 struct Slot {
     browser: Arc<CdpBrowser>,
     active: usize,
+    warm: VecDeque<WarmContext>,
+    warming: usize,
     jobs_served: u64,
     started: Instant,
     last_used: Instant,
@@ -93,6 +104,7 @@ struct ContextGuard {
     browser: Arc<CdpBrowser>,
     context: ContextId,
     download_dir: std::path::PathBuf,
+    warm_page: std::sync::Mutex<Option<CdpPage>>,
     http_defaults: std::sync::Mutex<HttpContextDefaults>,
     har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
     har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -105,11 +117,19 @@ impl ContextGuard {
         self.disposed.load(Ordering::SeqCst)
     }
 
+    async fn invalidate_warm_page(&self) {
+        let page = self.warm_page.lock().unwrap().take();
+        if let Some(p) = page {
+            let _ = self.browser.close_target(&p.target_id).await;
+        }
+    }
+
     async fn dispose(&self, completed: bool) {
         let _ = std::fs::remove_dir_all(&self.download_dir);
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
@@ -126,6 +146,7 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
@@ -147,6 +168,7 @@ impl Drop for ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
@@ -428,6 +450,13 @@ impl Engine {
             .acquire_context_guard(opts.priority, opts.proxy.clone(), timeout_budget)
             .await?;
         let guard = ctx;
+        if opts.storage_state.is_some()
+            || opts.record_har.is_some()
+            || opts.emulation.javascript_enabled == Some(false)
+            || opts.emulation.bypass_csp
+        {
+            guard.invalidate_warm_page().await;
+        }
         *guard.http_defaults.lock().unwrap() = HttpContextDefaults {
             base_url: opts.base_url.clone(),
             extra_http_headers: opts.emulation.extra_http_headers.clone(),
@@ -607,7 +636,7 @@ impl Engine {
     }
 
     pub async fn metrics(&self) -> MetricsSnapshot {
-        let (browsers, contexts, queued, reuse, crash, recycle, pids) = {
+        let (browsers, contexts, queued, warm_contexts, reuse, warm_hits, crash, recycle, pids) = {
             let st = self.inner.state.lock().await;
             let pids: Vec<u32> = st
                 .browsers
@@ -619,7 +648,9 @@ impl Engine {
                 st.browsers.iter().filter(|s| !s.crashed).count(),
                 st.browsers.iter().map(|s| s.active).sum::<usize>(),
                 st.queue.len(),
+                st.browsers.iter().map(|s| s.warm.len()).sum::<usize>(),
                 st.counters.reuse_rate(),
+                st.counters.warm_context_hits,
                 st.counters.crash_count,
                 st.counters.recycle_count,
                 pids,
@@ -636,6 +667,8 @@ impl Engine {
             pages: contexts,
             active_leases: leases,
             queued_requests: queued,
+            warm_contexts,
+            warm_context_hits: warm_hits,
             browser_reuse_rate: reuse,
             crash_count: crash,
             recycle_count: recycle,
@@ -711,8 +744,13 @@ impl Engine {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         let mut closing = tokio::task::JoinSet::new();
-        for s in browsers {
+        for mut s in browsers {
+            let warm: Vec<WarmContext> = s.warm.drain(..).collect();
             closing.spawn(async move {
+                for w in warm {
+                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                    let _ = s.browser.dispose_context(&w.context).await;
+                }
                 let _ = s.browser.close().await;
             });
         }
@@ -738,6 +776,7 @@ pub struct BrowserInfo {
 }
 
 enum Reservation {
+    Warm(Arc<CdpBrowser>, WarmContext),
     Reuse(Arc<CdpBrowser>),
     Launch,
 }
@@ -752,6 +791,21 @@ impl State {
                     && !s.draining
                     && !s.browser.connection_dead()
                     && s.active < max_contexts
+            })
+            .min_by_key(|(_, s)| s.active)
+            .map(|(i, _)| i)
+    }
+
+    fn next_warm_browser(&self, max_contexts: usize) -> Option<usize> {
+        self.browsers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.crashed
+                    && !s.draining
+                    && !s.browser.connection_dead()
+                    && s.active < max_contexts
+                    && !s.warm.is_empty()
             })
             .min_by_key(|(_, s)| s.active)
             .map(|(i, _)| i)
@@ -784,6 +838,8 @@ impl Inner {
             }
             drop_abandoned(&mut st.queue);
             if !st.can_dispatch(&self.config) {
+                drop(st);
+                self.maybe_prewarm().await;
                 return Ok(false);
             }
         }
@@ -800,6 +856,7 @@ impl Inner {
             Ok(p) => p,
             Err(_) => return Ok(false),
         };
+        let mut excess_warm: Option<(Arc<CdpBrowser>, WarmContext)> = None;
         let (waiter, reservation) = {
             let mut st = self.state.lock().await;
             if st.shutting_down {
@@ -813,7 +870,31 @@ impl Inner {
             let Some(waiter) = pick_waiter(&mut st.queue) else {
                 return Ok(false);
             };
-            let reservation = if let Some(i) = idx {
+            let reservation = if waiter.proxy.is_none() {
+                if let Some(wi) = st.next_warm_browser(self.config.max_contexts_per_browser) {
+                    let warm = st.browsers[wi].warm.pop_front().unwrap();
+                    st.browsers[wi].active += 1;
+                    st.counters.acquires += 1;
+                    st.counters.acquires_reused_browser += 1;
+                    st.counters.warm_context_hits += 1;
+                    Reservation::Warm(st.browsers[wi].browser.clone(), warm)
+                } else if let Some(i) = idx {
+                    st.browsers[i].active += 1;
+                    st.counters.acquires += 1;
+                    st.counters.acquires_reused_browser += 1;
+                    Reservation::Reuse(st.browsers[i].browser.clone())
+                } else {
+                    st.launching += 1;
+                    Reservation::Launch
+                }
+            } else if let Some(i) = idx {
+                if st.browsers[i].active + st.browsers[i].warm.len()
+                    >= self.config.max_contexts_per_browser
+                {
+                    if let Some(evicted) = st.browsers[i].warm.pop_back() {
+                        excess_warm = Some((st.browsers[i].browser.clone(), evicted));
+                    }
+                }
                 st.browsers[i].active += 1;
                 st.counters.acquires += 1;
                 st.counters.acquires_reused_browser += 1;
@@ -824,11 +905,18 @@ impl Inner {
             };
             (waiter, reservation)
         };
+        if let Some((browser, evicted)) = excess_warm {
+            tokio::spawn(async move {
+                let _ = std::fs::remove_dir_all(&evicted.download_dir);
+                let _ = browser.dispose_context(&evicted.context).await;
+            });
+        }
         let inner = self.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             let res = inner.prepare_context(waiter.proxy.as_ref(), reservation).await;
             let _ = waiter.tx.send(res);
+            drop(permit);
+            inner.maybe_prewarm().await;
             inner.admit.notify_waiters();
         });
         Ok(true)
@@ -892,18 +980,129 @@ impl Inner {
         total
     }
 
+    async fn maybe_prewarm(self: &Arc<Self>) {
+        let target_per_browser = self.config.prewarm_contexts;
+        if target_per_browser == 0 {
+            return;
+        }
+        let ceiling = self.config.memory_ceiling_mb * 1024 * 1024;
+        if ceiling > 0 {
+            let tree: u64 = self.rss_cache.lock().await.1.values().copied().sum();
+            if tree > ceiling {
+                return;
+            }
+        }
+        let mut to_spawn: Vec<(Arc<CdpBrowser>, tokio::sync::OwnedSemaphorePermit)> = Vec::new();
+        {
+            let mut st = self.state.lock().await;
+            if st.shutting_down {
+                return;
+            }
+            for s in st.browsers.iter_mut() {
+                if s.crashed || s.draining || s.browser.connection_dead() {
+                    continue;
+                }
+                let max_warm = target_per_browser
+                    .min(self.config.max_contexts_per_browser.saturating_sub(s.active));
+                let have = s.warm.len() + s.warming;
+                for _ in have..max_warm {
+                    let Ok(permit) = self.grants.clone().try_acquire_owned() else {
+                        break;
+                    };
+                    s.warming += 1;
+                    to_spawn.push((s.browser.clone(), permit));
+                }
+            }
+        }
+        let nav_timeout = self.config.navigation_timeout;
+        for (browser, permit) in to_spawn {
+            let inner = self.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let warm_res = async {
+                    let ctx = browser.create_context(None).await?;
+                    let download_dir = std::env::temp_dir()
+                        .join(format!("fluxwright-{}-dl-{}", std::process::id(), ctx.0));
+                    let _ = browser
+                        .context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5))
+                        .await;
+                    match browser.create_page(&ctx, nav_timeout).await {
+                        Ok(blank_page) => Ok::<_, fluxwright_cdp::Error>(WarmContext {
+                            context: ctx,
+                            download_dir,
+                            blank_page,
+                        }),
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&download_dir);
+                            let _ = browser.dispose_context(&ctx).await;
+                            Err(e)
+                        }
+                    }
+                }
+                .await;
+
+                let discarded: Option<WarmContext> = {
+                    let mut st = inner.state.lock().await;
+                    let shutting_down = st.shutting_down;
+                    let max_per_browser = inner.config.max_contexts_per_browser;
+                    match st.browsers.iter_mut().find(|s| s.browser.id == browser.id) {
+                        Some(s) => {
+                            s.warming = s.warming.saturating_sub(1);
+                            match warm_res {
+                                Ok(w)
+                                    if !shutting_down
+                                        && !s.crashed
+                                        && !s.draining
+                                        && !s.browser.connection_dead()
+                                        && s.warm.len() < target_per_browser
+                                        && s.active + s.warm.len() < max_per_browser =>
+                                {
+                                    s.warm.push_back(w);
+                                    None
+                                }
+                                Ok(w) => Some(w),
+                                Err(_) => None,
+                            }
+                        }
+                        None => warm_res.ok(),
+                    }
+                };
+                if let Some(w) = discarded {
+                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                    let _ = browser.dispose_context(&w.context).await;
+                }
+                inner.admit.notify_waiters();
+            });
+        }
+    }
+
     async fn prepare_context(
         self: &Arc<Self>,
         proxy: Option<&Proxy>,
         reservation: Reservation,
     ) -> Result<Arc<ContextGuard>> {
-        let browser = match reservation {
+        let (browser, warm_page, existing_ctx) = match reservation {
+            Reservation::Warm(b, w) => {
+                if self.state.lock().await.shutting_down {
+                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                    let _ = b.dispose_context(&w.context).await;
+                    self.release_slot(&b, false).await;
+                    return Err(Error::ShuttingDown);
+                }
+                if !b.connection_dead() && !w.blank_page.is_closed() {
+                    (b, Some(w.blank_page), Some((w.context, w.download_dir)))
+                } else {
+                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                    let _ = b.dispose_context(&w.context).await;
+                    (b, None, None)
+                }
+            }
             Reservation::Reuse(b) => {
                 if self.state.lock().await.shutting_down {
                     self.release_slot(&b, false).await;
                     return Err(Error::ShuttingDown);
                 }
-                b
+                (b, None, None)
             }
             Reservation::Launch => {
                 let launched = self.source.launch(&self.config.launch).await;
@@ -916,6 +1115,8 @@ impl Inner {
                             st.browsers.push(Slot {
                                 browser: browser.clone(),
                                 active: 1,
+                                warm: VecDeque::new(),
+                                warming: 0,
                                 jobs_served: 0,
                                 started: Instant::now(),
                                 last_used: Instant::now(),
@@ -929,7 +1130,7 @@ impl Inner {
                     }
                 };
                 match outcome {
-                    Ok(Ok(b)) => b,
+                    Ok(Ok(b)) => (b, None, None),
                     Ok(Err(b)) => {
                         let _ = b.close().await;
                         return Err(Error::ShuttingDown);
@@ -939,28 +1140,36 @@ impl Inner {
             }
         };
 
-        let ctx = match browser.create_context(proxy).await {
-            Ok(c) => c,
-            Err(e) => {
-                self.release_slot(&browser, false).await;
-                return Err(e.into());
+        let (ctx, download_dir) = match existing_ctx {
+            Some(pair) => pair,
+            None => {
+                let ctx = match browser.create_context(proxy).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.release_slot(&browser, false).await;
+                        return Err(e.into());
+                    }
+                };
+
+                // Named like profile folders, so the sweep after a crash finds it: `fluxwright-<pid>-…`.
+                let download_dir = std::env::temp_dir()
+                    .join(format!("fluxwright-{}-dl-{}", std::process::id(), ctx.0));
+                // Best effort: a Chrome that refuses only loses downloads.
+                let _ = browser
+                    .context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5))
+                    .await;
+                (ctx, download_dir)
             }
         };
 
-        info!(browser = %browser.id.0, context = %ctx.0, "context lease granted");
-
-        // Named like profile folders, so the sweep after a crash finds it: `fluxwright-<pid>-…`.
-        let download_dir = std::env::temp_dir().join(format!("fluxwright-{}-dl-{}", std::process::id(), ctx.0));
-        // Best effort: a Chrome that refuses only loses downloads.
-        let _ = browser
-            .context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5))
-            .await;
+        info!(browser = %browser.id.0, context = %ctx.0, warm = warm_page.is_some(), "context lease granted");
 
         Ok(Arc::new(ContextGuard {
             engine: self.clone(),
             browser,
             context: ctx,
             download_dir,
+            warm_page: std::sync::Mutex::new(warm_page),
             http_defaults: std::sync::Mutex::new(HttpContextDefaults::default()),
             har_recorders: Default::default(),
             har_route_tasks: Default::default(),
@@ -991,7 +1200,10 @@ impl Inner {
         while i < st.browsers.len() {
             let dead = st.browsers[i].browser.connection_dead() || st.browsers[i].crashed;
             if dead && st.browsers[i].active == 0 {
-                let slot = st.browsers.remove(i);
+                let mut slot = st.browsers.remove(i);
+                for w in slot.warm.drain(..) {
+                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                }
                 st.counters.crash_count += 1;
                 warn!(pid = slot.browser.pid, "removing dead browser");
                 // Not awaited: dispatch serves every waiter, and a close can take seconds.
@@ -1045,6 +1257,7 @@ impl Inner {
             HashMap::new()
         };
         let mut to_close = Vec::new();
+        let mut to_dispose_warm: Vec<(Arc<CdpBrowser>, WarmContext)> = Vec::new();
         let mut bump = 0u64;
         {
             let mut st = self.state.lock().await;
@@ -1053,6 +1266,9 @@ impl Inner {
             for s in st.browsers.iter_mut() {
                 if s.draining || s.crashed {
                     if s.draining && s.active == 0 {
+                        for w in s.warm.drain(..) {
+                            to_dispose_warm.push((s.browser.clone(), w));
+                        }
                         to_close.push(s.browser.clone());
                     }
                     continue;
@@ -1088,6 +1304,9 @@ impl Inner {
                     );
                     s.draining = true;
                     bump += 1;
+                    for w in s.warm.drain(..) {
+                        to_dispose_warm.push((s.browser.clone(), w));
+                    }
                     if s.active == 0 {
                         to_close.push(s.browser.clone());
                     }
@@ -1098,6 +1317,12 @@ impl Inner {
                 !to_close
                     .iter()
                     .any(|b| b.id == s.browser.id && s.active == 0 && s.draining)
+            });
+        }
+        for (browser, w) in to_dispose_warm {
+            tokio::spawn(async move {
+                let _ = std::fs::remove_dir_all(&w.download_dir);
+                let _ = browser.dispose_context(&w.context).await;
             });
         }
         // Not awaited: dispatch serves every waiter, and a close can take seconds.
@@ -1137,6 +1362,12 @@ async fn apply_context_blocking(guard: &ContextGuard, opts: &JobOptions) -> Resu
     }
     if opts.block_media {
         types.push(ResourceType::Media);
+    }
+    if opts.block_stylesheets {
+        types.push(ResourceType::Stylesheet);
+    }
+    if opts.block_scripts {
+        types.push(ResourceType::Script);
     }
     if !types.is_empty() {
         guard
@@ -1313,16 +1544,27 @@ impl ContextLease {
         if self.is_closed() {
             return Err(Error::Other("browser context is closed".into()));
         }
-        let page = self
+        let warm = self
             .guard
-            .browser
-            .create_page(
-                &self.guard.context,
-                self.navigation_timeout
-                    .or(self.action_timeout)
-                    .unwrap_or(self.guard.engine.config.navigation_timeout),
-            )
-            .await?;
+            .warm_page
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|p| !p.is_closed());
+        let page = match warm {
+            Some(p) => p,
+            None => {
+                self.guard
+                    .browser
+                    .create_page(
+                        &self.guard.context,
+                        self.navigation_timeout
+                            .or(self.action_timeout)
+                            .unwrap_or(self.guard.engine.config.navigation_timeout),
+                    )
+                    .await?
+            }
+        };
         Ok(build_page_lease(
             self.guard.engine.clone(),
             self.guard.clone(),
@@ -1411,6 +1653,7 @@ impl ContextLease {
         if self.is_closed() {
             return Err(Error::Other("browser context is closed".into()));
         }
+        self.guard.invalidate_warm_page().await;
         Ok(self
             .guard
             .browser
@@ -2616,6 +2859,17 @@ impl PageLease {
         if self.owns_context {
             self.context.dispose(completed).await;
         } else if !self.context.is_disposed() {
+            let flushers: Vec<_> = self
+                .context
+                .har_recorders
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.flusher())
+                .collect();
+            for f in flushers {
+                f.flush_session(Some(self.page.session_id.0.clone())).await;
+            }
             let _ = self.context.browser.close_target(&self.page.target_id).await;
         }
     }
@@ -2639,6 +2893,17 @@ impl Drop for PageLease {
             let owns = self.owns_context;
             let ctx = Arc::clone(&self.context);
             let target_id = self.page.target_id.clone();
+            let sid = self.page.session_id.0.clone();
+            let ctx_flushers: Vec<_> = if !owns {
+                ctx.har_recorders
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.flusher())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             self.runtime.spawn(async move {
                 for rec in recorders {
                     let _ = rec.finish().await;
@@ -2646,6 +2911,9 @@ impl Drop for PageLease {
                 if owns {
                     ctx.dispose(true).await;
                 } else if !ctx.is_disposed() {
+                    for f in ctx_flushers {
+                        f.flush_session(Some(sid.clone())).await;
+                    }
                     let _ = ctx.browser.close_target(&target_id).await;
                 }
             });
@@ -3252,6 +3520,48 @@ impl EngineBuilder {
         self.config.launch.executable = Some(path.into());
         self
     }
+    /// Extra CLI flags passed to Chromium on launch.
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config
+            .launch
+            .extra_args
+            .extend(args.into_iter().map(Into::into));
+        self
+    }
+    /// Skip all Fluxwright default Chromium CLI flags when `all` is true.
+    pub fn ignore_default_args(mut self, all: bool) -> Self {
+        self.config.launch.ignore_default_args = if all {
+            fluxwright_cdp::IgnoreDefaultArgs::All
+        } else {
+            fluxwright_cdp::IgnoreDefaultArgs::None
+        };
+        self
+    }
+    /// Skip specific default Chromium CLI flags by flag name (with or without `=...`).
+    pub fn ignore_default_args_list<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.launch.ignore_default_args = fluxwright_cdp::IgnoreDefaultArgs::Some(
+            args.into_iter().map(Into::into).collect(),
+        );
+        self
+    }
+    /// Browser channel (`chrome`, `chrome-beta`, `chrome-dev`, `chrome-canary`, `msedge`, ...).
+    pub fn channel(mut self, channel: impl Into<String>) -> Self {
+        self.config.launch.channel = Some(channel.into());
+        self
+    }
+    /// Pre-warmed blank context + `about:blank` page slots kept ready per running browser.
+    pub fn prewarm_contexts(mut self, n: usize) -> Self {
+        self.config.prewarm_contexts = n;
+        self
+    }
     pub fn source(mut self, source: Arc<dyn BrowserSource>) -> Self {
         self.source = source;
         self
@@ -3273,6 +3583,11 @@ impl EngineBuilder {
                 "max_browsers and max_contexts_per_browser must be at least 1".into(),
             ));
         }
+        if self.config.launch.executable.is_none() {
+            if let Some(ref ch) = self.config.launch.channel {
+                fluxwright_cdp::find_channel(ch)?;
+            }
+        }
         let engine = Engine::new(self.config, self.source);
         let n = engine.config().min_browsers;
         for _ in 0..n {
@@ -3281,6 +3596,8 @@ impl EngineBuilder {
             st.browsers.push(Slot {
                 browser: b,
                 active: 0,
+                warm: VecDeque::new(),
+                warming: 0,
                 jobs_served: 0,
                 started: Instant::now(),
                 last_used: Instant::now(),
@@ -3288,6 +3605,7 @@ impl EngineBuilder {
                 crashed: false,
             });
         }
+        engine.inner.maybe_prewarm().await;
         Ok(engine)
     }
 }
@@ -3526,6 +3844,8 @@ mod tests {
         eng.inner.state.lock().await.browsers.push(Slot {
             browser,
             active: 0,
+            warm: VecDeque::new(),
+            warming: 0,
             jobs_served: 0,
             started: Instant::now(),
             last_used: Instant::now(),

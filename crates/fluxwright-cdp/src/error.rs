@@ -57,21 +57,33 @@ impl Error {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum IgnoreDefaultArgs {
+    #[default]
+    None,
+    All,
+    Some(Vec<String>),
+}
+
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
     pub executable: Option<PathBuf>,
+    pub channel: Option<String>,
     pub headless: bool,
     pub no_sandbox: bool,
     pub extra_args: Vec<String>,
+    pub ignore_default_args: IgnoreDefaultArgs,
 }
 
 impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             executable: None,
+            channel: None,
             headless: true,
             no_sandbox: false,
             extra_args: Vec::new(),
+            ignore_default_args: IgnoreDefaultArgs::None,
         }
     }
 }

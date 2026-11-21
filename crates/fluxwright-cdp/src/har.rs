@@ -424,11 +424,43 @@ struct RecordedSlot {
     body_task: Option<JoinHandle<Option<(i64, String, Option<String>)>>>,
 }
 
+enum RecorderCmd {
+    Flush {
+        session_id: Option<String>,
+        done: oneshot::Sender<()>,
+    },
+}
+
+/// Handle to flush pending HAR captures on a recording session before closing its target.
+#[derive(Clone)]
+pub struct HarFlusher {
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<RecorderCmd>,
+}
+
+impl HarFlusher {
+    /// Waits for pending in-flight network bodies on `session_id` (up to 200 ms) so
+    /// closing a page target does not drop the response body of its final requests.
+    pub async fn flush_session(&self, session_id: Option<String>) {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(RecorderCmd::Flush {
+                session_id,
+                done: tx,
+            })
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
+}
+
 /// Active CDP listener recording HTTP traffic in HAR 1.2 format until [`finish`](Self::finish).
 pub struct HarRecorder {
     path: PathBuf,
     mode: HarMode,
     stop_tx: Option<oneshot::Sender<()>>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<RecorderCmd>,
     task: JoinHandle<Vec<RecordedSlot>>,
 }
 
@@ -442,6 +474,7 @@ impl HarRecorder {
     ) -> Self {
         let mut events = conn.subscribe_unbounded();
         let (stop_tx, mut stop_rx) = oneshot::channel();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<RecorderCmd>();
         let path = opts.path.clone();
         let mode = opts.mode;
         let policy = opts.effective_content_policy();
@@ -793,6 +826,55 @@ impl HarRecorder {
                         }
                         break;
                     }
+                    Some(RecorderCmd::Flush { session_id, done }) = cmd_rx.recv() => {
+                        while let Ok(ev) = events.try_recv() {
+                            handle_event(
+                                ev,
+                                &mut sessions,
+                                &mut in_flight,
+                                &mut completed,
+                                &mut next_seq,
+                            );
+                        }
+                        let has_pending = |map: &HashMap<(String, String), InFlightHar>| match session_id.as_deref() {
+                            Some(sid) => map.keys().any(|(s, _)| s == sid),
+                            None => map.values().any(|f| f.response_received),
+                        };
+                        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+                        while has_pending(&in_flight) && tokio::time::Instant::now() < deadline {
+                            match tokio::time::timeout_at(deadline, events.recv()).await {
+                                Ok(Some(ev)) => {
+                                    handle_event(
+                                        ev,
+                                        &mut sessions,
+                                        &mut in_flight,
+                                        &mut completed,
+                                        &mut next_seq,
+                                    );
+                                }
+                                _ => break,
+                            }
+                        }
+                        while let Ok(ev) = events.try_recv() {
+                            handle_event(
+                                ev,
+                                &mut sessions,
+                                &mut in_flight,
+                                &mut completed,
+                                &mut next_seq,
+                            );
+                        }
+                        for slot in &mut completed {
+                            if let Some(handle) = slot.body_task.take() {
+                                if let Ok(Some((size, text, encoding))) = handle.await {
+                                    slot.entry.response.content.size = size;
+                                    slot.entry.response.content.text = Some(text);
+                                    slot.entry.response.content.encoding = encoding;
+                                }
+                            }
+                        }
+                        let _ = done.send(());
+                    }
                     ev = events.recv() => {
                         let Some(ev) = ev else {
                             break;
@@ -815,12 +897,19 @@ impl HarRecorder {
             path,
             mode,
             stop_tx: Some(stop_tx),
+            cmd_tx,
             task,
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn flusher(&self) -> HarFlusher {
+        HarFlusher {
+            cmd_tx: self.cmd_tx.clone(),
+        }
     }
 
     /// Stops recording, awaits pending response body fetches, writes HAR 1.2 JSON to disk, and

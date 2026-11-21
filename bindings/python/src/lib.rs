@@ -1114,6 +1114,27 @@ fn build_record_har_options(
     })
 }
 
+enum PyIgnoreDefaultArgs {
+    All(bool),
+    Some(Vec<String>),
+}
+
+fn parse_ignore_default_args(val: Bound<'_, PyAny>) -> PyResult<PyIgnoreDefaultArgs> {
+    if val.is_instance_of::<PyBool>() {
+        Ok(PyIgnoreDefaultArgs::All(val.extract::<bool>()?))
+    } else if val.is_instance_of::<PyString>() {
+        Err(PyTypeError::new_err(
+            "ignore_default_args must be a bool or list[str], not str",
+        ))
+    } else if let Ok(list) = val.extract::<Vec<String>>() {
+        Ok(PyIgnoreDefaultArgs::Some(list))
+    } else {
+        Err(PyTypeError::new_err(
+            "ignore_default_args must be a bool or list[str]",
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_job_options<'py>(
     proxy: Option<Bound<'py, PyAny>>,
@@ -1140,6 +1161,9 @@ fn parse_job_options<'py>(
     record_har_content: Option<String>,
     record_har_mode: Option<String>,
     record_har_url_filter: Option<String>,
+    resource_preset: Option<String>,
+    block_resources: Option<Vec<String>>,
+    block_url_patterns: Option<Vec<String>>,
 ) -> PyResult<fluxwright::JobOptions> {
     let color_scheme = match color_scheme {
         None => None,
@@ -1167,7 +1191,7 @@ fn parse_job_options<'py>(
         )?),
         None => None,
     };
-    Ok(fluxwright::JobOptions {
+    let mut opts = fluxwright::JobOptions {
         proxy: proxy.map(|p| fluxwright::Proxy {
             server: p.server,
             bypass: p.bypass,
@@ -1200,7 +1224,30 @@ fn parse_job_options<'py>(
         http_credentials: http_credentials.map(|c| (c.username, c.password)),
         record_har,
         ..Default::default()
-    })
+    };
+    if let Some(ref preset) = resource_preset {
+        let p = fluxwright::ResourcePreset::parse(preset).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "resource_preset must be 'scraping', 'minimal', or 'no-media', not {preset:?}"
+            ))
+        })?;
+        opts = opts.resource_preset(p);
+    }
+    if let Some(resources) = block_resources {
+        let mut parsed = Vec::with_capacity(resources.len());
+        for r in resources {
+            parsed.push(fluxwright::ResourceType::parse(&r).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "block_resources entry must be image, font, media, stylesheet or script, not {r:?}"
+                ))
+            })?);
+        }
+        opts = opts.block_resources(parsed);
+    }
+    if let Some(patterns) = block_url_patterns {
+        opts = opts.block_url_patterns(patterns);
+    }
+    Ok(opts)
 }
 
 /// The engine: a pool of Chrome processes that pages are leased from.
@@ -1213,10 +1260,11 @@ struct Engine {
 impl Engine {
     #[staticmethod]
     #[pyo3(signature = (*, max_browsers=None, executable_path=None, headless=None, queue_timeout=None,
-        memory_ceiling_mb=None, max_concurrency_per_host=None, min_delay_per_host=None))]
+        memory_ceiling_mb=None, max_concurrency_per_host=None, min_delay_per_host=None,
+        args=None, ignore_default_args=None, channel=None, prewarm_contexts=None))]
     #[allow(clippy::too_many_arguments)]
-    fn launch(
-        py: Python<'_>,
+    fn launch<'py>(
+        py: Python<'py>,
         max_browsers: Option<usize>,
         executable_path: Option<PathBuf>,
         headless: Option<bool>,
@@ -1224,7 +1272,14 @@ impl Engine {
         memory_ceiling_mb: Option<u64>,
         max_concurrency_per_host: Option<usize>,
         min_delay_per_host: Option<f64>,
-    ) -> PyResult<Bound<'_, PyAny>> {
+        args: Option<Vec<String>>,
+        ignore_default_args: Option<Bound<'py, PyAny>>,
+        channel: Option<String>,
+        prewarm_contexts: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let parsed_ignore = ignore_default_args
+            .map(parse_ignore_default_args)
+            .transpose()?;
         future_into_py(py, async move {
             // new_page waits its turn however long the queue is, so starting every job at once
             // works; the engine's own default (256 waiting, then an error) is for a server
@@ -1251,6 +1306,21 @@ impl Engine {
             }
             if let Some(h) = headless {
                 b = b.headless(h);
+            }
+            if let Some(a) = args {
+                b = b.args(a);
+            }
+            if let Some(ig) = parsed_ignore {
+                match ig {
+                    PyIgnoreDefaultArgs::All(all) => b = b.ignore_default_args(all),
+                    PyIgnoreDefaultArgs::Some(list) => b = b.ignore_default_args_list(list),
+                }
+            }
+            if let Some(ch) = channel {
+                b = b.channel(ch);
+            }
+            if let Some(n) = prewarm_contexts {
+                b = b.prewarm_contexts(n);
             }
             Ok(Engine {
                 inner: b.build().await.map_err(error)?,
@@ -1281,7 +1351,8 @@ impl Engine {
                         java_script_enabled=None, offline=None, base_url=None, http_credentials=None,
                         bypass_csp=None, storage_state=None,
                         record_har_path=None, record_har_omit_content=None, record_har_content=None,
-                        record_har_mode=None, record_har_url_filter=None))]
+                        record_har_mode=None, record_har_url_filter=None,
+                        resource_preset=None, block_resources=None, block_url_patterns=None))]
     fn new_page<'py>(
         &self,
         py: Python<'py>,
@@ -1309,6 +1380,9 @@ impl Engine {
         record_har_content: Option<String>,
         record_har_mode: Option<String>,
         record_har_url_filter: Option<String>,
+        resource_preset: Option<String>,
+        block_resources: Option<Vec<String>>,
+        block_url_patterns: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = parse_job_options(
             proxy,
@@ -1335,6 +1409,9 @@ impl Engine {
             record_har_content,
             record_har_mode,
             record_har_url_filter,
+            resource_preset,
+            block_resources,
+            block_url_patterns,
         )?;
         let engine = self.inner.clone();
         future_into_py(py, async move {
@@ -1350,7 +1427,8 @@ impl Engine {
                         java_script_enabled=None, offline=None, base_url=None, http_credentials=None,
                         bypass_csp=None, storage_state=None,
                         record_har_path=None, record_har_omit_content=None, record_har_content=None,
-                        record_har_mode=None, record_har_url_filter=None))]
+                        record_har_mode=None, record_har_url_filter=None,
+                        resource_preset=None, block_resources=None, block_url_patterns=None))]
     fn new_context<'py>(
         &self,
         py: Python<'py>,
@@ -1378,6 +1456,9 @@ impl Engine {
         record_har_content: Option<String>,
         record_har_mode: Option<String>,
         record_har_url_filter: Option<String>,
+        resource_preset: Option<String>,
+        block_resources: Option<Vec<String>>,
+        block_url_patterns: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = parse_job_options(
             proxy,
@@ -1404,6 +1485,9 @@ impl Engine {
             record_har_content,
             record_har_mode,
             record_har_url_filter,
+            resource_preset,
+            block_resources,
+            block_url_patterns,
         )?;
         let engine = self.inner.clone();
         future_into_py(py, async move {

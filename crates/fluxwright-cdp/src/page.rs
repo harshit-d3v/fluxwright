@@ -3535,6 +3535,17 @@ impl ResourceType {
             ResourceType::Script => "Script",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "image" => Some(ResourceType::Image),
+            "font" => Some(ResourceType::Font),
+            "media" => Some(ResourceType::Media),
+            "stylesheet" => Some(ResourceType::Stylesheet),
+            "script" => Some(ResourceType::Script),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
