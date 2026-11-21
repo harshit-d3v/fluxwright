@@ -45,6 +45,11 @@ class Engine:
         http_credentials: Mapping[str, str] | None = None,
         bypass_csp: bool | None = None,
         storage_state: Mapping[str, Any] | _Path | None = None,
+        record_har_path: _Path | None = None,
+        record_har_omit_content: bool | None = None,
+        record_har_content: str | None = None,
+        record_har_mode: str | None = None,
+        record_har_url_filter: str | None = None,
     ) -> Awaitable[Lease]: ...
     def new_context(
         self,
@@ -68,6 +73,11 @@ class Engine:
         http_credentials: Mapping[str, str] | None = None,
         bypass_csp: bool | None = None,
         storage_state: Mapping[str, Any] | _Path | None = None,
+        record_har_path: _Path | None = None,
+        record_har_omit_content: bool | None = None,
+        record_har_content: str | None = None,
+        record_har_mode: str | None = None,
+        record_har_url_filter: str | None = None,
     ) -> Awaitable[Context]: ...
     def close(self) -> Awaitable[None]: ...
 
@@ -107,6 +117,15 @@ class Context:
     def storage_state(
         self, *, path: _Path | None = None, indexed_db: bool = False
     ) -> Awaitable[dict[str, Any]]: ...
+    def _start_har_recording(
+        self,
+        path: _Path,
+        *,
+        omit_content: bool | None = None,
+        content: str | None = None,
+        mode: str | None = None,
+        url_filter: str | None = None,
+    ) -> Awaitable[None]: ...
     def is_closed(self) -> bool: ...
     def close(self) -> Awaitable[None]: ...
 
@@ -487,6 +506,19 @@ class Page:
     def _frame_evaluate(self, frame_id: str, expression: str, arg: Any = None) -> Awaitable[Any]: ...
     def _frame_by_id(self, frame_id: str) -> FrameLocator: ...
     def _new_cdp_session(self, frame_id: str | None = None) -> Awaitable[CdpSession]: ...
+    def _websockets(self) -> WebSocketStream: ...
+    def _workers(self) -> list[WorkerInfo]: ...
+    def _worker_evaluate(self, worker_id: str, expression: str, arg: Any = None) -> Awaitable[Any]: ...
+    def _worker_events(self) -> WorkerStream: ...
+    def _start_har_recording(
+        self,
+        path: _Path,
+        *,
+        omit_content: bool | None = None,
+        content: str | None = None,
+        mode: str | None = None,
+        url_filter: str | None = None,
+    ) -> Awaitable[None]: ...
 
 class Locator:
     """Lazy, like Playwright's: every action runs the query again."""
@@ -836,3 +868,32 @@ class CdpSession:
     def send(self, method: str, params: Mapping[str, Any] | None = None) -> Awaitable[Any]: ...
     def _events(self) -> CdpEventStream: ...
     def detach(self) -> Awaitable[None]: ...
+
+
+class WebSocketEvent:
+    event: str
+    request_id: str
+    url: str | None
+    payload_text: str | None
+    payload_bytes: bytes | None
+    error_message: str | None
+
+
+class WebSocketStream:
+    def next(self) -> Awaitable[WebSocketEvent | None]: ...
+
+
+class WorkerInfo:
+    id: str
+    url: str
+
+
+class WorkerEvent:
+    event: str
+    id: str
+    url: str | None
+    message: ConsoleMessage | None
+
+
+class WorkerStream:
+    def next(self) -> Awaitable[WorkerEvent | None]: ...

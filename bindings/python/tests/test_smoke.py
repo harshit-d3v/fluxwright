@@ -4,6 +4,8 @@ chrome-headless-shell (see the README)."""
 import asyncio
 import base64
 import gc
+import hashlib
+import json as _json
 import os
 import re
 import subprocess
@@ -1689,3 +1691,332 @@ def test_api_request_cookies_indexeddb(base):
                 browser.close()
     finally:
         srv.shutdown()
+
+
+def test_websockets_har_workers(tmp_path):
+    """WebSockets, HAR 1.2 record/replay/fallback/update, and dedicated Web Workers (async & sync)."""
+    lock = threading.Lock()
+    state = {"api_hits": 0, "seq": 0}
+
+    def recv_exact(sock, n: int) -> bytes | None:
+        chunks = []
+        remaining = n
+        while remaining > 0:
+            part = sock.recv(remaining)
+            if not part:
+                return None
+            chunks.append(part)
+            remaining -= len(part)
+        return b"".join(chunks)
+
+    def make_ws_frame(opcode: int, payload: bytes) -> bytes:
+        n = len(payload)
+        if n < 126:
+            hdr = bytes([0x80 | opcode, n])
+        else:
+            hdr = bytes([0x80 | opcode, 126, (n >> 8) & 0xFF, n & 0xFF])
+        return hdr + payload
+
+    class Pr4cHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            if self.headers.get("Upgrade", "").lower() == "websocket":
+                ws_nonce = self.headers.get("Sec-WebSocket-Key", "")
+                accept = base64.b64encode(
+                    hashlib.sha1((ws_nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+                ).decode()
+                self.wfile.write(
+                    (
+                        "HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                    ).encode()
+                )
+                self.wfile.flush()
+                self.close_connection = True
+                sock = self.connection
+                try:
+                    while True:
+                        hdr = recv_exact(sock, 2)
+                        if hdr is None:
+                            break
+                        opcode = hdr[0] & 0x0F
+                        masked = (hdr[1] & 0x80) != 0
+                        plen = hdr[1] & 0x7F
+                        if plen == 126:
+                            ext = recv_exact(sock, 2)
+                            if ext is None:
+                                break
+                            plen = int.from_bytes(ext, "big")
+                        mask = recv_exact(sock, 4) if masked else b""
+                        if mask is None:
+                            break
+                        raw = recv_exact(sock, plen) if plen else b""
+                        if raw is None:
+                            break
+                        payload = (
+                            bytes(b ^ mask[i & 3] for i, b in enumerate(raw)) if masked else raw
+                        )
+                        if opcode == 0x8:
+                            sock.sendall(make_ws_frame(0x8, b""))
+                            break
+                        elif opcode == 0x1:
+                            sock.sendall(
+                                make_ws_frame(0x1, ("echo:" + payload.decode("utf-8")).encode("utf-8"))
+                            )
+                        elif opcode == 0x2:
+                            sock.sendall(make_ws_frame(0x2, b"\xfe" + payload))
+                        elif opcode == 0x9:
+                            sock.sendall(make_ws_frame(0xA, payload))
+                except OSError:
+                    pass
+                return
+
+            if self.path == "/":
+                ctype, body = "text/html", b"<!doctype html><h1>pr4c-py</h1>"
+            elif self.path == "/worker.js":
+                ctype, body = (
+                    "application/javascript",
+                    b"self.workerValue = 37; self.emitLog = (m) => console.log(m);",
+                )
+            elif self.path == "/api/hello":
+                with lock:
+                    state["api_hits"] += 1
+                    hits = state["api_hits"]
+                ctype = "application/json"
+                body = _json.dumps({"msg": "hello", "hits": hits}).encode()
+            elif self.path == "/api/seq":
+                with lock:
+                    state["seq"] += 1
+                    n = state["seq"]
+                ctype = "application/json"
+                body = _json.dumps({"n": n}).encode()
+            elif self.path == "/api/other":
+                ctype, body = "application/json", b'{"other":true}'
+            else:
+                ctype, body = "text/plain", b"ok"
+
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    class FastHttpServer(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    srv = FastHttpServer(("127.0.0.1", 0), Pr4cHandler)
+    port = srv.server_address[1]
+    base_url = f"http://127.0.0.1:{port}"
+    ws_url = f"ws://127.0.0.1:{port}/ws"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    har_path = tmp_path / "async.har"
+    har_update_path = tmp_path / "update.har"
+    har_sync_path = tmp_path / "sync.har"
+
+    async def run_async():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(max_browsers=1)
+            try:
+                async with await browser.new_context(
+                    base_url=base_url,
+                    record_har_path=har_path,
+                    record_har_mode="minimal",
+                    record_har_url_filter=re.compile(r"/api/"),
+                ) as rec_ctx:
+                    page = await rec_ctx.new_page()
+                    await page.goto("/")
+
+                    # generic expect_event('console')
+                    async with page.expect_event("console", lambda m: m.text == "evt-hi") as ce:
+                        await page.evaluate("console.log('evt-hi')")
+                    assert (await ce.value).text == "evt-hi"
+
+                    # WebSocket text + binary (Python delivers str / bytes directly)
+                    async with page.expect_websocket() as ws_info:
+                        await page.evaluate(
+                            """(u) => new Promise((resolve, reject) => {
+                                const ws = new WebSocket(u);
+                                ws.binaryType = 'arraybuffer';
+                                window.__ws = ws;
+                                ws.onopen = () => resolve();
+                                ws.onerror = () => reject(new Error('ws open failed'));
+                            })""",
+                            ws_url,
+                        )
+                    ws = await ws_info.value
+                    assert ws.url.startswith(f"ws://127.0.0.1:{port}")
+                    sent_frames: list[str | bytes] = []
+                    recv_frames: list[str | bytes] = []
+                    ws.on("framesent", sent_frames.append)
+                    ws.on("framereceived", recv_frames.append)
+                    async with ws.expect_event("close"):
+                        replies = await page.evaluate(
+                            """async () => {
+                                const ws = window.__ws;
+                                const out = [];
+                                ws.onmessage = (e) => {
+                                    out.push(typeof e.data === 'string' ? e.data : Array.from(new Uint8Array(e.data)));
+                                };
+                                ws.send('hi-py');
+                                ws.send(new Uint8Array([7, 8]));
+                                const deadline = Date.now() + 5000;
+                                while (out.length < 2 && Date.now() < deadline) {
+                                    await new Promise(r => setTimeout(r, 15));
+                                }
+                                ws.close(1000, 'bye');
+                                await new Promise(r => { ws.onclose = r; setTimeout(r, 1000); });
+                                return out;
+                            }"""
+                        )
+                    assert replies == ["echo:hi-py", [0xFE, 7, 8]]
+                    assert ws.is_closed()
+                    assert "hi-py" in sent_frames
+                    assert b"\x07\x08" in sent_frames
+                    assert "echo:hi-py" in recv_frames
+                    assert b"\xfe\x07\x08" in recv_frames
+
+                    # Dedicated Web Workers
+                    async with page.expect_worker() as w_info:
+                        await page.evaluate("window.__w = new Worker('/worker.js')")
+                    worker = await w_info.value
+                    assert worker.url.endswith("/worker.js")
+                    assert worker in page.workers
+                    w_val = None
+                    for _ in range(40):
+                        w_val = await worker.evaluate(
+                            "(n) => typeof self.workerValue === 'number' ? self.workerValue + n : null",
+                            5,
+                        )
+                        if w_val == 42:
+                            break
+                        await asyncio.sleep(0.025)
+                    assert w_val == 42
+                    async with worker.expect_event("console", lambda m: m.text == "worker-py") as w_ce:
+                        await worker.evaluate("() => self.emitLog('worker-py')")
+                    assert (await w_ce.value).text == "worker-py"
+                    async with worker.expect_event("close"):
+                        await page.evaluate("window.__w.terminate()")
+                    assert page.workers == []
+
+                    # Record HTTP traffic into HAR
+                    hello = await page.evaluate("fetch('/api/hello').then(r => r.json())")
+                    assert hello["msg"] == "hello"
+                    s1 = await page.evaluate("fetch('/api/seq').then(r => r.json())")
+                    s2 = await page.evaluate("fetch('/api/seq').then(r => r.json())")
+                    assert [s1["n"], s2["n"]] == [1, 2]
+
+                har_json = _json.loads(har_path.read_text(encoding="utf-8"))
+                assert har_json["log"]["version"] == "1.2"
+                assert len(har_json["log"]["entries"]) >= 3
+                assert all("/api/" in e["request"]["url"] for e in har_json["log"]["entries"])
+
+                with lock:
+                    state["api_hits"] = 0
+
+                async with await browser.new_context(base_url=base_url) as rep_ctx:
+                    await rep_ctx.route_from_har(har_path, url="**/api/*", not_found="abort")
+                    rp = await rep_ctx.new_page()
+                    await rp.goto("/")
+                    hello = await rp.evaluate("fetch('/api/hello').then(r => r.json())")
+                    assert hello["msg"] == "hello"
+                    s1 = await rp.evaluate("fetch('/api/seq').then(r => r.json())")
+                    s2 = await rp.evaluate("fetch('/api/seq').then(r => r.json())")
+                    assert [s1["n"], s2["n"]] == [1, 2]
+                    with lock:
+                        assert state["api_hits"] == 0
+                    aborted = await rp.evaluate("fetch('/api/other').then(() => false).catch(() => true)")
+                    assert aborted is True
+
+                async with await browser.new_context(base_url=base_url) as fb_ctx:
+                    fp = await fb_ctx.new_page()
+                    await fp.goto("/")
+
+                    async def fallback_handler(route):
+                        await route.fulfill(json={"mockedFallback": True})
+
+                    await fp.route("**/api/other", fallback_handler)
+                    await fp.route_from_har(har_path, url="**/api/*", not_found="fallback")
+                    assert (await fp.evaluate("fetch('/api/hello').then(r => r.json())"))["msg"] == "hello"
+                    assert await fp.evaluate("fetch('/api/other').then(r => r.json())") == {"mockedFallback": True}
+                    with lock:
+                        assert state["api_hits"] == 0
+
+                async with await browser.new_context(base_url=base_url) as upd_ctx:
+                    await upd_ctx.route_from_har(har_update_path, url="**/api/*", update=True)
+                    up = await upd_ctx.new_page()
+                    await up.goto("/")
+                    assert await up.evaluate("fetch('/api/other').then(r => r.json())") == {"other": True}
+                upd_har = _json.loads(har_update_path.read_text(encoding="utf-8"))
+                assert any(e["request"]["url"].endswith("/api/other") for e in upd_har["log"]["entries"])
+            finally:
+                await browser.close()
+
+    try:
+        asyncio.run(run_async())
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(max_browsers=1)
+            try:
+                with browser.new_context(base_url=base_url, record_har_path=har_sync_path) as ctx:
+                    page = ctx.new_page()
+                    page.goto("/")
+                    with page.expect_websocket() as ws_info:
+                        page.evaluate(
+                            """(u) => new Promise((resolve, reject) => {
+                                const ws = new WebSocket(u);
+                                window.__ws = ws;
+                                ws.onopen = () => resolve();
+                                ws.onerror = () => reject(new Error('ws open failed'));
+                            })""",
+                            ws_url,
+                        )
+                    ws = ws_info.value
+                    with ws.expect_event("framereceived", lambda msg: msg == "echo:sync-ws") as recv_info:
+                        page.evaluate("window.__ws.send('sync-ws')")
+                    assert recv_info.value == "echo:sync-ws"
+                    with ws.expect_event("close"):
+                        page.evaluate("window.__ws.close(1000, 'done')")
+                    assert ws.is_closed()
+
+                    with page.expect_worker() as w_info:
+                        page.evaluate("window.__w = new Worker('/worker.js')")
+                    worker = w_info.value
+                    assert worker in page.workers
+                    w_val = None
+                    for _ in range(40):
+                        w_val = worker.evaluate(
+                            "(n) => typeof self.workerValue === 'number' ? self.workerValue + n : null",
+                            5,
+                        )
+                        if w_val == 42:
+                            break
+                        time.sleep(0.025)
+                    assert w_val == 42
+                    with worker.expect_event("close"):
+                        page.evaluate("window.__w.terminate()")
+
+                    assert page.evaluate("fetch('/api/hello').then(r => r.json())")["msg"] == "hello"
+
+                with lock:
+                    state["api_hits"] = 0
+                with browser.new_context(base_url=base_url) as rep_ctx:
+                    rep_ctx.route_from_har(har_sync_path, url="**/api/*", not_found="abort")
+                    rp = rep_ctx.new_page()
+                    rp.goto("/")
+                    assert rp.evaluate("fetch('/api/hello').then(r => r.json())")["msg"] == "hello"
+                    with lock:
+                        assert state["api_hits"] == 0
+            finally:
+                browser.close()
+    finally:
+        srv.shutdown()
+

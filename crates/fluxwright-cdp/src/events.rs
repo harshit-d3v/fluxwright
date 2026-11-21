@@ -130,6 +130,48 @@ pub enum NetEvent {
     Failed(NetRequest, String),
 }
 
+/// One WebSocket lifecycle or frame event from a page, its popups, or its iframes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSocketEvent {
+    Created {
+        request_id: String,
+        url: String,
+    },
+    FrameSent {
+        request_id: String,
+        opcode: u8,
+        payload: Vec<u8>,
+        is_text: bool,
+    },
+    FrameReceived {
+        request_id: String,
+        opcode: u8,
+        payload: Vec<u8>,
+        is_text: bool,
+    },
+    Error {
+        request_id: String,
+        error_message: String,
+    },
+    Closed {
+        request_id: String,
+    },
+}
+
+pub(crate) fn decode_ws_frame(params: &Value) -> (u8, Vec<u8>, bool) {
+    let opcode = params["response"]["opcode"].as_u64().unwrap_or(1) as u8;
+    let raw = params["response"]["payloadData"].as_str().unwrap_or("");
+    if opcode == 1 {
+        (opcode, raw.as_bytes().to_vec(), true)
+    } else {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .unwrap_or_else(|_| raw.as_bytes().to_vec());
+        (opcode, payload, false)
+    }
+}
+
 fn headers(v: &Value) -> Vec<(String, String)> {
     v.as_object()
         .map(|m| {

@@ -4,6 +4,7 @@ mod connection;
 mod context;
 mod error;
 mod events;
+mod har;
 pub mod http_client;
 mod input;
 mod launch;
@@ -11,6 +12,7 @@ mod log;
 mod page;
 mod render;
 mod route;
+mod worker;
 
 pub use browser::{BrowserId, CdpBrowser, ContextId, FrameInfo, Proxy, SessionId, TargetId};
 pub use cdp_session::{CdpSession, CdpSessionEvent};
@@ -20,7 +22,12 @@ pub use context::{
     IndexedDbIndex, IndexedDbRecord, IndexedDbStore, OriginStorage, StorageItem, StorageState,
 };
 pub use error::{Error, LaunchOptions, Result};
-pub use events::{BindingCall, Dialog, FileChooser, NetEvent, NetRequest, NetResponse};
+pub use events::{BindingCall, Dialog, FileChooser, NetEvent, NetRequest, NetResponse, WebSocketEvent};
+pub use har::{
+    Har, HarBrowser, HarContent, HarContentPolicy, HarCreator, HarEntry, HarHeader, HarLog,
+    HarMode, HarNotFound, HarPostData, HarQueryParam, HarRecorder, HarRequest, HarResponse,
+    HarRouteOptions, HarRouter, HarTimings, RecordHarOptions,
+};
 pub use http_client::{ApiRequestOptions, ApiResponse, RouteFetchOptions};
 pub use input::{
     parse_modifiers, CheckOptions, ClickOptions, FileInput, FilePayload, HoverOptions, MouseButton,
@@ -34,3 +41,4 @@ pub use page::{
 };
 pub use render::{MAX_PDF_BYTES, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotOptions};
 pub use route::{Fulfill, InterceptedRequest, Overrides, RouteFetchHandle};
+pub use worker::{Worker, WorkerEvent};

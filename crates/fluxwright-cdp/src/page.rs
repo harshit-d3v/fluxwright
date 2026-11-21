@@ -31,6 +31,7 @@ pub type DownloadQueue = tokio::sync::mpsc::UnboundedReceiver<DownloadResult>;
 use crate::render::ScreenshotOptions;
 use crate::route::InterceptedRequest;
 use crate::error::{Error, Result};
+use crate::worker::{Worker, WorkerEvent, WorkerRegistry};
 
 /// When `goto` returns. Same meanings as Playwright's `waitUntil`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -561,7 +562,7 @@ fn json_texts(v: Option<Value>) -> Vec<String> {
 
 /// Maps `exceptionDetails` to a JS-style error. `description` carries
 /// "TypeError: msg\n    at <anonymous>:line:col"; a thrown non-Error only `text` + `value`.
-fn js_error(res: &Value) -> Option<Error> {
+pub(crate) fn js_error(res: &Value) -> Option<Error> {
     let d = &res["exceptionDetails"];
     if !d.is_object() {
         return None;
@@ -612,6 +613,7 @@ pub struct CdpPage {
     pub(crate) setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
     pub(crate) page_setups: Arc<Mutex<HashMap<String, PageSetup>>>,
     pub(crate) frames: Arc<std::sync::Mutex<FrameTree>>,
+    pub(crate) workers: Arc<std::sync::Mutex<WorkerRegistry>>,
     pub(crate) closed: Arc<AtomicBool>,
     pub(crate) mouse: Arc<std::sync::Mutex<MouseState>>,
     pub(crate) keyboard: Arc<std::sync::Mutex<KeyboardState>>,
@@ -642,6 +644,18 @@ impl CdpPage {
 
     pub fn frames(&self) -> Vec<FrameInfo> {
         self.frames.lock().unwrap().list()
+    }
+
+    pub fn workers(&self) -> Vec<Worker> {
+        self.workers.lock().unwrap().list()
+    }
+
+    pub fn worker(&self, target_id: &str) -> Option<Worker> {
+        self.workers.lock().unwrap().get(target_id)
+    }
+
+    pub fn subscribe_workers(&self) -> tokio::sync::mpsc::UnboundedReceiver<WorkerEvent> {
+        self.workers.lock().unwrap().subscribe()
     }
 
     pub async fn bring_to_front(&self, timeout: Duration) -> Result<()> {
