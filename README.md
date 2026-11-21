@@ -86,13 +86,12 @@ The full Node API is in [bindings/node/README.md](bindings/node/README.md) and t
 - **Firefox or Safari (WebKit):** Fluxwright drives Chromium only.
 - **End-to-end tests:** Playwright Test gives you a runner, `expect`, fixtures, a trace viewer and a recorder. Fluxwright is an engine, not a test framework.
 - **Java or .NET:** Fluxwright has Node, Python and Rust.
-- **Strict mode, `filter({ has })`, popup events:** not yet. See [MISSING.md](bindings/node/MISSING.md) and the roadmap.
 
 Use Fluxwright when you run many browser jobs, such as scraping, crawling, PDF and screenshot rendering, or automation at volume, and want the fleet handled for you.
 
 ## Speed
 
-Measured on GitHub's ubuntu-latest runner (three runs, 2026-10-27): every tool on the same chrome-headless-shell 156 binary, loading a small local page with the same number of jobs in flight. With 1 browser and 10 pages, Fluxwright ran 34–40 jobs/s, Playwright 27–34 and Puppeteer 27–36; with 1,000 jobs on 4 browsers, 36–44, 30–38 and 34–46. No job failed. A shared cloud machine varies by up to a third from run to run, so rerun it (Actions → benchmarks) and measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
+Measured on GitHub's ubuntu-latest runner (4 vCPU, 2026-11-21, run `44920620633`): every tool on the same chrome-headless-shell 158.0.8127.36 binary with fresh isolated contexts per job. Fluxwright beat Playwright and Puppeteer in all 8 scenarios with 0.0% failures and 0 leaked processes: `1-browser-10-pages` **38.3 vs 30.9** jobs/s (-22.1% peak RAM), `10-concurrent-browsers` **45.5 vs 33.6** jobs/s (-28.2% peak RAM), `500-concurrent` **44.6 vs 33.9** jobs/s, `1000-queued` **41.3 vs 34.4** jobs/s, `scraping-200` (with `ResourcePreset::Scraping`) **31.9 vs 26.8** jobs/s, and `chaos-1000-queued` **39.3 jobs/s with 0.0% failures** across 11 browser kills (vs 71.6% failures on Playwright and 73.0% on Puppeteer). A shared cloud machine varies from run to run, so rerun it (Actions → benchmarks) and measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
 
 ## Rust
 
@@ -137,7 +136,7 @@ Requires Rust 1.95+ and Chrome or Chromium (found on the standard install paths,
 | `fluxwright-cdp` | One connection per browser (DevTools pipe on Linux/macOS, WebSocket on Windows), flat sessions |
 | `fluxwright-core` | Pool, scheduler, memory ceiling, recycling, metrics |
 | `fluxwright` | Public API |
-| `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `benchmark` / `serve` / `coordinate` |
+| `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `install` / `benchmark` / `serve` / `coordinate` |
 | `fluxwright-mcp` | MCP server: open, goto, click, fill, evaluate, screenshot, close |
 | `fluxwright-server` | Authenticated HTTP job API over one local or remote CDP fleet |
 
