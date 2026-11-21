@@ -3035,7 +3035,7 @@ fn public_reexports_compile() {
     let _ = std::any::type_name::<IgnoreDefaultArgs>();
     let _ = std::any::type_name::<ResourcePreset>();
     let _ = managed_browsers_dir as fn() -> Option<std::path::PathBuf>;
-    let _ = find_channel as fn(&str) -> fluxwright::Result<std::path::PathBuf>;
+    assert!(find_channel("bogus-channel").is_err());
     let _ = std::any::type_name::<WebSocketEvent>();
     let _ = std::any::type_name::<Worker>();
     let _ = std::any::type_name::<WorkerEvent>();
