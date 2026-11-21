@@ -1,19 +1,75 @@
 name: release-pypi
 
-# Builds the wheels and the sdist for PyPI. Publishing stays a manual step: download the
-# `pypi-*` artifacts into one folder and upload them with `uvx twine upload <folder>/*`.
+# Automatically builds all platform wheels + sdist and publishes to PyPI whenever
+# `bindings/python/Cargo.toml`'s version is not yet on PyPI (on push to `main`, `v*`
+# tags, or manual `workflow_dispatch`). Uses `secrets.PYPI_API_TOKEN` when set, or
+# falls back to PyPI OIDC Trusted Publishing (`id-token: write`).
 on:
+  push:
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: bindings/python
+concurrency:
+  group: release-pypi-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      should_build: ${{ steps.meta.outputs.should_build }}
+      should_publish: ${{ steps.meta.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - id: meta
+        name: Check Python version against PyPI
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import tomllib
+          import urllib.error
+          import urllib.request
+
+          with open("bindings/python/Cargo.toml", "rb") as f:
+              version = tomllib.load(f)["package"]["version"]
+
+          url = f"https://pypi.org/pypi/fluxwright/{version}/json"
+          req = urllib.request.Request(url, headers={"User-Agent": "fluxwright-release-ci"})
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  already_published = resp.status == 200
+          except urllib.error.HTTPError as e:
+              if e.code == 404:
+                  already_published = False
+              else:
+                  print(f"Unexpected HTTP {e.code} checking {url}", file=sys.stderr)
+                  sys.exit(1)
+
+          should_build = (not already_published) or (os.environ.get("EVENT_NAME") == "workflow_dispatch")
+          should_publish = not already_published
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"should_build={'true' if should_build else 'false'}\n")
+              out.write(f"should_publish={'true' if should_publish else 'false'}\n")
+
+          print(f"fluxwright-python={version} already_published={already_published} should_build={should_build} should_publish={should_publish}")
+          PY
+
   wheels:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.host }}
     timeout-minutes: 45
@@ -48,6 +104,8 @@ jobs:
           if-no-files-found: error
 
   sdist:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -61,3 +119,41 @@ jobs:
           name: pypi-sdist
           path: bindings/python/dist/*.tar.gz
           if-no-files-found: error
+
+  publish:
+    needs: [check, wheels, sdist]
+    if: needs.check.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pypi-*
+          merge-multiple: true
+          path: dist
+      - id: auth
+        name: Detect PyPI auth mode
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          has_token = bool(os.environ.get("PYPI_API_TOKEN"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"has_token={'true' if has_token else 'false'}\n")
+          PY
+      - name: Publish to PyPI (API token)
+        if: steps.auth.outputs.has_token == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+      - name: Publish to PyPI (Trusted Publisher / OIDC)
+        if: steps.auth.outputs.has_token == 'false'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
