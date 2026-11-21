@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxwright_core::{
-    Engine, Har, HarNotFound, HarRouteOptions, JobOptions, RecordHarOptions, WebSocketEvent,
-    WorkerEvent,
+    Engine, Har, HarMode, HarNotFound, HarRouteOptions, JobOptions, RecordHarOptions,
+    WebSocketEvent, WorkerEvent,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;

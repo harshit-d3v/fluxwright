@@ -330,6 +330,48 @@ const cdpSessionRegistry = new FinalizationRegistry(({ page, id }) => {
   page._cdpDrop(id)
 })
 
+function awaitEmitterEvent(em, waits, event, timeout, pred, closedMessage, timeoutMessage) {
+  return new Promise((resolve, reject) => {
+    let timer = null
+    let settled = false
+    const done = () => {
+      em.off(event, listener)
+      clearTimeout(timer)
+      waits.delete(closed)
+    }
+    const fail = (err) => {
+      if (settled) return
+      settled = true
+      done()
+      reject(err)
+    }
+    const succeed = (arg) => {
+      if (settled) return
+      settled = true
+      done()
+      resolve(arg)
+    }
+    const closed = () => fail(new Error(closedMessage))
+    const listener = (arg) => {
+      try {
+        const out = pred(arg)
+        if (typeof out?.then === 'function') {
+          out.then((matched) => {
+            if (matched) succeed(arg)
+          }, fail)
+          return
+        }
+        if (out) succeed(arg)
+      } catch (err) {
+        fail(err)
+      }
+    }
+    em.on(event, listener)
+    waits.add(closed)
+    if (timeout > 0) timer = setTimeout(() => fail(new Error(timeoutMessage)), timeout)
+  })
+}
+
 function waitForEmitterEvent(emitter, isClosedFn, waits, label, event, allowedEvents, optionsOrPredicate) {
   if (!allowedEvents.includes(event)) {
     throw new Error(`${label}.waitForEvent: '${event}' is not supported (${allowedEvents.join(', ')})`)
@@ -344,33 +386,15 @@ function waitForEmitterEvent(emitter, isClosedFn, waits, label, event, allowedEv
   }
   const pred = options?.predicate ?? (() => true)
   const timeout = options?.timeout ?? 30000
-  return new Promise((resolve, reject) => {
-    let timer = null
-    const fail = (err) => {
-      done()
-      reject(err)
-    }
-    const closed = () => fail(new Error(`${label}.waitForEvent: target closed`))
-    const done = () => {
-      emitter.off(event, listener)
-      clearTimeout(timer)
-      waits.delete(closed)
-    }
-    const listener = async (arg) => {
-      try {
-        if (!(await pred(arg))) return
-      } catch (err) {
-        return fail(err)
-      }
-      done()
-      resolve(arg)
-    }
-    emitter.on(event, listener)
-    waits.add(closed)
-    if (timeout > 0) {
-      timer = setTimeout(() => fail(new Error(`${label}.waitForEvent: timeout ${timeout}ms exceeded`)), timeout)
-    }
-  })
+  return awaitEmitterEvent(
+    emitter,
+    waits,
+    event,
+    timeout,
+    pred,
+    `${label}.waitForEvent: target closed`,
+    `${label}.waitForEvent: timeout ${timeout}ms exceeded`,
+  )
 }
 
 class WebSocket {
@@ -928,38 +952,24 @@ function installEvents(Page) {
     }
   }
   function waitForEvent(page, method, event, allowed, options, makeMatch) {
-    return new Promise((resolve, reject) => {
+    try {
       checkOptions(`page.${method}`, options, allowed)
       const matches = makeMatch()
       if (closing.has(page) || page.isClosed()) throw new Error(`page.${method}: the page is closed`)
       const timeout = options?.timeout ?? 30000
       const { em, waits } = stateOf(page, event)
-      let timer = null
-      const fail = (err) => {
-        done()
-        reject(err)
-      }
-      const closed = () => fail(new Error(`page.${method}: the page closed`))
-      const done = () => {
-        em.off(event, listener)
-        clearTimeout(timer)
-        waits.delete(closed)
-      }
-      const listener = async (r) => {
-        try {
-          if (!(await matches(r))) return
-        } catch (err) {
-          return fail(err)
-        }
-        done()
-        resolve(r)
-      }
-      em.on(event, listener)
-      waits.add(closed)
-      if (timeout > 0) {
-        timer = setTimeout(() => fail(new Error(`page.${method}: timeout ${timeout}ms exceeded`)), timeout)
-      }
-    })
+      return awaitEmitterEvent(
+        em,
+        waits,
+        event,
+        timeout,
+        matches,
+        `page.${method}: the page closed`,
+        `page.${method}: timeout ${timeout}ms exceeded`,
+      )
+    } catch (err) {
+      return Promise.reject(err)
+    }
   }
   // page.waitForResponse / waitForRequest / waitForFileChooser: the first match from now on, within
   // `timeout` ms (default 30 s, 0 for none). Closing the page rejects it.
