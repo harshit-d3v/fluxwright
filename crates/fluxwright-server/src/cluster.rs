@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use fluxwright::BrowserEngine;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Notify};
@@ -38,6 +38,50 @@ const SHUTDOWN_REPORT_BUDGET: Duration =
     Duration::from_secs(3 * HTTP_REQUEST_TIMEOUT.as_secs() + TASK_STOP_WAIT.as_secs() + 2);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_WORKERS: usize = 1024;
+
+pub(crate) struct WorkerRecord {
+    pub(crate) max_jobs: usize,
+    pub(crate) registered_at: u64,
+    pub(crate) last_seen_at: u64,
+    pub(crate) draining: bool,
+    pub(crate) succeeded_jobs: u64,
+    pub(crate) failed_jobs: u64,
+    pub(crate) expired_leases: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Online,
+    Draining,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerInfo {
+    pub worker: String,
+    pub status: WorkerStatus,
+    pub max_jobs: usize,
+    pub active_jobs: usize,
+    pub succeeded_jobs: u64,
+    pub failed_jobs: u64,
+    pub expired_leases: u64,
+    pub registered_at: u64,
+    pub last_seen_at: u64,
+    pub draining: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WorkersSummary {
+    pub total: usize,
+    pub online: usize,
+    pub draining: usize,
+    pub stale: usize,
+    pub capacity: usize,
+    pub active_jobs: usize,
+    pub expired_leases: u64,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,17 +163,132 @@ fn validate_worker(worker: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn touch_worker<'a>(
+    registry: &'a mut crate::Registry,
+    worker: &str,
+    now: u64,
+    max_jobs: Option<usize>,
+) -> &'a mut WorkerRecord {
+    if !registry.workers.contains_key(worker) && registry.workers.len() >= MAX_WORKERS {
+        let evict = registry
+            .workers
+            .iter()
+            .filter(|(id, _)| {
+                !registry.jobs.iter().any(|r| {
+                    r.job.status == JobStatus::Running && r.worker.as_deref() == Some(id.as_str())
+                })
+            })
+            .min_by_key(|(_, rec)| rec.last_seen_at)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = evict {
+            registry.workers.remove(&id);
+        }
+    }
+    let rec = registry
+        .workers
+        .entry(worker.to_string())
+        .or_insert_with(|| WorkerRecord {
+            max_jobs: max_jobs.unwrap_or(1),
+            registered_at: now,
+            last_seen_at: now,
+            draining: false,
+            succeeded_jobs: 0,
+            failed_jobs: 0,
+            expired_leases: 0,
+        });
+    rec.last_seen_at = now;
+    if let Some(m) = max_jobs {
+        rec.max_jobs = m;
+    }
+    rec
+}
+
+fn worker_info_for(
+    worker: &str,
+    rec: &WorkerRecord,
+    active_jobs: usize,
+    now: u64,
+    stale_after: u64,
+) -> WorkerInfo {
+    let status = if active_jobs == 0 && now.saturating_sub(rec.last_seen_at) > stale_after {
+        WorkerStatus::Stale
+    } else if rec.draining {
+        WorkerStatus::Draining
+    } else {
+        WorkerStatus::Online
+    };
+    WorkerInfo {
+        worker: worker.to_string(),
+        status,
+        max_jobs: rec.max_jobs,
+        active_jobs,
+        succeeded_jobs: rec.succeeded_jobs,
+        failed_jobs: rec.failed_jobs,
+        expired_leases: rec.expired_leases,
+        registered_at: rec.registered_at,
+        last_seen_at: rec.last_seen_at,
+        draining: rec.draining,
+    }
+}
+
+pub(crate) fn workers_snapshot(
+    registry: &crate::Registry,
+    now: u64,
+    lease_ms: u64,
+) -> (Vec<WorkerInfo>, WorkersSummary) {
+    let mut active_counts: HashMap<&str, usize> = HashMap::new();
+    for r in &registry.jobs {
+        if r.job.status == JobStatus::Running {
+            if let Some(w) = r.worker.as_deref() {
+                *active_counts.entry(w).or_insert(0) += 1;
+            }
+        }
+    }
+    let stale_after = lease_ms.saturating_mul(2).max(1_000);
+    let mut workers: Vec<WorkerInfo> = registry
+        .workers
+        .iter()
+        .map(|(id, rec)| {
+            let active = active_counts.get(id.as_str()).copied().unwrap_or(0);
+            worker_info_for(id, rec, active, now, stale_after)
+        })
+        .collect();
+    workers.sort_by(|a, b| a.worker.cmp(&b.worker));
+
+    let mut summary = WorkersSummary {
+        total: workers.len(),
+        expired_leases: registry.expired_leases,
+        ..Default::default()
+    };
+    for w in &workers {
+        match w.status {
+            WorkerStatus::Online => {
+                summary.online += 1;
+                summary.capacity += w.max_jobs;
+            }
+            WorkerStatus::Draining => summary.draining += 1,
+            WorkerStatus::Stale => summary.stale += 1,
+        }
+        summary.active_jobs += w.active_jobs;
+    }
+    (workers, summary)
+}
+
 /// Requeues or fails leased jobs whose deadline passed without a heartbeat, returning job IDs
 /// that reached a terminal state and must be marked done in the journal once unlocked.
 pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Uuid> {
     let mut done = Vec::new();
+    let mut expired_workers = Vec::new();
     for record in &mut registry.jobs {
         if record.job.status == JobStatus::Running
             && record.lease_until.is_some_and(|expiry| expiry <= now)
         {
-            record.worker = None;
+            if let Some(prev) = record.worker.take() {
+                expired_workers.push(prev);
+            }
             record.lease_until = None;
             record.job.step_index = None;
+            registry.expired_leases += 1;
             if record.job.attempts <= record.request.retries {
                 record.job.status = JobStatus::Queued;
             } else {
@@ -139,6 +298,11 @@ pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Uui
                 registry.failed_jobs += 1;
                 done.push(record.job.id);
             }
+        }
+    }
+    for w in expired_workers {
+        if let Some(rec) = registry.workers.get_mut(&w) {
+            rec.expired_leases += 1;
         }
     }
     done
@@ -164,6 +328,10 @@ pub(crate) async fn lease(
         }
 
         let limit = req.max_jobs.min(MAX_LEASE_BATCH);
+        let draining = touch_worker(registry, &worker, now, Some(limit)).draining;
+        if draining {
+            return Ok(Vec::new());
+        }
         let mut candidates: Vec<(usize, LeasedJob)> =
             Vec::with_capacity(limit.min(registry.jobs.len()));
         let mut total_bytes: usize = 16; // {"jobs":[]}
@@ -223,6 +391,7 @@ pub(crate) async fn heartbeat(
 
     let lease_ms = inner.lease_ms();
     let cancelled = inner.with_registry(|registry, now| {
+        touch_worker(registry, &worker, now, None);
         let mut cancelled = Vec::new();
         for item in req.jobs {
             if let Some(record) = registry.find_mut(item.id) {
@@ -254,7 +423,8 @@ pub(crate) async fn release(
     let Json(req) =
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
 
-    let released = inner.with_registry(|registry, _| {
+    let released = inner.with_registry(|registry, now| {
+        touch_worker(registry, &worker, now, None);
         let mut released = Vec::new();
         for id in req.jobs {
             if let Some(record) = registry.find_mut(id) {
@@ -307,6 +477,7 @@ pub(crate) async fn result(
     }
 
     let (job, finished) = inner.with_registry(|registry, now| -> Result<(Job, bool), ApiError> {
+        touch_worker(registry, &req.worker, now, None);
         let record = registry.find_mut(id).ok_or_else(not_found)?;
         if record.job.status == JobStatus::Cancelled {
             return Ok((record.job.clone(), false));
@@ -353,8 +524,18 @@ pub(crate) async fn result(
         }
         let snapshot = record.job.clone();
         match req.status {
-            JobStatus::Succeeded => registry.succeeded_jobs += 1,
-            JobStatus::Failed => registry.failed_jobs += 1,
+            JobStatus::Succeeded => {
+                registry.succeeded_jobs += 1;
+                if let Some(w) = registry.workers.get_mut(&req.worker) {
+                    w.succeeded_jobs += 1;
+                }
+            }
+            JobStatus::Failed => {
+                registry.failed_jobs += 1;
+                if let Some(w) = registry.workers.get_mut(&req.worker) {
+                    w.failed_jobs += 1;
+                }
+            }
             _ => unreachable!(),
         }
         Ok((snapshot, true))
@@ -365,6 +546,70 @@ pub(crate) async fn result(
         tracing::info!(job_id = %id, status = ?job.status, worker = %req.worker, "cluster job finished");
     }
     Ok(Json(job))
+}
+
+pub(crate) async fn list_workers(State(inner): State<Arc<Inner>>) -> Json<Value> {
+    let lease_ms = inner.lease_ms();
+    inner.with_registry(|registry, now| {
+        let (workers, summary) = workers_snapshot(registry, now, lease_ms);
+        Json(json!({ "workers": workers, "summary": summary }))
+    })
+}
+
+pub(crate) async fn drain_worker(
+    State(inner): State<Arc<Inner>>,
+    Path(worker): Path<String>,
+) -> Result<Json<WorkerInfo>, ApiError> {
+    validate_worker(&worker)?;
+    let lease_ms = inner.lease_ms();
+    inner.with_registry(|registry, now| {
+        if !registry.workers.contains_key(&worker) {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "worker not found",
+            ));
+        }
+        let active = registry
+            .jobs
+            .iter()
+            .filter(|r| {
+                r.job.status == JobStatus::Running && r.worker.as_deref() == Some(worker.as_str())
+            })
+            .count();
+        let stale_after = lease_ms.saturating_mul(2).max(1_000);
+        let rec = registry.workers.get_mut(&worker).unwrap();
+        rec.draining = true;
+        Ok(Json(worker_info_for(&worker, rec, active, now, stale_after)))
+    })
+}
+
+pub(crate) async fn remove_worker(
+    State(inner): State<Arc<Inner>>,
+    Path(worker): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    validate_worker(&worker)?;
+    inner.with_registry(|registry, _| {
+        if !registry.workers.contains_key(&worker) {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "worker not found",
+            ));
+        }
+        let busy = registry.jobs.iter().any(|r| {
+            r.job.status == JobStatus::Running && r.worker.as_deref() == Some(worker.as_str())
+        });
+        if busy {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "worker_busy",
+                "cannot remove worker while it holds active job leases",
+            ));
+        }
+        registry.workers.remove(&worker);
+        Ok(Json(json!({ "removed": worker })))
+    })
 }
 
 #[derive(Clone)]

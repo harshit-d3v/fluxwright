@@ -28,7 +28,9 @@ pub use har::{
     HarLog, HarMode, HarNotFound, HarPostData, HarQueryParam, HarRecorder, HarRequest, HarResponse,
     HarRouteOptions, HarRouter, HarTimings, RecordHarOptions,
 };
-pub use http_client::{ApiRequestOptions, ApiResponse, RouteFetchOptions};
+pub use http_client::{
+    download_to_file, fetch_url_bytes, ApiRequestOptions, ApiResponse, RouteFetchOptions,
+};
 pub use input::{
     parse_modifiers, CheckOptions, ClickOptions, FileInput, FilePayload, HoverOptions, MouseButton,
     SelectEntry,
