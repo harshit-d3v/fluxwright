@@ -1001,7 +1001,8 @@ impl CdpBrowser {
             }
             "Target.detachedFromTarget" => {
                 if let Some(sid) = ev.params["sessionId"].as_str() {
-                    if let Some((tid, workers)) = self.worker_sessions.lock().unwrap().remove(sid) {
+                    let removed = self.worker_sessions.lock().unwrap().remove(sid);
+                    if let Some((tid, workers)) = removed {
                         self.targets.lock().await.remove(&tid);
                         workers.lock().unwrap().remove_by_session(sid);
                     }
