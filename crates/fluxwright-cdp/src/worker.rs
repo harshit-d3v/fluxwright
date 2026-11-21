@@ -191,7 +191,8 @@ impl WorkerRegistry {
     }
 
     pub(crate) fn close_all(&mut self) {
-        for w in self.live.drain(..) {
+        let drained: Vec<_> = self.live.drain(..).collect();
+        for w in drained {
             let tid = w.target_id().to_string();
             let url = w.url().to_string();
             w.mark_closed();
