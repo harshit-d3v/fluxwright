@@ -1263,8 +1263,8 @@ impl Engine {
         memory_ceiling_mb=None, max_concurrency_per_host=None, min_delay_per_host=None,
         args=None, ignore_default_args=None, channel=None, prewarm_contexts=None))]
     #[allow(clippy::too_many_arguments)]
-    fn launch(
-        py: Python<'_>,
+    fn launch<'py>(
+        py: Python<'py>,
         max_browsers: Option<usize>,
         executable_path: Option<PathBuf>,
         headless: Option<bool>,
@@ -1273,10 +1273,10 @@ impl Engine {
         max_concurrency_per_host: Option<usize>,
         min_delay_per_host: Option<f64>,
         args: Option<Vec<String>>,
-        ignore_default_args: Option<Bound<'_, PyAny>>,
+        ignore_default_args: Option<Bound<'py, PyAny>>,
         channel: Option<String>,
         prewarm_contexts: Option<usize>,
-    ) -> PyResult<Bound<'_, PyAny>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let parsed_ignore = ignore_default_args
             .map(parse_ignore_default_args)
             .transpose()?;

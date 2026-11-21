@@ -1043,13 +1043,14 @@ impl Inner {
 
                 let discarded: Option<WarmContext> = {
                     let mut st = inner.state.lock().await;
+                    let shutting_down = st.shutting_down;
                     let max_per_browser = inner.config.max_contexts_per_browser;
                     match st.browsers.iter_mut().find(|s| s.browser.id == browser.id) {
                         Some(s) => {
                             s.warming = s.warming.saturating_sub(1);
                             match warm_res {
                                 Ok(w)
-                                    if !st.shutting_down
+                                    if !shutting_down
                                         && !s.crashed
                                         && !s.draining
                                         && !s.browser.connection_dead()
