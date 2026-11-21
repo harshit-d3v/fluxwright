@@ -20,6 +20,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_REDIRECTS: usize = 20;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
 const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Options for `APIRequestContext` requests (`context.request().fetch(...)` / `.get(...)` / ...).
 #[derive(Debug, Clone, Default)]
@@ -662,7 +663,9 @@ fn try_decode_chunked_complete(raw: &[u8]) -> Option<Result<Vec<u8>>> {
     }
 }
 
-async fn read_http_response(stream: &mut HttpStream, method: &str) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>)> {
+async fn read_response_headers(
+    stream: &mut HttpStream,
+) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
     let header_end = loop {
@@ -702,6 +705,16 @@ async fn read_http_response(stream: &mut HttpStream, method: &str) -> Result<(u1
         (status, status_text, headers) = parse_headers_block(next_str)?;
         leftover = leftover[pos + 4..].to_vec();
     }
+
+    Ok((status, status_text, headers, leftover))
+}
+
+async fn read_http_response(
+    stream: &mut HttpStream,
+    method: &str,
+) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>)> {
+    let mut tmp = [0u8; 8192];
+    let (status, status_text, headers, mut leftover) = read_response_headers(stream).await?;
 
     if method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 304) || (100..200).contains(&status) {
         return Ok((status, status_text, headers, Vec::new()));
@@ -758,13 +771,13 @@ async fn read_http_response(stream: &mut HttpStream, method: &str) -> Result<(u1
     }
 }
 
-async fn send_single_hop(
+async fn open_and_send_hop(
     target: &ParsedUrl,
     method: &str,
     req_headers: Vec<(String, String)>,
     body: Option<&[u8]>,
     proxy: Option<&Proxy>,
-) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>)> {
+) -> Result<HttpStream> {
     validate_token_clean("HTTP method", method)?;
     let (target_host, target_port) = target.connect_host_port();
 
@@ -880,7 +893,260 @@ async fn send_single_hop(
         stream.write_all(body_bytes).await?;
     }
 
+    Ok(stream)
+}
+
+async fn send_single_hop(
+    target: &ParsedUrl,
+    method: &str,
+    req_headers: Vec<(String, String)>,
+    body: Option<&[u8]>,
+    proxy: Option<&Proxy>,
+) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>)> {
+    let mut stream = open_and_send_hop(target, method, req_headers, body, proxy).await?;
     read_http_response(&mut stream, method).await
+}
+
+fn non_empty_env(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn env_proxy_for(scheme: &str) -> Option<Proxy> {
+    let server = if scheme.eq_ignore_ascii_case("https") {
+        non_empty_env(&["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"])?
+    } else {
+        non_empty_env(&["HTTP_PROXY", "http_proxy"])?
+    };
+    Some(Proxy {
+        server,
+        bypass: non_empty_env(&["NO_PROXY", "no_proxy"]),
+        username: None,
+        password: None,
+    })
+}
+
+async fn stream_body_to_file(
+    stream: &mut HttpStream,
+    headers: &[(String, String)],
+    leftover: Vec<u8>,
+    dest: &std::path::Path,
+) -> Result<u64> {
+    let mut file = tokio::fs::File::create(dest).await?;
+    match stream_body_inner(stream, headers, leftover, &mut file).await {
+        Ok(n) => Ok(n),
+        Err(err) => {
+            drop(file);
+            let _ = tokio::fs::remove_file(dest).await;
+            Err(err)
+        }
+    }
+}
+
+async fn stream_body_inner(
+    stream: &mut HttpStream,
+    headers: &[(String, String)],
+    mut leftover: Vec<u8>,
+    file: &mut tokio::fs::File,
+) -> Result<u64> {
+    let is_chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    let mut buf = [0u8; 32 * 1024];
+
+    if is_chunked {
+        let mut written = 0u64;
+        loop {
+            let crlf = loop {
+                if let Some(pos) = leftover.windows(2).position(|w| w == b"\r\n") {
+                    break pos;
+                }
+                if leftover.len() > 4096 {
+                    return Err(Error::Other("HTTP chunk header too large".into()));
+                }
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    return Err(Error::Other("incomplete chunked HTTP download".into()));
+                }
+                leftover.extend_from_slice(&buf[..n]);
+            };
+            let size_line = std::str::from_utf8(&leftover[..crlf])
+                .map_err(|_| Error::Other("invalid chunk size encoding".into()))?;
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let chunk_size = usize::from_str_radix(size_hex, 16)
+                .map_err(|_| Error::Other(format!("invalid HTTP chunk size `{size_hex}`")))?;
+            leftover.drain(..crlf + 2);
+            if chunk_size == 0 {
+                file.flush().await?;
+                return Ok(written);
+            }
+            if written.saturating_add(chunk_size as u64) > MAX_DOWNLOAD_BYTES {
+                return Err(Error::Other("download exceeds 512 MiB limit".into()));
+            }
+            let take = chunk_size.min(leftover.len());
+            if take > 0 {
+                file.write_all(&leftover[..take]).await?;
+                leftover.drain(..take);
+            }
+            let mut rem = chunk_size - take;
+            while rem > 0 {
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    return Err(Error::Other("truncated chunked HTTP download".into()));
+                }
+                let need = rem.min(n);
+                file.write_all(&buf[..need]).await?;
+                if n > need {
+                    leftover.extend_from_slice(&buf[need..n]);
+                }
+                rem -= need;
+            }
+            written += chunk_size as u64;
+            while leftover.len() < 2 {
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    return Err(Error::Other("incomplete chunked HTTP terminator".into()));
+                }
+                leftover.extend_from_slice(&buf[..n]);
+            }
+            if &leftover[..2] != b"\r\n" {
+                return Err(Error::Other("missing CRLF after HTTP chunk data".into()));
+            }
+            leftover.drain(..2);
+        }
+    }
+
+    if let Some(len_str) = find_header_ci(headers, "content-length") {
+        let expected = len_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| Error::Other(format!("invalid Content-Length `{len_str}`")))?;
+        if expected > MAX_DOWNLOAD_BYTES {
+            return Err(Error::Other("download exceeds 512 MiB limit".into()));
+        }
+        let mut written = 0u64;
+        if !leftover.is_empty() {
+            let take = (leftover.len() as u64).min(expected) as usize;
+            file.write_all(&leftover[..take]).await?;
+            written += take as u64;
+        }
+        while written < expected {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Err(Error::Other("unexpected EOF during HTTP download".into()));
+            }
+            let need = ((expected - written) as usize).min(n);
+            file.write_all(&buf[..need]).await?;
+            written += need as u64;
+        }
+        file.flush().await?;
+        return Ok(written);
+    }
+
+    if leftover.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(Error::Other("download exceeds 512 MiB limit".into()));
+    }
+    let mut written = leftover.len() as u64;
+    if !leftover.is_empty() {
+        file.write_all(&leftover).await?;
+    }
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            file.flush().await?;
+            return Ok(written);
+        }
+        if written.saturating_add(n as u64) > MAX_DOWNLOAD_BYTES {
+            return Err(Error::Other("download exceeds 512 MiB limit".into()));
+        }
+        file.write_all(&buf[..n]).await?;
+        written += n as u64;
+    }
+}
+
+/// Fetches a URL over HTTP/HTTPS into memory (up to 128 MiB), following redirects and honoring
+/// standard `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` environment variables.
+pub async fn fetch_url_bytes(url: &str, timeout: Duration) -> Result<Vec<u8>> {
+    let work = async {
+        let mut current = ParsedUrl::parse(url)?.canonical();
+        let mut hops = 0usize;
+        loop {
+            let parsed = ParsedUrl::parse(&current)?;
+            let proxy = env_proxy_for(&parsed.scheme);
+            let headers = vec![("User-Agent".into(), "Fluxwright".into())];
+            let (status, status_text, resp_headers, body) =
+                send_single_hop(&parsed, "GET", headers, None, proxy.as_ref()).await?;
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if let Some(location) = find_header_ci(&resp_headers, "location") {
+                    if hops >= 10 {
+                        return Err(Error::Other("Max redirect count exceeded".into()));
+                    }
+                    hops += 1;
+                    current = resolve_url(Some(&current), location.trim())?;
+                    continue;
+                }
+            }
+            if !(200..300).contains(&status) {
+                return Err(Error::Other(format!("HTTP {status} {status_text} fetching {current}")));
+            }
+            return Ok(body);
+        }
+    };
+    if timeout.is_zero() {
+        work.await
+    } else {
+        tokio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| Error::timeout("fetch_url_bytes", timeout.as_millis() as u64))?
+    }
+}
+
+/// Streams a URL over HTTP/HTTPS directly to `dest` (up to 512 MiB), following redirects cleanly
+/// without buffering the payload in memory.
+pub async fn download_to_file(
+    url: &str,
+    dest: &std::path::Path,
+    timeout: Duration,
+) -> Result<u64> {
+    let work = async {
+        let mut current = ParsedUrl::parse(url)?.canonical();
+        let mut hops = 0usize;
+        loop {
+            let parsed = ParsedUrl::parse(&current)?;
+            let proxy = env_proxy_for(&parsed.scheme);
+            let headers = vec![("User-Agent".into(), "Fluxwright".into())];
+            let mut stream =
+                open_and_send_hop(&parsed, "GET", headers, None, proxy.as_ref()).await?;
+            let (status, status_text, resp_headers, leftover) =
+                read_response_headers(&mut stream).await?;
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if let Some(location) = find_header_ci(&resp_headers, "location") {
+                    if hops >= 10 {
+                        return Err(Error::Other("Max redirect count exceeded".into()));
+                    }
+                    hops += 1;
+                    drop(stream);
+                    current = resolve_url(Some(&current), location.trim())?;
+                    continue;
+                }
+            }
+            if !(200..300).contains(&status) {
+                return Err(Error::Other(format!(
+                    "HTTP {status} {status_text} downloading {current}"
+                )));
+            }
+            return stream_body_to_file(&mut stream, &resp_headers, leftover, dest).await;
+        }
+    };
+    if timeout.is_zero() {
+        work.await
+    } else {
+        tokio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| Error::timeout("download_to_file", timeout.as_millis() as u64))?
+    }
 }
 
 fn now_unix_secs() -> f64 {
@@ -1386,6 +1652,78 @@ mod tests {
         };
         assert!(r.ok());
         assert_eq!(r.headers_map().get("x-one").map(String::as_str), Some("a, b"));
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_download_follow_redirects_and_stream_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let resp = match path {
+                    "/redir" => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    "/json" => {
+                        let b = r#"{"ok":true}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            b.len(),
+                            b
+                        )
+                    }
+                    "/chunked" => {
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_string()
+                    }
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nConnection: close\r\n\r\nmiss".to_string(),
+                };
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let body = fetch_url_bytes(&format!("http://{addr}/redir"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(body, br#"{"ok":true}"#);
+
+        let err = fetch_url_bytes(&format!("http://{addr}/missing"), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "{err}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cl_path = tmp.path().join("cl.bin");
+        let n1 = download_to_file(
+            &format!("http://{addr}/json"),
+            &cl_path,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n1, 11);
+        assert_eq!(std::fs::read(&cl_path).unwrap(), br#"{"ok":true}"#);
+
+        let chunked_path = tmp.path().join("chunked.bin");
+        let n2 = download_to_file(
+            &format!("http://{addr}/chunked"),
+            &chunked_path,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n2, 11);
+        assert_eq!(std::fs::read(&chunked_path).unwrap(), b"hello world");
+
         srv.await.unwrap();
     }
 }

@@ -13,7 +13,7 @@ pub mod telemetry;
 #[cfg(test)]
 mod tests;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,7 +23,7 @@ use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use fluxwright::BrowserEngine;
@@ -32,7 +32,7 @@ use tokio::task::AbortHandle;
 use tracing::Instrument;
 use uuid::Uuid;
 
-pub use cluster::{spawn_worker, WorkerHandle};
+pub use cluster::{spawn_worker, WorkerHandle, WorkerInfo, WorkerStatus, WorkersSummary};
 pub use dashboard::dashboard_html;
 pub use job::{
     ConsoleEntry, FailureEvidence, Job, JobPriority, JobRequest, JobStatus, NavigationWait,
@@ -97,6 +97,7 @@ pub(crate) struct Inner {
     token: Vec<u8>,
     max_jobs: usize,
     lease_ms: AtomicU64,
+    lease_notify: tokio::sync::Notify,
     registry: Mutex<Registry>,
     journal: Option<journal::Journal>,
 }
@@ -104,9 +105,11 @@ pub(crate) struct Inner {
 struct Registry {
     accepting: bool,
     jobs: VecDeque<Record>,
+    workers: HashMap<String, cluster::WorkerRecord>,
     succeeded_jobs: u64,
     failed_jobs: u64,
     cancelled_jobs: u64,
+    expired_leases: u64,
 }
 
 struct Record {
@@ -162,7 +165,8 @@ impl Inner {
             Some(engine) => engine.metrics().await,
             None => Default::default(),
         };
-        let metrics = self.with_registry(|reg, _| {
+        let lease_ms = self.lease_ms();
+        let metrics = self.with_registry(|reg, now| {
             let mut queued = 0;
             let mut running = 0;
             for r in &reg.jobs {
@@ -172,6 +176,7 @@ impl Inner {
                     _ => {}
                 }
             }
+            let (_, workers_summary) = cluster::workers_snapshot(reg, now, lease_ms);
             ServerMetrics {
                 fleet,
                 queued_jobs: queued,
@@ -180,6 +185,10 @@ impl Inner {
                 failed_jobs: reg.failed_jobs,
                 cancelled_jobs: reg.cancelled_jobs,
                 max_jobs: self.max_jobs,
+                online_workers: workers_summary.online,
+                draining_workers: workers_summary.draining,
+                stale_workers: workers_summary.stale,
+                expired_leases: workers_summary.expired_leases,
             }
         });
         metrics.to_prometheus_text()
@@ -190,7 +199,13 @@ impl Inner {
             Some(engine) => engine.metrics().await,
             None => Default::default(),
         };
-        self.with_registry(|reg, _| {
+        let lease_ms = self.lease_ms();
+        let mode = if self.engine.is_some() {
+            "standalone"
+        } else {
+            "coordinator"
+        };
+        self.with_registry(|reg, now| {
             let mut queued = 0;
             let mut running = 0;
             let mut jobs = Vec::with_capacity(reg.jobs.len().min(DASHBOARD_JOBS));
@@ -213,10 +228,13 @@ impl Inner {
                     "step_index": r.job.step_index,
                     "error": r.job.error,
                     "trace_id": r.job.trace_id,
+                    "worker": r.worker,
                     "has_evidence": r.job.failure_evidence.is_some(),
                 }));
             }
+            let (workers, workers_summary) = cluster::workers_snapshot(reg, now, lease_ms);
             json!({
+                "mode": mode,
                 "fleet": fleet,
                 "server": {
                     "queued_jobs": queued,
@@ -226,6 +244,8 @@ impl Inner {
                     "cancelled_jobs": reg.cancelled_jobs,
                     "max_jobs": self.max_jobs,
                 },
+                "workers": workers,
+                "workers_summary": workers_summary,
                 "jobs": jobs,
             })
         })
@@ -268,6 +288,7 @@ impl HttpServer {
     pub fn set_lease_timeout(&self, timeout: Duration) {
         let ms = timeout.as_millis().clamp(1, u64::MAX as u128) as u64;
         self.inner.lease_ms.store(ms, Ordering::Relaxed);
+        self.inner.lease_notify.notify_one();
     }
 
     fn build(engine: Option<BrowserEngine>, config: ServerConfig) -> Result<Self, ConfigError> {
@@ -286,12 +307,15 @@ impl HttpServer {
             token: config.token.into_bytes(),
             max_jobs: config.max_jobs,
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
+            lease_notify: tokio::sync::Notify::new(),
             registry: Mutex::new(Registry {
                 accepting: true,
                 jobs: VecDeque::new(),
+                workers: HashMap::new(),
                 succeeded_jobs: 0,
                 failed_jobs: 0,
                 cancelled_jobs: 0,
+                expired_leases: 0,
             }),
             journal,
         });
@@ -314,6 +338,28 @@ impl HttpServer {
             }
         }
         drop(registry);
+        if inner.engine.is_none() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let weak = Arc::downgrade(&inner);
+                handle.spawn(async move {
+                    loop {
+                        let Some(inner) = weak.upgrade() else {
+                            break;
+                        };
+                        let accepting = inner.with_registry(|reg, _| reg.accepting);
+                        if !accepting {
+                            break;
+                        }
+                        let interval =
+                            Duration::from_millis((inner.lease_ms() / 2).clamp(25, 5_000));
+                        tokio::select! {
+                            _ = tokio::time::sleep(interval) => {}
+                            _ = inner.lease_notify.notified() => {}
+                        }
+                    }
+                });
+            }
+        }
         Ok(Self { inner })
     }
 
@@ -330,6 +376,9 @@ impl HttpServer {
         // them on a standalone `serve` instance would lease out jobs that it also runs locally.
         if self.inner.engine.is_none() {
             small = small
+                .route("/v1/workers", get(cluster::list_workers))
+                .route("/v1/workers/{worker}", delete(cluster::remove_worker))
+                .route("/v1/workers/{worker}/drain", post(cluster::drain_worker))
                 .route("/v1/workers/{worker}/lease", post(cluster::lease))
                 .route("/v1/workers/{worker}/heartbeat", post(cluster::heartbeat))
                 .route("/v1/workers/{worker}/release", post(cluster::release));
@@ -384,6 +433,7 @@ impl HttpServer {
             }
             registry.cancelled_jobs += newly_cancelled;
         }
+        self.inner.lease_notify.notify_one();
         match &self.inner.engine {
             Some(engine) => engine.shutdown(grace).await,
             None => Ok(()),

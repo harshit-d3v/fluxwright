@@ -463,6 +463,7 @@ async fn serves_dashboard_html_and_sse_events() {
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("Fluxwright Fleet Dashboard"));
         assert!(html.contains("Skip to main content"));
+        assert!(html.contains("Cluster Workers"));
         assert!(html.contains("Recent HTTP Jobs"));
     }
 
@@ -789,9 +790,11 @@ fn eviction_keeps_active_jobs() {
             record(JobStatus::Failed),
             record(JobStatus::Running),
         ]),
+        workers: HashMap::new(),
         succeeded_jobs: 0,
         failed_jobs: 0,
         cancelled_jobs: 0,
+        expired_leases: 0,
     };
     assert!(registry.make_room(5));
     let left: Vec<JobStatus> = registry.jobs.iter().map(|r| r.job.status).collect();
@@ -1046,6 +1049,22 @@ async fn standalone_server_does_not_expose_worker_cluster_routes() {
             StatusCode::NOT_FOUND
         );
     }
+    assert_eq!(
+        call(&server, "GET", "/v1/workers", Body::empty()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&server, "POST", "/v1/workers/w1/drain", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&server, "DELETE", "/v1/workers/w1", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(
         call(
             &server,
@@ -1310,5 +1329,145 @@ async fn validates_and_applies_resource_presets_and_block_rules() {
             resp.status()
         );
     }
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_tracks_workers_supports_drain_and_delete_and_exposes_dashboard_and_metrics() {
+    let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+    config.max_jobs = 8;
+    let server = HttpServer::coordinator(config).unwrap();
+
+    let job1 = submit_priority(&server, "normal", 0).await;
+    let job2 = submit_priority(&server, "normal", 0).await;
+
+    let lease_res = call(&server, "POST", "/v1/workers/w-alpha/lease", r#"{"max_jobs":1}"#).await;
+    assert_eq!(lease_res.status(), StatusCode::OK);
+    assert_eq!(body(lease_res).await["jobs"][0]["id"], job1.id.to_string());
+
+    let workers = body(call(&server, "GET", "/v1/workers", Body::empty()).await).await;
+    assert_eq!(workers["summary"]["total"], 1);
+    assert_eq!(workers["summary"]["online"], 1);
+    assert_eq!(workers["summary"]["capacity"], 1);
+    assert_eq!(workers["summary"]["active_jobs"], 1);
+    assert_eq!(workers["workers"][0]["worker"], "w-alpha");
+    assert_eq!(workers["workers"][0]["status"], "online");
+    assert_eq!(workers["workers"][0]["active_jobs"], 1);
+
+    let snap = server.inner.dashboard_snapshot().await;
+    assert_eq!(snap["mode"], "coordinator");
+    assert_eq!(snap["workers"][0]["worker"], "w-alpha");
+    let j1_snap = snap["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == job1.id.to_string())
+        .unwrap();
+    assert_eq!(j1_snap["worker"], "w-alpha");
+
+    // Draining worker keeps active leases allowed to finish, blocks removing while busy, and skips new leases.
+    let drain_res = call(&server, "POST", "/v1/workers/w-alpha/drain", Body::empty()).await;
+    assert_eq!(drain_res.status(), StatusCode::OK);
+    let drained = body(drain_res).await;
+    assert_eq!(drained["status"], "draining");
+    assert_eq!(drained["draining"], true);
+
+    assert_eq!(
+        call(&server, "DELETE", "/v1/workers/w-alpha", Body::empty())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let next_lease = body(call(&server, "POST", "/v1/workers/w-alpha/lease", r#"{"max_jobs":2}"#).await).await;
+    assert!(next_lease["jobs"].as_array().unwrap().is_empty());
+
+    let ok = serde_json::json!({
+        "worker": "w-alpha",
+        "status": "succeeded",
+        "attempts": 1,
+        "step_index": 0,
+        "results": ["done"]
+    });
+    assert_eq!(
+        call(&server, "POST", &format!("/v1/jobs/{}/result", job1.id), ok.to_string())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let after = body(call(&server, "GET", "/v1/workers", Body::empty()).await).await;
+    assert_eq!(after["workers"][0]["active_jobs"], 0);
+    assert_eq!(after["workers"][0]["succeeded_jobs"], 1);
+    assert_eq!(after["summary"]["draining"], 1);
+    assert_eq!(after["summary"]["capacity"], 0);
+
+    let metrics = server.inner.prometheus_text().await;
+    assert!(metrics.contains("fluxwright_cluster_workers{status=\"draining\"} 1\n"));
+    assert!(metrics.contains("fluxwright_cluster_lease_expirations_total 0\n"));
+
+    assert_eq!(
+        call(&server, "DELETE", "/v1/workers/w-alpha", Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&server, "POST", "/v1/workers/missing/drain", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&server, "DELETE", "/v1/workers/missing", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Remaining queued job is still available for another online worker.
+    let w2 = body(call(&server, "POST", "/v1/workers/w-beta/lease", r#"{"max_jobs":1}"#).await).await;
+    assert_eq!(w2["jobs"][0]["id"], job2.id.to_string());
+
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_background_reaper_expires_overdue_leases_proactively() {
+    let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+    config.max_jobs = 8;
+    let server = HttpServer::coordinator(config).unwrap();
+    server.set_lease_timeout(Duration::from_millis(50));
+
+    let job = submit_priority(&server, "normal", 0).await;
+    let lease_res = call(&server, "POST", "/v1/workers/w-reap/lease", r#"{"max_jobs":1}"#).await;
+    assert_eq!(lease_res.status(), StatusCode::OK);
+    assert_eq!(body(lease_res).await["jobs"].as_array().unwrap().len(), 1);
+
+    // Inspect registry mutex directly (bypassing `with_registry`) to verify background reaper acted.
+    let reaped = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let done = {
+                let reg = server.inner.registry.lock().unwrap();
+                reg.expired_leases == 1
+                    && reg.failed_jobs == 1
+                    && reg.jobs.iter().any(|r| {
+                        r.job.id == job.id && r.job.status == JobStatus::Failed
+                    })
+                    && reg
+                        .workers
+                        .get("w-reap")
+                        .is_some_and(|w| w.expired_leases == 1)
+            };
+            if done {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(reaped, "background reaper did not expire overdue lease proactively");
+
     server.shutdown(Duration::ZERO).await.unwrap();
 }

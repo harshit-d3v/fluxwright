@@ -3,6 +3,8 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod install;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use fluxwright::{BrowserEngine, QueueFullMode};
@@ -84,6 +86,27 @@ enum Cmd {
     Stats,
     Browsers,
     Doctor,
+    /// Download and install managed Chromium binaries into Fluxwright's browser cache.
+    Install {
+        /// Browser to install: `chrome-headless-shell` (default), `chrome`, `chromium`, or `all`.
+        #[arg(default_value = "chrome-headless-shell")]
+        browser: String,
+        /// Chrome for Testing release channel (`stable`, `beta`, `dev`, `canary`).
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        /// Pin a specific Chrome for Testing version (overrides --channel).
+        #[arg(long)]
+        version: Option<String>,
+        /// Re-download and overwrite even if already installed.
+        #[arg(long)]
+        force: bool,
+        /// Resolve download metadata and print JSON without downloading.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override destination cache directory (defaults to FLUXWRIGHT_BROWSERS_PATH or OS cache dir).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     Benchmark {
         #[arg(long, default_value = "benchmarks/results")]
         out: PathBuf,
@@ -168,6 +191,24 @@ async fn main() -> Result<()> {
         Cmd::Stats => rpc(&sock, Request::Stats).await,
         Cmd::Browsers => rpc(&sock, Request::Browsers).await,
         Cmd::Doctor => doctor().await,
+        Cmd::Install {
+            browser,
+            channel,
+            version,
+            force,
+            dry_run,
+            path,
+        } => {
+            install::run(install::InstallArgs {
+                browser,
+                channel,
+                version,
+                force,
+                dry_run,
+                path,
+            })
+            .await
+        }
         Cmd::Benchmark { out } => {
             let status = std::process::Command::new("cargo")
                 .args([
@@ -517,6 +558,7 @@ async fn doctor() -> Result<()> {
     let report = serde_json::json!({
         "chrome": chrome.as_ref().ok().map(|p| p.display().to_string()),
         "chrome_ok": chrome.is_ok(),
+        "managed_browsers_dir": fluxwright::managed_browsers_dir().map(|p| p.display().to_string()),
         "no_sandbox_env": std::env::var("FLUXWRIGHT_NO_SANDBOX").ok(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -613,6 +655,37 @@ mod tests {
             "w1",
         ])
         .is_ok());
+        match Cli::try_parse_from([
+            "fluxwright",
+            "install",
+            "chrome",
+            "--channel",
+            "beta",
+            "--force",
+            "--dry-run",
+            "--path",
+            "/tmp/fw-browsers",
+        ])
+        .expect("install subcommand should parse")
+        .cmd
+        {
+            Cmd::Install {
+                browser,
+                channel,
+                version,
+                force,
+                dry_run,
+                path,
+            } => {
+                assert_eq!(browser, "chrome");
+                assert_eq!(channel, "beta");
+                assert!(version.is_none());
+                assert!(force && dry_run);
+                assert_eq!(path, Some(PathBuf::from("/tmp/fw-browsers")));
+            }
+            _ => panic!("expected Cmd::Install"),
+        }
+        assert!(Cli::try_parse_from(["fluxwright", "install"]).is_ok());
     }
 
     #[test]

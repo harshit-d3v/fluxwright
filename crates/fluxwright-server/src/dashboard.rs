@@ -228,6 +228,10 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     .badge-succeeded { background: #22c55e33; color: #4ade80; }
     .badge-failed { background: #ef444433; color: #f87171; }
     .badge-cancelled { background: #6b728033; color: #9ca3af; }
+    .badge-online { background: #22c55e33; color: #4ade80; }
+    .badge-draining { background: #f59e0b33; color: #fbbf24; }
+    .badge-stale { background: #6b728033; color: #9ca3af; }
+    .btn-sm { padding: 0.25rem 0.625rem; font-size: 0.75rem; }
     .meter-bar {
       height: 8px;
       background: var(--border);
@@ -320,6 +324,27 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
+    <section id="workers-section" hidden aria-labelledby="workers-heading" style="margin-bottom: 1.5rem;">
+      <div class="table-container">
+        <table>
+          <caption id="workers-heading">Cluster Workers</caption>
+          <thead>
+            <tr>
+              <th scope="col">Worker</th>
+              <th scope="col">Status</th>
+              <th scope="col">Active / Max</th>
+              <th scope="col">Jobs (ok / err / exp)</th>
+              <th scope="col">Last Seen</th>
+              <th scope="col">Action</th>
+            </tr>
+          </thead>
+          <tbody id="workers-body">
+            <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No workers registered yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section aria-labelledby="jobs-heading">
       <div class="table-container">
         <table>
@@ -328,6 +353,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <tr>
               <th scope="col">Job ID</th>
               <th scope="col">Status</th>
+              <th scope="col">Worker</th>
               <th scope="col">Trace ID (W3C)</th>
               <th scope="col">Attempts</th>
               <th scope="col">Step Index</th>
@@ -336,7 +362,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </tr>
           </thead>
           <tbody id="jobs-body">
-            <tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">Waiting for fleet job data...</td></tr>
+            <tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 2rem;">Waiting for fleet job data...</td></tr>
           </tbody>
         </table>
       </div>
@@ -484,15 +510,18 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById('val-jobs-breakdown').textContent =
           (srv.succeeded_jobs || 0) + ' ok \u00b7 ' + (srv.failed_jobs || 0) + ' err \u00b7 ' + (srv.cancelled_jobs || 0) + ' cancelled';
 
+        renderWorkers(data);
+
         const tbody = document.getElementById('jobs-body');
         const jobs = data.jobs || [];
         if (jobs.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">No recent jobs in registry.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 2rem;">No recent jobs in registry.</td></tr>';
           return;
         }
 
         tbody.innerHTML = jobs.map(function (j) {
           const statusClass = 'badge-' + (j.status || 'queued');
+          const workerCell = j.worker ? '<span class="mono">' + escapeHtml(j.worker) + '</span>' : '&mdash;';
           const traceId = j.trace_id ? '<span class="mono">' + escapeHtml(j.trace_id.substring(0, 16)) + '&hellip;</span>' : '&mdash;';
           const step = j.step_index != null ? j.step_index : '&mdash;';
           let dur = '&mdash;';
@@ -506,6 +535,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           return '<tr>' +
             '<td class="mono">' + escapeHtml(j.id) + '</td>' +
             '<td><span class="badge ' + statusClass + '">' + escapeHtml(j.status) + '</span></td>' +
+            '<td>' + workerCell + '</td>' +
             '<td>' + traceId + '</td>' +
             '<td>' + (j.attempts || 0) + '</td>' +
             '<td>' + step + '</td>' +
@@ -514,6 +544,97 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             '</tr>';
         }).join('');
       }
+
+      function renderWorkers(data) {
+        const section = document.getElementById('workers-section');
+        const body = document.getElementById('workers-body');
+        const workers = Array.isArray(data.workers) ? data.workers : [];
+        const show = data.mode === 'coordinator' || workers.length > 0;
+        section.hidden = !show;
+        if (!show) return;
+
+        body.textContent = '';
+        if (workers.length === 0) {
+          const tr = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 6;
+          td.style.textAlign = 'center';
+          td.style.color = 'var(--text-muted)';
+          td.style.padding = '1.5rem';
+          td.textContent = 'No workers registered yet.';
+          tr.appendChild(td);
+          body.appendChild(tr);
+          return;
+        }
+
+        const nowMs = Date.now();
+        for (const w of workers) {
+          const tr = document.createElement('tr');
+
+          const tdId = document.createElement('td');
+          tdId.className = 'mono';
+          tdId.textContent = String(w.worker || '');
+          tr.appendChild(tdId);
+
+          const tdStatus = document.createElement('td');
+          const badge = document.createElement('span');
+          const st = w.status === 'online' || w.status === 'draining' || w.status === 'stale' ? w.status : 'stale';
+          badge.className = 'badge badge-' + st;
+          badge.textContent = st;
+          tdStatus.appendChild(badge);
+          tr.appendChild(tdStatus);
+
+          const tdSlots = document.createElement('td');
+          tdSlots.textContent = (w.active_jobs || 0) + ' / ' + (w.max_jobs || 0);
+          tr.appendChild(tdSlots);
+
+          const tdCounts = document.createElement('td');
+          tdCounts.textContent = (w.succeeded_jobs || 0) + ' / ' + (w.failed_jobs || 0) + ' / ' + (w.expired_leases || 0);
+          tr.appendChild(tdCounts);
+
+          const tdSeen = document.createElement('td');
+          const ageSec = Math.max(0, Math.round((nowMs - (w.last_seen_at || nowMs)) / 1000));
+          tdSeen.textContent = ageSec + 's ago';
+          tr.appendChild(tdSeen);
+
+          const tdAction = document.createElement('td');
+          if (!w.draining) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn-sm';
+            btn.dataset.workerId = String(w.worker || '');
+            btn.textContent = 'Drain';
+            tdAction.appendChild(btn);
+          } else {
+            tdAction.textContent = 'Draining';
+          }
+          tr.appendChild(tdAction);
+
+          body.appendChild(tr);
+        }
+      }
+
+      document.getElementById('workers-body').addEventListener('click', async function (e) {
+        const btn = e.target && e.target.closest ? e.target.closest('button[data-worker-id]') : null;
+        if (!btn) return;
+        const workerId = btn.dataset.workerId;
+        if (!workerId || !token) return;
+        btn.disabled = true;
+        try {
+          const res = await fetch('/v1/workers/' + encodeURIComponent(workerId) + '/drain', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + token },
+          });
+          if (res.ok) {
+            announce('Worker ' + workerId + ' draining');
+          } else {
+            btn.disabled = false;
+            announce('Failed to drain worker ' + workerId);
+          }
+        } catch (err) {
+          btn.disabled = false;
+        }
+      });
 
       function escapeHtml(s) {
         if (!s) return '';
