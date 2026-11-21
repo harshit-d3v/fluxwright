@@ -14,7 +14,56 @@ use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::error::{Error, LaunchOptions, Result};
+use crate::error::{Error, IgnoreDefaultArgs, LaunchOptions, Result};
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn local_app_data_dir() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join("AppData/Local")))
+}
+
+/// Directory where Fluxwright stores managed Chromium binaries downloaded by `fluxwright install`.
+/// Respects `FLUXWRIGHT_BROWSERS_PATH` when set and non-empty.
+pub fn managed_browsers_dir() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("FLUXWRIGHT_BROWSERS_PATH").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    default_managed_browsers_dir()
+}
+
+fn default_managed_browsers_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return local_app_data_dir().map(|d| d.join("fluxwright").join("browsers"));
+    }
+    if cfg!(target_os = "macos") {
+        return home_dir().map(|h| h.join("Library/Caches/fluxwright/browsers"));
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".cache")))
+        .map(|d| d.join("fluxwright").join("browsers"))
+}
+
+fn chrome_for_testing_rel() -> &'static Path {
+    if cfg!(windows) {
+        Path::new("chrome.exe")
+    } else if cfg!(target_os = "macos") {
+        Path::new("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
+    } else {
+        Path::new("chrome")
+    }
+}
 
 fn from_env() -> Option<PathBuf> {
     ["FLUXWRIGHT_CHROMIUM", "CHROME", "CHROMIUM", "GOOGLE_CHROME"]
@@ -39,13 +88,19 @@ pub fn find_browser(headless: bool) -> Result<PathBuf> {
     find_chrome(None)
 }
 
-/// chrome-headless-shell on PATH, else the newest in Puppeteer's or Playwright's cache.
+/// chrome-headless-shell on explicit FLUXWRIGHT_BROWSERS_PATH, PATH, Fluxwright cache,
+/// else newest in Puppeteer's or Playwright's cache.
 fn find_headless_shell() -> Option<PathBuf> {
     let exe = if cfg!(windows) {
         "chrome-headless-shell.exe"
     } else {
         "chrome-headless-shell"
     };
+    if let Some(explicit_dir) = std::env::var_os("FLUXWRIGHT_BROWSERS_PATH").filter(|v| !v.is_empty()) {
+        if let Some(p) = newest_shell(&PathBuf::from(explicit_dir).join("chrome-headless-shell"), "", exe) {
+            return Some(p);
+        }
+    }
     let on_path = std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|d| d.join(exe))
@@ -54,17 +109,18 @@ fn find_headless_shell() -> Option<PathBuf> {
     if on_path.is_some() {
         return on_path;
     }
-    let home = PathBuf::from(std::env::var_os(if cfg!(windows) {
-        "USERPROFILE"
-    } else {
-        "HOME"
-    })?);
+    if let Some(managed) = default_managed_browsers_dir() {
+        if let Some(p) = newest_shell(&managed.join("chrome-headless-shell"), "", exe) {
+            return Some(p);
+        }
+    }
+    let home = home_dir()?;
     let playwright = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             if cfg!(windows) {
-                std::env::var_os("LOCALAPPDATA")
-                    .map_or_else(|| home.join("AppData/Local"), PathBuf::from)
+                local_app_data_dir()
+                    .unwrap_or_else(|| home.join("AppData/Local"))
                     .join("ms-playwright")
             } else if cfg!(target_os = "macos") {
                 home.join("Library/Caches/ms-playwright")
@@ -80,23 +136,21 @@ fn find_headless_shell() -> Option<PathBuf> {
     .or_else(|| newest_shell(&playwright, "chromium_headless_shell-", exe))
 }
 
-/// Layout `<root>/<prefix><version>/chrome-headless-shell-<platform>/<exe>`; highest version
-/// wins ("1243" in Playwright's cache, "win64-131.0.6778.85" in Puppeteer's).
-fn newest_shell(root: &Path, prefix: &str, exe: &str) -> Option<PathBuf> {
+fn newest_bin(root: &Path, prefix: &str, rel: &Path) -> Option<PathBuf> {
     let mut found: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(root)
         .ok()?
         .flatten()
         .filter_map(|dir| {
             let name = dir.file_name().to_string_lossy().into_owned();
             let version = name.strip_prefix(prefix)?;
-            let key = version
+            let key: Vec<u64> = version
                 .split(|c: char| !c.is_ascii_digit())
                 .filter_map(|n| n.parse().ok())
                 .collect();
             let bin = std::fs::read_dir(dir.path())
                 .ok()?
                 .flatten()
-                .map(|d| d.path().join(exe))
+                .map(|d| d.path().join(rel))
                 .find(|p| p.is_file())?;
             Some((key, bin))
         })
@@ -105,11 +159,24 @@ fn newest_shell(root: &Path, prefix: &str, exe: &str) -> Option<PathBuf> {
     found.pop().map(|(_, bin)| bin)
 }
 
+/// Layout `<root>/<prefix><version>/chrome-headless-shell-<platform>/<exe>`; highest version
+/// wins ("1243" in Playwright's cache, "win64-131.0.6778.85" in Puppeteer's).
+fn newest_shell(root: &Path, prefix: &str, exe: &str) -> Option<PathBuf> {
+    newest_bin(root, prefix, Path::new(exe))
+}
+
+fn newest_chrome_bin(root: &Path) -> Option<PathBuf> {
+    newest_bin(root, "", chrome_for_testing_rel())
+}
+
 pub fn find_chrome(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }
     if let Some(p) = from_env() {
+        return Ok(p);
+    }
+    if let Some(p) = managed_browsers_dir().and_then(|d| newest_chrome_bin(&d.join("chrome"))) {
         return Ok(p);
     }
     let candidates = [
@@ -133,44 +200,140 @@ pub fn find_chrome(explicit: Option<&Path>) -> Result<PathBuf> {
     Err(Error::ChromeNotFound)
 }
 
-pub struct Launched {
-    pub child: Child,
-    pub pid: u32,
-    pub transport: Transport,
-    pub user_data_dir: tempfile::TempDir,
+/// Resolves a named browser channel (`chrome`, `chrome-beta`, `chrome-dev`, `chrome-canary`,
+/// `msedge`, `msedge-beta`, `msedge-dev`, `msedge-canary`, or `chromium`).
+pub fn find_channel(channel: &str) -> Result<PathBuf> {
+    let norm = channel.trim().to_ascii_lowercase();
+    let local = local_app_data_dir();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    match norm.as_str() {
+        "chromium" => {
+            for p in [
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/snap/bin/chromium",
+                r"C:\Program Files\Chromium\Application\chrome.exe",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ] {
+                let pb = PathBuf::from(p);
+                if pb.exists() {
+                    return Ok(pb);
+                }
+            }
+            if let Some(p) = managed_browsers_dir().and_then(|d| newest_chrome_bin(&d.join("chrome"))) {
+                return Ok(p);
+            }
+            return find_chrome(None).map_err(|_| {
+                Error::Launch(format!("browser channel `{channel}` is not installed"))
+            });
+        }
+        "chrome" => {
+            paths.extend([
+                PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+                PathBuf::from("/usr/bin/google-chrome"),
+                PathBuf::from("/usr/bin/google-chrome-stable"),
+                PathBuf::from("/opt/google/chrome/chrome"),
+                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Google\Chrome\Application\chrome.exe"));
+            }
+        }
+        "chrome-beta" => {
+            paths.extend([
+                PathBuf::from(r"C:\Program Files\Google\Chrome Beta\Application\chrome.exe"),
+                PathBuf::from(r"C:\Program Files (x86)\Google\Chrome Beta\Application\chrome.exe"),
+                PathBuf::from("/usr/bin/google-chrome-beta"),
+                PathBuf::from("/opt/google/chrome-beta/chrome"),
+                PathBuf::from("/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Google\Chrome Beta\Application\chrome.exe"));
+            }
+        }
+        "chrome-dev" => {
+            paths.extend([
+                PathBuf::from(r"C:\Program Files\Google\Chrome Dev\Application\chrome.exe"),
+                PathBuf::from(r"C:\Program Files (x86)\Google\Chrome Dev\Application\chrome.exe"),
+                PathBuf::from("/usr/bin/google-chrome-unstable"),
+                PathBuf::from("/opt/google/chrome-unstable/chrome"),
+                PathBuf::from("/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Google\Chrome Dev\Application\chrome.exe"));
+            }
+        }
+        "chrome-canary" => {
+            paths.extend([
+                PathBuf::from("/usr/bin/google-chrome-canary"),
+                PathBuf::from("/opt/google/chrome-canary/chrome"),
+                PathBuf::from("/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Google\Chrome SxS\Application\chrome.exe"));
+            }
+        }
+        "msedge" => {
+            paths.extend([
+                PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+                PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+                PathBuf::from("/usr/bin/microsoft-edge"),
+                PathBuf::from("/usr/bin/microsoft-edge-stable"),
+                PathBuf::from("/opt/microsoft/msedge/msedge"),
+                PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Microsoft\Edge\Application\msedge.exe"));
+            }
+        }
+        "msedge-beta" => {
+            paths.extend([
+                PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge Beta\Application\msedge.exe"),
+                PathBuf::from(r"C:\Program Files\Microsoft\Edge Beta\Application\msedge.exe"),
+                PathBuf::from("/usr/bin/microsoft-edge-beta"),
+                PathBuf::from("/opt/microsoft/msedge-beta/msedge"),
+                PathBuf::from("/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Microsoft\Edge Beta\Application\msedge.exe"));
+            }
+        }
+        "msedge-dev" => {
+            paths.extend([
+                PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge Dev\Application\msedge.exe"),
+                PathBuf::from(r"C:\Program Files\Microsoft\Edge Dev\Application\msedge.exe"),
+                PathBuf::from("/usr/bin/microsoft-edge-dev"),
+                PathBuf::from("/opt/microsoft/msedge-dev/msedge"),
+                PathBuf::from("/Applications/Microsoft Edge Dev.app/Contents/MacOS/Microsoft Edge Dev"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Microsoft\Edge Dev\Application\msedge.exe"));
+            }
+        }
+        "msedge-canary" => {
+            paths.extend([
+                PathBuf::from("/opt/microsoft/msedge-canary/msedge"),
+                PathBuf::from("/Applications/Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary"),
+            ]);
+            if let Some(l) = local {
+                paths.push(l.join(r"Microsoft\Edge SxS\Application\msedge.exe"));
+            }
+        }
+        _ => {
+            return Err(Error::Launch(format!(
+                "unsupported browser channel `{channel}`; expected chrome, chrome-beta, chrome-dev, chrome-canary, msedge, msedge-beta, msedge-dev, msedge-canary, or chromium"
+            )));
+        }
+    }
+    paths
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| Error::Launch(format!("browser channel `{channel}` is not installed")))
 }
 
-/// How the engine talks to a browser it launched.
-pub enum Transport {
-    /// DevTools WebSocket on a localhost port (Windows; the job object ties Chrome to us).
-    #[cfg(windows)]
-    WebSocket(String),
-    /// `--remote-debugging-pipe`: commands on Chrome's fd 3, replies on fd 4, NUL-separated.
-    /// Private to this process (a debugging port is open to every local user), and Chrome
-    /// exits when the pipe closes, so it cannot outlive a crashed engine. That is the only
-    /// tether on macOS, which has no parent-death signal.
-    #[cfg(unix)]
-    Pipe {
-        to_chrome: OwnedFd,
-        from_chrome: OwnedFd,
-    },
-}
-
-pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
-    static SWEEP: std::sync::Once = std::sync::Once::new();
-    SWEEP.call_once(|| {
-        std::thread::spawn(sweep_stale_profiles);
-    });
-    let exe = match opts.executable.as_deref() {
-        Some(p) => p.to_path_buf(),
-        None => find_browser(opts.headless)?,
-    };
-    // The pid in the name lets sweep_stale_profiles tell a dead engine's profile from a live one.
-    let user_data_dir = tempfile::Builder::new()
-        .prefix(&format!("fluxwright-{}-", std::process::id()))
-        .tempdir()?;
-    let mut args = vec![
-        format!("--user-data-dir={}", user_data_dir.path().display()),
+pub(crate) fn build_chrome_args(opts: &LaunchOptions, user_data_dir: &Path) -> Vec<String> {
+    let mut default_args = vec![
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-default-apps".to_string(),
@@ -201,27 +364,103 @@ pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
         "--disable-dev-shm-usage".to_string(),
         format!(
             "--crash-dumps-dir={}",
-            user_data_dir.path().join("Crashpad").display()
+            user_data_dir.join("Crashpad").display()
         ),
     ];
     if opts.headless {
-        args.push("--headless=new".to_string());
-        args.push("--hide-scrollbars".to_string());
-        args.push("--mute-audio".to_string());
+        default_args.push("--headless=new".to_string());
+        default_args.push("--hide-scrollbars".to_string());
+        default_args.push("--mute-audio".to_string());
     }
+    match &opts.ignore_default_args {
+        IgnoreDefaultArgs::None => {}
+        IgnoreDefaultArgs::All => default_args.clear(),
+        IgnoreDefaultArgs::Some(ignored) => {
+            default_args.retain(|a| {
+                !ignored
+                    .iter()
+                    .any(|ig| a == ig || a.split_once('=').is_some_and(|(k, _)| k == ig))
+            });
+        }
+    }
+
+    let mut args = Vec::new();
+    if !opts
+        .extra_args
+        .iter()
+        .any(|a| a.starts_with("--user-data-dir="))
+    {
+        args.push(format!("--user-data-dir={}", user_data_dir.display()));
+    }
+    args.extend(default_args);
     if opts.no_sandbox {
         warn!("launching chromium with --no-sandbox (explicit opt-in)");
-        args.push("--no-sandbox".to_string());
-        args.push("--disable-setuid-sandbox".to_string());
+        if !opts.extra_args.iter().any(|a| a == "--no-sandbox") {
+            args.push("--no-sandbox".to_string());
+        }
+        if !opts.extra_args.iter().any(|a| a == "--disable-setuid-sandbox") {
+            args.push("--disable-setuid-sandbox".to_string());
+        }
     }
     if cfg!(unix) {
-        args.push("--remote-debugging-pipe".to_string());
-    } else {
+        if !opts
+            .extra_args
+            .iter()
+            .any(|a| a == "--remote-debugging-pipe")
+        {
+            args.push("--remote-debugging-pipe".to_string());
+        }
+    } else if !opts
+        .extra_args
+        .iter()
+        .any(|a| a.starts_with("--remote-debugging-port"))
+    {
         args.push("--remote-debugging-port=0".to_string());
         // No --remote-allow-origins: it lets any web page in any job open a DevTools socket to
         // another job's page. tungstenite sends no Origin header, which Chrome accepts.
     }
     args.extend(opts.extra_args.iter().cloned());
+    args
+}
+
+pub struct Launched {
+    pub child: Child,
+    pub pid: u32,
+    pub transport: Transport,
+    pub user_data_dir: tempfile::TempDir,
+}
+
+/// How the engine talks to a browser it launched.
+pub enum Transport {
+    /// DevTools WebSocket on a localhost port (Windows; the job object ties Chrome to us).
+    #[cfg(windows)]
+    WebSocket(String),
+    /// `--remote-debugging-pipe`: commands on Chrome's fd 3, replies on fd 4, NUL-separated.
+    /// Private to this process (a debugging port is open to every local user), and Chrome
+    /// exits when the pipe closes, so it cannot outlive a crashed engine. That is the only
+    /// tether on macOS, which has no parent-death signal.
+    #[cfg(unix)]
+    Pipe {
+        to_chrome: OwnedFd,
+        from_chrome: OwnedFd,
+    },
+}
+
+pub async fn launch_chrome(opts: &LaunchOptions) -> Result<Launched> {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| {
+        std::thread::spawn(sweep_stale_profiles);
+    });
+    let exe = match (opts.executable.as_deref(), opts.channel.as_deref()) {
+        (Some(p), _) => p.to_path_buf(),
+        (None, Some(ch)) => find_channel(ch)?,
+        (None, None) => find_browser(opts.headless)?,
+    };
+    // The pid in the name lets sweep_stale_profiles tell a dead engine's profile from a live one.
+    let user_data_dir = tempfile::Builder::new()
+        .prefix(&format!("fluxwright-{}-", std::process::id()))
+        .tempdir()?;
+    let args = build_chrome_args(opts, user_data_dir.path());
 
     info!(executable = %exe.display(), "launching chromium");
     let mut cmd = Command::new(&exe);
@@ -570,6 +809,89 @@ mod tests {
         assert_eq!(stale_profile_pid("fluxwright-42-dl-ctx"), Some(42));
         assert_eq!(stale_profile_pid("other-1234-ab"), None);
         assert_eq!(stale_profile_pid("fluxwright-bad-ab"), None);
+    }
+
+    #[test]
+    fn newest_chrome_bin_picks_highest_version() {
+        let root = tempfile::tempdir().unwrap();
+        let rel = chrome_for_testing_rel();
+        for version in ["130.0.6723.58", "134.0.6998.165", "132.0.6834.83"] {
+            let bin = root
+                .path()
+                .join(version)
+                .join("chrome-platform")
+                .join(rel);
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "").unwrap();
+        }
+        let found = newest_chrome_bin(root.path()).unwrap();
+        assert!(
+            found.starts_with(root.path().join("134.0.6998.165")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn find_channel_rejects_unknown_channel() {
+        let err = find_channel("bogus-browser").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported browser channel"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_chrome_args_respects_ignore_default_args_and_extra_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = if cfg!(unix) {
+            "--remote-debugging-pipe"
+        } else {
+            "--remote-debugging-port=0"
+        };
+
+        let def = build_chrome_args(&LaunchOptions::default(), tmp.path());
+        assert!(def.iter().any(|a| a == "--mute-audio"));
+        assert!(def.iter().any(|a| a.starts_with("--disable-features=")));
+        assert!(def.iter().any(|a| a == transport));
+
+        let all_ignored = build_chrome_args(
+            &LaunchOptions {
+                ignore_default_args: IgnoreDefaultArgs::All,
+                extra_args: vec!["--custom-flag".into()],
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        assert!(!all_ignored.iter().any(|a| a == "--mute-audio"));
+        assert!(!all_ignored.iter().any(|a| a == "--no-first-run"));
+        assert!(all_ignored.iter().any(|a| a == transport));
+        assert!(all_ignored.iter().any(|a| a.starts_with("--user-data-dir=")));
+        assert!(all_ignored.iter().any(|a| a == "--custom-flag"));
+
+        let some_ignored = build_chrome_args(
+            &LaunchOptions {
+                ignore_default_args: IgnoreDefaultArgs::Some(vec![
+                    "--mute-audio".into(),
+                    "--disable-features".into(),
+                ]),
+                extra_args: vec!["--user-data-dir=/custom/profile".into()],
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        assert!(!some_ignored.iter().any(|a| a == "--mute-audio"));
+        assert!(!some_ignored.iter().any(|a| a.starts_with("--disable-features=")));
+        assert!(some_ignored.iter().any(|a| a == "--no-first-run"));
+        assert_eq!(
+            some_ignored
+                .iter()
+                .filter(|a| a.starts_with("--user-data-dir="))
+                .count(),
+            1
+        );
+        assert!(some_ignored
+            .iter()
+            .any(|a| a == "--user-data-dir=/custom/profile"));
     }
 
     #[cfg(windows)]

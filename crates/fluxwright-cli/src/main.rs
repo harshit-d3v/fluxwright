@@ -54,6 +54,15 @@ enum Cmd {
         /// Worker name registered with the coordinator when `--join` is set.
         #[arg(long)]
         worker_id: Option<String>,
+        /// Pre-warmed blank context slots kept ready per running browser.
+        #[arg(long, default_value_t = 0)]
+        prewarm_contexts: usize,
+        /// Browser channel (`chrome`, `chrome-beta`, `msedge`, `chromium`, ...).
+        #[arg(long)]
+        channel: Option<String>,
+        /// Extra CLI flags passed to Chromium on launch (repeatable).
+        #[arg(long = "chromium-arg", allow_hyphen_values = true)]
+        chromium_args: Vec<String>,
     },
     /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
     Coordinate {
@@ -118,6 +127,9 @@ async fn main() -> Result<()> {
             journal,
             join,
             worker_id,
+            prewarm_contexts,
+            channel,
+            chromium_args,
         } => {
             let address = listen.unwrap_or_else(|| {
                 if join.is_some() {
@@ -138,6 +150,9 @@ async fn main() -> Result<()> {
                 journal,
                 join,
                 worker_id,
+                prewarm_contexts,
+                channel,
+                chromium_args,
             )
             .await
         }
@@ -198,6 +213,7 @@ async fn coordinator_daemon(
     serve_http(listener, address, server, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn http_daemon(
     address: SocketAddr,
     max_browsers: Option<NonZeroUsize>,
@@ -210,6 +226,9 @@ async fn http_daemon(
     journal: Option<std::path::PathBuf>,
     join: Option<String>,
     worker_id: Option<String>,
+    prewarm_contexts: usize,
+    channel: Option<String>,
+    chromium_args: Vec<String>,
 ) -> Result<()> {
     let (token, config) = server_config(max_jobs, journal)?;
     // Bind before creating the engine so an occupied address never starts browser work.
@@ -221,9 +240,16 @@ async fn http_daemon(
     }
     builder = builder
         .max_contexts_per_browser(max_contexts)
+        .prewarm_contexts(prewarm_contexts)
         .queue_capacity(max_jobs)
         .queue_full_mode(QueueFullMode::Wait)
         .acquire_timeout(Duration::from_secs(300));
+    if let Some(ch) = channel {
+        builder = builder.channel(ch);
+    }
+    if !chromium_args.is_empty() {
+        builder = builder.args(chromium_args);
+    }
     if let Some(max) = max_browsers {
         builder = builder.max_browsers(max.get());
     }
@@ -530,6 +556,9 @@ mod tests {
                 journal,
                 join,
                 worker_id,
+                prewarm_contexts,
+                channel,
+                chromium_args,
             } => {
                 assert!(
                     max_per_host.is_none()
@@ -537,13 +566,40 @@ mod tests {
                         && journal.is_none()
                         && join.is_none()
                         && worker_id.is_none()
+                        && channel.is_none()
+                        && chromium_args.is_empty()
                 );
+                assert_eq!(prewarm_contexts, 0);
                 assert_eq!(listen, Some("0.0.0.0:7331".parse::<SocketAddr>().unwrap()));
                 assert!(max_browsers.is_none());
                 assert_eq!(max_contexts.get(), 8);
                 assert_eq!(max_jobs.get(), 128);
                 assert!(memory_ceiling_mb.is_none());
                 assert!(cdp_endpoint.is_none());
+            }
+            _ => panic!("expected Cmd::Serve"),
+        }
+        let custom = Cli::try_parse_from([
+            "fluxwright",
+            "serve",
+            "--prewarm-contexts",
+            "2",
+            "--channel",
+            "chrome",
+            "--chromium-arg",
+            "--disable-gpu",
+        ])
+        .expect("serve launch/prewarm flags should parse");
+        match custom.cmd {
+            Cmd::Serve {
+                prewarm_contexts,
+                channel,
+                chromium_args,
+                ..
+            } => {
+                assert_eq!(prewarm_contexts, 2);
+                assert_eq!(channel.as_deref(), Some("chrome"));
+                assert_eq!(chromium_args, vec!["--disable-gpu"]);
             }
             _ => panic!("expected Cmd::Serve"),
         }

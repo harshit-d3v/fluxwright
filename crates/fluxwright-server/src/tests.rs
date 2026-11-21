@@ -771,6 +771,9 @@ fn eviction_keeps_active_jobs() {
                 timeout_ms: 60_000,
                 retries: 0,
                 priority: JobPriority::Normal,
+                resource_preset: None,
+                block_resources: Vec::new(),
+                block_url_patterns: Vec::new(),
             },
             abort: active.then(|| tokio::spawn(std::future::pending::<()>()).abort_handle()),
             worker: None,
@@ -1248,6 +1251,63 @@ async fn rejects_invalid_init_script_and_tag_steps() {
             matches!(response.status(), StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY),
             "expected 400/422 for {payload}, got {}",
             response.status()
+        );
+    }
+    server.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn validates_and_applies_resource_presets_and_block_rules() {
+    let req: JobRequest = serde_json::from_str(
+        r#"{
+            "steps": [{ "action": "title" }],
+            "resource_preset": "scraping",
+            "block_resources": ["stylesheet"],
+            "block_url_patterns": ["**/tracker.js"]
+        }"#,
+    )
+    .unwrap();
+    assert!(req.validate().is_ok());
+    let opts = req.options();
+    assert!(opts.block_images && opts.block_fonts && opts.block_media);
+    assert!(opts.block_stylesheets);
+    assert!(!opts.block_scripts);
+    assert_eq!(opts.block_url_patterns, vec!["**/tracker.js"]);
+
+    let no_media: JobRequest = serde_json::from_str(
+        r#"{"steps":[{"action":"title"}],"resource_preset":"no-media"}"#,
+    )
+    .unwrap();
+    let nm_opts = no_media.options();
+    assert!(nm_opts.block_images && nm_opts.block_media);
+    assert!(!nm_opts.block_fonts && !nm_opts.block_stylesheets);
+
+    let server = server(2).await;
+    let ok = call(
+        &server,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}],"resource_preset":"minimal","block_url_patterns":["**/*.png"]}"#,
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+
+    let too_many_patterns = serde_json::json!({
+        "steps": [{ "action": "title" }],
+        "block_url_patterns": vec!["*.js"; 65],
+    })
+    .to_string();
+    for bad in [
+        r#"{"steps":[{"action":"title"}],"resource_preset":"unknown"}"#.to_string(),
+        r#"{"steps":[{"action":"title"}],"block_resources":["unknown"]}"#.to_string(),
+        r#"{"steps":[{"action":"title"}],"block_url_patterns":[""]}"#.to_string(),
+        too_many_patterns,
+    ] {
+        let resp = call(&server, "POST", "/v1/jobs", bad.clone()).await;
+        assert!(
+            matches!(resp.status(), StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY),
+            "expected 400/422 for {bad}, got {}",
+            resp.status()
         );
     }
     server.shutdown(Duration::ZERO).await.unwrap();

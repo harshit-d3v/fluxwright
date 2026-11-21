@@ -1,8 +1,50 @@
 use std::time::Duration;
 
 use fluxwright_cdp::{
-    ColorScheme, Emulation, Geolocation, LaunchOptions, Proxy, RecordHarOptions, StorageState,
+    ColorScheme, Emulation, Geolocation, LaunchOptions, Proxy, RecordHarOptions, ResourceType,
+    StorageState,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourcePreset {
+    /// Block images, fonts, and media; keep HTML, CSS, and scripts intact.
+    Scraping,
+    /// Block images, fonts, media, and stylesheets; keep HTML and scripts intact.
+    Minimal,
+    /// Block images and media; keep fonts, stylesheets, and scripts intact.
+    NoMedia,
+}
+
+impl ResourcePreset {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "scraping" => Some(Self::Scraping),
+            "minimal" => Some(Self::Minimal),
+            "no-media" | "no_media" => Some(Self::NoMedia),
+            _ => None,
+        }
+    }
+
+    pub fn apply(self, opts: &mut JobOptions) {
+        match self {
+            Self::Scraping => {
+                opts.block_images = true;
+                opts.block_fonts = true;
+                opts.block_media = true;
+            }
+            Self::Minimal => {
+                opts.block_images = true;
+                opts.block_fonts = true;
+                opts.block_media = true;
+                opts.block_stylesheets = true;
+            }
+            Self::NoMedia => {
+                opts.block_images = true;
+                opts.block_media = true;
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Priority {
@@ -25,6 +67,8 @@ pub struct EngineConfig {
     pub min_browsers: usize,
     pub max_browsers: usize,
     pub max_contexts_per_browser: usize,
+    /// Pre-warmed blank context + `about:blank` page slots kept ready per running browser.
+    pub prewarm_contexts: usize,
     pub memory_ceiling_mb: u64,
     pub idle_timeout: Option<Duration>,
     pub recycle_after_jobs: Option<u64>,
@@ -86,6 +130,7 @@ impl Default for EngineConfig {
             min_browsers: 0,
             max_browsers,
             max_contexts_per_browser: 8,
+            prewarm_contexts: 0,
             memory_ceiling_mb,
             idle_timeout: Some(Duration::from_secs(300)),
             recycle_after_jobs: Some(100),
@@ -117,6 +162,8 @@ pub struct JobOptions {
     pub block_images: bool,
     pub block_fonts: bool,
     pub block_media: bool,
+    pub block_stylesheets: bool,
+    pub block_scripts: bool,
     pub block_url_patterns: Vec<String>,
     /// Proxy for this job's browser context. Other jobs on the same browser are unaffected.
     pub proxy: Option<Proxy>,
@@ -143,6 +190,8 @@ impl Default for JobOptions {
             block_images: false,
             block_fonts: false,
             block_media: false,
+            block_stylesheets: false,
+            block_scripts: false,
             block_url_patterns: Vec::new(),
             proxy: None,
             emulation: Emulation::default(),
@@ -232,11 +281,91 @@ impl JobOptions {
         self.record_har = Some(opts);
         self
     }
+
+    pub fn block_images(mut self, v: bool) -> Self {
+        self.block_images = v;
+        self
+    }
+
+    pub fn block_fonts(mut self, v: bool) -> Self {
+        self.block_fonts = v;
+        self
+    }
+
+    pub fn block_media(mut self, v: bool) -> Self {
+        self.block_media = v;
+        self
+    }
+
+    pub fn block_stylesheets(mut self, v: bool) -> Self {
+        self.block_stylesheets = v;
+        self
+    }
+
+    pub fn block_scripts(mut self, v: bool) -> Self {
+        self.block_scripts = v;
+        self
+    }
+
+    pub fn block_resources<I>(mut self, types: I) -> Self
+    where
+        I: IntoIterator<Item = ResourceType>,
+    {
+        for t in types {
+            match t {
+                ResourceType::Image => self.block_images = true,
+                ResourceType::Font => self.block_fonts = true,
+                ResourceType::Media => self.block_media = true,
+                ResourceType::Stylesheet => self.block_stylesheets = true,
+                ResourceType::Script => self.block_scripts = true,
+            }
+        }
+        self
+    }
+
+    pub fn block_url_patterns<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.block_url_patterns
+            .extend(patterns.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn resource_preset(mut self, preset: ResourcePreset) -> Self {
+        preset.apply(&mut self);
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_preset_parses_and_applies() {
+        assert_eq!(ResourcePreset::parse("scraping"), Some(ResourcePreset::Scraping));
+        assert_eq!(ResourcePreset::parse("MINIMAL"), Some(ResourcePreset::Minimal));
+        assert_eq!(ResourcePreset::parse("no-media"), Some(ResourcePreset::NoMedia));
+        assert_eq!(ResourcePreset::parse("no_media"), Some(ResourcePreset::NoMedia));
+        assert_eq!(ResourcePreset::parse("unknown"), None);
+
+        let s = JobOptions::default().resource_preset(ResourcePreset::Scraping);
+        assert!(s.block_images && s.block_fonts && s.block_media);
+        assert!(!s.block_stylesheets && !s.block_scripts);
+
+        let m = JobOptions::default().resource_preset(ResourcePreset::Minimal);
+        assert!(m.block_images && m.block_fonts && m.block_media && m.block_stylesheets);
+        assert!(!m.block_scripts);
+
+        let r = JobOptions::default()
+            .block_resources([ResourceType::Script, ResourceType::Image])
+            .block_url_patterns(["**/*.png", "**/analytics*"]);
+        assert!(r.block_scripts && r.block_images);
+        assert!(!r.block_fonts);
+        assert_eq!(r.block_url_patterns, vec!["**/*.png", "**/analytics*"]);
+    }
 
     #[test]
     fn auto_tune_sizes_the_fleet_to_the_machine() {

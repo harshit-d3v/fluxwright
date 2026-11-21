@@ -7,6 +7,8 @@ pub struct MetricsSnapshot {
     pub pages: usize,
     pub active_leases: usize,
     pub queued_requests: usize,
+    pub warm_contexts: usize,
+    pub warm_context_hits: u64,
     pub browser_reuse_rate: f64,
     pub crash_count: u64,
     pub recycle_count: u64,
@@ -20,6 +22,7 @@ pub struct MetricsSnapshot {
 pub struct Counters {
     pub acquires: u64,
     pub acquires_reused_browser: u64,
+    pub warm_context_hits: u64,
     pub crash_count: u64,
     pub recycle_count: u64,
 }

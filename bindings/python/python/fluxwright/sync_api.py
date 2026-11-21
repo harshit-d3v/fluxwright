@@ -2078,6 +2078,9 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
+        block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
+        block_url_patterns: Sequence[str] | None = None,
     ) -> Page:
         """A page in a fresh browser context; every option applies to this page only, with
         Playwright's names."""
@@ -2108,6 +2111,9 @@ class Browser:
                 record_har_content=record_har_content,
                 record_har_mode=record_har_mode,
                 record_har_url_filter=record_har_url_filter,
+                resource_preset=resource_preset,
+                block_resources=block_resources,
+                block_url_patterns=block_url_patterns,
             )
         )
 
@@ -2138,6 +2144,9 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
+        block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
+        block_url_patterns: Sequence[str] | None = None,
     ) -> BrowserContext:
         """A browser context with ``new_page``'s options, as Playwright's ``new_context``; see ``BrowserContext``."""
         impl = _run(
@@ -2166,6 +2175,9 @@ class Browser:
             record_har_content=record_har_content,
             record_har_mode=record_har_mode,
             record_har_url_filter=record_har_url_filter,
+            resource_preset=resource_preset,
+            block_resources=block_resources,
+            block_url_patterns=block_url_patterns,
         )
         return BrowserContext(self, impl)
 
@@ -2304,6 +2316,10 @@ class BrowserType:
         memory_ceiling_mb: int | None = None,
         max_concurrency_per_host: int | None = None,
         min_delay_per_host: float | None = None,
+        args: Sequence[str] | None = None,
+        ignore_default_args: bool | Sequence[str] | None = None,
+        channel: str | None = None,
+        prewarm_contexts: int | None = None,
     ) -> Browser:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
         one per 4 CPUs, 8 pages each), headless unless ``headless=False``. New pages wait while
@@ -2323,6 +2339,10 @@ class BrowserType:
                 memory_ceiling_mb=memory_ceiling_mb,
                 max_concurrency_per_host=max_concurrency_per_host,
                 min_delay_per_host=min_delay_per_host,
+                args=args,
+                ignore_default_args=ignore_default_args,
+                channel=channel,
+                prewarm_contexts=prewarm_contexts,
             )
         )
 

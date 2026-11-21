@@ -2020,3 +2020,106 @@ def test_websockets_har_workers(tmp_path):
     finally:
         srv.shutdown()
 
+
+def test_launch_prewarm_and_resource_presets():
+    seen_paths: list[str] = []
+    seen_lock = threading.Lock()
+
+    class ResourceHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            with seen_lock:
+                seen_paths.append(self.path)
+            if self.path == "/":
+                ctype, body = (
+                    "text/html",
+                    b'<!doctype html><head><link rel="stylesheet" href="/style.css"></head>'
+                    b'<body><img src="/img.png"><script src="/app.js"></script><script src="/tracker.js"></script>'
+                    b'<style>@font-face{font-family:F;src:url(/font.woff2)}body{font-family:F}</style><p>ok</p></body>',
+                )
+            elif self.path == "/style.css":
+                ctype, body = "text/css", b"p { color: rgb(1, 2, 3); }"
+            elif self.path == "/app.js":
+                ctype, body = "application/javascript", b"window.__appLoaded = true;"
+            elif self.path == "/tracker.js":
+                ctype, body = "application/javascript", b"window.__trackerLoaded = true;"
+            elif self.path == "/img.png":
+                ctype, body = "image/png", b"\x00" * 10
+            elif self.path == "/font.woff2":
+                ctype, body = "font/woff2", b"\x00" * 10
+            else:
+                ctype, body = "text/plain", b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    class FastResourceServer(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    srv = FastResourceServer(("127.0.0.1", 0), ResourceHandler)
+    port = srv.server_address[1]
+    base_url = f"http://127.0.0.1:{port}"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    async def run_async():
+        async with async_playwright() as p:
+            with pytest.raises(Error, match="unsupported browser channel"):
+                await p.chromium.launch(channel="bogus-browser")
+            browser = await p.chromium.launch(
+                max_browsers=1,
+                prewarm_contexts=2,
+                args=["--user-agent=FluxwrightPyArg/1.0"],
+                ignore_default_args=["--mute-audio"],
+            )
+            try:
+                p1 = await browser.new_page(resource_preset="scraping")
+                assert await p1.evaluate("() => navigator.userAgent") == "FluxwrightPyArg/1.0"
+                await p1.goto(base_url)
+                await p1.evaluate("() => { document.cookie = 'leak=1; Path=/'; localStorage.setItem('k', 'v'); }")
+                assert await p1.evaluate("() => window.__appLoaded === true") is True
+                with seen_lock:
+                    assert "/img.png" not in seen_paths
+                    assert "/style.css" in seen_paths
+                    assert "/app.js" in seen_paths
+                    seen_paths.clear()
+                await p1.close()
+
+                p2 = await browser.new_page(resource_preset="minimal", block_url_patterns=["*tracker.js"])
+                await p2.goto(base_url)
+                assert await p2.evaluate(
+                    "() => [document.cookie, localStorage.getItem('k'), window.__appLoaded === true, window.__trackerLoaded === true]"
+                ) == ["", None, True, False]
+                with seen_lock:
+                    assert "/style.css" not in seen_paths
+                    assert "/tracker.js" not in seen_paths
+                    seen_paths.clear()
+                await p2.close()
+            finally:
+                await browser.close()
+
+    try:
+        asyncio.run(run_async())
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(max_browsers=1, prewarm_contexts=1, args=["--user-agent=FluxwrightPySync/1.0"])
+            try:
+                with seen_lock:
+                    seen_paths.clear()
+                page = browser.new_page(block_resources=["script"])
+                assert page.evaluate("() => navigator.userAgent") == "FluxwrightPySync/1.0"
+                page.goto(base_url)
+                assert page.evaluate("() => window.__appLoaded === true") is False
+                with seen_lock:
+                    assert "/app.js" not in seen_paths
+                page.close()
+            finally:
+                browser.close()
+    finally:
+        srv.shutdown()
+

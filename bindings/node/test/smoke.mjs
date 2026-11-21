@@ -1420,6 +1420,90 @@ try {
     }
   }
 
+  // Phase 3 PR 5A: custom args, ignoreDefaultArgs, unknown channel error, prewarmContexts isolation, resource presets
+  {
+    await assert.rejects(() => fluxwright.chromium.launch({ channel: 'bogus-browser' }), /unsupported browser channel/)
+    await assert.rejects(() => fluxwright.chromium.launch({ prewarmContexts: -1 }), TypeError)
+    const seenPaths = []
+    const resSrv = http.createServer((req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1')
+      seenPaths.push(u.pathname)
+      if (u.pathname === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        return res.end(
+          '<!doctype html><head><link rel="stylesheet" href="/style.css"></head>' +
+            '<body><img src="/img.png"><script src="/app.js"></script><script src="/tracker.js"></script>' +
+            '<style>@font-face{font-family:F;src:url(/font.woff2)}body{font-family:F}</style><p>hi</p></body>',
+        )
+      }
+      if (u.pathname === '/style.css') {
+        res.writeHead(200, { 'content-type': 'text/css' })
+        return res.end('p { color: rgb(1, 2, 3); }')
+      }
+      if (u.pathname === '/app.js') {
+        res.writeHead(200, { 'content-type': 'application/javascript' })
+        return res.end('window.__appLoaded = true;')
+      }
+      if (u.pathname === '/tracker.js') {
+        res.writeHead(200, { 'content-type': 'application/javascript' })
+        return res.end('window.__trackerLoaded = true;')
+      }
+      if (u.pathname === '/img.png') {
+        res.writeHead(200, { 'content-type': 'image/png' })
+        return res.end(Buffer.alloc(10))
+      }
+      if (u.pathname === '/font.woff2') {
+        res.writeHead(200, { 'content-type': 'font/woff2' })
+        return res.end(Buffer.alloc(10))
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('ok')
+    })
+    await new Promise((resolve) => resSrv.listen(0, '127.0.0.1', resolve))
+    const resBase = `http://127.0.0.1:${resSrv.address().port}`
+    const pwBrowser = await fluxwright.chromium.launch({
+      maxBrowsers: 1,
+      prewarmContexts: 2,
+      args: ['--user-agent=FluxwrightNodeArg/1.0'],
+      ignoreDefaultArgs: ['--mute-audio'],
+    })
+    try {
+      const p1 = await pwBrowser.newPage({ resourcePreset: 'scraping' })
+      assert.equal(await p1.evaluate(() => navigator.userAgent), 'FluxwrightNodeArg/1.0')
+      await p1.goto(resBase)
+      await p1.evaluate(() => {
+        document.cookie = 'leak=1; Path=/'
+        localStorage.setItem('leak_key', 'yes')
+      })
+      assert.equal(await p1.evaluate(() => window.__appLoaded === true), true)
+      assert.ok(!seenPaths.includes('/img.png'))
+      assert.ok(seenPaths.includes('/style.css'))
+      assert.ok(seenPaths.includes('/app.js'))
+      await p1.close()
+
+      seenPaths.length = 0
+      const p2 = await pwBrowser.newPage({ resourcePreset: 'minimal', blockUrlPatterns: ['*tracker.js'] })
+      await p2.goto(resBase)
+      assert.deepEqual(
+        await p2.evaluate(() => [document.cookie, localStorage.getItem('leak_key'), window.__appLoaded === true, window.__trackerLoaded === true]),
+        ['', null, true, false],
+      )
+      assert.ok(!seenPaths.includes('/style.css'))
+      assert.ok(!seenPaths.includes('/tracker.js'))
+      await p2.close()
+
+      seenPaths.length = 0
+      const p3 = await pwBrowser.newPage({ blockResources: ['script'] })
+      await p3.goto(resBase)
+      assert.equal(await p3.evaluate(() => window.__appLoaded === true), false)
+      assert.ok(!seenPaths.includes('/app.js'))
+      await p3.close()
+    } finally {
+      await pwBrowser.close()
+      resSrv.close()
+    }
+  }
+
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
 } finally {
