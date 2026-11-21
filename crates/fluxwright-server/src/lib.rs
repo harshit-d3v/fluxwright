@@ -3,6 +3,7 @@
 //! Exposes job submission, lifecycle management, Prometheus metrics, OpenTelemetry
 //! tracing spans per job, and a live fleet dashboard. See `docs/SERVER.md`.
 
+mod cdp_gateway;
 mod cluster;
 pub mod dashboard;
 mod job;
@@ -14,7 +15,7 @@ pub mod telemetry;
 mod tests;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +59,9 @@ pub struct ServerConfig {
     /// stopped are queued again, under their old ids, when it starts. A job that was running
     /// runs again from its first step.
     pub journal: Option<std::path::PathBuf>,
+    /// Allow `?token=<token>` authentication on `/cdp` and `/json/version` for CDP clients that
+    /// cannot send custom WebSocket headers. Disabled by default.
+    pub allow_query_token: bool,
 }
 
 const DEFAULT_LEASE_TIMEOUT_MS: u64 = 30_000;
@@ -83,6 +87,7 @@ impl ServerConfig {
             token,
             max_jobs: 128,
             journal: None,
+            allow_query_token: false,
         })
     }
 }
@@ -96,8 +101,12 @@ pub(crate) struct Inner {
     engine: Option<BrowserEngine>,
     token: Vec<u8>,
     max_jobs: usize,
+    allow_query_token: bool,
     lease_ms: AtomicU64,
     lease_notify: tokio::sync::Notify,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    active_cdp_sessions: AtomicUsize,
+    total_cdp_sessions: AtomicU64,
     registry: Mutex<Registry>,
     journal: Option<journal::Journal>,
 }
@@ -189,6 +198,8 @@ impl Inner {
                 draining_workers: workers_summary.draining,
                 stale_workers: workers_summary.stale,
                 expired_leases: workers_summary.expired_leases,
+                active_cdp_sessions: self.active_cdp_sessions.load(Ordering::Relaxed),
+                total_cdp_sessions: self.total_cdp_sessions.load(Ordering::Relaxed),
             }
         });
         metrics.to_prometheus_text()
@@ -243,6 +254,8 @@ impl Inner {
                     "failed_jobs": reg.failed_jobs,
                     "cancelled_jobs": reg.cancelled_jobs,
                     "max_jobs": self.max_jobs,
+                    "active_cdp_sessions": self.active_cdp_sessions.load(Ordering::Relaxed),
+                    "total_cdp_sessions": self.total_cdp_sessions.load(Ordering::Relaxed),
                 },
                 "workers": workers,
                 "workers_summary": workers_summary,
@@ -302,12 +315,17 @@ impl HttpServer {
             }
             None => (None, Vec::new()),
         };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let inner = Arc::new(Inner {
             engine,
             token: config.token.into_bytes(),
             max_jobs: config.max_jobs,
+            allow_query_token: config.allow_query_token,
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
             lease_notify: tokio::sync::Notify::new(),
+            shutdown_tx,
+            active_cdp_sessions: AtomicUsize::new(0),
+            total_cdp_sessions: AtomicU64::new(0),
             registry: Mutex::new(Registry {
                 accepting: true,
                 jobs: VecDeque::new(),
@@ -387,13 +405,18 @@ impl HttpServer {
                 .layer(DefaultBodyLimit::max(MAX_RESULT_BYTES * 2 + MAX_REQUEST_BYTES));
         }
 
-        let protected = small
+        let mut protected = small
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-            .merge(protected)
-            .route_layer(middleware::from_fn_with_state(
-                self.inner.clone(),
-                authorize,
-            ));
+            .merge(protected);
+        if self.inner.engine.is_some() {
+            protected = protected
+                .route("/cdp", get(cdp_gateway::ws_handler))
+                .route("/json/version", get(cdp_gateway::json_version));
+        }
+        let protected = protected.route_layer(middleware::from_fn_with_state(
+            self.inner.clone(),
+            authorize,
+        ));
 
         Router::new()
             // Liveness only: does not expose fleet state or launch Chrome.
@@ -434,6 +457,7 @@ impl HttpServer {
             registry.cancelled_jobs += newly_cancelled;
         }
         self.inner.lease_notify.notify_one();
+        let _ = self.inner.shutdown_tx.send(true);
         match &self.inner.engine {
             Some(engine) => engine.shutdown(grace).await,
             None => Ok(()),
@@ -441,10 +465,10 @@ impl HttpServer {
     }
 }
 
-/// The `Authorization` header only: a token in the URL lands in proxy logs, browser history and
-/// Referer headers. The dashboard reads its event stream with `fetch`, which can send the header.
+/// The `Authorization` header by default; `/cdp` and `/json/version` also accept `?token=` when
+/// `ServerConfig::allow_query_token` is explicitly enabled for CDP clients that cannot set headers.
 async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next) -> Response {
-    let valid = request
+    let header_valid = request
         .headers()
         .get(header::AUTHORIZATION)
         // RFC 9110: the auth scheme is case-insensitive.
@@ -452,7 +476,17 @@ async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(b"Bearer "))
         .is_some_and(|(_, supplied)| same_token(supplied, &inner.token));
 
-    if !valid {
+    let path = request.uri().path();
+    let query_valid = !header_valid
+        && inner.allow_query_token
+        && (path == "/cdp" || path == "/json/version")
+        && request
+            .uri()
+            .query()
+            .and_then(cdp_gateway::extract_query_token)
+            .is_some_and(|supplied| same_token(&supplied, &inner.token));
+
+    if !header_valid && !query_valid {
         let mut response = ApiError::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1154,6 +1188,7 @@ fn bounded_error(message: &str) -> String {
     message.chars().take(2048).collect()
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,

@@ -245,9 +245,32 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | GET | `/dashboard` | None | Live HTML fleet dashboard |
 | GET | `/` | None | Live HTML fleet dashboard (alias for `/dashboard`) |
 | GET | `/v1/events` | Bearer token | Server-Sent Events (SSE) stream of fleet and job snapshots |
+| GET | `/json/version` | Bearer (or `?token=` with `--allow-query-token`) | Standard DevTools discovery JSON pointing at `ws(s)://<host>/cdp` (standalone only) |
+| GET (WS) | `/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Pooled, context-isolated Chrome DevTools Protocol WebSocket gateway (standalone only) |
 
-The token is accepted only in the `Authorization` header, never in the URL, where proxy access
-logs, browser history and `Referer` headers would keep it.
+The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp` and `/json/version`, never `/v1/*` or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally.
+
+## Pooled CDP WebSocket gateway (`GET /cdp`, `GET /json/version`)
+
+Connect any existing CDP client (Playwright `connectOverCDP`, Puppeteer `connect`, Stagehand, Browser-Use, or Fluxwright `connect_over_cdp`) to the pooled fleet without changing automation code:
+
+```bash
+export FLUXWRIGHT_SERVER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+fluxwright serve --listen 127.0.0.1:7331 --allow-query-token
+```
+
+```javascript
+import { chromium } from 'playwright';
+
+const browser = await chromium.connectOverCDP(
+  `ws://127.0.0.1:7331/cdp?token=${process.env.FLUXWRIGHT_SERVER_TOKEN}`,
+);
+```
+
+- **Auth & discovery:** Authenticate via `Authorization: Bearer <token>`, or pass `?token=<token>` when `fluxwright serve` is started with `--allow-query-token`. `GET /json/version` returns DevTools metadata pointing at `/cdp` without echoing query tokens.
+- **Query options on `/cdp`:** Optional `priority=low|normal|high`, `resource_preset=scraping|minimal|no-media`, `timeout_ms=1..300000`, and `initial_page=true|false` (default `false`).
+- **Tenant isolation:** Each WebSocket connection holds its own pooled `ContextLease` (and up to 4 client-created child contexts). Commands and events (`Target.getTargets`, `Target.attachToTarget`, `Storage.*`) are scoped strictly to that lease's contexts/sessions; arbitrary browser-level shutdown/crash commands are rejected (`-32601`), and `Browser.close` only closes that WebSocket and disposes its leased context.
+- **Metrics:** Active and cumulative gateway sessions are exposed as `fluxwright_cdp_sessions_active` and `fluxwright_cdp_sessions_total` on `/metrics`.
 
 API errors use `{ "error": { "code": "…", "message": "…" } }`. Missing/invalid credentials
 return **401**, invalid fields **400/422**, malformed JSON **400**, wrong content type **415**,

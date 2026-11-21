@@ -905,3 +905,293 @@ async fn executes_init_script_and_tag_steps() {
 
     server.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+async fn connect_cdp_ws(
+    url: &str,
+    bearer: Option<&str>,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    if let Some(tok) = bearer {
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!("Bearer {tok}")).unwrap(),
+        );
+    }
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws
+}
+
+async fn cdp_rpc(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+) -> Value {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut payload = json!({ "id": id, "method": method, "params": params });
+    if let Some(sid) = session_id {
+        payload["sessionId"] = json!(sid);
+    }
+    ws.send(Message::Text(payload.to_string().into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = ws.next().await {
+            let msg = msg.unwrap();
+            if let Message::Text(text) = msg {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                if v.get("id").and_then(Value::as_u64) == Some(id) {
+                    return v;
+                }
+            }
+        }
+        panic!("WebSocket closed waiting for RPC id {id} ({method})");
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cdp_gateway_serves_json_version_and_connect_over_cdp() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.allow_query_token = true;
+    let server = HttpServer::new(engine.clone(), cfg).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    // Verify GET /json/version discovery over router with Bearer auth.
+    let ver_resp = server
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/json/version")
+                .header(header::HOST, addr.to_string())
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ver_resp.status(), StatusCode::OK);
+    let ver_json: Value =
+        serde_json::from_slice(&to_bytes(ver_resp.into_body(), 16_384).await.unwrap()).unwrap();
+    assert_eq!(ver_json["webSocketDebuggerUrl"], format!("ws://{addr}/cdp"));
+
+    // Connect Fluxwright's own `connect_over_cdp` client through `/cdp?token=...`.
+    let client_engine =
+        BrowserEngine::connect_over_cdp(format!("ws://{addr}/cdp?token={TOKEN}"))
+            .await
+            .unwrap();
+
+    let metrics_resp = server
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics_txt =
+        String::from_utf8(to_bytes(metrics_resp.into_body(), 65_536).await.unwrap().to_vec())
+            .unwrap();
+    assert!(metrics_txt.contains("fluxwright_cdp_sessions_active 1\n"));
+    assert!(metrics_txt.contains("fluxwright_cdp_sessions_total 1\n"));
+
+    let page = client_engine.acquire().await.unwrap();
+    page.goto(&format!("{}/forms", fixture.base_url)).await.unwrap();
+    assert_eq!(page.title().await.unwrap(), "forms");
+    page.fill("#name", "Gateway").await.unwrap();
+    page.click("#go").await.unwrap();
+    assert_eq!(
+        page.evaluate("document.querySelector('#name').value")
+            .await
+            .unwrap(),
+        json!("Gateway-ok")
+    );
+    drop(page);
+
+    client_engine.shutdown(Duration::from_secs(5)).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if engine.metrics().await.active_leases == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("lease released after client disconnect");
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cdp_gateway_isolates_concurrent_clients_and_blocks_escape() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let server = HttpServer::new(engine.clone(), ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    let ws_url = format!("ws://{addr}/cdp");
+    let mut ws1 = connect_cdp_ws(&ws_url, Some(TOKEN)).await;
+    let mut ws2 = connect_cdp_ws(&ws_url, Some(TOKEN)).await;
+
+    // Client 1 creates a page and sets a cookie on its isolated context.
+    let c1_target = cdp_rpc(&mut ws1, 1, "Target.createTarget", json!({ "url": "about:blank" }), None)
+        .await["result"]["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let s1 = cdp_rpc(&mut ws1, 2, "Target.attachToTarget", json!({ "targetId": c1_target, "flatten": true }), None)
+        .await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cdp_rpc(&mut ws1, 3, "Page.enable", json!({}), Some(&s1)).await;
+    cdp_rpc(&mut ws1, 4, "Page.navigate", json!({ "url": format!("{}/set-cookie", fixture.base_url) }), Some(&s1)).await;
+
+    let cookie1 = tokio::time::timeout(Duration::from_secs(10), async {
+        for seq in 5.. {
+            let res = cdp_rpc(
+                &mut ws1,
+                seq,
+                "Runtime.evaluate",
+                json!({ "expression": "document.cookie", "returnByValue": true }),
+                Some(&s1),
+            )
+            .await;
+            let val = res["result"]["result"]["value"].as_str().unwrap_or("");
+            if val.contains("fw=secret") {
+                return val.to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        unreachable!()
+    })
+    .await
+    .expect("client 1 cookie set");
+    assert!(cookie1.contains("fw=secret"));
+
+    // Client 2 creates its own page on the same browser and verifies cookie + target isolation.
+    let c2_target = cdp_rpc(&mut ws2, 1, "Target.createTarget", json!({ "url": "about:blank" }), None)
+        .await["result"]["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let s2 = cdp_rpc(&mut ws2, 2, "Target.attachToTarget", json!({ "targetId": c2_target, "flatten": true }), None)
+        .await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cdp_rpc(&mut ws2, 3, "Page.enable", json!({}), Some(&s2)).await;
+    cdp_rpc(&mut ws2, 4, "Page.navigate", json!({ "url": format!("{}/", fixture.base_url) }), Some(&s2)).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for seq in 5.. {
+            let res = cdp_rpc(
+                &mut ws2,
+                seq,
+                "Runtime.evaluate",
+                json!({ "expression": "document.title + '|' + document.cookie", "returnByValue": true }),
+                Some(&s2),
+            )
+            .await;
+            let val = res["result"]["result"]["value"].as_str().unwrap_or("");
+            if val.starts_with("home|") {
+                assert!(!val.contains("fw=secret"), "cookie leaked across CDP leases: {val}");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("client 2 navigation completed");
+
+    // Client 2 cannot see or attach to Client 1's target, nor run arbitrary Browser.* commands.
+    let targets2 = cdp_rpc(&mut ws2, 100, "Target.getTargets", json!({}), None).await;
+    let infos = targets2["result"]["targetInfos"].as_array().unwrap();
+    assert!(!infos.iter().any(|t| t["targetId"].as_str() == Some(c1_target.as_str())));
+
+    let hijack = cdp_rpc(
+        &mut ws2,
+        101,
+        "Target.attachToTarget",
+        json!({ "targetId": c1_target, "flatten": true }),
+        None,
+    )
+    .await;
+    assert_eq!(hijack["error"]["code"], -32000);
+
+    let forbidden = cdp_rpc(&mut ws2, 102, "Browser.crash", json!({}), None).await;
+    assert_eq!(forbidden["error"]["code"], -32601);
+
+    // Client 1's Browser.close only ends Client 1's lease; Client 2 stays healthy on the same browser.
+    let closed1 = cdp_rpc(&mut ws1, 103, "Browser.close", json!({}), None).await;
+    assert_eq!(closed1["result"], json!({}));
+    drop(ws1);
+
+    let still_alive = cdp_rpc(
+        &mut ws2,
+        104,
+        "Runtime.evaluate",
+        json!({ "expression": "1 + 1", "returnByValue": true }),
+        Some(&s2),
+    )
+    .await;
+    assert_eq!(still_alive["result"]["result"]["value"], 2);
+    assert_eq!(engine.metrics().await.browsers, 1);
+
+    drop(ws2);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if engine.metrics().await.active_leases == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all leases released after client disconnect");
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_handle.abort();
+}
