@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Chrome DevTools Protocol transport and sessions for Fluxwright"
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 tokio.workspace = true

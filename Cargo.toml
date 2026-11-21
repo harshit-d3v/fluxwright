@@ -18,12 +18,16 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/harshit-d3v/fluxwright"
 rust-version = "1.95"
+homepage = "https://fluxwright.vercel.app"
+keywords = ["chromium", "cdp", "browser", "automation", "headless"]
+categories = ["web-programming", "asynchronous"]
 
 [workspace.dependencies]
 fluxwright-cdp = { path = "crates/fluxwright-cdp", version = "0.1.0" }
 fluxwright-core = { path = "crates/fluxwright-core", version = "0.1.0" }
 fluxwright = { path = "crates/fluxwright", version = "0.1.0" }
-benchmark-server = { path = "benchmark-server", version = "0.1.0" }
+fluxwright-server = { path = "crates/fluxwright-server", version = "0.1.0" }
+benchmark-server = { path = "benchmark-server" }
 
 tokio = { version = "1.47", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }

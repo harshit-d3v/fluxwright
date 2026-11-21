@@ -1,7 +1,11 @@
 name: release-npm
 
+# Automatically builds all platform native addons and publishes to npm whenever
+# `bindings/node/package.json`'s version is not yet on npm (on push to `main`, `v*`
+# tags, or manual `workflow_dispatch`).
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -9,12 +13,64 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-npm-${{ github.ref }}
+  cancel-in-progress: false
+
 defaults:
   run:
     working-directory: bindings/node
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      should_build: ${{ steps.meta.outputs.should_build }}
+      should_publish: ${{ steps.meta.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: meta
+        name: Check Node version against npm
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          with open("package.json", "r", encoding="utf-8") as f:
+              version = json.load(f)["version"]
+
+          url = f"https://registry.npmjs.org/fluxwright/{version}"
+          req = urllib.request.Request(url, headers={"User-Agent": "fluxwright-release-ci"})
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  already_published = resp.status == 200
+          except urllib.error.HTTPError as e:
+              if e.code == 404:
+                  already_published = False
+              else:
+                  print(f"Unexpected HTTP {e.code} checking {url}", file=sys.stderr)
+                  sys.exit(1)
+
+          should_build = (not already_published) or (os.environ.get("EVENT_NAME") == "workflow_dispatch")
+          should_publish = not already_published
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"should_build={'true' if should_build else 'false'}\n")
+              out.write(f"should_publish={'true' if should_publish else 'false'}\n")
+
+          print(f"fluxwright-node={version} already_published={already_published} should_build={should_build} should_publish={should_publish}")
+          PY
+
   build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.host }}
     timeout-minutes: 45
@@ -31,6 +87,8 @@ jobs:
           # 22.04 for glibc 2.35: binaries built on 24.04 will not load on older distros.
           - host: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - host: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -53,9 +111,9 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [check, build]
+    if: needs.check.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -64,11 +122,15 @@ jobs:
           cache: npm
           cache-dependency-path: bindings/node/package-lock.json
       - run: npm ci
-      - name: Tag and platform package versions agree
+      - name: Package versions agree
         run: |
-          want="v$(node -p "require('./package.json').version")"
-          test "$want" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $want"; exit 1; }
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            want="v$(node -p "require('./package.json').version")"
+            test "$want" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $want"; exit 1; }
+          fi
           node -e '
+            const fs = require("fs");
+            const path = require("path");
             const p = require("./package.json");
             for (const [n, v] of Object.entries(p.optionalDependencies || {})) {
               if (v !== p.version) { console.error(`${n}@${v} != ${p.version}`); process.exit(1); }
@@ -76,6 +138,14 @@ jobs:
             if (Object.keys(p.optionalDependencies || {}).length === 0) {
               console.error("no optionalDependencies: the published package would ship no binary");
               process.exit(1);
+            }
+            for (const entry of fs.readdirSync("./npm", { withFileTypes: true })) {
+              if (!entry.isDirectory()) continue;
+              const subPkg = require(path.resolve("./npm", entry.name, "package.json"));
+              if (subPkg.version !== p.version) {
+                console.error(`${subPkg.name}@${subPkg.version} != ${p.version}`);
+                process.exit(1);
+              }
             }
           '
       - uses: actions/download-artifact@v8
@@ -86,6 +156,10 @@ jobs:
       - run: npx napi artifacts
       - name: Publish
         run: |
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN secret is not configured; cannot publish to npm"
+            exit 1
+          fi
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           npm publish --access public
         env:
