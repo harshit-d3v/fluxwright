@@ -12,6 +12,10 @@ pub struct ServerMetrics {
     pub failed_jobs: u64,
     pub cancelled_jobs: u64,
     pub max_jobs: usize,
+    pub online_workers: usize,
+    pub draining_workers: usize,
+    pub stale_workers: usize,
+    pub expired_leases: u64,
 }
 
 impl ServerMetrics {
@@ -147,6 +151,29 @@ impl ServerMetrics {
             self.max_jobs,
         );
 
+        out.push_str("# HELP fluxwright_cluster_workers Registered coordinator workers by status.\n");
+        out.push_str("# TYPE fluxwright_cluster_workers gauge\n");
+        out.push_str(&format!(
+            "fluxwright_cluster_workers{{status=\"online\"}} {}\n",
+            self.online_workers
+        ));
+        out.push_str(&format!(
+            "fluxwright_cluster_workers{{status=\"draining\"}} {}\n",
+            self.draining_workers
+        ));
+        out.push_str(&format!(
+            "fluxwright_cluster_workers{{status=\"stale\"}} {}\n",
+            self.stale_workers
+        ));
+
+        write_metric(
+            &mut out,
+            "fluxwright_cluster_lease_expirations_total",
+            "Total number of worker leases expired by the coordinator.",
+            "counter",
+            self.expired_leases,
+        );
+
         out
     }
 }
@@ -198,6 +225,10 @@ mod tests {
             failed_jobs: 2,
             cancelled_jobs: 1,
             max_jobs: 128,
+            online_workers: 2,
+            draining_workers: 1,
+            stale_workers: 0,
+            expired_leases: 3,
         };
 
         let text = metrics.to_prometheus_text();
@@ -210,5 +241,9 @@ mod tests {
         assert!(text.contains("fluxwright_http_jobs_active{status=\"queued\"} 1\n"));
         assert!(text.contains("fluxwright_http_jobs_active{status=\"running\"} 1\n"));
         assert!(text.contains("fluxwright_http_jobs_capacity 128\n"));
+        assert!(text.contains("fluxwright_cluster_workers{status=\"online\"} 2\n"));
+        assert!(text.contains("fluxwright_cluster_workers{status=\"draining\"} 1\n"));
+        assert!(text.contains("fluxwright_cluster_workers{status=\"stale\"} 0\n"));
+        assert!(text.contains("fluxwright_cluster_lease_expirations_total 3\n"));
     }
 }
