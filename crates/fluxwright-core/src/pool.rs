@@ -2859,6 +2859,17 @@ impl PageLease {
         if self.owns_context {
             self.context.dispose(completed).await;
         } else if !self.context.is_disposed() {
+            let flushers: Vec<_> = self
+                .context
+                .har_recorders
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.flusher())
+                .collect();
+            for f in flushers {
+                f.flush_session(Some(self.page.session_id.0.clone())).await;
+            }
             let _ = self.context.browser.close_target(&self.page.target_id).await;
         }
     }
@@ -2882,6 +2893,17 @@ impl Drop for PageLease {
             let owns = self.owns_context;
             let ctx = Arc::clone(&self.context);
             let target_id = self.page.target_id.clone();
+            let sid = self.page.session_id.0.clone();
+            let ctx_flushers: Vec<_> = if !owns {
+                ctx.har_recorders
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.flusher())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             self.runtime.spawn(async move {
                 for rec in recorders {
                     let _ = rec.finish().await;
@@ -2889,6 +2911,9 @@ impl Drop for PageLease {
                 if owns {
                     ctx.dispose(true).await;
                 } else if !ctx.is_disposed() {
+                    for f in ctx_flushers {
+                        f.flush_session(Some(sid.clone())).await;
+                    }
                     let _ = ctx.browser.close_target(&target_id).await;
                 }
             });
