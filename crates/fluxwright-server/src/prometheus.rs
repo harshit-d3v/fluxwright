@@ -55,6 +55,20 @@ impl ServerMetrics {
             "gauge",
             self.fleet.queued_requests,
         );
+        write_metric(
+            &mut out,
+            "fluxwright_warm_contexts",
+            "Number of pre-warmed blank contexts ready in the fleet.",
+            "gauge",
+            self.fleet.warm_contexts,
+        );
+        write_metric(
+            &mut out,
+            "fluxwright_warm_context_hits_total",
+            "Total number of leases fulfilled from a pre-warmed context.",
+            "counter",
+            self.fleet.warm_context_hits,
+        );
         write_float_metric(
             &mut out,
             "fluxwright_browser_reuse_rate",
@@ -169,6 +183,8 @@ mod tests {
                 pages: 3,
                 active_leases: 1,
                 queued_requests: 0,
+                warm_contexts: 0,
+                warm_context_hits: 0,
                 browser_reuse_rate: 0.75,
                 crash_count: 0,
                 recycle_count: 1,

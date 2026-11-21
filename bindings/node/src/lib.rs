@@ -1326,6 +1326,10 @@ pub struct LaunchOptions {
     pub max_concurrency_per_host: Option<u32>,
     /// Milliseconds between the starts of two `goto`s to one host, at least. 0 or unset: none.
     pub min_delay_per_host: Option<u32>,
+    pub args: Option<Vec<String>>,
+    pub ignore_default_args: Option<Either<bool, Vec<String>>>,
+    pub channel: Option<String>,
+    pub prewarm_contexts: Option<u32>,
 }
 
 /// `queueTimeout` as the engine's acquire timeout.
@@ -1391,6 +1395,11 @@ pub struct NewPageOptions {
     #[napi(ts_type = "StorageState | string")]
     pub storage_state: Option<StorageState>,
     pub record_har: Option<RecordHarOptions>,
+    #[napi(ts_type = "'scraping' | 'minimal' | 'no-media'")]
+    pub resource_preset: Option<String>,
+    #[napi(ts_type = "Array<'image' | 'font' | 'media' | 'stylesheet' | 'script'>")]
+    pub block_resources: Option<Vec<String>>,
+    pub block_url_patterns: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -1613,7 +1622,7 @@ fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
         })?),
     };
     let record_har = o.record_har.map(parse_record_har_options).transpose()?;
-    Ok(fluxwright::JobOptions {
+    let mut opts = fluxwright::JobOptions {
         proxy: o.proxy.map(|p| fluxwright::Proxy {
             server: p.server,
             bypass: p.bypass,
@@ -1646,7 +1655,30 @@ fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
         http_credentials: o.http_credentials.map(|c| (c.username, c.password)),
         record_har,
         ..Default::default()
-    })
+    };
+    if let Some(ref preset) = o.resource_preset {
+        let p = fluxwright::ResourcePreset::parse(preset).ok_or_else(|| {
+            Error::from_reason(format!(
+                "resourcePreset must be 'scraping', 'minimal', or 'no-media', not `{preset}`"
+            ))
+        })?;
+        opts = opts.resource_preset(p);
+    }
+    if let Some(resources) = o.block_resources {
+        let mut parsed = Vec::with_capacity(resources.len());
+        for r in resources {
+            parsed.push(fluxwright::ResourceType::parse(&r).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "blockResources entry must be image, font, media, stylesheet or script, not `{r}`"
+                ))
+            })?);
+        }
+        opts = opts.block_resources(parsed);
+    }
+    if let Some(patterns) = o.block_url_patterns {
+        opts = opts.block_url_patterns(patterns);
+    }
+    Ok(opts)
 }
 
 #[napi(object)]
@@ -1770,7 +1802,19 @@ pub struct Chromium {}
 impl Chromium {
     #[napi]
     pub async fn launch(options: Option<LaunchOptions>) -> Result<Browser> {
-        let (max, exe, headless, queue_timeout, ceiling, per_host, host_delay) = match options {
+        let (
+            max,
+            exe,
+            headless,
+            queue_timeout,
+            ceiling,
+            per_host,
+            host_delay,
+            args,
+            ignore_default_args,
+            channel,
+            prewarm_contexts,
+        ) = match options {
             Some(o) => (
                 o.max_browsers,
                 o.executable_path,
@@ -1779,8 +1823,12 @@ impl Chromium {
                 o.memory_ceiling_mb,
                 o.max_concurrency_per_host,
                 o.min_delay_per_host,
+                o.args,
+                o.ignore_default_args,
+                o.channel,
+                o.prewarm_contexts,
             ),
-            None => (None, None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None, None, None, None, None),
         };
         let engine = RT
             .spawn(async move {
@@ -1808,6 +1856,21 @@ impl Chromium {
                 }
                 if let Some(h) = headless {
                     b = b.headless(h);
+                }
+                if let Some(a) = args {
+                    b = b.args(a);
+                }
+                if let Some(ig) = ignore_default_args {
+                    match ig {
+                        Either::A(all) => b = b.ignore_default_args(all),
+                        Either::B(list) => b = b.ignore_default_args_list(list),
+                    }
+                }
+                if let Some(ch) = channel {
+                    b = b.channel(ch);
+                }
+                if let Some(n) = prewarm_contexts {
+                    b = b.prewarm_contexts(n as usize);
                 }
                 b.build().await
             })

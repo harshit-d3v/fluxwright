@@ -3028,9 +3028,14 @@ async fn api_request_cookies_and_indexeddb() {
 #[test]
 fn public_reexports_compile() {
     use fluxwright::{
-        Har, HarContentPolicy, HarLog, HarMode, HarNotFound, HarRouteOptions, HarRouter,
-        RecordHarOptions, WebSocketEvent, Worker, WorkerEvent,
+        find_channel, managed_browsers_dir, Har, HarContentPolicy, HarLog, HarMode, HarNotFound,
+        HarRouteOptions, HarRouter, IgnoreDefaultArgs, RecordHarOptions, ResourcePreset,
+        WebSocketEvent, Worker, WorkerEvent,
     };
+    let _ = std::any::type_name::<IgnoreDefaultArgs>();
+    let _ = std::any::type_name::<ResourcePreset>();
+    let _ = managed_browsers_dir as fn() -> Option<std::path::PathBuf>;
+    let _ = find_channel as fn(&str) -> fluxwright::Result<std::path::PathBuf>;
     let _ = std::any::type_name::<WebSocketEvent>();
     let _ = std::any::type_name::<Worker>();
     let _ = std::any::type_name::<WorkerEvent>();

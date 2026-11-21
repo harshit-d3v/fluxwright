@@ -20,6 +20,10 @@ class Engine:
         memory_ceiling_mb: int | None = None,
         max_concurrency_per_host: int | None = None,
         min_delay_per_host: float | None = None,
+        args: Sequence[str] | None = None,
+        ignore_default_args: bool | Sequence[str] | None = None,
+        channel: str | None = None,
+        prewarm_contexts: int | None = None,
     ) -> Awaitable[Engine]: ...
     @staticmethod
     def connect_over_cdp(endpoint_url: str) -> Awaitable[Engine]: ...
@@ -50,6 +54,9 @@ class Engine:
         record_har_content: str | None = None,
         record_har_mode: str | None = None,
         record_har_url_filter: str | None = None,
+        resource_preset: str | None = None,
+        block_resources: Sequence[str] | None = None,
+        block_url_patterns: Sequence[str] | None = None,
     ) -> Awaitable[Lease]: ...
     def new_context(
         self,
@@ -78,6 +85,9 @@ class Engine:
         record_har_content: str | None = None,
         record_har_mode: str | None = None,
         record_har_url_filter: str | None = None,
+        resource_preset: str | None = None,
+        block_resources: Sequence[str] | None = None,
+        block_url_patterns: Sequence[str] | None = None,
     ) -> Awaitable[Context]: ...
     def close(self) -> Awaitable[None]: ...
 

@@ -2236,6 +2236,9 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
+        block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
+        block_url_patterns: Sequence[str] | None = None,
     ) -> Page:
         """A page in a fresh browser context; every option applies to this page only, with
         Playwright's names. ``locale`` is BCP 47 (``de-DE``), ``timezone_id`` IANA
@@ -2268,6 +2271,9 @@ class Browser:
             record_har_content=record_har_content,
             record_har_mode=record_har_mode,
             record_har_url_filter=native_url_filter,
+            resource_preset=resource_preset,
+            block_resources=list(block_resources) if block_resources is not None else None,
+            block_url_patterns=list(block_url_patterns) if block_url_patterns is not None else None,
         )
         page = Page(lease)
         if pending_filter is not None:
@@ -2301,6 +2307,9 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
+        block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
+        block_url_patterns: Sequence[str] | None = None,
     ) -> BrowserContext:
         """A browser context with ``new_page``'s options, as Playwright's ``new_context``; see ``BrowserContext``."""
         native_url_filter, pending_filter = _split_har_url_filter(record_har_path, record_har_url_filter)
@@ -2329,6 +2338,9 @@ class Browser:
             record_har_content=record_har_content,
             record_har_mode=record_har_mode,
             record_har_url_filter=native_url_filter,
+            resource_preset=resource_preset,
+            block_resources=list(block_resources) if block_resources is not None else None,
+            block_url_patterns=list(block_url_patterns) if block_url_patterns is not None else None,
         )
         ctx = BrowserContext(self, native_ctx)
         if pending_filter is not None:
@@ -2610,6 +2622,10 @@ class BrowserType:
         memory_ceiling_mb: int | None = None,
         max_concurrency_per_host: int | None = None,
         min_delay_per_host: float | None = None,
+        args: Sequence[str] | None = None,
+        ignore_default_args: bool | Sequence[str] | None = None,
+        channel: str | None = None,
+        prewarm_contexts: int | None = None,
     ) -> Browser:
         """Starts the engine in this process: up to ``max_browsers`` Chrome processes (default
         one per 4 CPUs, 8 pages each), headless unless ``headless=False``. New pages wait while
@@ -2622,6 +2638,8 @@ class BrowserType:
         ``max_concurrency_per_host`` caps the pages on one host at once across the fleet and
         ``min_delay_per_host`` (milliseconds) spaces the ``goto`` calls to it: a ``goto`` waits
         its turn."""
+        if ignore_default_args is not None and not isinstance(ignore_default_args, bool):
+            ignore_default_args = list(ignore_default_args)
         engine = await _native.Engine.launch(
             max_browsers=max_browsers,
             executable_path=executable_path,
@@ -2630,6 +2648,10 @@ class BrowserType:
             memory_ceiling_mb=memory_ceiling_mb,
             max_concurrency_per_host=max_concurrency_per_host,
             min_delay_per_host=min_delay_per_host,
+            args=list(args) if args is not None else None,
+            ignore_default_args=ignore_default_args,
+            channel=channel,
+            prewarm_contexts=prewarm_contexts,
         )
         browser = Browser(engine)
         if self._launched is not None:

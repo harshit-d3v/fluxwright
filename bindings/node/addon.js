@@ -59,6 +59,26 @@ const LAUNCH = {
   memoryCeilingMb: true,
   maxConcurrencyPerHost: true,
   minDelayPerHost: true,
+  args: (v, m) => {
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+      throw new TypeError(`${m}: must be an array of strings`)
+    }
+  },
+  ignoreDefaultArgs: (v, m) => {
+    if (typeof v !== 'boolean' && (!Array.isArray(v) || v.some((x) => typeof x !== 'string'))) {
+      throw new TypeError(`${m}: must be a boolean or an array of strings`)
+    }
+  },
+  channel: (v, m) => {
+    if (typeof v !== 'string') {
+      throw new TypeError(`${m}: must be a string`)
+    }
+  },
+  prewarmContexts: (v, m) => {
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw new TypeError(`${m}: must be a non-negative integer`)
+    }
+  },
 }
 const RECORD_HAR = {
   path: true,
@@ -95,6 +115,18 @@ const PAGE = {
   bypassCSP: true,
   storageState: true,
   recordHar: RECORD_HAR,
+  resourcePreset: ['scraping', 'minimal', 'no-media'],
+  blockResources: (v, m) => {
+    const allowed = ['image', 'font', 'media', 'stylesheet', 'script']
+    if (!Array.isArray(v) || v.some((x) => !allowed.includes(x))) {
+      throw new TypeError(`${m}: entries must be ${allowed.join(', ')}`)
+    }
+  },
+  blockUrlPatterns: (v, m) => {
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+      throw new TypeError(`${m}: must be an array of strings`)
+    }
+  },
 }
 const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true, response: true }
 const CONTINUE = { url: true, method: true, headers: true, postData: true }

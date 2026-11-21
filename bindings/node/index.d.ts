@@ -499,6 +499,10 @@ export interface LaunchOptions {
   maxConcurrencyPerHost?: number
   /** Milliseconds between the starts of two `goto`s to one host, at least. 0 or unset: none. */
   minDelayPerHost?: number
+  args?: Array<string>
+  ignoreDefaultArgs?: boolean | Array<string>
+  channel?: string
+  prewarmContexts?: number
 }
 
 /** One console message or uncaught error, for `page.on`. */
@@ -570,6 +574,9 @@ export interface NewPageOptions {
    */
   storageState?: StorageState | string
   recordHar?: RecordHarOptions
+  resourcePreset?: 'scraping' | 'minimal' | 'no-media'
+  blockResources?: Array<'image' | 'font' | 'media' | 'stylesheet' | 'script'>
+  blockUrlPatterns?: Array<string>
 }
 
 export interface OriginStorage {

@@ -21,7 +21,7 @@ pub use context::{
     filter_cookies, ColorScheme, Cookie, CookieFilter, Emulation, Geolocation, IndexedDbDatabase,
     IndexedDbIndex, IndexedDbRecord, IndexedDbStore, OriginStorage, StorageItem, StorageState,
 };
-pub use error::{Error, LaunchOptions, Result};
+pub use error::{Error, IgnoreDefaultArgs, LaunchOptions, Result};
 pub use events::{BindingCall, Dialog, FileChooser, NetEvent, NetRequest, NetResponse, WebSocketEvent};
 pub use har::{
     Har, HarBrowser, HarContent, HarContentPolicy, HarCreator, HarEntry, HarHeader, HarLog,
@@ -33,7 +33,7 @@ pub use input::{
     parse_modifiers, CheckOptions, ClickOptions, FileInput, FilePayload, HoverOptions, MouseButton,
     SelectEntry,
 };
-pub use launch::{find_browser, find_chrome, sweep_stale_profiles};
+pub use launch::{find_browser, find_channel, find_chrome, managed_browsers_dir, sweep_stale_profiles};
 pub use log::{ConsoleMessage, Download, DownloadResult, LogEntry, PageError, PageLog};
 pub use page::{
     url_glob_matches, BoundingBox, CdpPage, DownloadQueue, ResourceType, RoleOptions,
