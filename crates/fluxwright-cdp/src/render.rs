@@ -406,6 +406,7 @@ mod tests {
             setups: Default::default(),
             page_setups: Default::default(),
             frames: Default::default(),
+            workers: Default::default(),
             closed: Default::default(),
             mouse: Default::default(),
             keyboard: Default::default(),

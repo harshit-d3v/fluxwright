@@ -1,9 +1,10 @@
 // Smoke test of the published entry point: `npm test` after `npm run build`. Needs Chrome or
 // chrome-headless-shell (see the README).
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { chmodSync, statSync } from 'node:fs'
-import { readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -1178,6 +1179,244 @@ try {
     } finally {
       await ctx.close()
       srv.close()
+    }
+  }
+
+  // PR 4C: WebSockets, HAR 1.2 record/replay/fallback/update, dedicated Web Workers
+  {
+    const harDir = await mkdtemp(join(tmpdir(), 'fw-node-har-'))
+    const harPath = join(harDir, 'rec.har')
+    const harUpdatePath = join(harDir, 'upd.har')
+    let apiHits = 0
+    let seq = 0
+    const pr4cSrv = http.createServer((req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1')
+      if (u.pathname === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        return res.end('<!doctype html><h1>pr4c-node</h1>')
+      }
+      if (u.pathname === '/worker.js') {
+        res.writeHead(200, { 'content-type': 'application/javascript' })
+        return res.end('self.workerValue = 37; self.emitLog = (m) => console.log(m);')
+      }
+      if (u.pathname === '/api/hello') {
+        apiHits += 1
+        res.writeHead(200, { 'content-type': 'application/json', 'x-src': 'node-srv' })
+        return res.end(JSON.stringify({ msg: 'hello', hits: apiHits }))
+      }
+      if (u.pathname === '/api/seq') {
+        seq += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ n: seq }))
+      }
+      if (u.pathname === '/api/other') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ other: true }))
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('ok')
+    })
+    const makeWsFrame = (opcode, payloadBuf) => {
+      const len = payloadBuf.length
+      const hdr =
+        len < 126
+          ? Buffer.from([0x80 | opcode, len])
+          : Buffer.from([0x80 | opcode, 126, (len >> 8) & 0xff, len & 0xff])
+      return Buffer.concat([hdr, payloadBuf])
+    }
+    const wsSockets = new Set()
+    pr4cSrv.on('upgrade', (req, socket) => {
+      const wsNonce = req.headers['sec-websocket-key'] || ''
+      const accept = createHash('sha1').update(`${wsNonce}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+          + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      )
+      wsSockets.add(socket)
+      socket.on('close', () => wsSockets.delete(socket))
+      let buf = Buffer.alloc(0)
+      socket.on('data', (chunk) => {
+        buf = Buffer.concat([buf, chunk])
+        while (buf.length >= 2) {
+          const opcode = buf[0] & 0x0f
+          const masked = (buf[1] & 0x80) !== 0
+          let plen = buf[1] & 0x7f
+          let off = 2
+          if (plen === 126) {
+            if (buf.length < 4) return
+            plen = buf.readUInt16BE(2)
+            off = 4
+          }
+          const maskLen = masked ? 4 : 0
+          if (buf.length < off + maskLen + plen) return
+          const payload = Buffer.from(buf.subarray(off + maskLen, off + maskLen + plen))
+          if (masked) {
+            const m = buf.subarray(off, off + 4)
+            for (let i = 0; i < plen; i++) payload[i] ^= m[i & 3]
+          }
+          buf = buf.subarray(off + maskLen + plen)
+          if (opcode === 0x8) {
+            socket.end(makeWsFrame(0x8, Buffer.alloc(0)))
+            return
+          }
+          if (opcode === 0x1) {
+            socket.write(makeWsFrame(0x1, Buffer.from(`echo:${payload.toString('utf8')}`)))
+          } else if (opcode === 0x2) {
+            socket.write(makeWsFrame(0x2, Buffer.concat([Buffer.from([0xfe]), payload])))
+          } else if (opcode === 0x9) {
+            socket.write(makeWsFrame(0xa, payload))
+          }
+        }
+      })
+    })
+    await new Promise((resolve) => pr4cSrv.listen(0, '127.0.0.1', resolve))
+    const port = pr4cSrv.address().port
+    const pr4cBase = `http://127.0.0.1:${port}`
+    const pr4cWs = `ws://127.0.0.1:${port}`
+    try {
+      const recCtx = await browser.newContext({
+        baseURL: pr4cBase,
+        recordHar: { path: harPath, mode: 'minimal', urlFilter: /\/api\// },
+      })
+      try {
+        const p = await recCtx.newPage()
+        await p.goto('/')
+
+        // WebSockets
+        const wsPromise = p.waitForEvent('websocket')
+        await p.evaluate(
+          (u) =>
+            new Promise((resolve, reject) => {
+              const ws = new WebSocket(u)
+              ws.binaryType = 'arraybuffer'
+              window.__ws = ws
+              ws.onopen = () => resolve()
+              ws.onerror = () => reject(new Error('ws open failed'))
+            }),
+          pr4cWs,
+        )
+        const ws = await wsPromise
+        assert.ok(ws.url().startsWith(pr4cWs))
+        const sentTextP = ws.waitForEvent('framesent', (f) => f.payload === 'hi-node')
+        const sentBinP = ws.waitForEvent(
+          'framesent',
+          (f) => Buffer.isBuffer(f.payload) && Buffer.compare(f.payload, Buffer.from([7, 8])) === 0,
+        )
+        const recvTextP = ws.waitForEvent('framereceived', (f) => f.payload === 'echo:hi-node')
+        const recvBinP = ws.waitForEvent(
+          'framereceived',
+          (f) => Buffer.isBuffer(f.payload) && Buffer.compare(f.payload, Buffer.from([0xfe, 7, 8])) === 0,
+        )
+        const wsCloseP = ws.waitForEvent('close')
+        const replies = await p.evaluate(async () => {
+          const ws = window.__ws
+          const out = []
+          ws.onmessage = (e) => {
+            out.push(typeof e.data === 'string' ? e.data : Array.from(new Uint8Array(e.data)))
+          }
+          ws.send('hi-node')
+          ws.send(new Uint8Array([7, 8]))
+          const deadline = Date.now() + 5000
+          while (out.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 15))
+          ws.close(1000, 'bye')
+          await new Promise((r) => {
+            ws.onclose = r
+            setTimeout(r, 1000)
+          })
+          return out
+        })
+        assert.deepEqual(replies, ['echo:hi-node', [0xfe, 7, 8]])
+        await Promise.all([sentTextP, sentBinP, recvTextP, recvBinP, wsCloseP])
+        assert.equal(ws.isClosed(), true)
+
+        // Dedicated Web Workers
+        const workerPromise = p.waitForEvent('worker')
+        await p.evaluate(() => {
+          window.__w = new Worker('/worker.js')
+        })
+        const worker = await workerPromise
+        assert.ok(worker.url().endsWith('/worker.js'))
+        assert.ok(p.workers().includes(worker))
+        let wVal = null
+        for (let i = 0; i < 40; i++) {
+          wVal = await worker.evaluate((n) => (typeof self.workerValue === 'number' ? self.workerValue + n : null), 5)
+          if (wVal === 42) break
+          await new Promise((r) => setTimeout(r, 25))
+        }
+        assert.equal(wVal, 42)
+        const wConsoleP = worker.waitForEvent('console', (m) => m.text === 'worker-node')
+        await worker.evaluate(() => self.emitLog('worker-node'))
+        const wMsg = await wConsoleP
+        assert.equal(wMsg.text, 'worker-node')
+        const wCloseP = worker.waitForEvent('close')
+        await p.evaluate(() => window.__w.terminate())
+        await wCloseP
+        assert.equal(p.workers().length, 0)
+
+        // Traffic recorded into HAR
+        const hello = await p.evaluate(() => fetch('/api/hello').then((r) => r.json()))
+        assert.equal(hello.msg, 'hello')
+        const s1 = await p.evaluate(() => fetch('/api/seq').then((r) => r.json()))
+        const s2 = await p.evaluate(() => fetch('/api/seq').then((r) => r.json()))
+        assert.deepEqual([s1.n, s2.n], [1, 2])
+      } finally {
+        await recCtx.close()
+      }
+
+      const harJson = JSON.parse(await readFile(harPath, 'utf8'))
+      assert.equal(harJson.log.version, '1.2')
+      assert.ok(harJson.log.entries.length >= 3)
+      assert.ok(harJson.log.entries.every((e) => /\/api\//.test(e.request.url)))
+
+      apiHits = 0
+      const repCtx = await browser.newContext({ baseURL: pr4cBase })
+      try {
+        await repCtx.routeFromHAR(harPath, { url: '**/api/*', notFound: 'abort' })
+        const rp = await repCtx.newPage()
+        await rp.goto('/')
+        const hello = await rp.evaluate(() => fetch('/api/hello').then((r) => r.json()))
+        assert.equal(hello.msg, 'hello')
+        const s1 = await rp.evaluate(() => fetch('/api/seq').then((r) => r.json()))
+        const s2 = await rp.evaluate(() => fetch('/api/seq').then((r) => r.json()))
+        assert.deepEqual([s1.n, s2.n], [1, 2])
+        assert.equal(apiHits, 0)
+        const aborted = await rp.evaluate(() => fetch('/api/other').then(() => false).catch(() => true))
+        assert.equal(aborted, true)
+      } finally {
+        await repCtx.close()
+      }
+
+      const fbCtx = await browser.newContext({ baseURL: pr4cBase })
+      try {
+        const fp = await fbCtx.newPage()
+        await fp.goto('/')
+        await fp.route('**/api/other', (route) => route.fulfill({ json: { mockedFallback: true } }))
+        await fp.routeFromHAR(harPath, { url: '**/api/*', notFound: 'fallback' })
+        const rHello = await fp.evaluate(() => fetch('/api/hello').then((r) => r.json()))
+        assert.equal(rHello.msg, 'hello')
+        const rOther = await fp.evaluate(() => fetch('/api/other').then((r) => r.json()))
+        assert.deepEqual(rOther, { mockedFallback: true })
+        assert.equal(apiHits, 0)
+      } finally {
+        await fbCtx.close()
+      }
+
+      const updCtx = await browser.newContext({ baseURL: pr4cBase })
+      try {
+        await updCtx.routeFromHAR(harUpdatePath, { url: '**/api/*', update: true })
+        const up = await updCtx.newPage()
+        await up.goto('/')
+        const rOther = await up.evaluate(() => fetch('/api/other').then((r) => r.json()))
+        assert.deepEqual(rOther, { other: true })
+      } finally {
+        await updCtx.close()
+      }
+      const updHar = JSON.parse(await readFile(harUpdatePath, 'utf8'))
+      assert.ok(updHar.log.entries.some((e) => e.request.url.endsWith('/api/other')))
+    } finally {
+      for (const s of wsSockets) s.destroy()
+      pr4cSrv.close()
+      await rm(harDir, { recursive: true, force: true })
     }
   }
 

@@ -1390,6 +1390,43 @@ pub struct NewPageOptions {
     /// path of the JSON file it saved.
     #[napi(ts_type = "StorageState | string")]
     pub storage_state: Option<StorageState>,
+    pub record_har: Option<RecordHarOptions>,
+}
+
+#[napi(object)]
+pub struct RecordHarOptions {
+    pub path: String,
+    pub omit_content: Option<bool>,
+    #[napi(ts_type = "'embed' | 'omit'")]
+    pub content: Option<String>,
+    #[napi(ts_type = "'full' | 'minimal'")]
+    pub mode: Option<String>,
+    #[napi(ts_type = "string | RegExp")]
+    pub url_filter: Option<String>,
+}
+
+#[napi(object)]
+pub struct WebSocketNativeEvent {
+    pub event: String,
+    pub request_id: String,
+    pub url: Option<String>,
+    pub payload_text: Option<String>,
+    pub payload_bytes: Option<Buffer>,
+    pub error_message: Option<String>,
+}
+
+#[napi(object)]
+pub struct WorkerInfo {
+    pub id: String,
+    pub url: String,
+}
+
+#[napi(object)]
+pub struct WorkerNativeEvent {
+    pub event: String,
+    pub id: String,
+    pub url: Option<String>,
+    pub message: Option<ConsoleMessage>,
 }
 
 #[napi(object)]
@@ -1539,6 +1576,35 @@ impl From<fluxwright::StorageState> for StorageState {
     }
 }
 
+fn parse_record_har_options(o: RecordHarOptions) -> Result<fluxwright::RecordHarOptions> {
+    let content = match o.content.as_deref() {
+        None => None,
+        Some("embed") => Some(fluxwright::HarContentPolicy::Embed),
+        Some("omit") => Some(fluxwright::HarContentPolicy::Omit),
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "recordHar.content must be 'embed' or 'omit', not `{other}`"
+            )))
+        }
+    };
+    let mode = match o.mode.as_deref() {
+        None | Some("full") => fluxwright::HarMode::Full,
+        Some("minimal") => fluxwright::HarMode::Minimal,
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "recordHar.mode must be 'full' or 'minimal', not `{other}`"
+            )))
+        }
+    };
+    Ok(fluxwright::RecordHarOptions {
+        path: o.path.into(),
+        omit_content: o.omit_content.unwrap_or(false),
+        content,
+        mode,
+        url_filter: o.url_filter,
+    })
+}
+
 fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
     let color_scheme = match o.color_scheme.as_deref() {
         None => None,
@@ -1546,6 +1612,7 @@ fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
             Error::from_reason(format!("colorScheme must be light, dark or no-preference, not `{s}`"))
         })?),
     };
+    let record_har = o.record_har.map(parse_record_har_options).transpose()?;
     Ok(fluxwright::JobOptions {
         proxy: o.proxy.map(|p| fluxwright::Proxy {
             server: p.server,
@@ -1577,6 +1644,7 @@ fn job_options(o: NewPageOptions) -> Result<fluxwright::JobOptions> {
         storage_state: o.storage_state.map(TryInto::try_into).transpose()?,
         base_url: o.base_url,
         http_credentials: o.http_credentials.map(|c| (c.username, c.password)),
+        record_har,
         ..Default::default()
     })
 }
@@ -2040,6 +2108,20 @@ impl Browser {
         self.context_routes.lock().unwrap().remove(&ctx_id);
         self.contexts.lock().unwrap().1.remove(&ctx_id);
     }
+
+    #[napi(js_name = "_contextStartHarRecording")]
+    pub async fn context_start_har_recording(
+        &self,
+        ctx_id: u32,
+        options: RecordHarOptions,
+    ) -> Result<()> {
+        let ctx = self.get_context(ctx_id)?;
+        let opts = parse_record_har_options(options)?;
+        RT.spawn(async move { ctx.start_har_recording(opts).await })
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
 }
 
 impl Browser {
@@ -2421,7 +2503,9 @@ impl Page {
             for s in sessions {
                 let _ = s.detach(std::time::Duration::from_secs(5)).await;
             }
-            *slot.page.write().await = None;
+            if let Some(p) = slot.page.write().await.take() {
+                let _ = p.close().await;
+            }
         })
         .await
         .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -2860,6 +2944,148 @@ impl Page {
     #[napi(js_name = "_cdpDrop")]
     pub fn cdp_drop(&self, session_id: u32) {
         self.cdp_sessions.lock().unwrap().1.remove(&session_id);
+    }
+
+    #[napi(js_name = "_onWebSocket")]
+    pub fn on_websocket(&self, handler: Function<WebSocketNativeEvent, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
+        let mut events = self.now(|p| p.subscribe_websockets())?;
+        RT.spawn(async move {
+            while let Some(ev) = events.recv().await {
+                let msg = match ev {
+                    fluxwright::WebSocketEvent::Created { request_id, url } => WebSocketNativeEvent {
+                        event: "created".into(),
+                        request_id,
+                        url: Some(url),
+                        payload_text: None,
+                        payload_bytes: None,
+                        error_message: None,
+                    },
+                    fluxwright::WebSocketEvent::FrameSent {
+                        request_id,
+                        payload,
+                        is_text,
+                        ..
+                    } => WebSocketNativeEvent {
+                        event: "framesent".into(),
+                        request_id,
+                        url: None,
+                        payload_text: is_text.then(|| String::from_utf8_lossy(&payload).into_owned()),
+                        payload_bytes: (!is_text).then(|| Buffer::from(payload)),
+                        error_message: None,
+                    },
+                    fluxwright::WebSocketEvent::FrameReceived {
+                        request_id,
+                        payload,
+                        is_text,
+                        ..
+                    } => WebSocketNativeEvent {
+                        event: "framereceived".into(),
+                        request_id,
+                        url: None,
+                        payload_text: is_text.then(|| String::from_utf8_lossy(&payload).into_owned()),
+                        payload_bytes: (!is_text).then(|| Buffer::from(payload)),
+                        error_message: None,
+                    },
+                    fluxwright::WebSocketEvent::Error {
+                        request_id,
+                        error_message,
+                    } => WebSocketNativeEvent {
+                        event: "socketerror".into(),
+                        request_id,
+                        url: None,
+                        payload_text: None,
+                        payload_bytes: None,
+                        error_message: Some(error_message),
+                    },
+                    fluxwright::WebSocketEvent::Closed { request_id } => WebSocketNativeEvent {
+                        event: "close".into(),
+                        request_id,
+                        url: None,
+                        payload_text: None,
+                        payload_bytes: None,
+                        error_message: None,
+                    },
+                };
+                tsfn.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    #[napi(js_name = "_workers")]
+    pub fn workers(&self) -> Vec<WorkerInfo> {
+        self.now(|p| {
+            p.workers()
+                .into_iter()
+                .map(|w| WorkerInfo {
+                    id: w.target_id().to_owned(),
+                    url: w.url().to_owned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    #[napi(js_name = "_workerEvaluate")]
+    pub async fn worker_evaluate(
+        &self,
+        worker_id: String,
+        expression: String,
+    ) -> Result<serde_json::Value> {
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move {
+                let w = p
+                    .worker(&worker_id)
+                    .ok_or_else(|| fluxwright::Error::Other("worker is closed".into()))?;
+                Ok(w.evaluate(&expression, p.navigation_timeout()).await?)
+            })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_onWorker")]
+    pub fn on_worker(&self, handler: Function<WorkerNativeEvent, ()>) -> Result<()> {
+        let tsfn = callback(handler)?;
+        let mut events = self.now(|p| p.subscribe_workers())?;
+        RT.spawn(async move {
+            while let Some(ev) = events.recv().await {
+                let msg = match ev {
+                    fluxwright::WorkerEvent::Created(w) => WorkerNativeEvent {
+                        event: "created".into(),
+                        id: w.target_id().to_owned(),
+                        url: Some(w.url().to_owned()),
+                        message: None,
+                    },
+                    fluxwright::WorkerEvent::Closed { target_id, url } => WorkerNativeEvent {
+                        event: "close".into(),
+                        id: target_id,
+                        url: Some(url),
+                        message: None,
+                    },
+                    fluxwright::WorkerEvent::Console { target_id, message } => WorkerNativeEvent {
+                        event: "console".into(),
+                        id: target_id,
+                        url: None,
+                        message: Some(ConsoleMessage {
+                            kind: message.kind,
+                            text: message.text,
+                        }),
+                    },
+                };
+                tsfn.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+        Ok(())
+    }
+
+    #[napi(js_name = "_startHarRecording")]
+    pub async fn start_har_recording(&self, options: RecordHarOptions) -> Result<()> {
+        let opts = parse_record_har_options(options)?;
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.start_har_recording(opts).await })
+        })
+        .await
     }
 }
 

@@ -178,6 +178,66 @@ export interface Download {
   failure(): Promise<string | null>
 }
 
+export interface WebSocket {
+  url(): string
+  isClosed(): boolean
+  on(event: 'framesent' | 'framereceived', handler: (data: { payload: string | Buffer }) => unknown): this
+  on(event: 'socketerror', handler: (error: string) => unknown): this
+  on(event: 'close', handler: (webSocket: WebSocket) => unknown): this
+  once(event: 'framesent' | 'framereceived', handler: (data: { payload: string | Buffer }) => unknown): this
+  once(event: 'socketerror', handler: (error: string) => unknown): this
+  once(event: 'close', handler: (webSocket: WebSocket) => unknown): this
+  addListener(event: 'framesent' | 'framereceived', handler: (data: { payload: string | Buffer }) => unknown): this
+  addListener(event: 'socketerror', handler: (error: string) => unknown): this
+  addListener(event: 'close', handler: (webSocket: WebSocket) => unknown): this
+  off(event: string, handler: (...args: any[]) => unknown): this
+  removeListener(event: string, handler: (...args: any[]) => unknown): this
+  waitForEvent(
+    event: 'framesent' | 'framereceived',
+    optionsOrPredicate?:
+      | { predicate?: (data: { payload: string | Buffer }) => boolean | Promise<boolean>; timeout?: number }
+      | ((data: { payload: string | Buffer }) => boolean | Promise<boolean>),
+  ): Promise<{ payload: string | Buffer }>
+  waitForEvent(
+    event: 'socketerror',
+    optionsOrPredicate?: { predicate?: (error: string) => boolean | Promise<boolean>; timeout?: number } | ((error: string) => boolean | Promise<boolean>),
+  ): Promise<string>
+  waitForEvent(
+    event: 'close',
+    optionsOrPredicate?: { predicate?: (webSocket: WebSocket) => boolean | Promise<boolean>; timeout?: number } | ((webSocket: WebSocket) => boolean | Promise<boolean>),
+  ): Promise<WebSocket>
+}
+
+export interface Worker {
+  url(): string
+  evaluate<R, Arg = undefined>(pageFunction: (arg: Arg) => R, arg?: Arg): Promise<Awaited<R>>
+  evaluate(pageFunction: string, arg?: unknown): Promise<any>
+  on(event: 'close', handler: (worker: Worker) => unknown): this
+  on(event: 'console', handler: (message: ConsoleMessage) => unknown): this
+  once(event: 'close', handler: (worker: Worker) => unknown): this
+  once(event: 'console', handler: (message: ConsoleMessage) => unknown): this
+  addListener(event: 'close', handler: (worker: Worker) => unknown): this
+  addListener(event: 'console', handler: (message: ConsoleMessage) => unknown): this
+  off(event: 'close' | 'console', handler: (...args: any[]) => unknown): this
+  removeListener(event: 'close' | 'console', handler: (...args: any[]) => unknown): this
+  waitForEvent(
+    event: 'close',
+    optionsOrPredicate?: { predicate?: (worker: Worker) => boolean | Promise<boolean>; timeout?: number } | ((worker: Worker) => boolean | Promise<boolean>),
+  ): Promise<Worker>
+  waitForEvent(
+    event: 'console',
+    optionsOrPredicate?: { predicate?: (message: ConsoleMessage) => boolean | Promise<boolean>; timeout?: number } | ((message: ConsoleMessage) => boolean | Promise<boolean>),
+  ): Promise<ConsoleMessage>
+}
+
+export interface RouteFromHarOptions {
+  url?: string | RegExp
+  notFound?: 'abort' | 'fallback'
+  update?: boolean
+  updateContent?: 'embed' | 'omit'
+  updateMode?: 'full' | 'minimal'
+}
+
 export type KeyModifier = 'Alt' | 'Control' | 'Meta' | 'Shift' | 'ControlOrMeta'
 export type MouseButton = 'left' | 'right' | 'middle'
 
@@ -270,6 +330,7 @@ export interface BrowserContext {
   /** `page.route` for all pages and popups in this context; added before `newPage()`, it applies from the first request. */
   route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
   unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
+  routeFromHAR(har: string, options?: RouteFromHarOptions): Promise<void>
   addInitScript<Arg>(script: (arg: Arg) => unknown, arg: Arg): Promise<void>
   addInitScript(script: (() => unknown) | string | { path?: string; content?: string }): Promise<void>
   exposeFunction(name: string, callback: (...args: any[]) => unknown): Promise<void>
@@ -375,6 +436,8 @@ declare module './index' {
     route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
     /** Removes the handlers added for `url` (only `handler`, when given). */
     unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
+    routeFromHAR(har: string, options?: RouteFromHarOptions): Promise<void>
+    workers(): Worker[]
     on(event: 'console', handler: (message: ConsoleMessage) => void): this
     on(event: 'pageerror', handler: (error: Error) => void): this
     on(event: 'request' | 'requestfinished' | 'requestfailed', handler: (request: Request) => void): this
@@ -382,6 +445,8 @@ declare module './index' {
     on(event: 'dialog', handler: (dialog: Dialog) => unknown): this
     on(event: 'filechooser', handler: (fileChooser: FileChooser) => unknown): this
     on(event: 'popup', handler: (popup: Page) => unknown): this
+    on(event: 'websocket', handler: (webSocket: WebSocket) => unknown): this
+    on(event: 'worker', handler: (worker: Worker) => unknown): this
     once(event: 'console', handler: (message: ConsoleMessage) => void): this
     once(event: 'pageerror', handler: (error: Error) => void): this
     once(event: 'request' | 'requestfinished' | 'requestfailed', handler: (request: Request) => void): this
@@ -389,6 +454,8 @@ declare module './index' {
     once(event: 'dialog', handler: (dialog: Dialog) => unknown): this
     once(event: 'filechooser', handler: (fileChooser: FileChooser) => unknown): this
     once(event: 'popup', handler: (popup: Page) => unknown): this
+    once(event: 'websocket', handler: (webSocket: WebSocket) => unknown): this
+    once(event: 'worker', handler: (worker: Worker) => unknown): this
     off(
       event:
         | 'console'
@@ -399,9 +466,47 @@ declare module './index' {
         | 'requestfailed'
         | 'dialog'
         | 'filechooser'
-        | 'popup',
+        | 'popup'
+        | 'websocket'
+        | 'worker',
       handler: (...args: any[]) => unknown,
     ): this
+    waitForEvent(
+      event: 'console',
+      optionsOrPredicate?: { predicate?: (message: ConsoleMessage) => boolean | Promise<boolean>; timeout?: number } | ((message: ConsoleMessage) => boolean | Promise<boolean>),
+    ): Promise<ConsoleMessage>
+    waitForEvent(
+      event: 'pageerror',
+      optionsOrPredicate?: { predicate?: (error: Error) => boolean | Promise<boolean>; timeout?: number } | ((error: Error) => boolean | Promise<boolean>),
+    ): Promise<Error>
+    waitForEvent(
+      event: 'request' | 'requestfinished' | 'requestfailed',
+      optionsOrPredicate?: { predicate?: (request: Request) => boolean | Promise<boolean>; timeout?: number } | ((request: Request) => boolean | Promise<boolean>),
+    ): Promise<Request>
+    waitForEvent(
+      event: 'response',
+      optionsOrPredicate?: { predicate?: (response: Response) => boolean | Promise<boolean>; timeout?: number } | ((response: Response) => boolean | Promise<boolean>),
+    ): Promise<Response>
+    waitForEvent(
+      event: 'dialog',
+      optionsOrPredicate?: { predicate?: (dialog: Dialog) => boolean | Promise<boolean>; timeout?: number } | ((dialog: Dialog) => boolean | Promise<boolean>),
+    ): Promise<Dialog>
+    waitForEvent(
+      event: 'filechooser',
+      optionsOrPredicate?: { predicate?: (fileChooser: FileChooser) => boolean | Promise<boolean>; timeout?: number } | ((fileChooser: FileChooser) => boolean | Promise<boolean>),
+    ): Promise<FileChooser>
+    waitForEvent(
+      event: 'popup',
+      optionsOrPredicate?: { predicate?: (popup: Page) => boolean | Promise<boolean>; timeout?: number } | ((popup: Page) => boolean | Promise<boolean>),
+    ): Promise<Page>
+    waitForEvent(
+      event: 'websocket',
+      optionsOrPredicate?: { predicate?: (webSocket: WebSocket) => boolean | Promise<boolean>; timeout?: number } | ((webSocket: WebSocket) => boolean | Promise<boolean>),
+    ): Promise<WebSocket>
+    waitForEvent(
+      event: 'worker',
+      optionsOrPredicate?: { predicate?: (worker: Worker) => boolean | Promise<boolean>; timeout?: number } | ((worker: Worker) => boolean | Promise<boolean>),
+    ): Promise<Worker>
     /**
      * The first response from now on whose URL matches (a glob or RegExp, as in `page.route`) or
      * that the predicate accepts. Default timeout 30 s; 0 waits until the page closes.

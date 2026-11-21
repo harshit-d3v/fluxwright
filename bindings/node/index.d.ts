@@ -29,6 +29,7 @@ export declare class Browser {
   _contextIntercept(ctxId: number): Promise<void>
   _closeContext(ctxId: number): Promise<void>
   _dropContext(ctxId: number): void
+  _contextStartHarRecording(ctxId: number, options: RecordHarOptions): Promise<void>
 }
 
 export declare class Chromium {
@@ -279,6 +280,11 @@ export declare class Page {
   _cdpOnEvent(sessionId: number, handler: (arg: CdpEventPayload) => void): void
   _cdpDetach(sessionId: number): Promise<void>
   _cdpDrop(sessionId: number): void
+  _onWebSocket(handler: (arg: WebSocketNativeEvent) => void): void
+  _workers(): Array<WorkerInfo>
+  _workerEvaluate(workerId: string, expression: string): Promise<any>
+  _onWorker(handler: (arg: WorkerNativeEvent) => void): void
+  _startHarRecording(options: RecordHarOptions): Promise<void>
 }
 
 /**
@@ -563,6 +569,7 @@ export interface NewPageOptions {
    * path of the JSON file it saved.
    */
   storageState?: StorageState | string
+  recordHar?: RecordHarOptions
 }
 
 export interface OriginStorage {
@@ -615,6 +622,14 @@ export interface ProxyOptions {
   password?: string
 }
 
+export interface RecordHarOptions {
+  path: string
+  omitContent?: boolean
+  content?: 'embed' | 'omit'
+  mode?: 'full' | 'minimal'
+  urlFilter?: string | RegExp
+}
+
 export interface RouteFetchOptions {
   url?: string
   method?: string
@@ -659,4 +674,25 @@ export interface StorageState {
 export interface ViewportSize {
   width: number
   height: number
+}
+
+export interface WebSocketNativeEvent {
+  event: string
+  requestId: string
+  url?: string
+  payloadText?: string
+  payloadBytes?: Buffer
+  errorMessage?: string
+}
+
+export interface WorkerInfo {
+  id: string
+  url: string
+}
+
+export interface WorkerNativeEvent {
+  event: string
+  id: string
+  url?: string
+  message?: ConsoleMessage
 }

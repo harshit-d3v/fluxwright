@@ -3024,3 +3024,24 @@ async fn api_request_cookies_and_indexeddb() {
     ctx.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[test]
+fn public_reexports_compile() {
+    use fluxwright::{
+        Har, HarContentPolicy, HarLog, HarMode, HarNotFound, HarRouteOptions, HarRouter,
+        RecordHarOptions, WebSocketEvent, Worker, WorkerEvent,
+    };
+    let _ = std::any::type_name::<WebSocketEvent>();
+    let _ = std::any::type_name::<Worker>();
+    let _ = std::any::type_name::<WorkerEvent>();
+    let _ = std::any::type_name::<Har>();
+    let _ = std::any::type_name::<HarLog>();
+    let _ = std::any::type_name::<HarMode>();
+    let _ = std::any::type_name::<HarContentPolicy>();
+    let _ = std::any::type_name::<HarNotFound>();
+    let _ = std::any::type_name::<HarRouter>();
+    let rec = RecordHarOptions::new("example.har");
+    let route = HarRouteOptions::default();
+    assert_eq!(rec.effective_content_policy(), HarContentPolicy::Embed);
+    assert_eq!(route.not_found, HarNotFound::Abort);
+}
