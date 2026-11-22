@@ -35,6 +35,8 @@
     "addon.d.ts",
     "expect.js",
     "tracing.js",
+    "video.js",
+    "visual.js",
     "index.js",
     "index.d.ts",
     "MISSING.md",
@@ -43,7 +45,7 @@
   ],
   "scripts": {
     "build": "napi build --platform --release",
-    "test": "node --expose-gc test/smoke.mjs && node test/expect.mjs && node test/tracing.mjs",
+    "test": "node --expose-gc test/smoke.mjs && node test/expect.mjs && node test/tracing.mjs && node test/video_visual.mjs",
     "test:types": "tsc -p test",
     "build:debug": "napi build --platform",
     "artifacts": "napi artifacts",

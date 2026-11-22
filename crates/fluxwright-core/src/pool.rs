@@ -25,6 +25,7 @@ use crate::profiles::{validate_profile_name, ProfileStore};
 use crate::proxies::{ProxyLease, ProxyPool};
 use crate::source::BrowserSource;
 use crate::tracing_rec::{ContextTracing, Tracing};
+use crate::video::{RecordVideoOptions, Video, VideoRecorder};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -116,6 +117,8 @@ struct ContextGuard {
     http_defaults: std::sync::Mutex<HttpContextDefaults>,
     har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
     har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    record_video: std::sync::Mutex<Option<RecordVideoOptions>>,
+    video_recorders: std::sync::Mutex<Vec<VideoRecorder>>,
     proxy_lease: std::sync::Mutex<Option<ProxyLease>>,
     profile_target: std::sync::Mutex<Option<(Arc<ProfileStore>, String)>>,
     tracing: Arc<ContextTracing>,
@@ -158,6 +161,10 @@ impl ContextGuard {
         for rec in recorders {
             let _ = rec.finish().await;
         }
+        let video_recorders = std::mem::take(&mut *self.video_recorders.lock().unwrap());
+        for rec in video_recorders {
+            let _ = rec.finish().await;
+        }
         let _ = self.browser.dispose_context(&self.context).await;
         self.engine.release_slot(&self.browser, completed).await;
     }
@@ -174,9 +181,13 @@ impl ContextGuard {
             handle.abort();
         }
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
+        let video_recorders = std::mem::take(&mut *self.video_recorders.lock().unwrap());
         let guard = Arc::clone(self);
         self.runtime.spawn(async move {
             for rec in recorders {
+                let _ = rec.finish().await;
+            }
+            for rec in video_recorders {
                 let _ = rec.finish().await;
             }
             let _ = guard.browser.dispose_context(&guard.context).await;
@@ -199,11 +210,15 @@ impl Drop for ContextGuard {
             handle.abort();
         }
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
+        let video_recorders = std::mem::take(&mut *self.video_recorders.lock().unwrap());
         let browser = self.browser.clone();
         let ctx = self.context.clone();
         let engine = self.engine.clone();
         self.runtime.spawn(async move {
             for rec in recorders {
+                let _ = rec.finish().await;
+            }
+            for rec in video_recorders {
                 let _ = rec.finish().await;
             }
             let _ = browser.dispose_context(&ctx).await;
@@ -331,6 +346,8 @@ pub struct PageLease {
     base_url: std::sync::Mutex<Option<String>>,
     har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
     har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    video_recorder: std::sync::Mutex<Option<VideoRecorder>>,
+    video: Option<Video>,
 }
 
 tokio::task_local! {
@@ -524,6 +541,14 @@ impl Engine {
             (None, None) => (None, None),
         };
 
+        if let Some(ref rv) = opts.record_video {
+            rv.validate()?;
+            let dir = rv.dir.clone();
+            tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir))
+                .await
+                .map_err(|e| Error::Other(e.to_string()))?
+                .map_err(|e| Error::Other(format!("record_video create_dir_all: {e}")))?;
+        }
         let timeout_budget = opts.timeout.unwrap_or(self.inner.config.acquire_timeout);
         let guard = self
             .acquire_context_guard(opts.priority, effective_proxy.clone(), timeout_budget)
@@ -541,10 +566,14 @@ impl Engine {
             .or(loaded_profile_state.as_ref());
         if effective_storage_state.is_some()
             || opts.record_har.is_some()
+            || opts.record_video.is_some()
             || opts.emulation.javascript_enabled == Some(false)
             || opts.emulation.bypass_csp
         {
             guard.invalidate_warm_page().await;
+        }
+        if let Some(ref rv) = opts.record_video {
+            *guard.record_video.lock().unwrap() = Some(rv.clone());
         }
         *guard.http_defaults.lock().unwrap() = HttpContextDefaults {
             base_url: opts.base_url.clone(),
@@ -1306,6 +1335,8 @@ impl Inner {
             http_defaults: std::sync::Mutex::new(HttpContextDefaults::default()),
             har_recorders: Default::default(),
             har_route_tasks: Default::default(),
+            record_video: Default::default(),
+            video_recorders: Default::default(),
             proxy_lease: Default::default(),
             profile_target: Default::default(),
             tracing: ContextTracing::new(),
@@ -1568,6 +1599,27 @@ fn build_page_lease(
             }
         });
 
+        let record_video_opts = context.record_video.lock().unwrap().clone();
+        let (video_recorder, video) = match record_video_opts {
+            Some(rv) => match page.new_cdp_session(Duration::from_secs(5)).await {
+                Ok(sess) => match VideoRecorder::start(sess, rv).await {
+                    Ok((rec, vid)) => {
+                        context.video_recorders.lock().unwrap().push(rec.clone());
+                        (Some(rec), Some(vid))
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to start video recorder");
+                        (None, None)
+                    }
+                },
+                Err(err) => {
+                    warn!(error = %err, "failed to attach CDP session for video recording");
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
+
         PageLease {
             engine,
             context,
@@ -1591,6 +1643,8 @@ fn build_page_lease(
             base_url: std::sync::Mutex::new(base_url),
             har_recorders: Default::default(),
             har_route_tasks: Default::default(),
+            video_recorder: std::sync::Mutex::new(video_recorder),
+            video,
         }
     })
 }
@@ -2024,6 +2078,11 @@ impl PageLease {
 
     pub fn lease_id(&self) -> Uuid {
         self.lease_id
+    }
+
+    /// Recorded video handle when `JobOptions::record_video` was configured on this context.
+    pub fn video(&self) -> Option<Video> {
+        self.video.clone()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -3516,6 +3575,15 @@ impl PageLease {
         for rec in recorders {
             let _ = rec.finish().await;
         }
+        let video_rec = self.video_recorder.lock().unwrap().take();
+        if let Some(rec) = video_rec {
+            let _ = rec.finish().await;
+            self.context
+                .video_recorders
+                .lock()
+                .unwrap()
+                .retain(|r| !r.is_finished());
+        }
         if self.owns_context {
             self.context.dispose(completed).await;
         } else if !self.context.is_disposed() {
@@ -3549,7 +3617,8 @@ impl Drop for PageLease {
         self.context.tracing.unregister_page(self.lease_id);
         let completed = !self.context.failed.load(Ordering::SeqCst);
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
-        if self.owns_context && recorders.is_empty() {
+        let video_rec = self.video_recorder.lock().unwrap().take();
+        if self.owns_context && recorders.is_empty() && video_rec.is_none() {
             self.context.dispose_in_background(completed);
         } else {
             let owns = self.owns_context;
@@ -3569,6 +3638,13 @@ impl Drop for PageLease {
             self.runtime.spawn(async move {
                 for rec in recorders {
                     let _ = rec.finish().await;
+                }
+                if let Some(rec) = video_rec {
+                    let _ = rec.finish().await;
+                    ctx.video_recorders
+                        .lock()
+                        .unwrap()
+                        .retain(|r| !r.is_finished());
                 }
                 if owns {
                     ctx.dispose(completed).await;
@@ -3616,6 +3692,10 @@ pub struct Locator<'a> {
 }
 
 impl<'a> Locator<'a> {
+    pub(crate) fn lease(&self) -> &'a PageLease {
+        self.lease
+    }
+
     pub fn selector(&self) -> &Selector {
         &self.selector
     }

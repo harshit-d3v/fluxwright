@@ -8,6 +8,7 @@ use fluxwright_cdp::{
 
 use crate::adaptive::AdaptiveConfig;
 use crate::proxies::ProxyPool;
+use crate::video::RecordVideoOptions;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePreset {
@@ -192,6 +193,8 @@ pub struct JobOptions {
     pub http_credentials: Option<(String, String)>,
     /// HAR 1.2 recording options for this browser context.
     pub record_har: Option<RecordHarOptions>,
+    /// Video recording options for pages in this browser context.
+    pub record_video: Option<RecordVideoOptions>,
     /// Named persistent profile (loads `storageState` on acquire, saves on clean completion).
     pub profile: Option<String>,
     /// Persist updated `storageState` back to `profile` on clean completion (default `true`).
@@ -219,6 +222,7 @@ impl Default for JobOptions {
             base_url: None,
             http_credentials: None,
             record_har: None,
+            record_video: None,
             profile: None,
             persist_profile: true,
             proxy_session: None,
@@ -301,6 +305,11 @@ impl JobOptions {
 
     pub fn record_har(mut self, opts: RecordHarOptions) -> Self {
         self.record_har = Some(opts);
+        self
+    }
+
+    pub fn record_video(mut self, opts: RecordVideoOptions) -> Self {
+        self.record_video = Some(opts);
         self
     }
 

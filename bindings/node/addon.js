@@ -6,6 +6,7 @@ const { dirname } = require('node:path')
 const { Script } = require('node:vm')
 const { createExpect } = require('./expect.js')
 const { Tracing } = require('./tracing.js')
+const { Video, VideoRecorder, validateRecordVideoOptions } = require('./video.js')
 
 // Like Playwright, `{ path }` creates missing folders (`.auth/state.json`).
 async function save(path, data) {
@@ -117,6 +118,7 @@ const PAGE = {
   bypassCSP: true,
   storageState: true,
   recordHar: RECORD_HAR,
+  recordVideo: validateRecordVideoOptions,
   resourcePreset: ['scraping', 'minimal', 'no-media'],
   blockResources: (v, m) => {
     const allowed = ['image', 'font', 'media', 'stylesheet', 'script']
@@ -1543,6 +1545,41 @@ function cookieFilterMatches(filter, value, isDomain = false) {
   return f.startsWith('.') ? v === f : v === f || v === `.${f}`
 }
 
+const pageVideos = new WeakMap()
+const pageVideoRecorders = new WeakMap()
+const browserVideoRecorders = new WeakMap()
+
+async function startPageVideo(page, recordVideo, browser) {
+  const id = await page._newCdpSession(null)
+  const session = new CDPSession(page, id)
+  const recorder = await VideoRecorder.start(session, recordVideo)
+  const video = new Video(recorder)
+  pageVideos.set(page, video)
+  pageVideoRecorders.set(page, { recorder, browser })
+  if (browser) {
+    let set = browserVideoRecorders.get(browser)
+    if (!set) {
+      set = new Set()
+      browserVideoRecorders.set(browser, set)
+    }
+    set.add(recorder)
+  }
+  return video
+}
+
+async function stopPageVideo(page) {
+  const entry = pageVideoRecorders.get(page)
+  if (!entry) return
+  pageVideoRecorders.delete(page)
+  try {
+    await entry.recorder.stop()
+  } finally {
+    if (entry.browser) {
+      browserVideoRecorders.get(entry.browser)?.delete(entry.recorder)
+    }
+  }
+}
+
 // browser.newContext() and context.newPage(), as in Playwright. Each context can hold multiple
 // pages and popups sharing cookies, storage, init scripts, exposed functions and routes.
 class BrowserContext {
@@ -1558,11 +1595,13 @@ class BrowserContext {
   #routeGetter
   #request
   #tracing
+  #recordVideo = null
 
-  constructor(browser, id, ensurePopup) {
+  constructor(browser, id, ensurePopup, recordVideo = null) {
     this.#browser = browser
     this.#id = id
     this.#ensurePopup = ensurePopup
+    this.#recordVideo = recordVideo
     const ref = new WeakRef(this)
     this.#routeGetter = () => ref.deref()?.#routes ?? []
     contextRegistry.register(this, { browser, id }, this)
@@ -1612,6 +1651,9 @@ class BrowserContext {
     if (this.#closed) return
     this._adoptPage(popup)
     this.#tracing?._onPageCreated(popup).catch(() => {})
+    if (this.#recordVideo) {
+      startPageVideo(popup, this.#recordVideo, this.#browser).catch(() => {})
+    }
   }
 
   _removePage(page) {
@@ -1627,6 +1669,9 @@ class BrowserContext {
     }
     this._adoptPage(page)
     await this.#tracing?._onPageCreated(page)
+    if (this.#recordVideo) {
+      await startPageVideo(page, this.#recordVideo, this.#browser)
+    }
     return page
   }
 
@@ -2198,6 +2243,11 @@ try {
     checkOptions(method, options, PAGE)
     let out = options
     let regexHar = null
+    const recordVideo = options?.recordVideo ?? null
+    if (recordVideo != null) {
+      const { recordVideo: _rv, ...rest } = out
+      out = rest
+    }
     if (options?.recordHar) {
       if (typeof options.recordHar.path !== 'string' || !options.recordHar.path) {
         throw new TypeError(`${method}: recordHar.path must be a non-empty string`)
@@ -2214,14 +2264,18 @@ try {
     if (typeof options?.storageState === 'string') {
       out = { ...out, storageState: JSON.parse(await fs.readFile(options.storageState, 'utf8')) }
     }
-    return { opts: out, regexHar }
+    return { opts: out, regexHar, recordVideo }
+  }
+  native.Page.prototype.video = function () {
+    return pageVideos.get(this) ?? null
   }
   const newPage = native.Browser.prototype.newPage
   native.Browser.prototype.newPage = async function (options) {
-    const { opts, regexHar } = await normalizeContextOptions('browser.newPage', options)
+    const { opts, regexHar, recordVideo } = await normalizeContextOptions('browser.newPage', options)
     const page = await newPage.call(this, opts)
     if (regexHar) addPendingHarFilter(page, regexHar.path, regexHar.regex)
     trackTarget(page)
+    if (recordVideo) await startPageVideo(page, recordVideo, this)
     return page
   }
   const storageState = native.Page.prototype.storageState
@@ -2694,11 +2748,21 @@ function applyFilter(loc, options, label) {
   }
   const ensurePopup = installEvents(native.Page)
   native.Browser.prototype.newContext = async function (options) {
-    const { opts, regexHar } = await normalizeContextOptions('browser.newContext', options)
+    const { opts, regexHar, recordVideo } = await normalizeContextOptions('browser.newContext', options)
     const id = await this._newContext(opts)
-    const ctx = new BrowserContext(this, id, ensurePopup)
+    const ctx = new BrowserContext(this, id, ensurePopup, recordVideo)
     if (regexHar) addPendingHarFilter(ctx, regexHar.path, regexHar.regex)
     return ctx
+  }
+  const origBrowserClose = native.Browser.prototype.close
+  native.Browser.prototype.close = async function () {
+    const recs = browserVideoRecorders.get(this)
+    if (recs && recs.size > 0) {
+      const list = [...recs]
+      recs.clear()
+      await Promise.allSettled(list.map((r) => r.stop()))
+    }
+    return origBrowserClose.call(this)
   }
   installRoutes(native.Page)
   installDownloads(native.Page)
@@ -2775,7 +2839,13 @@ function applyFilter(loc, options, label) {
       return traceAction(page, 'Locator', name, `locator.${name}`, {}, () => orig.apply(this, args))
     }
   }
+  const origPageCloseWithBindings = native.Page.prototype.close
+  native.Page.prototype.close = async function (options) {
+    await stopPageVideo(this)
+    return origPageCloseWithBindings.call(this, options)
+  }
   module.exports = native
+  module.exports.Video = Video
   // Chromium.launch is read-only on the native class, so `chromium` is a checked stand-in.
   module.exports.chromium = {
     launch: async (options) => {

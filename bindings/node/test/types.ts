@@ -1,5 +1,15 @@
 // Compile-only check of the published typings: `npm run test:types`.
-import fluxwright, { chromium, expect, type LocatorAssertions, type PageAssertions, type StorageState, type Tracing } from '../addon'
+import fluxwright, {
+  chromium,
+  expect,
+  type LocatorAssertions,
+  type PageAssertions,
+  type RecordVideoOptions,
+  type StorageState,
+  type ToHaveScreenshotOptions,
+  type Tracing,
+  type Video,
+} from '../addon'
 
 export async function typed(): Promise<void> {
   const browser = await chromium.launch({ maxBrowsers: 2 })
@@ -270,6 +280,33 @@ export async function typed(): Promise<void> {
   await tracing.start({ path: 'bad.zip' })
   // @ts-expect-error tracing.stopChunk does not accept screenshots
   await tracing.stopChunk({ screenshots: true })
+
+  const recOpts: RecordVideoOptions = { dir: 'videos', size: { width: 640, height: 480 } }
+  const vidCtx = await browser.newContext({ recordVideo: recOpts })
+  const vidPage = await vidCtx.newPage()
+  const video: Video | null = vidPage.video()
+  if (video) {
+    const vp: string = await video.path()
+    await video.saveAs('out.avi')
+    await video.delete()
+    void vp
+  }
+  const shotOpts: ToHaveScreenshotOptions = {
+    threshold: 0.2,
+    maxDiffPixels: 5,
+    maxDiffPixelRatio: 0.01,
+    animations: 'disabled',
+    timeout: 2000,
+    update: true,
+    omitBackground: false,
+  }
+  await pageAssert.toHaveScreenshot('page.png', { ...shotOpts, fullPage: true, clip: { x: 0, y: 0, width: 10, height: 10 } })
+  await locAssert.toHaveScreenshot(['shots', 'item.png'], shotOpts)
+  // @ts-expect-error fullPage is only on PageAssertions.toHaveScreenshot
+  await locAssert.toHaveScreenshot('item.png', { fullPage: true })
+  // @ts-expect-error invalid animations mode
+  await pageAssert.toHaveScreenshot('page.png', { animations: 'paused' })
+  await vidCtx.close()
 
   await context.close()
   await browser.close()

@@ -1,5 +1,19 @@
 'use strict'
 
+const fs = require('node:fs/promises')
+const { dirname } = require('node:path')
+const {
+  decodePng,
+  compareImages,
+  isWithinTolerance,
+  artifactPaths,
+  shouldUpdateSnapshots,
+  DISABLE_ANIMATIONS_PAGE_FN,
+  RESTORE_ANIMATIONS_PAGE_FN,
+  DISABLE_ANIMATIONS_LOCATOR_FN,
+  RESTORE_ANIMATIONS_LOCATOR_FN,
+} = require('./visual.js')
+
 const DEFAULT_TIMEOUT_MS = 5000
 const POLL_INTERVAL_MS = 50
 const MIN_PROBE_TIMEOUT_MS = 50
@@ -419,6 +433,30 @@ class LocatorAssertions {
       },
     })
   }
+
+  async toHaveScreenshot(nameOrPath, options) {
+    if (this.#negated) {
+      throw new Error('expect(locator).toHaveScreenshot: .not is not supported')
+    }
+    const opts = validateScreenshotCall(`${formatLocator(this.#locator)}.toHaveScreenshot`, nameOrPath, options, false)
+    const timeoutMs = opts.timeout ?? this.#defaultTimeout
+    return runToHaveScreenshot({
+      targetLabel: formatLocator(this.#locator),
+      nameOrPath,
+      opts,
+      timeoutMs,
+      isClosed: () => false,
+      disableAnimations: (limitMs) =>
+        this.#locator.evaluate(DISABLE_ANIMATIONS_LOCATOR_FN, undefined, { timeout: Math.min(limitMs, 500) }).catch(() => {}),
+      restoreAnimations: () =>
+        this.#locator.evaluate(RESTORE_ANIMATIONS_LOCATOR_FN, undefined, { timeout: 250 }).catch(() => {}),
+      captureShot: (limitMs) =>
+        this.#locator.screenshot({
+          omitBackground: opts.omitBackground,
+          timeout: limitMs,
+        }),
+    })
+  }
 }
 
 class PageAssertions {
@@ -482,6 +520,245 @@ class PageAssertions {
         }
       },
     })
+  }
+
+  async toHaveScreenshot(nameOrPath, options) {
+    if (this.#negated) {
+      throw new Error('expect(page).toHaveScreenshot: .not is not supported')
+    }
+    const opts = validateScreenshotCall('expect(page).toHaveScreenshot', nameOrPath, options, true)
+    const timeoutMs = opts.timeout ?? this.#defaultTimeout
+    return runToHaveScreenshot({
+      targetLabel: 'expect(page)',
+      nameOrPath,
+      opts,
+      timeoutMs,
+      isClosed: () => this.#page.isClosed(),
+      disableAnimations: () => this.#page.evaluate(DISABLE_ANIMATIONS_PAGE_FN).catch(() => {}),
+      restoreAnimations: () => this.#page.evaluate(RESTORE_ANIMATIONS_PAGE_FN).catch(() => {}),
+      captureShot: (limitMs) =>
+        this.#page.screenshot({
+          fullPage: opts.fullPage,
+          clip: opts.clip,
+          omitBackground: opts.omitBackground,
+          timeout: limitMs,
+        }),
+    })
+  }
+}
+
+function validateScreenshotCall(method, nameOrPath, options, isPage) {
+  if (typeof nameOrPath === 'string') {
+    if (!nameOrPath) throw new TypeError(`${method}: path must be a non-empty string`)
+  } else if (Array.isArray(nameOrPath)) {
+    if (!nameOrPath.length || nameOrPath.some((s) => typeof s !== 'string' || !s)) {
+      throw new TypeError(`${method}: path segments must be non-empty strings`)
+    }
+  } else {
+    throw new TypeError(`${method}: path must be a string or string[]`)
+  }
+
+  const allowed = {
+    timeout: true,
+    threshold: true,
+    maxDiffPixels: true,
+    maxDiffPixelRatio: true,
+    animations: true,
+    update: true,
+    omitBackground: true,
+    ...(isPage ? { fullPage: true, clip: true } : {}),
+  }
+  const opts = validateOptions(method, options, allowed)
+  const threshold = opts.threshold ?? 0.2
+  if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new TypeError(`${method}: threshold must be a finite number in [0, 1]`)
+  }
+  if (opts.maxDiffPixels != null) {
+    if (typeof opts.maxDiffPixels !== 'number' || !Number.isInteger(opts.maxDiffPixels) || opts.maxDiffPixels < 0) {
+      throw new TypeError(`${method}: maxDiffPixels must be a non-negative integer`)
+    }
+  }
+  if (opts.maxDiffPixelRatio != null) {
+    if (
+      typeof opts.maxDiffPixelRatio !== 'number' ||
+      !Number.isFinite(opts.maxDiffPixelRatio) ||
+      opts.maxDiffPixelRatio < 0 ||
+      opts.maxDiffPixelRatio > 1
+    ) {
+      throw new TypeError(`${method}: maxDiffPixelRatio must be a finite number in [0, 1]`)
+    }
+  }
+  const animations = opts.animations ?? 'disabled'
+  if (animations !== 'disabled' && animations !== 'allow') {
+    throw new TypeError(`${method}: animations must be 'disabled' or 'allow'`)
+  }
+  for (const bKey of ['update', 'omitBackground', 'fullPage']) {
+    if (opts[bKey] != null && typeof opts[bKey] !== 'boolean') {
+      throw new TypeError(`${method}: ${bKey} must be a boolean`)
+    }
+  }
+  if (opts.clip != null) {
+    const clip = validateOptions(`${method} clip`, opts.clip, { x: true, y: true, width: true, height: true })
+    for (const k of ['x', 'y', 'width', 'height']) {
+      if (typeof clip[k] !== 'number' || !Number.isFinite(clip[k])) {
+        throw new TypeError(`${method}: clip.${k} must be a finite number`)
+      }
+    }
+    if (clip.width <= 0 || clip.height <= 0) {
+      throw new TypeError(`${method}: clip.width and clip.height must be positive`)
+    }
+  }
+  return {
+    timeout: opts.timeout,
+    threshold,
+    maxDiffPixels: opts.maxDiffPixels,
+    maxDiffPixelRatio: opts.maxDiffPixelRatio,
+    animations,
+    update: opts.update ?? false,
+    omitBackground: opts.omitBackground ?? false,
+    fullPage: opts.fullPage ?? false,
+    clip: opts.clip,
+  }
+}
+
+async function writeArtifact(filePath, data) {
+  await fs.mkdir(dirname(filePath), { recursive: true })
+  await fs.writeFile(filePath, data)
+}
+
+async function runToHaveScreenshot({
+  targetLabel,
+  nameOrPath,
+  opts,
+  timeoutMs,
+  isClosed,
+  disableAnimations,
+  restoreAnimations,
+  captureShot,
+}) {
+  const { baselinePath, actualPath, diffPath } = artifactPaths(nameOrPath)
+  const disableAnim = opts.animations === 'disabled'
+  const unlimited = timeoutMs === 0
+  const shotLimit = (remaining) => (!Number.isFinite(remaining) ? 2000 : Math.max(100, Math.min(remaining, 2000)))
+
+  try {
+    if (shouldUpdateSnapshots(opts.update)) {
+      const start = Date.now()
+      let prevImg = null
+      let lastErr = null
+      let attempts = 0
+      while (true) {
+        if (isClosed()) throw new Error('page is closed')
+        const remaining = unlimited ? Infinity : Math.max(0, timeoutMs - (Date.now() - start))
+        if (disableAnim) await disableAnimations(shotLimit(remaining))
+        try {
+          const bytes = await captureShot(shotLimit(remaining))
+          attempts++
+          const img = decodePng(bytes)
+          if (prevImg) {
+            const diff = compareImages(prevImg, img, opts.threshold, false)
+            if (isWithinTolerance(diff, opts)) {
+              await writeArtifact(baselinePath, bytes)
+              return
+            }
+          } else if (unlimited) {
+            await writeArtifact(baselinePath, bytes)
+            return
+          }
+          prevImg = img
+          lastErr = null
+        } catch (err) {
+          if (isFatalError(err)) throw err
+          lastErr = String(err?.message ?? err)
+        }
+
+        const elapsed = Date.now() - start
+        if (!unlimited && elapsed >= timeoutMs) {
+          if (attempts === 1 && prevImg) {
+            try {
+              const bytes = await captureShot(1000)
+              const img = decodePng(bytes)
+              const diff = compareImages(prevImg, img, opts.threshold, false)
+              if (isWithinTolerance(diff, opts)) {
+                await writeArtifact(baselinePath, bytes)
+                return
+              }
+            } catch {}
+          }
+          throw new Error(
+            `${targetLabel}.toHaveScreenshot: ${
+              attempts >= 2
+                ? `Timed out ${timeoutMs}ms waiting for screenshot to stabilize for update at ${baselinePath}`
+                : `Failed to capture snapshot (${lastErr ?? 'did not stabilize'})`
+            }`,
+          )
+        }
+        const waitMs = unlimited ? POLL_INTERVAL_MS : Math.min(POLL_INTERVAL_MS, Math.max(0, timeoutMs - elapsed))
+        if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs))
+      }
+    }
+
+    let baselineBytes
+    try {
+      baselineBytes = await fs.readFile(baselinePath)
+    } catch (err) {
+      if (err?.code === 'ENOENT') {
+        if (disableAnim) await disableAnimations(500)
+        try {
+          const actual = await captureShot(2000)
+          await writeArtifact(actualPath, actual)
+        } catch {}
+        throw new Error(
+          `${targetLabel}.toHaveScreenshot: Baseline snapshot does not exist at ${baselinePath}.\n` +
+            `Run with FLUXWRIGHT_UPDATE_SNAPSHOTS=1 or { update: true } to create it. Actual saved to ${actualPath}`,
+        )
+      }
+      throw err
+    }
+
+    const baselineImg = decodePng(baselineBytes)
+    const start = Date.now()
+    let lastMismatch = null
+    let lastErr = null
+
+    while (true) {
+      if (isClosed()) throw new Error('page is closed')
+      const remaining = unlimited ? Infinity : Math.max(0, timeoutMs - (Date.now() - start))
+      if (disableAnim) await disableAnimations(shotLimit(remaining))
+      try {
+        const bytes = await captureShot(shotLimit(remaining))
+        const actualImg = decodePng(bytes)
+        const diff = compareImages(baselineImg, actualImg, opts.threshold, false)
+        if (isWithinTolerance(diff, opts)) return
+        lastMismatch = { bytes, actualImg }
+        lastErr = null
+      } catch (err) {
+        if (isFatalError(err)) throw err
+        lastErr = String(err?.message ?? err)
+      }
+
+      const elapsed = Date.now() - start
+      if (!unlimited && elapsed >= timeoutMs) break
+      const waitMs = unlimited ? POLL_INTERVAL_MS : Math.min(POLL_INTERVAL_MS, Math.max(0, timeoutMs - elapsed))
+      if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs))
+    }
+
+    if (lastMismatch) {
+      const finalDiff = compareImages(baselineImg, lastMismatch.actualImg, opts.threshold, true)
+      await writeArtifact(actualPath, lastMismatch.bytes)
+      if (finalDiff.diffPng) await writeArtifact(diffPath, finalDiff.diffPng)
+      throw new Error(
+        `${targetLabel}.toHaveScreenshot: Screenshot mismatch (${finalDiff.diffPixels} of ${finalDiff.totalPixels} pixels differ, ratio ${finalDiff.diffRatio.toFixed(6)}; ` +
+          `expected ${finalDiff.expectedSize[0]}x${finalDiff.expectedSize[1]}, actual ${finalDiff.actualSize[0]}x${finalDiff.actualSize[1]}).\n` +
+          `Baseline: ${baselinePath}\nActual:   ${actualPath}\nDiff:     ${diffPath}`,
+      )
+    }
+
+    throw new Error(
+      `${targetLabel}.toHaveScreenshot: Timed out ${timeoutMs}ms waiting for screenshot (${lastErr ?? 'unknown error'}).`,
+    )
+  } finally {
+    if (disableAnim && !isClosed()) await restoreAnimations()
   }
 }
 

@@ -11,6 +11,8 @@ mod profiles;
 mod proxies;
 mod source;
 mod tracing_rec;
+mod video;
+mod visual;
 
 pub use adaptive::AdaptiveConfig;
 pub use fluxwright_cdp::{
@@ -34,3 +36,8 @@ pub use profiles::{validate_profile_name, ProfileInfo, ProfileStore};
 pub use proxies::{parse_proxy_url, ProxyLease, ProxyPool, ProxyRotation, ProxyStatus};
 pub use source::{BrowserSource, LocalChromium, RemoteCdp};
 pub use tracing_rec::{Tracing, TracingChunkOptions, TracingStartOptions};
+pub use video::{encode_mjpeg_avi, RecordVideoOptions, Video, VideoRecorder};
+pub use visual::{
+    compare_images, decode_png, encode_png, Animations, RgbaImage, ToHaveScreenshotOptions,
+    VisualDiff,
+};

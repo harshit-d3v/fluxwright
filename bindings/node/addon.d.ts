@@ -1,5 +1,6 @@
 export * from './index'
 import {
+  BoundingBox,
   Browser,
   Chromium,
   ConsoleMessage,
@@ -13,7 +14,34 @@ import {
   PdfOptions,
   ScreenshotOptions,
   StorageState,
+  ViewportSize,
 } from './index'
+
+export interface RecordVideoOptions {
+  dir: string
+  size?: ViewportSize
+}
+
+export interface Video {
+  path(): Promise<string>
+  saveAs(path: string): Promise<void>
+  delete(): Promise<void>
+}
+
+export interface ToHaveScreenshotOptions {
+  threshold?: number
+  maxDiffPixels?: number
+  maxDiffPixelRatio?: number
+  animations?: 'disabled' | 'allow'
+  timeout?: number
+  update?: boolean
+  omitBackground?: boolean
+}
+
+export interface PageToHaveScreenshotOptions extends ToHaveScreenshotOptions {
+  fullPage?: boolean
+  clip?: BoundingBox
+}
 
 export interface FilterOptions {
   has?: Locator
@@ -40,12 +68,14 @@ export interface LocatorAssertions {
   toHaveAttribute(name: string, value: string | RegExp, options?: ExpectOptions): Promise<void>
   toHaveClass(expected: string | RegExp, options?: ExpectOptions): Promise<void>
   toHaveCount(count: number, options?: ExpectOptions): Promise<void>
+  toHaveScreenshot(nameOrPath: string | Array<string>, options?: ToHaveScreenshotOptions): Promise<void>
 }
 
 export interface PageAssertions {
   readonly not: PageAssertions
   toHaveTitle(titleOrRegExp: string | RegExp, options?: ExpectOptions): Promise<void>
   toHaveURL(urlOrRegExp: string | RegExp, options?: ExpectOptions): Promise<void>
+  toHaveScreenshot(nameOrPath: string | Array<string>, options?: PageToHaveScreenshotOptions): Promise<void>
 }
 
 export interface Expect {
@@ -461,6 +491,9 @@ export interface Frame {
 }
 
 declare module './index' {
+  interface NewPageOptions {
+    recordVideo?: RecordVideoOptions
+  }
   interface Browser {
     /** A browser context with `newPage`'s options, as Playwright's `newContext`. */
     newContext(options?: NewPageOptions): Promise<BrowserContext>
@@ -469,6 +502,7 @@ declare module './index' {
     locator(selector: string, options?: FilterOptions): Locator
   }
   interface Page {
+    video(): Video | null
     locator(selector: string, options?: FilterOptions): Locator
     /**
      * Runs `pageFunction` in the page with `arg` and returns its result, awaiting promises.

@@ -1,7 +1,13 @@
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::pool::{with_timeout, Locator, PageLease};
+use crate::visual::{
+    artifact_paths, compare_images, decode_png, should_update_snapshots, Animations, RgbaImage,
+    ToHaveScreenshotOptions, DISABLE_ANIMATIONS_LOCATOR_JS, DISABLE_ANIMATIONS_PAGE_JS,
+    RESTORE_ANIMATIONS_LOCATOR_JS, RESTORE_ANIMATIONS_PAGE_JS,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5000);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -570,6 +576,32 @@ impl<'a> LocatorExpect<'a> {
         )
         .await
     }
+
+    /// Asserts that the element screenshot matches the golden PNG at `path` (auto-retrying).
+    pub async fn to_have_screenshot(self, path: impl AsRef<Path>) -> Result<()> {
+        self.to_have_screenshot_with(path, &ToHaveScreenshotOptions::default())
+            .await
+    }
+
+    /// Asserts that the element screenshot matches the golden PNG at `path` with options.
+    pub async fn to_have_screenshot_with(
+        self,
+        path: impl AsRef<Path>,
+        options: &ToHaveScreenshotOptions,
+    ) -> Result<()> {
+        let target = self.target_label();
+        run_to_have_screenshot(
+            &target,
+            path.as_ref(),
+            options,
+            self.negated,
+            self.timeout,
+            self.poll_interval,
+            self.locator.lease(),
+            Some(self.locator),
+        )
+        .await
+    }
 }
 
 impl<'a> PageExpect<'a> {
@@ -655,6 +687,330 @@ impl<'a> PageExpect<'a> {
         )
         .await
     }
+
+    /// Asserts that the page screenshot matches the golden PNG at `path` (auto-retrying).
+    pub async fn to_have_screenshot(self, path: impl AsRef<Path>) -> Result<()> {
+        self.to_have_screenshot_with(path, &ToHaveScreenshotOptions::default())
+            .await
+    }
+
+    /// Asserts that the page screenshot matches the golden PNG at `path` with options.
+    pub async fn to_have_screenshot_with(
+        self,
+        path: impl AsRef<Path>,
+        options: &ToHaveScreenshotOptions,
+    ) -> Result<()> {
+        run_to_have_screenshot(
+            "expect(page)",
+            path.as_ref(),
+            options,
+            self.negated,
+            self.timeout,
+            self.poll_interval,
+            self.page,
+            None,
+        )
+        .await
+    }
+}
+
+async fn apply_animation_guard(
+    page: &PageLease,
+    locator: Option<&Locator<'_>>,
+    disable: bool,
+) {
+    if !disable || page.is_closed() {
+        return;
+    }
+    let _ = with_timeout(
+        Some(Duration::from_millis(500)),
+        page.evaluate(DISABLE_ANIMATIONS_PAGE_JS),
+    )
+    .await;
+    if let Some(loc) = locator.filter(|l| !l.selector().frames.is_empty()) {
+        let _ = with_timeout(
+            Some(Duration::from_millis(500)),
+            loc.evaluate(DISABLE_ANIMATIONS_LOCATOR_JS, None),
+        )
+        .await;
+    }
+}
+
+async fn clear_animation_guard(
+    page: &PageLease,
+    locator: Option<&Locator<'_>>,
+    disable: bool,
+) {
+    if !disable || page.is_closed() {
+        return;
+    }
+    let _ = with_timeout(
+        Some(Duration::from_millis(500)),
+        page.evaluate(RESTORE_ANIMATIONS_PAGE_JS),
+    )
+    .await;
+    if let Some(loc) = locator.filter(|l| !l.selector().frames.is_empty()) {
+        let _ = with_timeout(
+            Some(Duration::from_millis(500)),
+            loc.evaluate(RESTORE_ANIMATIONS_LOCATOR_JS, None),
+        )
+        .await;
+    }
+}
+
+async fn capture_png_shot(
+    page: &PageLease,
+    locator: Option<&Locator<'_>>,
+    options: &ToHaveScreenshotOptions,
+    limit: Duration,
+) -> Result<Vec<u8>> {
+    if page.is_closed() {
+        return Err(Error::Other("page is closed".into()));
+    }
+    if let Some(loc) = locator {
+        let shot_opts = fluxwright_cdp::ScreenshotOptions {
+            omit_background: options.omit_background,
+            ..Default::default()
+        };
+        with_timeout(Some(limit), loc.screenshot_with(&shot_opts)).await
+    } else {
+        let shot_opts = fluxwright_cdp::ScreenshotOptions {
+            full_page: options.full_page,
+            clip: options.clip,
+            omit_background: options.omit_background,
+            ..Default::default()
+        };
+        with_timeout(Some(limit), page.screenshot_with(&shot_opts)).await
+    }
+}
+
+async fn write_file_mkdir(path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &bytes)
+    })
+    .await
+    .map_err(|e| Error::Other(e.to_string()))?
+    .map_err(|e| Error::Other(format!("write snapshot artifact: {e}")))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_to_have_screenshot(
+    target: &str,
+    path: &Path,
+    options: &ToHaveScreenshotOptions,
+    negated: bool,
+    timeout: Duration,
+    poll_interval: Duration,
+    page: &PageLease,
+    locator: Option<&Locator<'_>>,
+) -> Result<()> {
+    if negated {
+        return Err(Error::Other(format!(
+            "{target}.to_have_screenshot: .not() is not supported"
+        )));
+    }
+    options.validate()?;
+    if locator.is_some() && (options.full_page || options.clip.is_some()) {
+        return Err(Error::Other(
+            "expect(locator).to_have_screenshot: full_page and clip are for page screenshots only"
+                .into(),
+        ));
+    }
+
+    let disable_animations = options.animations == Animations::Disabled;
+    let res = run_to_have_screenshot_inner(
+        target,
+        path,
+        options,
+        timeout,
+        poll_interval,
+        page,
+        locator,
+        disable_animations,
+    )
+    .await;
+    clear_animation_guard(page, locator, disable_animations).await;
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_to_have_screenshot_inner(
+    target: &str,
+    path: &Path,
+    options: &ToHaveScreenshotOptions,
+    timeout: Duration,
+    poll_interval: Duration,
+    page: &PageLease,
+    locator: Option<&Locator<'_>>,
+    disable_animations: bool,
+) -> Result<()> {
+    let (baseline_path, actual_path, diff_path) = artifact_paths(path);
+    let shot_limit = |remaining: Duration| -> Duration {
+        remaining.clamp(Duration::from_millis(100), Duration::from_secs(2))
+    };
+
+    if should_update_snapshots(options.update) {
+        let start = Instant::now();
+        let mut prev_img: Option<RgbaImage> = None;
+        let mut last_err: Option<String>;
+        let mut attempts = 0usize;
+        loop {
+            apply_animation_guard(page, locator, disable_animations).await;
+            let remaining = timeout.saturating_sub(start.elapsed());
+            match capture_png_shot(page, locator, options, shot_limit(remaining)).await {
+                Ok(bytes) => {
+                    attempts += 1;
+                    let img = decode_png(&bytes)?;
+                    if let Some(ref prev) = prev_img {
+                        let diff = compare_images(prev, &img, options.threshold, false)?;
+                        if diff.is_within_tolerance(options) {
+                            write_file_mkdir(baseline_path, bytes).await?;
+                            return Ok(());
+                        }
+                    } else if timeout.is_zero() {
+                        write_file_mkdir(baseline_path, bytes).await?;
+                        return Ok(());
+                    }
+                    prev_img = Some(img);
+                    last_err = None;
+                }
+                Err(e) if is_fatal_error(&e) => return Err(e),
+                Err(e) => last_err = Some(e.to_string()),
+            }
+
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                if attempts >= 2 {
+                    return Err(Error::Cdp(fluxwright_cdp::Error::timeout(
+                        format!(
+                            "{target}.to_have_screenshot: screenshot did not stabilize for snapshot update at {}",
+                            baseline_path.display()
+                        ),
+                        timeout.as_millis() as u64,
+                    )));
+                }
+                if attempts == 1 {
+                    // Single shot exhausted a tight timeout; capture one confirmation shot.
+                    let confirm_limit = Duration::from_secs(1);
+                    if let Ok(bytes) = capture_png_shot(page, locator, options, confirm_limit).await {
+                        let img = decode_png(&bytes)?;
+                        if let Some(ref prev) = prev_img {
+                            let diff = compare_images(prev, &img, options.threshold, false)?;
+                            if diff.is_within_tolerance(options) {
+                                write_file_mkdir(baseline_path, bytes).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                return Err(Error::Cdp(fluxwright_cdp::Error::timeout(
+                    format!(
+                        "{target}.to_have_screenshot: failed to capture snapshot ({})",
+                        last_err.unwrap_or_else(|| "did not stabilize".into())
+                    ),
+                    timeout.as_millis() as u64,
+                )));
+            }
+            let wait = poll_interval.min(timeout - elapsed);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+
+    let baseline_read = {
+        let p = baseline_path.clone();
+        tokio::task::spawn_blocking(move || std::fs::read(&p))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
+    };
+    let baseline_bytes = match baseline_read {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            apply_animation_guard(page, locator, disable_animations).await;
+            if let Ok(actual) = capture_png_shot(page, locator, options, Duration::from_secs(2)).await {
+                let _ = write_file_mkdir(actual_path.clone(), actual).await;
+            }
+            return Err(Error::Other(format!(
+                "{target}.to_have_screenshot: baseline snapshot does not exist at {} (run with FLUXWRIGHT_UPDATE_SNAPSHOTS=1 or update(true) to create it; actual={})",
+                baseline_path.display(),
+                actual_path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(Error::Other(format!(
+                "{target}.to_have_screenshot: failed to read baseline {}: {e}",
+                baseline_path.display()
+            )))
+        }
+    };
+
+    let baseline_img = decode_png(&baseline_bytes)?;
+    let start = Instant::now();
+    let mut last_mismatch: Option<(Vec<u8>, RgbaImage)> = None;
+    let mut last_err: Option<String>;
+
+    loop {
+        apply_animation_guard(page, locator, disable_animations).await;
+        let remaining = timeout.saturating_sub(start.elapsed());
+        match capture_png_shot(page, locator, options, shot_limit(remaining)).await {
+            Ok(bytes) => {
+                let actual_img = decode_png(&bytes)?;
+                let diff = compare_images(&baseline_img, &actual_img, options.threshold, false)?;
+                if diff.is_within_tolerance(options) {
+                    return Ok(());
+                }
+                last_mismatch = Some((bytes, actual_img));
+                last_err = None;
+            }
+            Err(e) if is_fatal_error(&e) => return Err(e),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            break;
+        }
+        let wait = poll_interval.min(timeout - elapsed);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    if let Some((actual_bytes, actual_img)) = last_mismatch {
+        let final_diff = compare_images(&baseline_img, &actual_img, options.threshold, true)?;
+        write_file_mkdir(actual_path.clone(), actual_bytes).await?;
+        if let Some(diff_png) = final_diff.diff_png {
+            write_file_mkdir(diff_path.clone(), diff_png).await?;
+        }
+        return Err(Error::Cdp(fluxwright_cdp::Error::timeout(
+            format!(
+                "{target}.to_have_screenshot: screenshot mismatch ({} of {} pixels differ, ratio {:.6}; expected {}x{}, actual {}x{}; baseline={}, actual={}, diff={})",
+                final_diff.diff_pixels,
+                final_diff.total_pixels,
+                final_diff.diff_ratio,
+                final_diff.expected_size.0,
+                final_diff.expected_size.1,
+                final_diff.actual_size.0,
+                final_diff.actual_size.1,
+                baseline_path.display(),
+                actual_path.display(),
+                diff_path.display(),
+            ),
+            timeout.as_millis() as u64,
+        )));
+    }
+
+    Err(Error::Cdp(fluxwright_cdp::Error::timeout(
+        format!(
+            "{target}.to_have_screenshot: {}",
+            last_err.unwrap_or_else(|| "screenshot comparison timed out".into())
+        ),
+        timeout.as_millis() as u64,
+    )))
 }
 
 #[cfg(test)]
