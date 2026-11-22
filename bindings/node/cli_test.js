@@ -45,12 +45,81 @@ Options:
 `)
 }
 
-function parseRegexPattern(pattern) {
-  const slashMatch = /^\/(.+)\/([dgimsuvy]*)$/.exec(pattern)
-  if (slashMatch) {
-    return new RegExp(slashMatch[1], slashMatch[2].replace(/[gy]/g, ''))
+function matchGrepBranch(haystack, branch) {
+  let raw = branch
+  const anchorStart = raw.startsWith('^')
+  if (anchorStart) raw = raw.slice(1)
+  const anchorEnd = raw.endsWith('$') && !raw.endsWith('\\$')
+  if (anchorEnd) raw = raw.slice(0, -1)
+
+  const parts = raw.split(/\.\*|\*/).map((s) => s.replace(/\\([.*+?^${}()|[\]\\/])/g, '$1'))
+  if (parts.length === 1) {
+    const pat = parts[0]
+    if (anchorStart && anchorEnd) return haystack === pat
+    if (anchorStart) return haystack.startsWith(pat)
+    if (anchorEnd) return haystack.endsWith(pat)
+    return haystack.includes(pat)
   }
-  return new RegExp(pattern)
+
+  let pos = 0
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]
+    if (i === 0 && anchorStart) {
+      if (!haystack.startsWith(part)) return false
+      pos = part.length
+      continue
+    }
+    if (i === parts.length - 1 && anchorEnd) {
+      return part === '' ? true : haystack.endsWith(part) && haystack.length - part.length >= pos
+    }
+    if (!part) continue
+    const idx = haystack.indexOf(part, pos)
+    if (idx === -1) return false
+    pos = idx + part.length
+  }
+  return true
+}
+
+function splitTopLevelAlternatives(pattern) {
+  const branches = []
+  let cur = ''
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]
+    if (ch === '\\' && i + 1 < pattern.length) {
+      cur += ch + pattern[i + 1]
+      i += 1
+    } else if (ch === '|') {
+      branches.push(cur)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  branches.push(cur)
+  return branches
+}
+
+function compileGrepMatcher(pattern) {
+  let body = String(pattern)
+  let caseInsensitive = false
+  if (body.length >= 2 && body.startsWith('/')) {
+    const lastSlash = body.lastIndexOf('/')
+    if (lastSlash > 0) {
+      const flags = body.slice(lastSlash + 1)
+      if (/^[dgimsuvy]*$/.test(flags)) {
+        caseInsensitive = flags.includes('i')
+        body = body.slice(1, lastSlash)
+      }
+    }
+  }
+  const branches = splitTopLevelAlternatives(body).map((b) => (caseInsensitive ? b.toLowerCase() : b))
+  return {
+    lastIndex: 0,
+    test(text) {
+      const haystack = caseInsensitive ? String(text).toLowerCase() : String(text)
+      return branches.some((branch) => matchGrepBranch(haystack, branch))
+    },
+  }
 }
 
 function parseShard(raw) {
@@ -161,9 +230,9 @@ function parseArgs(argv) {
     } else if (flag === '--retries') {
       opts.retries = parseNonNegativeInt(takeValue(), flag)
     } else if (flag === '--grep' || flag === '-g') {
-      opts.grep = parseRegexPattern(takeValue())
+      opts.grep = compileGrepMatcher(takeValue())
     } else if (flag === '--grep-invert') {
-      opts.grepInvert = parseRegexPattern(takeValue())
+      opts.grepInvert = compileGrepMatcher(takeValue())
     } else if (flag === '--reporter') {
       const list = takeValue().split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
       if (!list.length) throw new Error('Invalid --reporter: must specify at least one reporter')

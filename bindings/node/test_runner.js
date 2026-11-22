@@ -657,8 +657,10 @@ async function loadTestFile(filePath, cwd = process.cwd()) {
   const fileSuite = createSuite('', null, relPath)
   const prevRoot = state.rootSuite
   const prevStack = state.suiteStack
+  const prevNextId = state.nextId
   state.rootSuite = fileSuite
   state.suiteStack = [fileSuite]
+  state.nextId = 1
   try {
     const url = pathToFileURL(absPath).href
     await import(url)
@@ -671,6 +673,7 @@ async function loadTestFile(filePath, cwd = process.cwd()) {
   } finally {
     state.rootSuite = prevRoot
     state.suiteStack = prevStack
+    state.nextId = prevNextId
   }
 }
 
