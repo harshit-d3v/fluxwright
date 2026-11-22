@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import threading
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -194,6 +196,16 @@ def test_intentional_failure(page):
     traces = list(out_dir.rglob("*.zip"))
     assert len(traces) == 1, f"expected 1 failure trace, found {traces}"
     assert traces[0].read_bytes()[:4] == b"PK\x03\x04"
+    # Verify page stayed open until tracing.stop() so trace.zip includes >= 1 screenshot frame!
+    with zipfile.ZipFile(traces[0], "r") as zf:
+        trace_lines = [
+            json.loads(line)
+            for line in zf.read("trace.trace").decode("utf-8").splitlines()
+            if line.strip()
+        ]
+        frames = [e for e in trace_lines if e.get("type") == "screencast-frame"]
+        assert len(frames) >= 1, f"expected >= 1 screencast-frame in pytest trace.zip: {trace_lines}"
+        assert f"resources/{frames[0]['sha1']}" in set(zf.namelist())
     videos = list(out_dir.rglob("*.avi")) + list(out_dir.rglob("*.webm"))
     assert len(videos) == 1, f"expected 1 failure video, found {videos}"
     assert videos[0].read_bytes()[:4] in (b"RIFF", b"\x1a\x45\xdf\xa3")
@@ -299,3 +311,208 @@ def test_plugin_feature_detection_hooks_with_mocks(tmp_path: Path) -> None:
 
     assert pytest_plugin._get_video_handle(_FakePageWithProp()) is v_keep  # type: ignore[arg-type]
     assert pytest_plugin._get_video_handle(_FakePageWithMethod()) is v_drop  # type: ignore[arg-type]
+
+    # When delete_source=False (user-configured record_video_dir), delete() is NEVER called.
+    prev_deletes = len(deleted_videos)
+    pytest_plugin._save_or_discard_video(v_drop, keep=False, artifact_dir=artifact_dir, index=0, delete_source=False)
+    pytest_plugin._save_or_discard_video(v_keep, keep=True, artifact_dir=artifact_dir, index=2, delete_source=False)
+    assert len(deleted_videos) == prev_deletes
+
+
+def test_plugin_sanitize_nodeid_rep_reset_and_base_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    s1 = pytest_plugin._sanitize_nodeid("test_a.py::test_fn[a/b]")
+    s2 = pytest_plugin._sanitize_nodeid("test_a.py::test_fn[a:b]")
+    assert s1 != s2
+
+    for bad_dot in (".", "..", "...", ""):
+        res = pytest_plugin._sanitize_nodeid(bad_dot)
+        assert res not in ("", ".", "..")
+        assert not res.endswith((".", " "))
+
+    trailing = pytest_plugin._sanitize_nodeid("test_dots...   ")
+    assert not trailing.endswith((".", " "))
+
+    for reserved in ("CON", "PRN", "AUX", "NUL", "COM1", "COM9", "LPT1", "LPT9", "nul.py", "CON.txt"):
+        res = pytest_plugin._sanitize_nodeid(reserved)
+        assert res.split(".", 1)[0].upper() not in pytest_plugin._WINDOWS_RESERVED_NAMES
+        assert res.startswith("_")
+
+    # pytest_runtest_setup clears stale _fluxwright_rep_* attributes (e.g. reruns).
+    class _DummyItem:
+        pass
+
+    item = _DummyItem()
+    item._fluxwright_rep_setup = object()  # type: ignore[attr-defined]
+    item._fluxwright_rep_call = object()  # type: ignore[attr-defined]
+    item._fluxwright_rep_teardown = object()  # type: ignore[attr-defined]
+    pytest_plugin.pytest_runtest_setup(item)  # type: ignore[arg-type]
+    assert not hasattr(item, "_fluxwright_rep_setup")
+    assert not hasattr(item, "_fluxwright_rep_call")
+    assert not hasattr(item, "_fluxwright_rep_teardown")
+
+    # base_url falls back to PYTEST_BASE_URL when --base-url, ini, and FLUXWRIGHT_BASE_URL are unset.
+    class _DummyConfig:
+        def getoption(self, name: str, default: object = None) -> object:
+            return default
+
+        def getini(self, name: str) -> str:
+            return ""
+
+    monkeypatch.delenv("FLUXWRIGHT_BASE_URL", raising=False)
+    monkeypatch.setenv("PYTEST_BASE_URL", "http://127.0.0.1:9999")
+    assert pytest_plugin._resolve_base_url(_DummyConfig()) == "http://127.0.0.1:9999"  # type: ignore[arg-type]
+
+
+def test_plugin_user_video_dir_preserved_secondary_pages_and_soft_expect(
+    tmp_path: Path, plugin_server: str
+) -> None:
+    # 1. User-configured record_video_dir must NEVER be deleted on passing tests.
+    user_vid_dir = tmp_path / "user-videos"
+    user_proj = tmp_path / "user_vid_proj"
+    user_proj.mkdir()
+    (user_proj / "conftest.py").write_text(
+        f"""
+import pytest
+
+@pytest.fixture(scope="session")
+def browser_context_args():
+    return {{"record_video_dir": {str(user_vid_dir)!r}}}
+""",
+        encoding="utf-8",
+    )
+    (user_proj / "test_user_vid.py").write_text(
+        """
+def test_pass_keeps_user_video(page):
+    page.goto("/hello")
+    assert page.title() == "Plugin Hello"
+""",
+        encoding="utf-8",
+    )
+    res_user = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-o",
+            "addopts=",
+            str(user_proj / "test_user_vid.py"),
+            f"--base-url={plugin_server}",
+            "--fluxwright-max-browsers=1",
+            "--fluxwright-video=retain-on-failure",
+        ],
+        cwd=str(user_proj),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_user.returncode == 0, res_user.stdout + res_user.stderr
+    user_vids = list(user_vid_dir.glob("*.avi")) + list(user_vid_dir.glob("*.webm"))
+    assert len(user_vids) == 1, f"user record_video_dir video should be preserved, found {user_vids}"
+
+    # 2. Early-closed secondary page retains video on failure, and expect.soft fails the test cleanly.
+    multi_out = tmp_path / "multi-artifacts"
+    multi_file = tmp_path / "test_multi_and_soft.py"
+    multi_file.write_text(
+        """
+from fluxwright.sync_api import expect
+
+def test_early_closed_page_and_soft_fail(context, page):
+    page.goto("/hello")
+    p2 = context.new_page()
+    p2.goto("/")
+    p2.close()
+    expect.soft(page.locator("#hdr")).to_have_text("Soft Wrong 1", timeout=100)
+    expect.soft(page.locator("#hdr")).to_have_text("Soft Wrong 2", timeout=100)
+""",
+        encoding="utf-8",
+    )
+    res_multi = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-o",
+            "addopts=",
+            str(multi_file),
+            f"--base-url={plugin_server}",
+            "--fluxwright-max-browsers=1",
+            f"--fluxwright-output={multi_out}",
+            "--fluxwright-screenshot=only-on-failure",
+            "--fluxwright-video=retain-on-failure",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_multi.returncode != 0
+    assert "Soft Wrong 1" in res_multi.stdout
+    assert "Soft Wrong 2" in res_multi.stdout
+    pngs = list(multi_out.rglob("*.png"))
+    assert len(pngs) == 1
+    videos = list(multi_out.rglob("*.avi")) + list(multi_out.rglob("*.webm"))
+    assert len(videos) >= 2, f"expected >= 2 videos (main + early-closed p2), found {videos}"
+
+
+def test_plugin_context_setup_failure_cleans_tempdir_and_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    created_dirs: list[Path] = []
+    orig_mkdtemp = pytest_plugin.tempfile.mkdtemp
+
+    def _track_mkdtemp(*args: object, **kwargs: object) -> str:
+        d = orig_mkdtemp(*args, **kwargs)
+        created_dirs.append(Path(d))
+        return d
+
+    monkeypatch.setattr(pytest_plugin.tempfile, "mkdtemp", _track_mkdtemp)
+
+    class _BoomTracing:
+        def start(self, **kwargs: object) -> None:
+            raise RuntimeError("tracing start boom")
+
+        def stop(self, **kwargs: object) -> None:
+            return None
+
+    class _FakeCtx:
+        def __init__(self) -> None:
+            self.pages: list = []
+            self.tracing = _BoomTracing()
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_ctx = _FakeCtx()
+
+    class _FakeBrowser:
+        def new_context(self, *, record_video_dir: str | None = None, **kwargs: object) -> _FakeCtx:
+            return fake_ctx
+
+    class _FakeConfig:
+        def getoption(self, name: str, default: object = None) -> object:
+            return {
+                "--fluxwright-output": str(tmp_path / "out"),
+                "--fluxwright-screenshot": "only-on-failure",
+                "--fluxwright-tracing": "on",
+                "--fluxwright-video": "on",
+            }.get(name, default)
+
+    class _FakeNode:
+        nodeid = "test_setup_leak.py::test_boom"
+
+    class _FakeRequest:
+        node = _FakeNode()
+
+    gen = pytest_plugin._context_lifecycle(
+        _FakeBrowser(),  # type: ignore[arg-type]
+        {},
+        None,
+        _FakeConfig(),  # type: ignore[arg-type]
+        _FakeRequest(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(RuntimeError, match="tracing start boom"):
+        next(gen)
+    assert fake_ctx.closed is True
+    assert len(created_dirs) == 1
+    assert not created_dirs[0].exists()

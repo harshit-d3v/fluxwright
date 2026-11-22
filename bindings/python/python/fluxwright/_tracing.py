@@ -11,11 +11,57 @@ import os
 from pathlib import Path
 import sys
 import time
+import traceback
 from typing import Any
 import weakref
 import zipfile
 
+try:
+    from . import _native
+except ImportError:  # pragma: no cover
+    _native = None  # type: ignore[assignment]
 from ._errors import Error
+
+
+def _to_camel_method(name: str) -> str:
+    if name == "wait_for_url":
+        return "waitForURL"
+    if "_" not in name:
+        return name
+    parts = name.split("_")
+    return parts[0] + "".join(p.capitalize() for p in parts[1:] if p)
+
+
+def _page_key(page: Any) -> str:
+    target_id_fn = getattr(page, "_target_id", None)
+    if callable(target_id_fn):
+        tid = target_id_fn()
+        if isinstance(tid, str) and tid:
+            return tid
+    return f"obj:{id(page)}"
+
+
+def _request_key(page_id: str, req: Any) -> tuple[str, str]:
+    native = getattr(req, "_native", None)
+    req_id = getattr(native, "id", None) if native is not None else getattr(req, "id", None)
+    if isinstance(req_id, str) and req_id:
+        return (page_id, req_id)
+    return (page_id, f"obj:{id(req)}")
+
+
+def _write_trace_zip(
+    dest_path: str,
+    trace_body: str,
+    net_body: str,
+    resources: dict[str, bytes],
+) -> None:
+    out = Path(dest_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("trace.trace", trace_body.encode("utf-8"))
+        zf.writestr("trace.network", net_body.encode("utf-8"))
+        for res_key in sorted(resources.keys()):
+            zf.writestr(res_key, resources[res_key])
 
 
 def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -156,21 +202,25 @@ class AsyncTracing:
         self._lock: asyncio.Lock | None = None
         self._active = False
         self._chunk_active = False
+        self._session_gen = 0
+        self._chunk_seq = 0
         self._screenshots = False
         self._snapshots = False
+        self._sources = False
         self._name: str | None = None
         self._title: str | None = None
         self._origin_perf = 0.0
         self._origin_wall = 0
         self._next_call_seq = 0
         self._next_page_seq = 0
-        self._page_ids: dict[int, str] = {}
+        self._page_ids: dict[str, str] = {}
         self._trace_lines: list[str] = []
         self._network_lines: list[str] = []
         self._resources: dict[str, bytes] = {}
         self._chunk_frames = 0
-        self._in_flight_net: dict[int, dict[str, Any]] = {}
-        self._watchers: dict[int, dict[str, Any]] = {}
+        self._in_flight_net: dict[tuple[str, str], dict[str, Any]] = {}
+        self._watchers: dict[str, dict[str, Any]] = {}
+        self._pending_page_tasks: set[asyncio.Task[Any]] = set()
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -181,7 +231,7 @@ class AsyncTracing:
         return (time.perf_counter() - self._origin_perf) * 1000.0
 
     def _ensure_page_id(self, page: Any) -> str:
-        key = id(page)
+        key = _page_key(page)
         page_id = self._page_ids.get(key)
         if page_id is None:
             self._next_page_seq += 1
@@ -202,6 +252,7 @@ class AsyncTracing:
             "options": {
                 "screenshots": self._screenshots,
                 "snapshots": self._snapshots,
+                "sources": self._sources,
             },
         }
         if self._title is not None:
@@ -211,6 +262,7 @@ class AsyncTracing:
         self._trace_lines.append(json.dumps(entry, separators=(",", ":")))
 
     def _reset_chunk(self, name: str | None, title: str | None) -> None:
+        self._chunk_seq += 1
         self._name = name
         self._title = title
         self._trace_lines = []
@@ -239,13 +291,14 @@ class AsyncTracing:
                     )
                 )
 
-    def _flush_network(self) -> None:
+    def _snapshot_network_lines(self) -> list[str]:
         end_ms = self._mono_ms()
-        for key in list(self._in_flight_net.keys()):
-            item = self._in_flight_net.pop(key)
-            if self._chunk_active:
+        lines = list(self._network_lines)
+        if self._chunk_active:
+            for item in self._in_flight_net.values():
                 snap = _build_resource_snapshot(item, end_ms)
-                self._network_lines.append(json.dumps(snap, separators=(",", ":")))
+                lines.append(json.dumps(snap, separators=(",", ":")))
+        return lines
 
     def _record_jpeg_frame(
         self,
@@ -284,19 +337,20 @@ class AsyncTracing:
         )
 
     async def _attach_page(self, page: Any) -> None:
-        page_key = id(page)
+        page_key = _page_key(page)
         if not self._active or page.is_closed() or page_key in self._watchers:
             return
         ctx = self._context_ref()
         if ctx is None:
             return
+        gen = self._session_gen
         page_id = self._ensure_page_id(page)
         self_ref = weakref.ref(self)
         page_ref = weakref.ref(page)
 
         def on_console(msg: Any) -> None:
             t = self_ref()
-            if t is None or not t._active or not t._chunk_active:
+            if t is None or not t._active or not t._chunk_active or t._session_gen != gen:
                 return
             t._trace_lines.append(
                 json.dumps(
@@ -315,7 +369,7 @@ class AsyncTracing:
 
         def on_pageerror(err: Any) -> None:
             t = self_ref()
-            if t is None or not t._active or not t._chunk_active:
+            if t is None or not t._active or not t._chunk_active or t._session_gen != gen:
                 return
             t._trace_lines.append(
                 json.dumps(
@@ -341,9 +395,9 @@ class AsyncTracing:
 
         def on_request(req: Any) -> None:
             t = self_ref()
-            if t is None or not t._active or not t._chunk_active:
+            if t is None or not t._active or not t._chunk_active or t._session_gen != gen:
                 return
-            t._in_flight_net[id(req)] = {
+            t._in_flight_net[_request_key(page_id, req)] = {
                 "page_id": page_id,
                 "started_date_time": _iso_utc_now(),
                 "start_mono_ms": t._mono_ms(),
@@ -361,10 +415,10 @@ class AsyncTracing:
 
         def on_response(res: Any) -> None:
             t = self_ref()
-            if t is None or not t._active or not t._chunk_active:
+            if t is None or not t._active or not t._chunk_active or t._session_gen != gen:
                 return
             req = res.request
-            req_key = id(req)
+            req_key = _request_key(page_id, req)
             now_ms = t._mono_ms()
             item = t._in_flight_net.get(req_key)
             if item is None:
@@ -394,10 +448,10 @@ class AsyncTracing:
 
         def on_finished(req: Any) -> None:
             t = self_ref()
-            if t is None or not t._active or not t._chunk_active:
+            if t is None or not t._active or not t._chunk_active or t._session_gen != gen:
                 return
             now_ms = t._mono_ms()
-            item = t._in_flight_net.pop(id(req), None)
+            item = t._in_flight_net.pop(_request_key(page_id, req), None)
             if item is None:
                 item = {
                     "page_id": page_id,
@@ -420,10 +474,10 @@ class AsyncTracing:
 
         def on_failed(req: Any) -> None:
             t = self_ref()
-            if t is None or not t._active or not t._chunk_active:
+            if t is None or not t._active or not t._chunk_active or t._session_gen != gen:
                 return
             now_ms = t._mono_ms()
-            item = t._in_flight_net.pop(id(req), None)
+            item = t._in_flight_net.pop(_request_key(page_id, req), None)
             if item is None:
                 item = {
                     "page_id": page_id,
@@ -472,10 +526,21 @@ class AsyncTracing:
         }
         self._watchers[page_key] = watcher
 
+        def _is_stale() -> bool:
+            return (
+                not self._active
+                or self._session_gen != gen
+                or page.is_closed()
+                or self._watchers.get(page_key) is not watcher
+            )
+
         if self._screenshots and not page.is_closed():
-            with suppress(Exception):
+            cdp: Any = None
+            cleanup_cdp: Callable[[], None] | None = None
+            screencast_started = False
+            try:
                 cdp = await ctx.new_cdp_session(page)
-                if not self._active or page.is_closed() or self._watchers.get(page_key) is not watcher:
+                if _is_stale():
                     with suppress(Exception):
                         await cdp.detach()
                     return
@@ -483,7 +548,12 @@ class AsyncTracing:
                 async def on_frame(ev: dict[str, Any]) -> None:
                     t = self_ref()
                     data_b64 = ev.get("data") if isinstance(ev, dict) else None
-                    if t is not None and isinstance(data_b64, str) and data_b64:
+                    if (
+                        t is not None
+                        and t._session_gen == gen
+                        and isinstance(data_b64, str)
+                        and data_b64
+                    ):
                         with suppress(Exception):
                             raw = base64.b64decode(data_b64)
                             meta = ev.get("metadata") or {}
@@ -506,8 +576,14 @@ class AsyncTracing:
                             await cdp.send("Page.screencastFrameAck", {"sessionId": session_id})
 
                 cdp.on("Page.screencastFrame", on_frame)
+                cleanup_cdp = lambda: cdp.remove_listener("Page.screencastFrame", on_frame)  # noqa: E731
                 with suppress(Exception):
                     await cdp.send("Page.enable")
+                if _is_stale():
+                    cleanup_cdp()
+                    with suppress(Exception):
+                        await cdp.detach()
+                    return
                 await cdp.send(
                     "Page.startScreencast",
                     {
@@ -518,10 +594,28 @@ class AsyncTracing:
                         "everyNthFrame": 1,
                     },
                 )
+                screencast_started = True
+                if _is_stale():
+                    cleanup_cdp()
+                    with suppress(Exception):
+                        await cdp.send("Page.stopScreencast")
+                    with suppress(Exception):
+                        await cdp.detach()
+                    return
                 watcher["cdp"] = cdp
-                watcher["cleanup_cdp"] = lambda: cdp.remove_listener("Page.screencastFrame", on_frame)
+                watcher["cleanup_cdp"] = cleanup_cdp
+            except Exception:
+                if cleanup_cdp is not None:
+                    with suppress(Exception):
+                        cleanup_cdp()
+                if cdp is not None:
+                    if screencast_started:
+                        with suppress(Exception):
+                            await cdp.send("Page.stopScreencast")
+                    with suppress(Exception):
+                        await cdp.detach()
 
-    async def _detach_page(self, page_key: int) -> None:
+    async def _detach_page(self, page_key: str) -> None:
         watcher = self._watchers.pop(page_key, None)
         if watcher is None:
             return
@@ -538,30 +632,53 @@ class AsyncTracing:
     def _is_active(self) -> bool:
         return self._active
 
+    def _track_page_created(self, page: Any) -> asyncio.Task[Any]:
+        task = asyncio.ensure_future(self._on_page_created(page))
+        self._pending_page_tasks.add(task)
+        task.add_done_callback(self._pending_page_tasks.discard)
+        return task
+
+    async def _drain_pending_page_tasks(self) -> None:
+        while self._pending_page_tasks:
+            pending = [t for t in self._pending_page_tasks if not t.done()]
+            if not pending:
+                self._pending_page_tasks.clear()
+                break
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def _on_page_created(self, page: Any) -> None:
-        if not self._active:
-            return
-        page_id = self._ensure_page_id(page)
-        if self._chunk_active:
-            self._trace_lines.append(
-                json.dumps(
-                    {
-                        "type": "event",
-                        "time": self._mono_ms(),
-                        "class": "BrowserContext",
-                        "method": "page",
-                        "params": {"pageId": page_id},
-                        "pageId": page_id,
-                    },
-                    separators=(",", ":"),
+        task = asyncio.current_task()
+        added = False
+        if task is not None and task not in self._pending_page_tasks:
+            self._pending_page_tasks.add(task)
+            added = True
+        try:
+            if not self._active:
+                return
+            page_id = self._ensure_page_id(page)
+            if self._chunk_active:
+                self._trace_lines.append(
+                    json.dumps(
+                        {
+                            "type": "event",
+                            "time": self._mono_ms(),
+                            "class": "BrowserContext",
+                            "method": "page",
+                            "params": {"pageId": page_id},
+                            "pageId": page_id,
+                        },
+                        separators=(",", ":"),
+                    )
                 )
-            )
-        await self._attach_page(page)
+            await self._attach_page(page)
+        finally:
+            if added and task is not None:
+                self._pending_page_tasks.discard(task)
 
     async def _on_page_closing(self, page: Any) -> None:
         if not self._active:
             return
-        page_key = id(page)
+        page_key = _page_key(page)
         if self._chunk_active:
             page_id = self._ensure_page_id(page)
             self._trace_lines.append(
@@ -581,10 +698,12 @@ class AsyncTracing:
         self._page_ids.pop(page_key, None)
 
     async def _dispose(self) -> None:
-        if not self._active:
+        if not self._active and not self._watchers and not self._pending_page_tasks:
             return
+        self._session_gen += 1
         self._active = False
         self._chunk_active = False
+        await self._drain_pending_page_tasks()
         for key in list(self._watchers.keys()):
             await self._detach_page(key)
         self._trace_lines.clear()
@@ -592,6 +711,7 @@ class AsyncTracing:
         self._resources.clear()
         self._in_flight_net.clear()
         self._page_ids.clear()
+        self._chunk_frames = 0
 
     async def _run_action(
         self,
@@ -606,6 +726,9 @@ class AsyncTracing:
             return await fn()
         self._next_call_seq += 1
         call_id = f"call@{self._next_call_seq}"
+        chunk_seq = self._chunk_seq
+        session_gen = self._session_gen
+        camel_method = _to_camel_method(method_name)
         page_id = self._ensure_page_id(page)
         start_time = self._mono_ms()
         self._trace_lines.append(
@@ -615,7 +738,7 @@ class AsyncTracing:
                     "callId": call_id,
                     "startTime": start_time,
                     "class": class_name,
-                    "method": method_name,
+                    "method": camel_method,
                     "apiName": api_name,
                     "params": params or {},
                     "pageId": page_id,
@@ -624,24 +747,34 @@ class AsyncTracing:
                 separators=(",", ":"),
             )
         )
-        error_msg: str | None = None
+        error_info: dict[str, str] | None = None
         try:
             return await fn()
         except BaseException as exc:
-            error_msg = str(exc)
+            error_info = {
+                "name": getattr(exc, "name", None) or type(exc).__name__,
+                "message": str(exc),
+                "stack": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            }
             raise
         finally:
-            if self._active and self._chunk_active:
+            if (
+                self._active
+                and self._chunk_active
+                and self._chunk_seq == chunk_seq
+                and self._session_gen == session_gen
+            ):
                 after: dict[str, Any] = {
                     "type": "after",
                     "callId": call_id,
                     "endTime": self._mono_ms(),
                 }
-                if error_msg is not None:
-                    after["error"] = {"message": error_msg}
+                if error_info is not None:
+                    after["error"] = error_info
                 self._trace_lines.append(json.dumps(after, separators=(",", ":")))
 
     async def _finalize_chunk(self, dest_path: str | None) -> None:
+        await self._drain_pending_page_tasks()
         ctx = self._context_ref()
         open_pages = [p for p in (ctx.pages if ctx is not None else []) if not p.is_closed()]
         if dest_path is not None and self._screenshots and self._chunk_frames == 0 and open_pages:
@@ -652,36 +785,40 @@ class AsyncTracing:
                 for page in open_pages:
                     if page.is_closed():
                         continue
-                    watcher = self._watchers.get(id(page))
+                    watcher = self._watchers.get(_page_key(page))
                     cdp = watcher.get("cdp") if watcher is not None else None
-                    if cdp is None:
-                        continue
                     page_id = self._ensure_page_id(page)
-                    with suppress(Exception):
-                        res = await cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 80})
-                        data_b64 = res.get("data") if isinstance(res, dict) else None
-                        if isinstance(data_b64, str) and data_b64:
-                            raw = base64.b64decode(data_b64)
-                            if raw:
-                                self._record_jpeg_frame(page_id, raw)
-                                break
+                    raw: bytes | None = None
+                    if cdp is not None:
+                        with suppress(Exception):
+                            res = await cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 80})
+                            data_b64 = res.get("data") if isinstance(res, dict) else None
+                            if isinstance(data_b64, str) and data_b64:
+                                raw = base64.b64decode(data_b64)
+                    if not raw:
+                        with suppress(Exception):
+                            if _native is not None and isinstance(page, _native.Page):
+                                raw = await _native.Page.screenshot(page, type="jpeg", quality=80)
+                            else:
+                                raw = await page.screenshot(type="jpeg", quality=80)
+                    if raw:
+                        self._record_jpeg_frame(page_id, raw)
 
         await asyncio.sleep(0.02)
-        self._flush_network()
-        self._chunk_active = False
 
         if dest_path is not None:
-            out = Path(dest_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
+            net_lines = self._snapshot_network_lines()
             trace_body = ("\n".join(self._trace_lines) + "\n") if self._trace_lines else ""
-            net_body = ("\n".join(self._network_lines) + "\n") if self._network_lines else ""
-            with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as zf:
-                zf.writestr("trace.trace", trace_body.encode("utf-8"))
-                zf.writestr("trace.network", net_body.encode("utf-8"))
-                for res_key in sorted(self._resources.keys()):
-                    zf.writestr(res_key, self._resources[res_key])
-        else:
-            self._resources.clear()
+            net_body = ("\n".join(net_lines) + "\n") if net_lines else ""
+            resources_copy = dict(self._resources)
+            await asyncio.to_thread(_write_trace_zip, dest_path, trace_body, net_body, resources_copy)
+
+        self._chunk_active = False
+        self._trace_lines.clear()
+        self._network_lines.clear()
+        self._resources.clear()
+        self._in_flight_net.clear()
+        self._chunk_frames = 0
 
     async def start(
         self,
@@ -690,21 +827,25 @@ class AsyncTracing:
         title: str | None = None,
         screenshots: bool | None = None,
         snapshots: bool | None = None,
+        sources: bool | None = None,
     ) -> None:
         """Begins recording a Playwright-compatible trace for every page in this context."""
         opt_name = _check_opt_str("tracing.start", "name", name)
         opt_title = _check_opt_str("tracing.start", "title", title)
         opt_screenshots = _check_opt_bool("tracing.start", "screenshots", screenshots)
         opt_snapshots = _check_opt_bool("tracing.start", "snapshots", snapshots)
+        opt_sources = _check_opt_bool("tracing.start", "sources", sources)
         async with self._get_lock():
             ctx = self._context_ref()
             if ctx is None or ctx._is_closed():
                 raise Error("tracing.start: browser context is closed")
             if self._active:
                 raise Error("Tracing has been already started")
+            self._session_gen += 1
             self._active = True
             self._screenshots = bool(opt_screenshots)
             self._snapshots = bool(opt_snapshots)
+            self._sources = bool(opt_sources)
             self._origin_perf = time.perf_counter()
             self._origin_wall = int(time.time() * 1000)
             self._reset_chunk(opt_name, opt_title)
@@ -741,9 +882,9 @@ class AsyncTracing:
                 if dest_path is not None:
                     raise Error("Tracing has not been started")
                 return
-            if dest_path is not None and not self._chunk_active:
-                raise Error("No active trace chunk; call start_chunk() before stop(path=...)")
             try:
+                if dest_path is not None and not self._chunk_active:
+                    raise Error("No active trace chunk; call start_chunk() before stop(path=...)")
                 if self._chunk_active:
                     await self._finalize_chunk(dest_path)
             finally:
@@ -764,6 +905,7 @@ class SyncTracing:
         title: str | None = None,
         screenshots: bool | None = None,
         snapshots: bool | None = None,
+        sources: bool | None = None,
     ) -> None:
         self._run(
             self._impl.start,
@@ -771,6 +913,7 @@ class SyncTracing:
             title=title,
             screenshots=screenshots,
             snapshots=snapshots,
+            sources=sources,
         )
 
     def start_chunk(self, *, name: str | None = None, title: str | None = None) -> None:

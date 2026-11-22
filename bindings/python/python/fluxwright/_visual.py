@@ -23,7 +23,11 @@ DISABLE_ANIMATIONS_PAGE_JS = """() => {
 
 RESTORE_ANIMATIONS_PAGE_JS = """() => {
   const el = document.getElementById('__fw_disable_animations');
-  if (el) el.remove();
+  if (el) {
+    el.remove();
+    return true;
+  }
+  return false;
 }"""
 
 DISABLE_ANIMATIONS_LOCATOR_JS = """(el) => {
@@ -76,6 +80,15 @@ class VisualDiff:
         return True
 
 
+_VALID_BIT_DEPTHS: dict[int, tuple[int, ...]] = {
+    0: (1, 2, 4, 8, 16),
+    2: (8, 16),
+    3: (1, 2, 4, 8),
+    4: (8, 16),
+    6: (8, 16),
+}
+
+
 def _unfilter_pass(
     raw: memoryview,
     offset: int,
@@ -86,6 +99,11 @@ def _unfilter_pass(
     bit_depth: int,
 ) -> tuple[bytearray, int, int]:
     row_bytes = (width * channels * bit_depth + 7) // 8
+    needed = height * (1 + row_bytes)
+    if len(raw) - offset < needed:
+        raise ValueError(
+            f"decode_png: truncated image data (need {needed} bytes at offset {offset}, have {len(raw) - offset})"
+        )
     recon = bytearray(height * row_bytes)
     for y in range(height):
         flt = raw[offset]
@@ -185,7 +203,17 @@ def _write_rgba_pixels(
             elif color_type == 2 and bit_depth == 8:
                 s = px * 3
                 r, g, b = row[s], row[s + 1], row[s + 2]
-                a = 0 if (trns and len(trns) >= 6 and r == trns[1] and g == trns[3] and b == trns[5]) else 255
+                a = (
+                    0
+                    if (
+                        trns
+                        and len(trns) >= 6
+                        and r == int.from_bytes(trns[0:2], "big")
+                        and g == int.from_bytes(trns[2:4], "big")
+                        and b == int.from_bytes(trns[4:6], "big")
+                    )
+                    else 255
+                )
                 out[dst_idx] = r
                 out[dst_idx + 1] = g
                 out[dst_idx + 2] = b
@@ -210,13 +238,13 @@ def _write_rgba_pixels(
                 g = _read_sample(row, px, 0, channels, bit_depth)
                 a = 255
                 if trns and len(trns) >= 2:
-                    raw_mask = (1 << bit_depth) - 1
-                    t_val = int.from_bytes(trns[:2], "big") & (0xFFFF if bit_depth == 16 else raw_mask)
+                    t_val = int.from_bytes(trns[:2], "big")
                     if bit_depth == 16:
                         raw_sample = int.from_bytes(row[px * 2 : px * 2 + 2], "big")
                     elif bit_depth == 8:
                         raw_sample = row[px]
                     else:
+                        raw_mask = (1 << bit_depth) - 1
                         spb = 8 // bit_depth
                         raw_sample = (row[px // spb] >> (8 - bit_depth * ((px % spb) + 1))) & raw_mask
                     if raw_sample == t_val:
@@ -286,12 +314,24 @@ def decode_png(data: bytes) -> RgbaImage:
     if ihdr is None:
         raise ValueError("decode_png: missing IHDR chunk")
     width, height, bit_depth, color_type, compression, flt_method, interlace = ihdr
+    if width <= 0 or height <= 0 or width > 0x7FFFFFFF or height > 0x7FFFFFFF:
+        raise ValueError(f"decode_png: invalid image dimensions {width}x{height}")
     if compression != 0 or flt_method != 0:
         raise ValueError("decode_png: unsupported compression or filter method")
+    valid_depths = _VALID_BIT_DEPTHS.get(color_type)
+    if valid_depths is None or bit_depth not in valid_depths:
+        raise ValueError(f"decode_png: invalid (color_type={color_type}, bit_depth={bit_depth})")
+    if color_type == 3 and (plte is None or len(plte) == 0 or len(plte) % 3 != 0):
+        raise ValueError("decode_png: indexed PNG requires a valid PLTE chunk")
+    if not idat_parts:
+        raise ValueError("decode_png: missing IDAT chunk")
 
     channels = 1 if color_type in (0, 3) else (3 if color_type == 2 else (2 if color_type == 4 else 4))
     bpp = max(1, (channels * bit_depth + 7) // 8)
-    raw = memoryview(zlib.decompress(b"".join(idat_parts)))
+    try:
+        raw = memoryview(zlib.decompress(b"".join(idat_parts)))
+    except zlib.error as exc:
+        raise ValueError(f"decode_png: invalid zlib stream: {exc}") from None
     rgba = bytearray(width * height * 4)
 
     if interlace == 0:
@@ -347,30 +387,29 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
     return _PNG_SIGNATURE + _make_chunk(b"IHDR", ihdr) + _make_chunk(b"IDAT", idat) + _make_chunk(b"IEND", b"")
 
 
-def _yiq_delta_sq(r1: int, g1: int, b1: int, a1: int, r2: int, g2: int, b2: int, a2: int) -> float:
-    if a1 < 255:
-        a1f = a1 / 255.0
-        rf1 = 192.0 + (r1 - 192.0) * a1f
-        gf1 = 192.0 + (g1 - 192.0) * a1f
-        bf1 = 192.0 + (b1 - 192.0) * a1f
-    else:
-        rf1, gf1, bf1 = float(r1), float(g1), float(b1)
-    if a2 < 255:
-        a2f = a2 / 255.0
-        rf2 = 192.0 + (r2 - 192.0) * a2f
-        gf2 = 192.0 + (g2 - 192.0) * a2f
-        bf2 = 192.0 + (b2 - 192.0) * a2f
-    else:
-        rf2, gf2, bf2 = float(r2), float(g2), float(b2)
-    dr = rf1 - rf2
-    dg = gf1 - gf2
-    db = bf1 - bf2
+def _yiq_rgb_delta_sq(dr: float, dg: float, db: float) -> float:
     if dr == 0.0 and dg == 0.0 and db == 0.0:
         return 0.0
     y = dr * 0.29889531 + dg * 0.58662247 + db * 0.11448223
     i = dr * 0.59597799 - dg * 0.27417610 - db * 0.32180189
     q = dr * 0.21147017 - dg * 0.52261711 + db * 0.31114694
     return 0.5053 * y * y + 0.299 * i * i + 0.1957 * q * q
+
+
+def _yiq_delta_sq(r1: int, g1: int, b1: int, a1: int, r2: int, g2: int, b2: int, a2: int) -> float:
+    if a1 == 255 and a2 == 255:
+        return _yiq_rgb_delta_sq(float(r1 - r2), float(g1 - g2), float(b1 - b2))
+    a1f = a1 / 255.0
+    a2f = a2 / 255.0
+    pr1, pg1, pb1 = r1 * a1f, g1 * a1f, b1 * a1f
+    pr2, pg2, pb2 = r2 * a2f, g2 * a2f, b2 * a2f
+    dr_black = pr1 - pr2
+    dg_black = pg1 - pg2
+    db_black = pb1 - pb2
+    d_black = _yiq_rgb_delta_sq(dr_black, dg_black, db_black)
+    inv_diff = 255.0 * (a2f - a1f)
+    d_white = _yiq_rgb_delta_sq(dr_black + inv_diff, dg_black + inv_diff, db_black + inv_diff)
+    return d_black if d_black >= d_white else d_white
 
 
 def compare_images(
@@ -466,19 +505,43 @@ def compare_images(
     )
 
 
+def _has_parent_traversal(raw: str) -> bool:
+    return any(part == ".." for part in raw.replace("\\", "/").split("/"))
+
+
 def artifact_paths(name: str | PathLike[str] | Sequence[str]) -> tuple[Path, Path, Path]:
+    if isinstance(name, (bytes, bytearray)):
+        raise TypeError("to_have_screenshot: path must be a str, PathLike, or Sequence[str]")
     if isinstance(name, (str, PathLike)):
         s = os.fspath(name)
-        if not isinstance(s, str) or not s:
+        if not isinstance(s, str) or not s or not s.strip():
             raise ValueError("to_have_screenshot: path must be non-empty")
+        if s.endswith(("/", "\\")) or s == "." or s.replace("\\", "/").endswith("/."):
+            raise ValueError("to_have_screenshot: path must include a filename")
+        if _has_parent_traversal(s):
+            raise ValueError("to_have_screenshot: path must not contain '..' segments")
         baseline = Path(s)
     elif isinstance(name, Sequence):
-        parts = [str(p) for p in name]
-        if not parts or any(not p for p in parts):
+        parts: list[str] = []
+        for seg in name:
+            if not isinstance(seg, (str, PathLike)):
+                raise TypeError("to_have_screenshot: path segments must be str or PathLike")
+            seg_s = os.fspath(seg)
+            if not isinstance(seg_s, str) or not seg_s or not seg_s.strip():
+                raise ValueError("to_have_screenshot: path segments must be non-empty")
+            if _has_parent_traversal(seg_s):
+                raise ValueError("to_have_screenshot: path must not contain '..' segments")
+            parts.append(seg_s)
+        if not parts:
             raise ValueError("to_have_screenshot: path segments must be non-empty")
+        if parts[-1].endswith(("/", "\\")) or parts[-1] == "." or parts[-1].replace("\\", "/").endswith("/."):
+            raise ValueError("to_have_screenshot: path must include a filename")
         baseline = Path(*parts)
     else:
         raise TypeError("to_have_screenshot: path must be a str, PathLike, or Sequence[str]")
+
+    if ".." in baseline.parts or not baseline.name or baseline.name in (".", "..") or not baseline.name.strip():
+        raise ValueError(f"to_have_screenshot: invalid filename in path {baseline!r}")
 
     stem = baseline.stem or "screenshot"
     return (
@@ -489,7 +552,7 @@ def artifact_paths(name: str | PathLike[str] | Sequence[str]) -> tuple[Path, Pat
 
 
 def should_update_snapshots(explicit_update: bool | None) -> bool:
-    if explicit_update:
-        return True
+    if explicit_update is not None:
+        return bool(explicit_update)
     val = os.environ.get("FLUXWRIGHT_UPDATE_SNAPSHOTS", "").strip().lower()
     return val in ("1", "true", "yes", "all")

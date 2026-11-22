@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from contextlib import suppress
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
-from . import _native
+try:
+    from . import _native
+except ImportError:  # pragma: no cover
+    _native = None  # type: ignore[assignment]
 from ._errors import Error
 from ._types import FloatRect
 from ._visual import (
@@ -29,6 +33,7 @@ from ._visual import (
 )
 
 if TYPE_CHECKING:
+    from .async_api import Locator as AsyncLocator
     from .async_api import Page as AsyncPage
     from .sync_api import Locator as SyncLocator
     from .sync_api import Page as SyncPage
@@ -41,13 +46,74 @@ MAX_PROBE_TIMEOUT_MS = 250.0
 _ProbeKind = Literal["value", "not-attached", "transient"]
 _ProbeResult = tuple[_ProbeKind, bool, str]
 
+_soft_errors_var: contextvars.ContextVar[list[AssertionError] | None] = contextvars.ContextVar(
+    "fluxwright_soft_errors", default=None
+)
+_default_soft_errors: list[AssertionError] = []
+
+
+def _get_soft_errors_store() -> list[AssertionError]:
+    scoped = _soft_errors_var.get()
+    return _default_soft_errors if scoped is None else scoped
+
+
+def get_soft_errors() -> list[AssertionError]:
+    """Returns a copy of soft assertion errors recorded in the current scope."""
+    return list(_get_soft_errors_store())
+
+
+def clear_soft_errors() -> list[AssertionError]:
+    """Clears and returns all soft assertion errors recorded in the current scope."""
+    store = _get_soft_errors_store()
+    errors = list(store)
+    store.clear()
+    return errors
+
+
+def format_soft_errors(errors: Sequence[AssertionError]) -> AssertionError:
+    if len(errors) == 1:
+        return errors[0]
+    lines = [f"{len(errors)} soft assertion failures:"]
+    for idx, err in enumerate(errors, 1):
+        lines.append(f"  {idx}. {err}")
+    return AssertionError("\n".join(lines))
+
+
+def assert_no_soft_errors() -> None:
+    """Consumes recorded soft assertion errors and raises if any failed."""
+    errors = clear_soft_errors()
+    if errors:
+        raise format_soft_errors(errors)
+
+
+def _record_soft_error(exc: AssertionError, message: str | None = None) -> None:
+    err = AssertionError(f"{message}\n{exc}") if message else exc
+    _get_soft_errors_store().append(err)
+
+
+@contextmanager
+def soft_assertions() -> Iterator[list[AssertionError]]:
+    """Scopes ``expect.soft`` failures to this block and raises on exit if any failed."""
+    bucket: list[AssertionError] = []
+    token = _soft_errors_var.set(bucket)
+    try:
+        yield bucket
+    finally:
+        _soft_errors_var.reset(token)
+    if bucket:
+        raise format_soft_errors(bucket)
+
 
 def _normalize_ws(text: str) -> str:
     return " ".join(text.split())
 
 
 def _validate_pattern(expected: str | re.Pattern[str], method: str) -> None:
-    if not isinstance(expected, (str, re.Pattern)):
+    if isinstance(expected, re.Pattern):
+        if isinstance(expected.pattern, bytes):
+            raise TypeError(f"{method}: expected a str or re.Pattern[str], got re.Pattern[bytes]")
+        return
+    if not isinstance(expected, str):
         raise TypeError(f"{method}: expected a str or re.Pattern[str], got {type(expected).__name__}")
 
 
@@ -94,7 +160,9 @@ def _probe_timeout(remaining_ms: float | None) -> float:
 def _is_fatal_error(exc: Exception) -> bool:
     return bool(
         re.search(
-            r"page (is )?closed|browser process exited|session .* is gone|target crashed|invalid selector:",
+            r"page (is )?closed|browser process exited|session .* is gone|target crashed|"
+            r"invalid selector:|devtools websocket:|engine is shut down|"
+            r"browser context is closed|target closed|session with given id not found",
             str(exc),
             re.IGNORECASE,
         )
@@ -106,9 +174,6 @@ def _resolve_url(page: Any, expected: str | re.Pattern[str]) -> str | re.Pattern
         return expected
     base_url = page._base_url()
     if base_url is not None and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", expected):
-        if expected.startswith("/"):
-            parsed = urlparse(base_url)
-            return f"{parsed.scheme}://{parsed.netloc}{expected}"
         return urljoin(base_url, expected)
     return expected
 
@@ -124,6 +189,7 @@ async def _poll_until(
 ) -> None:
     unlimited = timeout_ms == 0.0
     deadline = None if unlimited else time.monotonic() + (timeout_ms / 1000.0)
+    last_known_desc: str | None = None
     while True:
         remaining_ms = None if deadline is None else max(0.0, (deadline - time.monotonic()) * 1000.0)
         try:
@@ -137,8 +203,12 @@ async def _poll_until(
             ok = (not matched) if negated else matched
             if ok:
                 return
+            last_known_desc = actual_desc
         elif kind == "not-attached":
             actual_desc = "element not found (count: 0)"
+            last_known_desc = actual_desc
+        elif last_known_desc is not None:
+            actual_desc = last_known_desc
 
         if deadline is not None:
             rem_s = deadline - time.monotonic()
@@ -157,16 +227,46 @@ async def _poll_until(
 class LocatorAssertions:
     """Auto-retrying assertions for an async ``Locator``."""
 
-    def __init__(self, locator: _native.Locator, default_timeout: float = DEFAULT_TIMEOUT_MS) -> None:
+    def __init__(
+        self,
+        locator: AsyncLocator | _native.Locator,
+        default_timeout: float = DEFAULT_TIMEOUT_MS,
+        *,
+        soft: bool = False,
+        message: str | None = None,
+    ) -> None:
         self._locator = locator
+        impl = getattr(locator, "_impl", None)
+        self._raw_locator: Any = impl if (_native is not None and isinstance(impl, _native.Locator)) else locator
         self._default_timeout = default_timeout
+        self._soft = soft
+        self._message = message
+
+    def _owner_page(self) -> Any:
+        fn = getattr(self._locator, "_owner_page", None)
+        if callable(fn):
+            return fn()
+        return None
 
     def _target(self) -> str:
         return f"expect({self._locator!r})"
 
-    async def _ensure_attached(self) -> _ProbeResult | None:
+    async def _run_checked(self, coro: Awaitable[None]) -> None:
         try:
-            n = await self._locator.count()
+            await coro
+        except AssertionError as exc:
+            if self._soft:
+                _record_soft_error(exc, self._message)
+                return
+            if self._message:
+                raise AssertionError(f"{self._message}\n{exc}") from None
+            raise
+
+    async def _ensure_attached(self, limit_ms: float) -> _ProbeResult | None:
+        try:
+            n = await asyncio.wait_for(self._raw_locator.count(), timeout=limit_ms / 1000.0)
+        except asyncio.TimeoutError:
+            return ("transient", False, "timed out waiting for element count")
         except Exception as exc:
             if _is_fatal_error(exc):
                 raise
@@ -191,40 +291,44 @@ class LocatorAssertions:
 
         async def probe(limit_ms: float) -> _ProbeResult:
             if require_attached:
-                early = await self._ensure_attached()
+                early = await self._ensure_attached(limit_ms)
                 if early is not None:
                     return early
             val = await call(limit_ms)
             return ("value", val, true_label if val else false_label)
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc=expected,
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc=expected,
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _attached_check(self, *, matcher: str, negated: bool, timeout: float | None) -> None:
         timeout_ms = _validate_timeout(timeout, self._default_timeout)
 
         async def probe(limit_ms: float) -> _ProbeResult:
-            n = await self._locator.count()
+            n = await asyncio.wait_for(self._raw_locator.count(), timeout=limit_ms / 1000.0)
             if n == 0:
                 return ("value", False, "detached (count: 0)")
             if n == 1:
                 return ("value", True, "attached")
-            await self._locator.is_visible(timeout=limit_ms)
+            await self._raw_locator.is_visible(timeout=limit_ms)
             return ("value", True, f"attached (count: {n})")
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc="attached",
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc="attached",
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _checked_check(
@@ -235,23 +339,27 @@ class LocatorAssertions:
         checked: bool | None,
         timeout: float | None,
     ) -> None:
-        want = True if checked is None else bool(checked)
+        if checked is not None and not isinstance(checked, bool):
+            raise TypeError(f"expect(locator).{matcher}: checked must be a bool, got {type(checked).__name__}")
+        want = True if checked is None else checked
         timeout_ms = _validate_timeout(timeout, self._default_timeout)
 
         async def probe(limit_ms: float) -> _ProbeResult:
-            early = await self._ensure_attached()
+            early = await self._ensure_attached(limit_ms)
             if early is not None:
                 return early
-            val = await self._locator.is_checked(timeout=limit_ms)
+            val = await self._raw_locator.is_checked(timeout=limit_ms)
             return ("value", val is want, "checked" if val else "unchecked")
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc="checked" if want else "unchecked",
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc="checked" if want else "unchecked",
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _text_check(
@@ -272,10 +380,10 @@ class LocatorAssertions:
         )
 
         async def probe(limit_ms: float) -> _ProbeResult:
-            early = await self._ensure_attached()
+            early = await self._ensure_attached(limit_ms)
             if early is not None:
                 return early
-            raw = await self._locator.text_content(timeout=limit_ms) or ""
+            raw = await self._raw_locator.text_content(timeout=limit_ms) or ""
             actual_norm = _normalize_ws(raw)
             return (
                 "value",
@@ -283,13 +391,15 @@ class LocatorAssertions:
                 repr(actual_norm),
             )
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc=expected_desc,
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc=expected_desc,
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _value_check(
@@ -304,19 +414,21 @@ class LocatorAssertions:
         timeout_ms = _validate_timeout(timeout, self._default_timeout)
 
         async def probe(limit_ms: float) -> _ProbeResult:
-            early = await self._ensure_attached()
+            early = await self._ensure_attached(limit_ms)
             if early is not None:
                 return early
-            val = await self._locator.input_value(timeout=limit_ms)
+            val = await self._raw_locator.input_value(timeout=limit_ms)
             return ("value", _match_pattern(val, expected), repr(val))
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc=_format_expected(expected),
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc=_format_expected(expected),
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _attribute_check(
@@ -334,21 +446,23 @@ class LocatorAssertions:
         timeout_ms = _validate_timeout(timeout, self._default_timeout)
 
         async def probe(limit_ms: float) -> _ProbeResult:
-            early = await self._ensure_attached()
+            early = await self._ensure_attached(limit_ms)
             if early is not None:
                 return early
-            val = await self._locator.get_attribute(name, timeout=limit_ms)
+            val = await self._raw_locator.get_attribute(name, timeout=limit_ms)
             if val is None:
                 return ("value", False, f"{name}=<absent>")
             return ("value", _match_pattern(val, expected), f"{name}={val!r}")
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc=f"{name}={_format_expected(expected)}",
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc=f"{name}={_format_expected(expected)}",
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _class_check(
@@ -363,19 +477,21 @@ class LocatorAssertions:
         timeout_ms = _validate_timeout(timeout, self._default_timeout)
 
         async def probe(limit_ms: float) -> _ProbeResult:
-            early = await self._ensure_attached()
+            early = await self._ensure_attached(limit_ms)
             if early is not None:
                 return early
-            cls = await self._locator.get_attribute("class", timeout=limit_ms) or ""
+            cls = await self._raw_locator.get_attribute("class", timeout=limit_ms) or ""
             return ("value", _match_pattern(cls, expected), repr(cls))
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc=_format_expected(expected),
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc=_format_expected(expected),
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _count_check(
@@ -390,17 +506,19 @@ class LocatorAssertions:
             raise ValueError(f"expect(locator).{matcher}: count must be a non-negative int")
         timeout_ms = _validate_timeout(timeout, self._default_timeout)
 
-        async def probe(_limit_ms: float) -> _ProbeResult:
-            n = await self._locator.count()
+        async def probe(limit_ms: float) -> _ProbeResult:
+            n = await asyncio.wait_for(self._raw_locator.count(), timeout=limit_ms / 1000.0)
             return ("value", n == count, str(n))
 
-        await _poll_until(
-            target_label=self._target(),
-            matcher=matcher,
-            expected_desc=str(count),
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label=self._target(),
+                matcher=matcher,
+                expected_desc=str(count),
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def to_be_visible(self, timeout: float | None = None) -> None:
@@ -412,7 +530,7 @@ class LocatorAssertions:
             require_attached=False,
             negated=False,
             timeout=timeout,
-            call=lambda lim: self._locator.is_visible(timeout=lim),
+            call=lambda lim: self._raw_locator.is_visible(timeout=lim),
         )
 
     async def not_to_be_visible(self, timeout: float | None = None) -> None:
@@ -424,7 +542,7 @@ class LocatorAssertions:
             require_attached=False,
             negated=True,
             timeout=timeout,
-            call=lambda lim: self._locator.is_visible(timeout=lim),
+            call=lambda lim: self._raw_locator.is_visible(timeout=lim),
         )
 
     async def to_be_hidden(self, timeout: float | None = None) -> None:
@@ -436,7 +554,7 @@ class LocatorAssertions:
             require_attached=False,
             negated=False,
             timeout=timeout,
-            call=lambda lim: self._locator.is_hidden(timeout=lim),
+            call=lambda lim: self._raw_locator.is_hidden(timeout=lim),
         )
 
     async def not_to_be_hidden(self, timeout: float | None = None) -> None:
@@ -448,7 +566,7 @@ class LocatorAssertions:
             require_attached=False,
             negated=True,
             timeout=timeout,
-            call=lambda lim: self._locator.is_hidden(timeout=lim),
+            call=lambda lim: self._raw_locator.is_hidden(timeout=lim),
         )
 
     async def to_be_attached(self, timeout: float | None = None) -> None:
@@ -466,7 +584,7 @@ class LocatorAssertions:
             require_attached=True,
             negated=False,
             timeout=timeout,
-            call=lambda lim: self._locator.is_enabled(timeout=lim),
+            call=lambda lim: self._raw_locator.is_enabled(timeout=lim),
         )
 
     async def not_to_be_enabled(self, timeout: float | None = None) -> None:
@@ -478,7 +596,7 @@ class LocatorAssertions:
             require_attached=True,
             negated=True,
             timeout=timeout,
-            call=lambda lim: self._locator.is_enabled(timeout=lim),
+            call=lambda lim: self._raw_locator.is_enabled(timeout=lim),
         )
 
     async def to_be_disabled(self, timeout: float | None = None) -> None:
@@ -490,7 +608,7 @@ class LocatorAssertions:
             require_attached=True,
             negated=False,
             timeout=timeout,
-            call=lambda lim: self._locator.is_disabled(timeout=lim),
+            call=lambda lim: self._raw_locator.is_disabled(timeout=lim),
         )
 
     async def not_to_be_disabled(self, timeout: float | None = None) -> None:
@@ -502,7 +620,7 @@ class LocatorAssertions:
             require_attached=True,
             negated=True,
             timeout=timeout,
-            call=lambda lim: self._locator.is_disabled(timeout=lim),
+            call=lambda lim: self._raw_locator.is_disabled(timeout=lim),
         )
 
     async def to_be_checked(self, timeout: float | None = None, *, checked: bool | None = None) -> None:
@@ -520,7 +638,7 @@ class LocatorAssertions:
             require_attached=True,
             negated=False,
             timeout=timeout,
-            call=lambda lim: self._locator.is_editable(timeout=lim),
+            call=lambda lim: self._raw_locator.is_editable(timeout=lim),
         )
 
     async def not_to_be_editable(self, timeout: float | None = None) -> None:
@@ -532,7 +650,7 @@ class LocatorAssertions:
             require_attached=True,
             negated=True,
             timeout=timeout,
-            call=lambda lim: self._locator.is_editable(timeout=lim),
+            call=lambda lim: self._raw_locator.is_editable(timeout=lim),
         )
 
     async def to_have_text(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
@@ -601,34 +719,69 @@ class LocatorAssertions:
             update=update,
         )
 
+        def _is_closed() -> bool:
+            page = self._owner_page()
+            return page is not None and bool(page.is_closed())
+
         async def _disable(limit_ms: float) -> None:
             with suppress(Exception):
-                await self._locator.evaluate(DISABLE_ANIMATIONS_LOCATOR_JS, None, timeout=min(limit_ms, 500.0))
+                await self._raw_locator.evaluate(DISABLE_ANIMATIONS_LOCATOR_JS, None, timeout=min(limit_ms, 500.0))
 
         async def _restore() -> None:
-            with suppress(Exception):
-                await self._locator.evaluate(RESTORE_ANIMATIONS_LOCATOR_JS, None, timeout=250.0)
+            removed = False
+            page = self._owner_page()
+            if page is not None and not page.is_closed():
+                with suppress(Exception):
+                    if _native is not None and isinstance(page, _native.Page):
+                        removed = bool(await _native.Page.evaluate(page, RESTORE_ANIMATIONS_PAGE_JS))
+                    else:
+                        removed = bool(await page.evaluate(RESTORE_ANIMATIONS_PAGE_JS))
+            if not removed:
+                with suppress(Exception):
+                    await self._raw_locator.evaluate(RESTORE_ANIMATIONS_LOCATOR_JS, None, timeout=250.0)
 
-        await _run_to_have_screenshot(
-            target_label=self._target(),
-            name=name,
-            opts=opts,
-            is_closed=lambda: False,
-            disable_animations=_disable,
-            restore_animations=_restore,
-            capture_shot=lambda limit_ms: self._locator.screenshot(
-                omit_background=opts["omit_background"],
-                timeout=limit_ms,
-            ),
+        await self._run_checked(
+            _run_to_have_screenshot(
+                target_label=self._target(),
+                name=name,
+                opts=opts,
+                is_closed=_is_closed,
+                disable_animations=_disable,
+                restore_animations=_restore,
+                capture_shot=lambda limit_ms: self._raw_locator.screenshot(
+                    omit_background=opts["omit_background"],
+                    timeout=limit_ms,
+                ),
+            )
         )
 
 
 class PageAssertions:
     """Auto-retrying assertions for an async ``Page``."""
 
-    def __init__(self, page: AsyncPage, default_timeout: float = DEFAULT_TIMEOUT_MS) -> None:
+    def __init__(
+        self,
+        page: AsyncPage,
+        default_timeout: float = DEFAULT_TIMEOUT_MS,
+        *,
+        soft: bool = False,
+        message: str | None = None,
+    ) -> None:
         self._page = page
         self._default_timeout = default_timeout
+        self._soft = soft
+        self._message = message
+
+    async def _run_checked(self, coro: Awaitable[None]) -> None:
+        try:
+            await coro
+        except AssertionError as exc:
+            if self._soft:
+                _record_soft_error(exc, self._message)
+                return
+            if self._message:
+                raise AssertionError(f"{self._message}\n{exc}") from None
+            raise
 
     async def _title_check(
         self,
@@ -641,20 +794,22 @@ class PageAssertions:
         _validate_pattern(expected, f"expect(page).{matcher}")
         timeout_ms = _validate_timeout(timeout, self._default_timeout)
 
-        async def probe(_limit_ms: float) -> _ProbeResult:
+        async def probe(limit_ms: float) -> _ProbeResult:
             if self._page.is_closed():
                 raise Error("page is closed")
-            raw = await self._page.title()
+            raw = await asyncio.wait_for(self._page.title(), timeout=limit_ms / 1000.0)
             actual_norm = _normalize_ws(raw)
             return ("value", _match_pattern(raw, expected, normalize=True), repr(actual_norm))
 
-        await _poll_until(
-            target_label="expect(page)",
-            matcher=matcher,
-            expected_desc=_format_expected(expected, normalize=True),
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label="expect(page)",
+                matcher=matcher,
+                expected_desc=_format_expected(expected, normalize=True),
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def _url_check(
@@ -675,13 +830,15 @@ class PageAssertions:
             actual = self._page.url
             return ("value", _match_pattern(actual, target), repr(actual))
 
-        await _poll_until(
-            target_label="expect(page)",
-            matcher=matcher,
-            expected_desc=_format_expected(target),
-            negated=negated,
-            timeout_ms=timeout_ms,
-            probe=probe,
+        await self._run_checked(
+            _poll_until(
+                target_label="expect(page)",
+                matcher=matcher,
+                expected_desc=_format_expected(target),
+                negated=negated,
+                timeout_ms=timeout_ms,
+                probe=probe,
+            )
         )
 
     async def to_have_title(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
@@ -724,28 +881,79 @@ class PageAssertions:
             update=update,
         )
 
+        is_native_page = _native is not None and isinstance(self._page, _native.Page)
+
         async def _disable(_limit_ms: float) -> None:
             with suppress(Exception):
-                await self._page.evaluate(DISABLE_ANIMATIONS_PAGE_JS)
+                if is_native_page:
+                    await _native.Page.evaluate(self._page, DISABLE_ANIMATIONS_PAGE_JS)
+                else:
+                    await self._page.evaluate(DISABLE_ANIMATIONS_PAGE_JS)
 
         async def _restore() -> None:
             with suppress(Exception):
-                await self._page.evaluate(RESTORE_ANIMATIONS_PAGE_JS)
+                if is_native_page:
+                    await _native.Page.evaluate(self._page, RESTORE_ANIMATIONS_PAGE_JS)
+                else:
+                    await self._page.evaluate(RESTORE_ANIMATIONS_PAGE_JS)
 
-        await _run_to_have_screenshot(
-            target_label="expect(page)",
-            name=name,
-            opts=opts,
-            is_closed=self._page.is_closed,
-            disable_animations=_disable,
-            restore_animations=_restore,
-            capture_shot=lambda limit_ms: self._page.screenshot(
+        def _capture(limit_ms: float) -> Awaitable[bytes]:
+            if is_native_page:
+                return _native.Page.screenshot(
+                    self._page,
+                    full_page=opts["full_page"],
+                    clip=opts["clip"],
+                    omit_background=opts["omit_background"],
+                    timeout=limit_ms,
+                )
+            return self._page.screenshot(
                 full_page=opts["full_page"],
                 clip=opts["clip"],
                 omit_background=opts["omit_background"],
                 timeout=limit_ms,
-            ),
+            )
+
+        await self._run_checked(
+            _run_to_have_screenshot(
+                target_label="expect(page)",
+                name=name,
+                opts=opts,
+                is_closed=self._page.is_closed,
+                disable_animations=_disable,
+                restore_animations=_restore,
+                capture_shot=_capture,
+            )
         )
+
+
+def _validate_clip(method: str, clip: Any) -> FloatRect | None:
+    if clip is None:
+        return None
+    if not isinstance(clip, Mapping):
+        raise TypeError(f"{method}: clip must be a mapping with x, y, width, height")
+    expected_keys = {"x", "y", "width", "height"}
+    keys = set(clip.keys())
+    unknown = keys - expected_keys
+    if unknown:
+        raise ValueError(f"{method}: clip has unsupported keys {sorted(unknown)}")
+    missing = expected_keys - keys
+    if missing:
+        raise ValueError(f"{method}: clip is missing required keys {sorted(missing)}")
+    parsed: dict[str, float] = {}
+    for k in ("x", "y", "width", "height"):
+        v = clip[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or math.isnan(v) or math.isinf(v):
+            raise ValueError(f"{method}: clip.{k} must be a finite number")
+        fv = float(v)
+        if k in ("width", "height") and fv <= 0:
+            raise ValueError(f"{method}: clip.{k} must be > 0")
+        parsed[k] = fv
+    return {
+        "x": parsed["x"],
+        "y": parsed["y"],
+        "width": parsed["width"],
+        "height": parsed["height"],
+    }
 
 
 def _validate_screenshot_options(
@@ -763,8 +971,10 @@ def _validate_screenshot_options(
     update: bool | None,
 ) -> dict[str, Any]:
     timeout_ms = _validate_timeout(timeout, default_timeout)
+    if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float))):
+        raise ValueError(f"{method}: threshold must be a finite float in [0.0, 1.0]")
     thresh = 0.2 if threshold is None else float(threshold)
-    if isinstance(threshold, bool) or math.isnan(thresh) or math.isinf(thresh) or not (0.0 <= thresh <= 1.0):
+    if math.isnan(thresh) or math.isinf(thresh) or not (0.0 <= thresh <= 1.0):
         raise ValueError(f"{method}: threshold must be a finite float in [0.0, 1.0]")
     if max_diff_pixels is not None and (
         isinstance(max_diff_pixels, bool) or not isinstance(max_diff_pixels, int) or max_diff_pixels < 0
@@ -782,16 +992,24 @@ def _validate_screenshot_options(
     anim = "disabled" if animations is None else animations
     if anim not in ("disabled", "allow"):
         raise ValueError(f"{method}: animations must be 'disabled' or 'allow', not {animations!r}")
+    for opt_name, opt_val in (
+        ("omit_background", omit_background),
+        ("full_page", full_page),
+        ("update", update),
+    ):
+        if opt_val is not None and not isinstance(opt_val, bool):
+            raise TypeError(f"{method}: {opt_name} must be a bool, got {type(opt_val).__name__}")
+    validated_clip = _validate_clip(method, clip)
     return {
         "timeout_ms": timeout_ms,
         "threshold": thresh,
         "max_diff_pixels": max_diff_pixels,
         "max_diff_pixel_ratio": float(max_diff_pixel_ratio) if max_diff_pixel_ratio is not None else None,
         "animations": anim,
-        "omit_background": bool(omit_background) if omit_background is not None else False,
-        "full_page": bool(full_page) if full_page is not None else False,
-        "clip": clip,
-        "update": bool(update) if update is not None else False,
+        "omit_background": False if omit_background is None else omit_background,
+        "full_page": False if full_page is None else full_page,
+        "clip": validated_clip,
+        "update": update,
     }
 
 
@@ -837,6 +1055,7 @@ async def _run_to_have_screenshot(
                 limit = _shot_limit(rem_ms)
                 if disable_anim:
                     await disable_animations(limit)
+                stabilized_raw: bytes | None = None
                 try:
                     raw = await capture_shot(limit)
                     attempts += 1
@@ -847,11 +1066,7 @@ async def _run_to_have_screenshot(
                             max_diff_pixels=opts["max_diff_pixels"],
                             max_diff_pixel_ratio=opts["max_diff_pixel_ratio"],
                         ):
-                            await _write_artifact(baseline_path, raw)
-                            return
-                    elif unlimited:
-                        await _write_artifact(baseline_path, raw)
-                        return
+                            stabilized_raw = raw
                     prev_img = img
                     last_err = None
                 except Exception as exc:
@@ -859,10 +1074,15 @@ async def _run_to_have_screenshot(
                         raise
                     last_err = str(exc)
 
+                if stabilized_raw is not None:
+                    await _write_artifact(baseline_path, stabilized_raw)
+                    return
+
                 if deadline is not None:
                     rem_s = deadline - time.monotonic()
                     if rem_s <= 0:
                         if attempts == 1 and prev_img is not None:
+                            final_raw: bytes | None = None
                             with suppress(Exception):
                                 raw = await capture_shot(1000.0)
                                 img = decode_png(raw)
@@ -871,8 +1091,10 @@ async def _run_to_have_screenshot(
                                     max_diff_pixels=opts["max_diff_pixels"],
                                     max_diff_pixel_ratio=opts["max_diff_pixel_ratio"],
                                 ):
-                                    await _write_artifact(baseline_path, raw)
-                                    return
+                                    final_raw = raw
+                            if final_raw is not None:
+                                await _write_artifact(baseline_path, final_raw)
+                                return
                         if attempts >= 2:
                             raise AssertionError(
                                 f"{target_label}.to_have_screenshot: Timed out {timeout_ms:g}ms "
@@ -959,25 +1181,53 @@ async def _run_to_have_screenshot(
 
 
 class _AsyncExpect:
-    def __init__(self, default_timeout: float = DEFAULT_TIMEOUT_MS) -> None:
+    def __init__(self, default_timeout: float = DEFAULT_TIMEOUT_MS, *, soft: bool = False) -> None:
         self._default_timeout = default_timeout
+        self._soft = soft
 
     @overload
-    def __call__(self, actual: AsyncPage) -> PageAssertions: ...
+    def __call__(self, actual: AsyncPage, message: str | None = None) -> PageAssertions: ...
 
     @overload
-    def __call__(self, actual: _native.Locator) -> LocatorAssertions: ...
+    def __call__(self, actual: AsyncLocator | _native.Locator, message: str | None = None) -> LocatorAssertions: ...
 
-    def __call__(self, actual: AsyncPage | _native.Locator) -> PageAssertions | LocatorAssertions:
-        if isinstance(actual, _native.Page):
-            return PageAssertions(actual, self._default_timeout)  # type: ignore[arg-type]
-        if isinstance(actual, _native.Locator):
-            return LocatorAssertions(actual, self._default_timeout)
+    def __call__(
+        self,
+        actual: AsyncPage | AsyncLocator | _native.Locator,
+        message: str | None = None,
+    ) -> PageAssertions | LocatorAssertions:
+        if _native is not None and isinstance(actual, _native.Page):
+            return PageAssertions(actual, self._default_timeout, soft=self._soft, message=message)  # type: ignore[arg-type]
+        if _native is not None and (
+            isinstance(actual, _native.Locator) or isinstance(getattr(actual, "_impl", None), _native.Locator)
+        ):
+            return LocatorAssertions(actual, self._default_timeout, soft=self._soft, message=message)
         raise TypeError(f"expect: expected a Page or Locator, got {type(actual).__name__}")
 
-    def configure(self, *, timeout: float | None = None) -> _AsyncExpect:
+    @property
+    def soft(self) -> _AsyncExpect:
+        return _AsyncExpect(self._default_timeout, soft=True)
+
+    def configure(self, *, timeout: float | None = None, soft: bool | None = None) -> _AsyncExpect:
         next_timeout = _validate_timeout(timeout, self._default_timeout)
-        return _AsyncExpect(next_timeout)
+        if soft is not None and not isinstance(soft, bool):
+            raise TypeError(f"expect.configure: soft must be a bool, got {type(soft).__name__}")
+        next_soft = self._soft if soft is None else soft
+        return _AsyncExpect(next_timeout, soft=next_soft)
+
+    def set_options(self, timeout: float | None = None) -> None:
+        """Updates the default assertion timeout (Playwright Python standard API)."""
+        if timeout is not None:
+            self._default_timeout = _validate_timeout(timeout, self._default_timeout)
+
+    def soft_errors(self) -> list[AssertionError]:
+        return get_soft_errors()
+
+    def clear_soft_errors(self) -> list[AssertionError]:
+        return clear_soft_errors()
+
+    def assert_no_soft_errors(self) -> None:
+        assert_no_soft_errors()
 
 
 expect = _AsyncExpect()
@@ -990,91 +1240,107 @@ class SyncLocatorAssertions:
         self,
         impl: LocatorAssertions,
         run_fn: Callable[..., Any],
+        *,
+        soft: bool = False,
+        message: str | None = None,
     ) -> None:
         self._impl = impl
         self._run = run_fn
+        self._soft = soft
+        self._message = message
+
+    def _exec(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        try:
+            self._run(fn, *args, **kwargs)
+        except AssertionError as exc:
+            if self._soft:
+                _record_soft_error(exc, self._message)
+                return
+            if self._message:
+                raise AssertionError(f"{self._message}\n{exc}") from None
+            raise
 
     def to_be_visible(self, timeout: float | None = None) -> None:
-        self._run(self._impl.to_be_visible, timeout=timeout)
+        self._exec(self._impl.to_be_visible, timeout=timeout)
 
     def not_to_be_visible(self, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_be_visible, timeout=timeout)
+        self._exec(self._impl.not_to_be_visible, timeout=timeout)
 
     def to_be_hidden(self, timeout: float | None = None) -> None:
-        self._run(self._impl.to_be_hidden, timeout=timeout)
+        self._exec(self._impl.to_be_hidden, timeout=timeout)
 
     def not_to_be_hidden(self, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_be_hidden, timeout=timeout)
+        self._exec(self._impl.not_to_be_hidden, timeout=timeout)
 
     def to_be_attached(self, timeout: float | None = None) -> None:
-        self._run(self._impl.to_be_attached, timeout=timeout)
+        self._exec(self._impl.to_be_attached, timeout=timeout)
 
     def not_to_be_attached(self, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_be_attached, timeout=timeout)
+        self._exec(self._impl.not_to_be_attached, timeout=timeout)
 
     def to_be_enabled(self, timeout: float | None = None) -> None:
-        self._run(self._impl.to_be_enabled, timeout=timeout)
+        self._exec(self._impl.to_be_enabled, timeout=timeout)
 
     def not_to_be_enabled(self, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_be_enabled, timeout=timeout)
+        self._exec(self._impl.not_to_be_enabled, timeout=timeout)
 
     def to_be_disabled(self, timeout: float | None = None) -> None:
-        self._run(self._impl.to_be_disabled, timeout=timeout)
+        self._exec(self._impl.to_be_disabled, timeout=timeout)
 
     def not_to_be_disabled(self, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_be_disabled, timeout=timeout)
+        self._exec(self._impl.not_to_be_disabled, timeout=timeout)
 
     def to_be_checked(self, timeout: float | None = None, *, checked: bool | None = None) -> None:
-        self._run(self._impl.to_be_checked, timeout=timeout, checked=checked)
+        self._exec(self._impl.to_be_checked, timeout=timeout, checked=checked)
 
     def not_to_be_checked(self, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_be_checked, timeout=timeout)
+        self._exec(self._impl.not_to_be_checked, timeout=timeout)
 
     def to_be_editable(self, timeout: float | None = None) -> None:
-        self._run(self._impl.to_be_editable, timeout=timeout)
+        self._exec(self._impl.to_be_editable, timeout=timeout)
 
     def not_to_be_editable(self, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_be_editable, timeout=timeout)
+        self._exec(self._impl.not_to_be_editable, timeout=timeout)
 
     def to_have_text(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.to_have_text, expected, timeout=timeout)
+        self._exec(self._impl.to_have_text, expected, timeout=timeout)
 
     def not_to_have_text(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_have_text, expected, timeout=timeout)
+        self._exec(self._impl.not_to_have_text, expected, timeout=timeout)
 
     def to_contain_text(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.to_contain_text, expected, timeout=timeout)
+        self._exec(self._impl.to_contain_text, expected, timeout=timeout)
 
     def not_to_contain_text(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_contain_text, expected, timeout=timeout)
+        self._exec(self._impl.not_to_contain_text, expected, timeout=timeout)
 
     def to_have_value(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.to_have_value, expected, timeout=timeout)
+        self._exec(self._impl.to_have_value, expected, timeout=timeout)
 
     def not_to_have_value(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_have_value, expected, timeout=timeout)
+        self._exec(self._impl.not_to_have_value, expected, timeout=timeout)
 
     def to_have_attribute(
         self, name: str, expected: str | re.Pattern[str], timeout: float | None = None
     ) -> None:
-        self._run(self._impl.to_have_attribute, name, expected, timeout=timeout)
+        self._exec(self._impl.to_have_attribute, name, expected, timeout=timeout)
 
     def not_to_have_attribute(
         self, name: str, expected: str | re.Pattern[str], timeout: float | None = None
     ) -> None:
-        self._run(self._impl.not_to_have_attribute, name, expected, timeout=timeout)
+        self._exec(self._impl.not_to_have_attribute, name, expected, timeout=timeout)
 
     def to_have_class(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.to_have_class, expected, timeout=timeout)
+        self._exec(self._impl.to_have_class, expected, timeout=timeout)
 
     def not_to_have_class(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_have_class, expected, timeout=timeout)
+        self._exec(self._impl.not_to_have_class, expected, timeout=timeout)
 
     def to_have_count(self, count: int, timeout: float | None = None) -> None:
-        self._run(self._impl.to_have_count, count, timeout=timeout)
+        self._exec(self._impl.to_have_count, count, timeout=timeout)
 
     def not_to_have_count(self, count: int, timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_have_count, count, timeout=timeout)
+        self._exec(self._impl.not_to_have_count, count, timeout=timeout)
 
     def to_have_screenshot(
         self,
@@ -1088,7 +1354,7 @@ class SyncLocatorAssertions:
         omit_background: bool | None = None,
         update: bool | None = None,
     ) -> None:
-        self._run(
+        self._exec(
             self._impl.to_have_screenshot,
             name,
             threshold=threshold,
@@ -1108,21 +1374,37 @@ class SyncPageAssertions:
         self,
         impl: PageAssertions,
         run_fn: Callable[..., Any],
+        *,
+        soft: bool = False,
+        message: str | None = None,
     ) -> None:
         self._impl = impl
         self._run = run_fn
+        self._soft = soft
+        self._message = message
+
+    def _exec(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        try:
+            self._run(fn, *args, **kwargs)
+        except AssertionError as exc:
+            if self._soft:
+                _record_soft_error(exc, self._message)
+                return
+            if self._message:
+                raise AssertionError(f"{self._message}\n{exc}") from None
+            raise
 
     def to_have_title(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.to_have_title, expected, timeout=timeout)
+        self._exec(self._impl.to_have_title, expected, timeout=timeout)
 
     def not_to_have_title(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_have_title, expected, timeout=timeout)
+        self._exec(self._impl.not_to_have_title, expected, timeout=timeout)
 
     def to_have_url(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.to_have_url, expected, timeout=timeout)
+        self._exec(self._impl.to_have_url, expected, timeout=timeout)
 
     def not_to_have_url(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
-        self._run(self._impl.not_to_have_url, expected, timeout=timeout)
+        self._exec(self._impl.not_to_have_url, expected, timeout=timeout)
 
     def to_have_screenshot(
         self,
@@ -1138,7 +1420,7 @@ class SyncPageAssertions:
         clip: FloatRect | None = None,
         update: bool | None = None,
     ) -> None:
-        self._run(
+        self._exec(
             self._impl.to_have_screenshot,
             name,
             threshold=threshold,
@@ -1162,6 +1444,8 @@ class SyncExpect:
         locator_assertions_cls: type[SyncLocatorAssertions],
         run_fn: Callable[..., Any],
         default_timeout: float = DEFAULT_TIMEOUT_MS,
+        *,
+        soft: bool = False,
     ) -> None:
         self._page_cls = page_cls
         self._locator_cls = locator_cls
@@ -1169,22 +1453,52 @@ class SyncExpect:
         self._locator_assertions_cls = locator_assertions_cls
         self._run = run_fn
         self._default_timeout = default_timeout
+        self._soft = soft
 
     @overload
-    def __call__(self, actual: SyncPage) -> SyncPageAssertions: ...
+    def __call__(self, actual: SyncPage, message: str | None = None) -> SyncPageAssertions: ...
 
     @overload
-    def __call__(self, actual: SyncLocator) -> SyncLocatorAssertions: ...
+    def __call__(self, actual: SyncLocator, message: str | None = None) -> SyncLocatorAssertions: ...
 
-    def __call__(self, actual: SyncPage | SyncLocator) -> SyncPageAssertions | SyncLocatorAssertions:
+    def __call__(
+        self,
+        actual: SyncPage | SyncLocator,
+        message: str | None = None,
+    ) -> SyncPageAssertions | SyncLocatorAssertions:
         if isinstance(actual, self._page_cls):
-            return self._page_assertions_cls(PageAssertions(actual._impl, self._default_timeout), self._run)
+            return self._page_assertions_cls(
+                PageAssertions(actual._impl, self._default_timeout),
+                self._run,
+                soft=self._soft,
+                message=message,
+            )
         if isinstance(actual, self._locator_cls):
-            return self._locator_assertions_cls(LocatorAssertions(actual._impl, self._default_timeout), self._run)
+            return self._locator_assertions_cls(
+                LocatorAssertions(actual._impl, self._default_timeout),
+                self._run,
+                soft=self._soft,
+                message=message,
+            )
         raise TypeError(f"expect: expected a Page or Locator, got {type(actual).__name__}")
 
-    def configure(self, *, timeout: float | None = None) -> SyncExpect:
+    @property
+    def soft(self) -> SyncExpect:
+        return SyncExpect(
+            self._page_cls,
+            self._locator_cls,
+            self._page_assertions_cls,
+            self._locator_assertions_cls,
+            self._run,
+            self._default_timeout,
+            soft=True,
+        )
+
+    def configure(self, *, timeout: float | None = None, soft: bool | None = None) -> SyncExpect:
         next_timeout = _validate_timeout(timeout, self._default_timeout)
+        if soft is not None and not isinstance(soft, bool):
+            raise TypeError(f"expect.configure: soft must be a bool, got {type(soft).__name__}")
+        next_soft = self._soft if soft is None else soft
         return SyncExpect(
             self._page_cls,
             self._locator_cls,
@@ -1192,4 +1506,19 @@ class SyncExpect:
             self._locator_assertions_cls,
             self._run,
             next_timeout,
+            soft=next_soft,
         )
+
+    def set_options(self, timeout: float | None = None) -> None:
+        """Updates the default assertion timeout (Playwright Python standard API)."""
+        if timeout is not None:
+            self._default_timeout = _validate_timeout(timeout, self._default_timeout)
+
+    def soft_errors(self) -> list[AssertionError]:
+        return get_soft_errors()
+
+    def clear_soft_errors(self) -> list[AssertionError]:
+        return clear_soft_errors()
+
+    def assert_no_soft_errors(self) -> None:
+        assert_no_soft_errors()
