@@ -907,11 +907,12 @@ fn finish_job(
                 );
             }
         }
-        match record.job.status {
+        let snapshot = record.job.clone();
+        match snapshot.status {
             JobStatus::Succeeded => registry.succeeded_jobs += 1,
             _ => registry.failed_jobs += 1,
         }
-        Some(record.job.clone())
+        Some(snapshot)
     });
     if let Some(job) = finished_job {
         inner.store_finished(&job);
