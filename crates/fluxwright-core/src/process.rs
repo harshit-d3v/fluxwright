@@ -196,7 +196,7 @@ mod tests {
 
         let me = std::process::id();
         let own = footprint(me, current_process_rss_bytes());
-        let tree = process_trees_memory_bytes(&[me]);
+        let tree: u64 = process_tree_memory_map(&[me]).values().copied().sum();
 
         stop.store(true, Ordering::Relaxed);
         for t in threads {
