@@ -61,6 +61,7 @@ export interface TestInfo {
   outputPath(...segments: string[]): string
   status: 'passed' | 'failed' | 'skipped' | 'timedOut'
   error?: Error
+  readonly errors?: Error[]
   attachments: TestAttachment[]
   attach(
     name: string,
@@ -122,6 +123,9 @@ export interface Expect {
   (page: Page): PageAssertions
   (locator: Locator): LocatorAssertions
   <T>(actual: T): ValueAssertions<T>
+  soft(page: Page): PageAssertions
+  soft(locator: Locator): LocatorAssertions
+  soft<T>(actual: T): ValueAssertions<T>
   configure(options: ExpectOptions): Expect
 }
 

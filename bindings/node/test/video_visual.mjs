@@ -5,11 +5,12 @@ import http from 'node:http'
 import os from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
+import zlib from 'node:zlib'
 import { chromium, expect } from '../addon.js'
 
 const require = createRequire(import.meta.url)
-const { encodeMjpegAvi } = require('../video.js')
-const { decodePng, encodePng, compareImages } = require('../visual.js')
+const { encodeMjpegAvi, VideoRecorder } = require('../video.js')
+const { decodePng, encodePng, compareImages, artifactPaths, shouldUpdateSnapshots } = require('../visual.js')
 
 function assertValidVideoHeader(buf) {
   assert.ok(buf.length > 16, `video file too small: ${buf.length}`)
@@ -50,6 +51,104 @@ function assertValidVideoHeader(buf) {
   assert.equal(diff.diffRatio, 1)
   const diffDecoded = decodePng(diff.diffPng)
   assert.deepEqual([...diffDecoded.data.subarray(0, 4)], [255, 0, 255, 255])
+
+  // Alpha-channel blind spot: opaque #C0C0C0 vs transparent (0,0,0,0) must NEVER diff as 0!
+  const grayOpaque = Buffer.alloc(4 * 4)
+  const transparent = Buffer.alloc(4 * 4)
+  const transparentRed = Buffer.alloc(4 * 4)
+  for (let i = 0; i < 4; i++) {
+    grayOpaque[i * 4] = 192
+    grayOpaque[i * 4 + 1] = 192
+    grayOpaque[i * 4 + 2] = 192
+    grayOpaque[i * 4 + 3] = 255
+    transparentRed[i * 4] = 255
+    transparentRed[i * 4 + 3] = 0
+  }
+  const alphaDiffZero = compareImages(
+    { width: 2, height: 2, data: grayOpaque },
+    { width: 2, height: 2, data: transparent },
+    0,
+    false,
+  )
+  assert.equal(alphaDiffZero.diffPixels, 4, 'opaque #C0C0C0 vs transparent must differ at threshold 0')
+  const alphaDiffDefault = compareImages(
+    { width: 2, height: 2, data: grayOpaque },
+    { width: 2, height: 2, data: transparent },
+    0.2,
+    false,
+  )
+  assert.equal(alphaDiffDefault.diffPixels, 4, 'opaque #C0C0C0 vs transparent must differ at default threshold')
+  const bothTransparent = compareImages(
+    { width: 2, height: 2, data: transparent },
+    { width: 2, height: 2, data: transparentRed },
+    0,
+    false,
+  )
+  assert.equal(bothTransparent.diffPixels, 0, 'two fully transparent pixels should match')
+
+  // PNG validation: zero dims, invalid colorType/bitDepth, missing PLTE, truncated IDAT, grayscale tRNS 16-bit.
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  const makeRawChunk = (type, data) => {
+    const out = Buffer.alloc(12 + data.length)
+    out.writeUInt32BE(data.length, 0)
+    out.write(type, 4, 4, 'ascii')
+    data.copy(out, 8)
+    return out
+  }
+  const makeIhdr = (w, h, bitDepth, colorType) => {
+    const b = Buffer.alloc(13)
+    b.writeUInt32BE(w, 0)
+    b.writeUInt32BE(h, 4)
+    b[8] = bitDepth
+    b[9] = colorType
+    return makeRawChunk('IHDR', b)
+  }
+  const makePng = (chunks) => Buffer.concat([PNG_SIG, ...chunks, makeRawChunk('IEND', Buffer.alloc(0))])
+
+  assert.throws(
+    () => decodePng(makePng([makeIhdr(0, 4, 8, 6), makeRawChunk('IDAT', zlib.deflateSync(Buffer.alloc(0)))])),
+    /invalid PNG dimensions/,
+  )
+  assert.throws(
+    () => decodePng(makePng([makeIhdr(2, 2, 4, 2), makeRawChunk('IDAT', zlib.deflateSync(Buffer.alloc(10)))])),
+    /invalid colorType/,
+  )
+  assert.throws(
+    () => decodePng(makePng([makeIhdr(2, 2, 8, 3), makeRawChunk('IDAT', zlib.deflateSync(Buffer.alloc(6)))])),
+    /PLTE/,
+  )
+  assert.throws(
+    () => decodePng(makePng([makeIhdr(4, 4, 8, 6), makeRawChunk('IDAT', zlib.deflateSync(Buffer.alloc(5)))])),
+    /truncated image data/,
+  )
+  // Grayscale 8-bit PNG with pixel=0 and tRNS=0x0100 (out-of-range for 8-bit) must remain opaque (a=255).
+  const grayTrns = Buffer.from([0x01, 0x00])
+  const grayRaw = Buffer.from([0x00, 0x00]) // 1x1 filter=0, pixel=0
+  const grayPng = makePng([makeIhdr(1, 1, 8, 0), makeRawChunk('tRNS', grayTrns), makeRawChunk('IDAT', zlib.deflateSync(grayRaw))])
+  const decGray = decodePng(grayPng)
+  assert.deepEqual([...decGray.data], [0, 0, 0, 255])
+
+  // artifactPaths rejects path traversal and empty filenames.
+  assert.throws(() => artifactPaths('../escape.png'), TypeError)
+  assert.throws(() => artifactPaths('a/../b.png'), TypeError)
+  assert.throws(() => artifactPaths(['shots', '..', 'b.png']), TypeError)
+  assert.throws(() => artifactPaths('./local.png'), TypeError)
+  assert.throws(() => artifactPaths('dir/'), TypeError)
+  assert.throws(() => artifactPaths('.'), TypeError)
+  assert.throws(() => artifactPaths('..'), TypeError)
+  assert.throws(() => artifactPaths('   '), TypeError)
+
+  // shouldUpdateSnapshots respects explicit false over env var.
+  const savedEnv = process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS
+  process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS = '1'
+  try {
+    assert.equal(shouldUpdateSnapshots(undefined), true)
+    assert.equal(shouldUpdateSnapshots(true), true)
+    assert.equal(shouldUpdateSnapshots(false), false)
+  } finally {
+    if (savedEnv === undefined) delete process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS
+    else process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS = savedEnv
+  }
 }
 
 const server = http.createServer((req, res) => {
@@ -250,6 +349,170 @@ try {
     )
 
     await page.close()
+  }
+
+  // Regression: self-closing page (`window.close()`) with video recording must NOT deadlock context.close() / video.path().
+  {
+    const ctx = await browser.newContext({ recordVideo: { dir: videoDir } })
+    const opener = await ctx.newPage()
+    await opener.goto(url)
+    const [popup] = await Promise.all([
+      opener.waitForEvent('popup'),
+      opener.evaluate((u) => {
+        window.open(u, '_blank')
+      }, url),
+    ])
+    // Popup video handle must be synchronously non-null immediately upon 'popup' event!
+    const popupVideo = popup.video()
+    assert.ok(popupVideo !== null, 'popup.video() must be immediately non-null on waitForEvent("popup")')
+
+    await popup.evaluate(() => window.close())
+    await new Promise((r) => setTimeout(r, 100))
+    // Calling pages() prunes closed popup and starts stopping its recorder cleanly.
+    const remainingPages = ctx.pages()
+    assert.equal(remainingPages.length, 1)
+
+    // Self-close main page too (if permitted by browser) or close context directly.
+    await ctx.close()
+
+    const popupPath = await Promise.race([
+      popupVideo.path(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('popup video.path() deadlocked')), 5000)),
+    ])
+    assertValidVideoHeader(await fs.readFile(popupPath))
+  }
+
+  // Regression: fast-closing popup (closes immediately on load) still resolves popup.video().path().
+  {
+    const ctx = await browser.newContext({ recordVideo: { dir: videoDir } })
+    const opener = await ctx.newPage()
+    await opener.goto(url)
+    let syncVideo = null
+    opener.once('popup', (p) => {
+      syncVideo = p.video()
+    })
+    const [popup] = await Promise.all([
+      opener.waitForEvent('popup'),
+      opener.evaluate(() => {
+        const w = window.open('about:blank', '_blank')
+        if (w) setTimeout(() => w.close(), 15)
+      }),
+    ])
+    assert.ok(syncVideo !== null, 'popup.video() must be non-null inside synchronous popup listener')
+    assert.equal(popup.video(), syncVideo)
+    await new Promise((r) => setTimeout(r, 120))
+    await ctx.close()
+    const pPath = await Promise.race([
+      syncVideo.path(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('fast popup video.path() deadlocked')), 5000)),
+    ])
+    assertValidVideoHeader(await fs.readFile(pPath))
+  }
+
+  // Regression: failed startPageVideo must close the page so no browser slot leaks (maxBrowsers: 1).
+  {
+    const blockingFile = join(tmpDir, 'not-a-dir')
+    await fs.writeFile(blockingFile, 'x')
+    await assert.rejects(() => browser.newPage({ recordVideo: { dir: blockingFile } }))
+    const ctx = await browser.newContext({ recordVideo: { dir: blockingFile } })
+    await assert.rejects(() => ctx.newPage())
+    await ctx.close()
+    // Browser slot must still be free!
+    const healthy = await browser.newPage()
+    await healthy.goto(url)
+    await healthy.close()
+  }
+
+  // Regression: unobserved VideoRecorder finish rejection must not cause UnhandledPromiseRejection.
+  {
+    let unhandled = null
+    const onUnhandled = (err) => {
+      unhandled = err
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const blockingFile = join(tmpDir, 'unwritable-dir')
+      await fs.writeFile(blockingFile, 'x')
+      const mockSession = {
+        on() {},
+        off() {},
+        async send() { return {} },
+        async detach() {},
+      }
+      const rec = new VideoRecorder(blockingFile, null, mockSession)
+      await assert.rejects(() => rec.stop())
+      await new Promise((r) => setTimeout(r, 30))
+      assert.equal(unhandled, null, 'unobserved VideoRecorder finish error must not trigger unhandledRejection')
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  }
+
+  // Regression: { update: false } overrides FLUXWRIGHT_UPDATE_SNAPSHOTS=1; clip rejects timeout;
+  // FS error in writeArtifact fails immediately; detached locator does not leak animation style.
+  {
+    const page = await browser.newPage({ viewport: { width: 320, height: 240 } })
+    await page.goto(url)
+
+    // Nested clip must reject timeout option immediately.
+    await assert.rejects(
+      () => expect(page).toHaveScreenshot(join(snapDir, 'clip.png'), { clip: { x: 0, y: 0, width: 10, height: 10, timeout: 1 } }),
+      TypeError,
+    )
+
+    // { update: false } overrides FLUXWRIGHT_UPDATE_SNAPSHOTS=1.
+    const missingWithFalse = join(snapDir, 'must-not-create.png')
+    const prevEnv = process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS
+    process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS = '1'
+    try {
+      await assert.rejects(
+        () => expect(page.locator('#box')).toHaveScreenshot(missingWithFalse, { update: false, timeout: 200 }),
+        /Baseline snapshot does not exist/,
+      )
+      await assert.rejects(() => fs.stat(missingWithFalse), { code: 'ENOENT' })
+    } finally {
+      if (prevEnv === undefined) delete process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS
+      else process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS = prevEnv
+    }
+
+    // update: true with timeout: 0 still captures cleanly (requiring 2 consecutive stable frames).
+    const zeroTimeoutShot = join(snapDir, 'zero-timeout.png')
+    await expect(page.locator('#box')).toHaveScreenshot(zeroTimeoutShot, { update: true, timeout: 0 })
+    await fs.stat(zeroTimeoutShot)
+
+    // FS write error in update mode must fail immediately (not spin to stabilization timeout).
+    const dirAsFile = join(snapDir, 'dir-as-baseline')
+    await fs.mkdir(dirAsFile, { recursive: true })
+    const fsStart = Date.now()
+    await assert.rejects(
+      () => expect(page.locator('#box')).toHaveScreenshot(dirAsFile, { update: true, timeout: 5000 }),
+      (err) => !/Timed out.*stabilize/.test(err.message),
+    )
+    assert.ok(Date.now() - fsStart < 3000, 'FS write error should fail immediately rather than spinning to timeout')
+
+    // Detached element during LocatorAssertions.toHaveScreenshot must not leak __fw_disable_animations style.
+    await page.evaluate(() => {
+      const el = document.createElement('div')
+      el.id = 'ephemeral'
+      el.style.cssText = 'width:20px;height:20px;background:blue;'
+      document.body.appendChild(el)
+      setTimeout(() => el.remove(), 40)
+    })
+    await assert.rejects(
+      () => expect(page.locator('#ephemeral')).toHaveScreenshot(join(snapDir, 'box.png'), { timeout: 250 }),
+    )
+    const leakedStyle = await page.evaluate(() => Boolean(document.getElementById('__fw_disable_animations')))
+    assert.equal(leakedStyle, false, '__fw_disable_animations style must be removed even if locator detaches')
+
+    // Closed page fails fast on LocatorAssertions.toHaveScreenshot.
+    const boxLoc = page.locator('#box')
+    await page.close()
+    const closedStart = Date.now()
+    await assert.rejects(
+      () => expect(boxLoc).toHaveScreenshot(join(snapDir, 'box.png'), { timeout: 5000 }),
+      /page is closed/i,
+    )
+    assert.ok(Date.now() - closedStart < 1500, 'closed page must fail fast on locator toHaveScreenshot')
   }
 } finally {
   await browser.close()

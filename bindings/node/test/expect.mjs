@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import http from 'node:http'
+import { createRequire } from 'node:module'
 import fluxwright, { chromium, expect } from '../addon.js'
+
+const require = createRequire(import.meta.url)
+const { createExpect, setSoftErrorCollector, isFatalError, resolveUrl } = require('../expect.js')
 
 assert.equal(fluxwright.expect, expect)
 
@@ -32,8 +36,51 @@ const base = `http://127.0.0.1:${server.address().port}`
 // Option & argument validation before/without hitting browser.
 assert.throws(() => expect(null), TypeError)
 assert.throws(() => expect({}), TypeError)
+assert.throws(() => expect.soft(null), TypeError)
 assert.throws(() => expect.configure({ timeout: -1 }), TypeError)
 assert.throws(() => expect.configure({ bogus: true }), TypeError)
+
+// Regression: resolveUrl handles protocol-relative URLs and dot-segments via new URL().
+{
+  const fakePage = { _baseUrl: () => 'http://127.0.0.1:8080/app/index.html' }
+  assert.equal(resolveUrl(fakePage, '/done'), 'http://127.0.0.1:8080/done')
+  assert.equal(resolveUrl(fakePage, '//cdn.example.com/assets'), 'http://cdn.example.com/assets')
+  assert.equal(resolveUrl(fakePage, '/a/../b'), 'http://127.0.0.1:8080/b')
+  assert.equal(resolveUrl(fakePage, 'sub'), 'http://127.0.0.1:8080/app/sub')
+}
+
+// Regression: expanded isFatalError covers engine/CDP disconnect messages.
+for (const msg of [
+  'devtools websocket: closed',
+  'engine is shut down',
+  'browser context is closed',
+  'Target closed',
+  'Session with given id not found',
+]) {
+  assert.equal(isFatalError(new Error(msg)), true, `isFatalError should match: ${msg}`)
+}
+
+// Regression: count() and title() probes are bounded by timeout (never hang 30s).
+{
+  class FakePage {
+    isClosed() { return false }
+    title() { return new Promise(() => {}) }
+    url() { return 'http://127.0.0.1/' }
+  }
+  class FakeLocator {
+    _frames() { return [] }
+    _query() { return '#hung' }
+    count() { return new Promise(() => {}) }
+  }
+  const fakeExpect = createExpect(FakePage, FakeLocator, 5000)
+  const t1 = Date.now()
+  await assert.rejects(() => fakeExpect(new FakePage()).toHaveTitle('Hi', { timeout: 150 }), /Timed out 150ms/)
+  assert.ok(Date.now() - t1 < 1500, 'toHaveTitle hung beyond bounded timeout')
+
+  const t2 = Date.now()
+  await assert.rejects(() => fakeExpect(new FakeLocator()).toHaveCount(1, { timeout: 150 }), /Timed out 150ms/)
+  assert.ok(Date.now() - t2 < 1500, 'toHaveCount hung beyond bounded timeout')
+}
 
 const browser = await chromium.launch({ maxBrowsers: 1 })
 try {
@@ -165,6 +212,28 @@ try {
     () => expect(page).toHaveURL('/never', { timeout: 150 }),
     /Expected:.*\/never[\s\S]*Received:/,
   )
+
+  // Regression: sticky /y RegExp semantics preserved (matches at index 0 only); /g does not mutate caller lastIndex.
+  await expect(page.locator('#txt')).toHaveText(/Loaded/y)
+  await expect(page.locator('#txt')).not.toHaveText(/42/y)
+  const globalRe = /Loaded/g
+  globalRe.lastIndex = 5
+  await expect(page.locator('#txt')).toHaveText(globalRe)
+  assert.equal(globalRe.lastIndex, 5, 'caller RegExp lastIndex must not be mutated')
+
+  // Regression: expect.soft records failures without throwing and continues execution.
+  const collectedSoft = []
+  const prevCollector = setSoftErrorCollector((err) => collectedSoft.push(err))
+  try {
+    await expect.soft(page.locator('#txt')).toHaveText('SoftMismatch', { timeout: 120 })
+    await expect.configure({ timeout: 120 }).soft(page).toHaveTitle('WrongSoftTitle')
+    await expect.soft(page.locator('#txt')).toHaveText('Loaded 42 items', { timeout: 200 })
+  } finally {
+    setSoftErrorCollector(prevCollector)
+  }
+  assert.equal(collectedSoft.length, 2, `expected 2 soft errors, got ${collectedSoft.length}`)
+  assert.match(collectedSoft[0].message, /SoftMismatch/)
+  assert.match(collectedSoft[1].message, /WrongSoftTitle/)
 
   await page.close()
 } finally {

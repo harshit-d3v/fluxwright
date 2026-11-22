@@ -37,6 +37,10 @@ function paethPredictor(a, b, c) {
 
 function unfilterPass(raw, offset, width, height, bpp, channels, bitDepth) {
   const rowBytes = Math.ceil((width * channels * bitDepth) / 8)
+  const needed = height * (1 + rowBytes)
+  if (offset + needed > raw.length) {
+    throw new Error(`decodePng: truncated image data (expected at least ${offset + needed} bytes, got ${raw.length})`)
+  }
   const recon = Buffer.alloc(height * rowBytes)
   for (let y = 0; y < height; y++) {
     const filter = raw[offset++]
@@ -107,7 +111,13 @@ function writeRgbaPixels(recon, rowBytes, width, height, colorType, bitDepth, pl
         const g = row[s + 1]
         const b = row[s + 2]
         const a =
-          trns && trns.length >= 6 && r === trns[1] && g === trns[3] && b === trns[5] ? 0 : 255
+          trns &&
+          trns.length >= 6 &&
+          r === trns.readUInt16BE(0) &&
+          g === trns.readUInt16BE(2) &&
+          b === trns.readUInt16BE(4)
+            ? 0
+            : 255
         out[dstIdx] = r
         out[dstIdx + 1] = g
         out[dstIdx + 2] = b
@@ -136,8 +146,8 @@ function writeRgbaPixels(recon, rowBytes, width, height, colorType, bitDepth, pl
         const g = readSample(row, px, 0, channels, bitDepth)
         let a = 255
         if (trns && trns.length >= 2) {
-          const rawMask = (1 << bitDepth) - 1
-          const tVal = bitDepth === 16 ? trns.readUInt16BE(0) : trns.readUInt16BE(0) & rawMask
+          const tVal = trns.readUInt16BE(0)
+          const rawMask = bitDepth < 16 ? (1 << bitDepth) - 1 : 0xffff
           const spb = Math.max(1, 8 / bitDepth)
           const rawSample =
             bitDepth === 16
@@ -235,8 +245,28 @@ function decodePng(buf) {
   }
 
   if (!ihdr) throw new Error('decodePng: missing IHDR chunk')
+  if (ihdr.width <= 0 || ihdr.height <= 0) {
+    throw new Error(`decodePng: invalid PNG dimensions ${ihdr.width}x${ihdr.height}`)
+  }
+  const VALID_BIT_DEPTHS = {
+    0: [1, 2, 4, 8, 16],
+    2: [8, 16],
+    3: [1, 2, 4, 8],
+    4: [8, 16],
+    6: [8, 16],
+  }
+  const allowedDepths = VALID_BIT_DEPTHS[ihdr.colorType]
+  if (!allowedDepths || !allowedDepths.includes(ihdr.bitDepth)) {
+    throw new Error(`decodePng: invalid colorType ${ihdr.colorType} / bitDepth ${ihdr.bitDepth}`)
+  }
+  if (ihdr.colorType === 3 && (!plte || plte.length === 0 || plte.length % 3 !== 0)) {
+    throw new Error('decodePng: indexed PNG requires a valid PLTE chunk')
+  }
   if (ihdr.compression !== 0 || ihdr.filter !== 0) {
     throw new Error('decodePng: unsupported compression or filter method')
+  }
+  if (idatChunks.length === 0) {
+    throw new Error('decodePng: missing IDAT chunk')
   }
   const channels =
     ihdr.colorType === 0 || ihdr.colorType === 3 ? 1 : ihdr.colorType === 2 ? 3 : ihdr.colorType === 4 ? 2 : 4
@@ -245,10 +275,13 @@ function decodePng(buf) {
   const rgba = Buffer.alloc(ihdr.width * ihdr.height * 4)
 
   if (ihdr.interlace === 0) {
-    const { recon } = unfilterPass(raw, 0, ihdr.width, ihdr.height, bpp, channels, ihdr.bitDepth)
+    const res = unfilterPass(raw, 0, ihdr.width, ihdr.height, bpp, channels, ihdr.bitDepth)
+    if (res.nextOffset !== raw.length) {
+      throw new Error(`decodePng: unexpected inflated data length (expected ${res.nextOffset}, got ${raw.length})`)
+    }
     writeRgbaPixels(
-      recon,
-      Math.ceil((ihdr.width * channels * ihdr.bitDepth) / 8),
+      res.recon,
+      res.rowBytes,
       ihdr.width,
       ihdr.height,
       ihdr.colorType,
@@ -290,6 +323,9 @@ function decodePng(buf) {
         yStep[pass],
         ihdr.width,
       )
+    }
+    if (offset !== raw.length) {
+      throw new Error(`decodePng: unexpected inflated data length (expected ${offset}, got ${raw.length})`)
     }
   } else {
     throw new Error(`decodePng: unsupported interlace method ${ihdr.interlace}`)
@@ -334,34 +370,40 @@ function blendChannel(c, alpha, bg) {
   return bg + (c - bg) * a
 }
 
-function yiqDeltaSq(d1, i1, d2, i2) {
-  let r1 = d1[i1]
-  let g1 = d1[i1 + 1]
-  let b1 = d1[i1 + 2]
-  const a1 = d1[i1 + 3]
-  let r2 = d2[i2]
-  let g2 = d2[i2 + 1]
-  let b2 = d2[i2 + 2]
-  const a2 = d2[i2 + 3]
-  if (r1 === r2 && g1 === g2 && b1 === b2 && a1 === a2) return 0
-  if (a1 < 255) {
-    r1 = blendChannel(r1, a1, 192)
-    g1 = blendChannel(g1, a1, 192)
-    b1 = blendChannel(b1, a1, 192)
-  }
-  if (a2 < 255) {
-    r2 = blendChannel(r2, a2, 192)
-    g2 = blendChannel(g2, a2, 192)
-    b2 = blendChannel(b2, a2, 192)
-  }
-  const dr = r1 - r2
-  const dg = g1 - g2
-  const db = b1 - b2
+function rgbYiqDeltaSq(dr, dg, db) {
   if (dr === 0 && dg === 0 && db === 0) return 0
   const y = dr * 0.29889531 + dg * 0.58662247 + db * 0.11448223
   const i = dr * 0.59597799 - dg * 0.2741761 - db * 0.32180189
   const q = dr * 0.21147017 - dg * 0.52261711 + db * 0.31114694
   return 0.5053 * y * y + 0.299 * i * i + 0.1957 * q * q
+}
+
+function yiqDeltaSq(d1, i1, d2, i2) {
+  const r1 = d1[i1]
+  const g1 = d1[i1 + 1]
+  const b1 = d1[i1 + 2]
+  const a1 = d1[i1 + 3]
+  const r2 = d2[i2]
+  const g2 = d2[i2 + 1]
+  const b2 = d2[i2 + 2]
+  const a2 = d2[i2 + 3]
+  if (r1 === r2 && g1 === g2 && b1 === b2 && a1 === a2) return 0
+  if (a1 === 255 && a2 === 255) {
+    return rgbYiqDeltaSq(r1 - r2, g1 - g2, b1 - b2)
+  }
+  // Dual-background blending (black=0 and white=255) eliminates the single-background
+  // alpha blind spot (e.g., opaque #C0C0C0 vs fully transparent (0,0,0,0)).
+  const deltaBlack = rgbYiqDeltaSq(
+    blendChannel(r1, a1, 0) - blendChannel(r2, a2, 0),
+    blendChannel(g1, a1, 0) - blendChannel(g2, a2, 0),
+    blendChannel(b1, a1, 0) - blendChannel(b2, a2, 0),
+  )
+  const deltaWhite = rgbYiqDeltaSq(
+    blendChannel(r1, a1, 255) - blendChannel(r2, a2, 255),
+    blendChannel(g1, a1, 255) - blendChannel(g2, a2, 255),
+    blendChannel(b1, a1, 255) - blendChannel(b2, a2, 255),
+  )
+  return deltaBlack >= deltaWhite ? deltaBlack : deltaWhite
 }
 
 function compareImages(expected, actual, threshold = 0.2, renderDiff = false) {
@@ -452,10 +494,31 @@ function isWithinTolerance(diff, opts) {
 }
 
 function artifactPaths(nameOrPath) {
+  const segments = Array.isArray(nameOrPath) ? nameOrPath : [nameOrPath]
+  if (!segments.length) {
+    throw new TypeError('toHaveScreenshot: path must not be empty')
+  }
+  for (const seg of segments) {
+    if (typeof seg !== 'string' || !seg.trim()) {
+      throw new TypeError('toHaveScreenshot: path segments must be non-empty strings')
+    }
+    for (const part of seg.split(/[\\/]+/)) {
+      if (part === '.' || part === '..') {
+        throw new TypeError(`toHaveScreenshot: path must not contain '.' or '..' segments`)
+      }
+    }
+  }
   const baselinePath = Array.isArray(nameOrPath) ? join(...nameOrPath) : nameOrPath
+  if (/[\\/]$/.test(baselinePath)) {
+    throw new TypeError('toHaveScreenshot: path must include a filename')
+  }
   const dir = dirname(baselinePath)
   const ext = extname(baselinePath)
-  const stem = basename(baselinePath, ext) || 'screenshot'
+  const base = basename(baselinePath)
+  const stem = basename(baselinePath, ext)
+  if (!base || base === '.' || base === '..' || !stem) {
+    throw new TypeError('toHaveScreenshot: path must include a valid filename')
+  }
   return {
     baselinePath,
     actualPath: join(dir, `${stem}-actual.png`),
@@ -464,7 +527,7 @@ function artifactPaths(nameOrPath) {
 }
 
 function shouldUpdateSnapshots(explicitUpdate) {
-  if (explicitUpdate) return true
+  if (explicitUpdate !== undefined) return Boolean(explicitUpdate)
   return /^(1|true|yes|all)$/i.test(String(process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS ?? '').trim())
 }
 

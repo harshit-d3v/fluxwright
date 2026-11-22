@@ -6,6 +6,7 @@ const fs = require('node:fs/promises')
 const { dirname, join } = require('node:path')
 
 const SCREENCAP_SETTLE_MS = 25
+const FFMPEG_TIMEOUT_MS = 60_000
 
 // Valid 2x2 black baseline JPEG used only if a page closes before any frame can be captured.
 const FALLBACK_JPEG = Buffer.from(
@@ -223,7 +224,7 @@ function encodeMjpegAvi(frameBuffers, fps, width, height) {
   return out
 }
 
-async function tryMuxWebm(outPath, frames, fps, size, firstDims) {
+async function tryMuxWebm(outPath, frames, fps, size, firstDims, timeoutMs = FFMPEG_TIMEOUT_MS) {
   const args = [
     '-y',
     '-loglevel',
@@ -252,37 +253,79 @@ async function tryMuxWebm(outPath, frames, fps, size, firstDims) {
 
   const ok = await new Promise((resolve) => {
     let settled = false
+    let timer = null
+    let child = null
     const finish = (val) => {
       if (!settled) {
         settled = true
+        if (timer) {
+          clearTimeout(timer)
+          timer = null
+        }
         resolve(val)
       }
     }
-    let child
     try {
       child = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'], shell: false })
     } catch {
       return finish(false)
     }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          try {
+            child.kill()
+          } catch {}
+        }
+        finish(false)
+      }, timeoutMs)
+      if (typeof timer.unref === 'function') timer.unref()
+    }
     child.on('error', () => finish(false))
     child.stdin.on('error', () => {})
-    child.on('close', (code) => finish(code === 0))
-    try {
-      for (const f of frames) {
-        child.stdin.write(f.jpeg)
+    child.on('close', (code, signal) => finish(code === 0 && signal == null))
+    ;(async () => {
+      try {
+        for (const f of frames) {
+          if (settled || child.stdin.destroyed) return
+          if (!child.stdin.write(f.jpeg)) {
+            await new Promise((res) => {
+              const done = () => {
+                child.stdin.off('drain', done)
+                child.stdin.off('close', done)
+                child.stdin.off('error', done)
+                child.off('close', done)
+                res()
+              }
+              child.stdin.once('drain', done)
+              child.stdin.once('close', done)
+              child.stdin.once('error', done)
+              child.once('close', done)
+            })
+          }
+        }
+        if (!settled && !child.stdin.destroyed) {
+          child.stdin.end()
+        }
+      } catch {
+        finish(false)
       }
-      child.stdin.end()
-    } catch {
-      finish(false)
-    }
+    })()
   })
 
   if (!ok) return false
+  let fh = null
   try {
-    const data = await fs.readFile(outPath)
-    return data.length >= 4 && data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3
+    fh = await fs.open(outPath, 'r')
+    const header = Buffer.alloc(4)
+    const { bytesRead } = await fh.read(header, 0, 4, 0)
+    return bytesRead === 4 && header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3
   } catch {
     return false
+  } finally {
+    if (fh) await fh.close().catch(() => {})
   }
 }
 
@@ -316,23 +359,32 @@ class VideoRecorder {
   #dir
   #size
   #id = randomUUID()
-  #session
+  #session = null
   #frames = []
   #onFrame
+  #onDetached
+  #unsubDetach = null
   #finishedPromise
   #resolveFinished
   #rejectFinished
+  #startPromise = null
+  #stopRequested = false
   #stopping = null
 
-  constructor(dir, size, session) {
+  constructor(dir, size, session = null) {
     this.#dir = dir
     this.#size = size ?? null
-    this.#session = session
     this.#finishedPromise = new Promise((resolve, reject) => {
       this.#resolveFinished = resolve
       this.#rejectFinished = reject
     })
+    // Prevent UnhandledPromiseRejection if finish errors are never observed via video.path().
+    this.#finishedPromise.catch(() => {})
+    this.#onDetached = () => {
+      this.stop().catch(() => {})
+    }
     this.#onFrame = (params) => {
+      if (this.#stopRequested) return
       if (params?.data) {
         try {
           const jpeg = Buffer.from(params.data, 'base64')
@@ -345,27 +397,92 @@ class VideoRecorder {
           })
         } catch {}
       }
-      if (params?.sessionId !== undefined) {
-        this.#session.send('Page.screencastFrameAck', { sessionId: params.sessionId }).catch(() => {})
+      if (params?.sessionId !== undefined && this.#session) {
+        this.#session.send('Page.screencastFrameAck', { sessionId: params.sessionId }).catch((err) => {
+          const msg = String(err?.message ?? err ?? '')
+          if (/detached|closed|gone|crashed|not found/i.test(msg)) {
+            this.stop().catch(() => {})
+          }
+        })
       }
+    }
+    if (session) this.#attachSession(session)
+  }
+
+  #attachSession(session) {
+    this.#session = session
+    session.on('Page.screencastFrame', this.#onFrame)
+    session.on('Inspector.detached', this.#onDetached)
+    session.on('Inspector.targetCrashed', this.#onDetached)
+    if (typeof session._onDetach === 'function') {
+      this.#unsubDetach = session._onDetach(this.#onDetached)
+    }
+  }
+
+  #detachListeners() {
+    if (this.#unsubDetach) {
+      this.#unsubDetach()
+      this.#unsubDetach = null
+    }
+    if (this.#session) {
+      this.#session.off('Page.screencastFrame', this.#onFrame)
+      this.#session.off('Inspector.detached', this.#onDetached)
+      this.#session.off('Inspector.targetCrashed', this.#onDetached)
     }
   }
 
   static async start(session, options) {
     await fs.mkdir(options.dir, { recursive: true })
     const recorder = new VideoRecorder(options.dir, options.size ?? null, session)
-    session.on('Page.screencastFrame', recorder.#onFrame)
-    await session.send('Page.enable').catch(() => {})
-    const startParams = {
-      format: 'jpeg',
-      quality: 80,
-      everyNthFrame: 1,
+    try {
+      await session.send('Page.enable').catch(() => {})
+      const startParams = {
+        format: 'jpeg',
+        quality: 80,
+        everyNthFrame: 1,
+      }
+      if (options.size) {
+        startParams.maxWidth = options.size.width
+        startParams.maxHeight = options.size.height
+      }
+      await session.send('Page.startScreencast', startParams)
+    } catch (err) {
+      recorder.#detachListeners()
+      throw err
     }
-    if (options.size) {
-      startParams.maxWidth = options.size.width
-      startParams.maxHeight = options.size.height
-    }
-    await session.send('Page.startScreencast', startParams)
+    return recorder
+  }
+
+  static startDeferred(options, createSessionFn) {
+    const recorder = new VideoRecorder(options.dir, options.size ?? null, null)
+    recorder.#startPromise = (async () => {
+      await fs.mkdir(options.dir, { recursive: true })
+      if (recorder.#stopRequested) return
+      const session = await createSessionFn()
+      if (recorder.#stopRequested) {
+        await session.detach().catch(() => {})
+        return
+      }
+      recorder.#attachSession(session)
+      try {
+        await session.send('Page.enable').catch(() => {})
+        if (recorder.#stopRequested) return
+        const startParams = {
+          format: 'jpeg',
+          quality: 80,
+          everyNthFrame: 1,
+        }
+        if (options.size) {
+          startParams.maxWidth = options.size.width
+          startParams.maxHeight = options.size.height
+        }
+        await session.send('Page.startScreencast', startParams)
+      } catch {
+        // Popup may close while starting screencast; #finish() falls back cleanly.
+      }
+    })().catch(() => {
+      // Popup closed before CDP session could attach; #finish() writes fallback frame.
+    })
     return recorder
   }
 
@@ -374,6 +491,7 @@ class VideoRecorder {
   }
 
   stop() {
+    this.#stopRequested = true
     if (!this.#stopping) {
       this.#stopping = this.#finish()
     }
@@ -381,25 +499,36 @@ class VideoRecorder {
   }
 
   async #finish() {
+    this.#stopRequested = true
     try {
-      await this.#session.send('Page.stopScreencast').catch(() => {})
-      await new Promise((r) => setTimeout(r, SCREENCAP_SETTLE_MS))
-      this.#session.off('Page.screencastFrame', this.#onFrame)
-
-      if (this.#frames.length === 0) {
-        const shot = await this.#session
-          .send('Page.captureScreenshot', { format: 'jpeg', quality: 80 })
-          .catch(() => null)
-        if (shot?.data) {
-          this.#frames.push({
-            jpeg: Buffer.from(shot.data, 'base64'),
-            timestamp: null,
-            width: this.#size?.width ?? null,
-            height: this.#size?.height ?? null,
-          })
-        }
+      if (this.#startPromise) {
+        await this.#startPromise.catch(() => {})
       }
-      await this.#session.detach().catch(() => {})
+      const session = this.#session
+      if (session) {
+        if (this.#unsubDetach) {
+          this.#unsubDetach()
+          this.#unsubDetach = null
+        }
+        await session.send('Page.stopScreencast').catch(() => {})
+        await new Promise((r) => setTimeout(r, SCREENCAP_SETTLE_MS))
+        this.#detachListeners()
+
+        if (this.#frames.length === 0) {
+          const shot = await session
+            .send('Page.captureScreenshot', { format: 'jpeg', quality: 80 })
+            .catch(() => null)
+          if (shot?.data) {
+            this.#frames.push({
+              jpeg: Buffer.from(shot.data, 'base64'),
+              timestamp: null,
+              width: this.#size?.width ?? null,
+              height: this.#size?.height ?? null,
+            })
+          }
+        }
+        await session.detach().catch(() => {})
+      }
 
       const frames = this.#frames.length
         ? this.#frames
@@ -410,7 +539,7 @@ class VideoRecorder {
       const f0 = frames[0]
       const firstDims =
         jpegDimensions(f0.jpeg) ?? (f0.width && f0.height ? { width: f0.width, height: f0.height } : null)
-      const dims = this.#size ?? firstDims ?? { width: 800, height: 600 }
+      const dims = firstDims ?? this.#size ?? { width: 800, height: 600 }
 
       const webmPath = join(this.#dir, `${this.#id}.webm`)
       if (await tryMuxWebm(webmPath, frames, fps, this.#size, firstDims)) {
@@ -432,6 +561,9 @@ class VideoRecorder {
     } catch (err) {
       this.#rejectFinished(err)
       throw err
+    } finally {
+      this.#frames = []
+      this.#session = null
     }
   }
 }
@@ -442,4 +574,5 @@ module.exports = {
   validateRecordVideoOptions,
   encodeMjpegAvi,
   jpegDimensions,
+  tryMuxWebm,
 }
