@@ -42,6 +42,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 
 from . import _native
 from ._errors import Error, TimeoutError
+from ._expect import LocatorAssertions, PageAssertions, expect
 from ._native import ConsoleMessage, Download, FrameLocator, Locator
 from ._types import (
     FilePayload,
@@ -77,8 +78,10 @@ __all__ = [
     "HttpCredentials",
     "Keyboard",
     "Locator",
+    "LocatorAssertions",
     "Mouse",
     "Page",
+    "PageAssertions",
     "PdfMargins",
     "Playwright",
     "PlaywrightContextManager",
@@ -95,6 +98,7 @@ __all__ = [
     "Worker",
     "async_playwright",
     "chromium",
+    "expect",
 ]
 
 _log = logging.getLogger("fluxwright")

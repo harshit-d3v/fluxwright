@@ -1,6 +1,7 @@
 mod adaptive;
 mod config;
 mod error;
+mod expect;
 mod hosts;
 mod metrics;
 pub mod netguard;
@@ -22,6 +23,7 @@ pub use fluxwright_cdp::{
 };
 pub use config::{EngineConfig, JobOptions, Priority, QueueFullMode, ResourcePreset};
 pub use error::{Error, Result};
+pub use expect::{expect_locator, expect_page, LocatorExpect, PageExpect};
 pub use metrics::MetricsSnapshot;
 pub use pool::{
     with_timeout, ApiRequestContext, BrowserInfo, ContextLease, Downloads, Engine, EngineBuilder,

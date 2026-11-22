@@ -1,5 +1,5 @@
 // Compile-only check of the published typings: `npm run test:types`.
-import fluxwright, { chromium, type StorageState } from '../addon'
+import fluxwright, { chromium, expect, type LocatorAssertions, type PageAssertions, type StorageState } from '../addon'
 
 export async function typed(): Promise<void> {
   const browser = await chromium.launch({ maxBrowsers: 2 })
@@ -234,6 +234,32 @@ export async function typed(): Promise<void> {
     void [customCtx, customPage]
   }
   void [closed, currentUrl, wf1, wf2, wf3, cookies, idbState, apiBody, pageReq.headersArray(), cdpEval, context.pages().length, context.browser()]
+
+  const pageAssert: PageAssertions = expect(page)
+  const locAssert: LocatorAssertions = expect(item)
+  const softExpect = expect.configure({ timeout: 2_000 })
+  await pageAssert.toHaveTitle('Home')
+  await pageAssert.not.toHaveTitle(/Err/, { timeout: 1_000 })
+  await softExpect(page).toHaveURL(/example\.com/)
+  await locAssert.toBeVisible({ timeout: 500 })
+  await locAssert.not.toBeHidden()
+  await locAssert.toBeAttached()
+  await locAssert.toBeEnabled()
+  await locAssert.toBeDisabled()
+  await locAssert.toBeChecked({ checked: false })
+  await locAssert.toBeEditable()
+  await locAssert.toHaveText(/ok/i, { timeout: 500 })
+  await locAssert.toContainText('ok')
+  await locAssert.toHaveValue('abc')
+  await locAssert.toHaveAttribute('data-id', /^12/)
+  await locAssert.toHaveClass('active')
+  await locAssert.toHaveCount(1)
+  await fluxwright.expect(item).not.toHaveText('nope')
+  // @ts-expect-error toBeVisible is only on LocatorAssertions, not PageAssertions
+  await expect(page).toBeVisible()
+  // @ts-expect-error toHaveURL is only on PageAssertions, not LocatorAssertions
+  await expect(item).toHaveURL('https://example.com')
+
   await context.close()
   await browser.close()
 }

@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events')
 const fs = require('node:fs/promises')
 const { dirname } = require('node:path')
 const { Script } = require('node:vm')
+const { createExpect } = require('./expect.js')
 
 // Like Playwright, `{ path }` creates missing folders (`.auth/state.json`).
 async function save(path, data) {
@@ -2580,6 +2581,7 @@ function applyFilter(loc, options, label) {
       return native.Chromium.connectOverCDP(endpointURL)
     },
   }
+  module.exports.expect = createExpect(native.Page, native.Locator)
   module.exports.default = module.exports
 } catch (err) {
   // Keep why: no prebuild for this platform, a missing optional dependency, or a checkout that
@@ -2599,6 +2601,7 @@ function applyFilter(loc, options, label) {
         throw error
       },
     },
+    expect: createExpect(null, null),
   }
   module.exports.default = module.exports
 }

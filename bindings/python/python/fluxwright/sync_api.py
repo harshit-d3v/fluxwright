@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 
-from . import _native
+from . import _expect, _native
 from . import async_api as _a
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage
@@ -67,8 +67,10 @@ __all__ = [
     "HttpCredentials",
     "Keyboard",
     "Locator",
+    "LocatorAssertions",
     "Mouse",
     "Page",
+    "PageAssertions",
     "PdfMargins",
     "Playwright",
     "PlaywrightContextManager",
@@ -84,6 +86,7 @@ __all__ = [
     "WebSocket",
     "Worker",
     "chromium",
+    "expect",
     "sync_playwright",
 ]
 
@@ -2421,3 +2424,14 @@ def sync_playwright() -> PlaywrightContextManager:
 
 #: Launches the engine directly: ``browser = chromium.launch()``.
 chromium = BrowserType(_a.chromium)
+
+
+class LocatorAssertions(_expect.SyncLocatorAssertions):
+    """Auto-retrying assertions for a sync ``Locator``."""
+
+
+class PageAssertions(_expect.SyncPageAssertions):
+    """Auto-retrying assertions for a sync ``Page``."""
+
+
+expect = _expect.SyncExpect(Page, Locator, PageAssertions, LocatorAssertions, _run)

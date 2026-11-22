@@ -21,6 +21,41 @@ export interface FilterOptions {
   hasText?: string | RegExp
   hasNotText?: string | RegExp
 }
+export interface ExpectOptions {
+  timeout?: number
+}
+
+export interface LocatorAssertions {
+  readonly not: LocatorAssertions
+  toBeVisible(options?: ExpectOptions): Promise<void>
+  toBeHidden(options?: ExpectOptions): Promise<void>
+  toBeAttached(options?: ExpectOptions): Promise<void>
+  toBeEnabled(options?: ExpectOptions): Promise<void>
+  toBeDisabled(options?: ExpectOptions): Promise<void>
+  toBeChecked(options?: ExpectOptions & { checked?: boolean }): Promise<void>
+  toBeEditable(options?: ExpectOptions): Promise<void>
+  toHaveText(expected: string | RegExp, options?: ExpectOptions): Promise<void>
+  toContainText(expected: string | RegExp, options?: ExpectOptions): Promise<void>
+  toHaveValue(value: string | RegExp, options?: ExpectOptions): Promise<void>
+  toHaveAttribute(name: string, value: string | RegExp, options?: ExpectOptions): Promise<void>
+  toHaveClass(expected: string | RegExp, options?: ExpectOptions): Promise<void>
+  toHaveCount(count: number, options?: ExpectOptions): Promise<void>
+}
+
+export interface PageAssertions {
+  readonly not: PageAssertions
+  toHaveTitle(titleOrRegExp: string | RegExp, options?: ExpectOptions): Promise<void>
+  toHaveURL(urlOrRegExp: string | RegExp, options?: ExpectOptions): Promise<void>
+}
+
+export interface Expect {
+  (page: Page): PageAssertions
+  (locator: Locator): LocatorAssertions
+  configure(options: ExpectOptions): Expect
+}
+
+export const expect: Expect
+
 /**
  * Playwright-style export: `chromium.launch(...)`, which is `Chromium.launch` after a check that
  * every option is one Fluxwright implements (others throw a TypeError).
@@ -28,7 +63,7 @@ export interface FilterOptions {
 export const chromium: Pick<typeof Chromium, 'launch'> & {
   connectOverCDP(endpointURL: string, options?: Record<string, never>): Promise<Browser>
 }
-declare const fluxwright: { chromium: typeof chromium }
+declare const fluxwright: { chromium: typeof chromium; expect: typeof expect }
 export default fluxwright
 
 /** Playwright's `page.pdf` options. */
