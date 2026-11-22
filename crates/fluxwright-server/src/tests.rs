@@ -1935,7 +1935,7 @@ async fn coordinator_sqlite_store_preserves_finished_results_and_replays_unfinis
         &coord1,
         "POST",
         &format!("/v1/jobs/{}/result", j_ok.id),
-        &json!({
+        json!({
             "worker": "w1",
             "status": "succeeded",
             "attempts": 1,
@@ -1952,7 +1952,7 @@ async fn coordinator_sqlite_store_preserves_finished_results_and_replays_unfinis
         &coord1,
         "POST",
         &format!("/v1/jobs/{}/result", j_fail.id),
-        &json!({
+        json!({
             "worker": "w1",
             "status": "failed",
             "attempts": 1,
@@ -2175,7 +2175,7 @@ async fn coordinator_enforces_global_per_host_concurrency_without_hol_blocking()
         &coord,
         "POST",
         &format!("/v1/jobs/{}/result", a1.id),
-        &json!({
+        json!({
             "worker": "w1",
             "status": "succeeded",
             "attempts": 1,
@@ -2205,7 +2205,7 @@ async fn coordinator_enforces_global_per_host_concurrency_without_hol_blocking()
             &coord,
             "POST",
             "/v1/workers/w2/release",
-            &json!({ "jobs": [a2.id] }).to_string(),
+            json!({ "jobs": [a2.id] }).to_string(),
         )
         .await
         .status(),
@@ -2277,7 +2277,7 @@ async fn coordinator_enforces_global_per_host_delay_across_workers_without_hol_b
             &coord,
             "POST",
             &format!("/v1/jobs/{}/result", a1.id),
-            &json!({
+            json!({
                 "worker": "w1",
                 "status": "succeeded",
                 "attempts": 1,
