@@ -86,6 +86,10 @@ class ZipStoreWriter {
       offset += lfh.length + entry.data.length
     }
 
+    if (offset > 0xffffffff) {
+      throw new Error('ZipStoreWriter: archive exceeds 4 GiB ZIP limit')
+    }
+
     const cdOffset = offset >>> 0
     let cdSize = 0
     for (const rec of records) {
@@ -110,6 +114,10 @@ class ZipStoreWriter {
       rec.nameBuf.copy(cd, 46)
       chunks.push(cd)
       cdSize += cd.length
+    }
+
+    if (cdSize > 0xffffffff) {
+      throw new Error('ZipStoreWriter: archive exceeds 4 GiB ZIP limit')
     }
 
     const eocd = Buffer.allocUnsafe(22)
@@ -242,12 +250,16 @@ class Tracing {
   #chunkActive = false
   #screenshots = false
   #snapshots = false
+  #sources = false
   #name = undefined
   #title = undefined
   #originPerf = 0
   #originWall = 0
   #nextCallSeq = 0
   #nextPageSeq = 0
+  #chunkSeq = 0
+  #sessionGen = 0
+  #suppressActions = false
   #pageIds = new WeakMap()
   #traceLines = []
   #networkLines = []
@@ -255,6 +267,7 @@ class Tracing {
   #chunkFrames = 0
   #inFlightNet = new Map()
   #watchers = new Map()
+  #pendingPageAttaches = new Set()
   #opChain = Promise.resolve()
 
   constructor(context) {
@@ -294,6 +307,7 @@ class Tracing {
       options: {
         screenshots: this.#screenshots,
         snapshots: this.#snapshots,
+        ...(this.#sources ? { sources: true } : {}),
       },
     }
     if (this.#title !== undefined) entry.title = this.#title
@@ -302,6 +316,7 @@ class Tracing {
   }
 
   #resetChunk(name, title) {
+    this.#chunkSeq += 1
     this.#name = name
     this.#title = title
     this.#traceLines = []
@@ -529,13 +544,16 @@ class Tracing {
     this.#watchers.set(page, watcher)
 
     if (this.#screenshots && !page.isClosed()) {
+      const gen = this.#sessionGen
+      let cdp = null
+      let onFrame = null
       try {
-        const cdp = await ctx.newCDPSession(page)
-        if (!this.#active || page.isClosed() || this.#watchers.get(page) !== watcher) {
+        cdp = await ctx.newCDPSession(page)
+        if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
           await cdp.detach().catch(() => {})
           return
         }
-        const onFrame = (ev) => {
+        onFrame = (ev) => {
           if (ev?.sessionId != null) {
             cdp.send('Page.screencastFrameAck', { sessionId: ev.sessionId }).catch(() => {})
           }
@@ -553,6 +571,11 @@ class Tracing {
         }
         cdp.on('Page.screencastFrame', onFrame)
         await cdp.send('Page.enable').catch(() => {})
+        if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
+          cdp.off('Page.screencastFrame', onFrame)
+          await cdp.detach().catch(() => {})
+          return
+        }
         await cdp.send('Page.startScreencast', {
           format: 'jpeg',
           quality: 80,
@@ -560,10 +583,20 @@ class Tracing {
           maxHeight: 720,
           everyNthFrame: 1,
         })
+        if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
+          cdp.off('Page.screencastFrame', onFrame)
+          await cdp.send('Page.stopScreencast').catch(() => {})
+          await cdp.detach().catch(() => {})
+          return
+        }
         watcher.cdp = cdp
         watcher.cleanupCdp = () => cdp.off('Page.screencastFrame', onFrame)
       } catch {
         // Page or context closed concurrently while attaching screencast.
+        if (cdp) {
+          if (onFrame) cdp.off('Page.screencastFrame', onFrame)
+          await cdp.detach().catch(() => {})
+        }
       }
     }
   }
@@ -584,8 +617,8 @@ class Tracing {
     return this.#active
   }
 
-  async _onPageCreated(page) {
-    if (!this.#active) return
+  _onPageCreated(page) {
+    if (!this.#active) return Promise.resolve()
     const pageId = this.#ensurePageId(page)
     if (this.#chunkActive) {
       this.#traceLines.push(
@@ -599,7 +632,10 @@ class Tracing {
         }),
       )
     }
-    await this.#attachPage(page)
+    const p = this.#attachPage(page).catch(() => {})
+    this.#pendingPageAttaches.add(p)
+    p.finally(() => this.#pendingPageAttaches.delete(p))
+    return p
   }
 
   async _onPageClosing(page) {
@@ -624,8 +660,14 @@ class Tracing {
     if (!this.#active) return
     this.#active = false
     this.#chunkActive = false
+    this.#sessionGen += 1
+    this.#chunkSeq += 1
     const pages = [...this.#watchers.keys()]
-    await Promise.allSettled(pages.map((p) => this.#detachPage(p)))
+    await Promise.allSettled([
+      ...pages.map((p) => this.#detachPage(p)),
+      ...[...this.#pendingPageAttaches],
+    ])
+    this.#pendingPageAttaches.clear()
     this.#traceLines = []
     this.#networkLines = []
     this.#resources.clear()
@@ -633,7 +675,8 @@ class Tracing {
   }
 
   async _runAction(page, className, methodName, apiName, params, fn) {
-    if (!this.#active || !this.#chunkActive) return fn()
+    if (!this.#active || !this.#chunkActive || this.#suppressActions) return fn()
+    const chunkSeq = this.#chunkSeq
     const callId = `call@${++this.#nextCallSeq}`
     const pageId = this.#ensurePageId(page)
     const startTime = this.#monoMs()
@@ -650,26 +693,32 @@ class Tracing {
         stepId: callId,
       }),
     )
-    let errorMsg
+    let errorInfo
     try {
       return await fn()
     } catch (err) {
-      errorMsg = err instanceof Error ? err.message : String(err)
+      errorInfo =
+        err instanceof Error
+          ? { name: err.name || 'Error', message: err.message, stack: err.stack || '' }
+          : { name: 'Error', message: String(err), stack: '' }
       throw err
     } finally {
-      if (this.#active && this.#chunkActive) {
+      if (this.#active && this.#chunkActive && this.#chunkSeq === chunkSeq) {
         const after = {
           type: 'after',
           callId,
           endTime: this.#monoMs(),
         }
-        if (errorMsg !== undefined) after.error = { message: errorMsg }
+        if (errorInfo !== undefined) after.error = errorInfo
         this.#traceLines.push(JSON.stringify(after))
       }
     }
   }
 
   async #finalizeChunk(path) {
+    if (this.#pendingPageAttaches.size > 0) {
+      await Promise.allSettled([...this.#pendingPageAttaches])
+    }
     const ctx = this.#contextRef.deref()
     const openPages = ctx ? ctx.pages().filter((p) => !p.isClosed()) : []
     if (path != null && this.#screenshots && this.#chunkFrames === 0 && openPages.length > 0) {
@@ -687,10 +736,16 @@ class Tracing {
             if (watcher?.cdp) {
               const res = await watcher.cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 80 })
               if (res?.data) buf = Buffer.from(res.data, 'base64')
+            } else if (typeof page.screenshot === 'function') {
+              this.#suppressActions = true
+              try {
+                buf = await page.screenshot({ type: 'jpeg', quality: 80 })
+              } finally {
+                this.#suppressActions = false
+              }
             }
             if (buf?.length) {
               this.#recordJpegFrame(pageId, buf)
-              break
             }
           } catch {}
         }
@@ -699,7 +754,6 @@ class Tracing {
 
     await new Promise((r) => setTimeout(r, 20))
     this.#flushNetwork()
-    this.#chunkActive = false
 
     if (path != null) {
       const zip = new ZipStoreWriter()
@@ -713,9 +767,13 @@ class Tracing {
       const zipBytes = zip.toBuffer()
       await fs.mkdir(dirname(path), { recursive: true })
       await fs.writeFile(path, zipBytes)
-    } else {
-      this.#resources.clear()
     }
+
+    this.#chunkActive = false
+    this.#traceLines = []
+    this.#networkLines = []
+    this.#resources.clear()
+    this.#inFlightNet.clear()
   }
 
   async start(options) {
@@ -724,14 +782,17 @@ class Tracing {
       title: 'string',
       screenshots: 'boolean',
       snapshots: 'boolean',
+      sources: 'boolean',
     })
     return this.#serialized(async () => {
       const ctx = this.#contextRef.deref()
       if (!ctx || ctx._isClosed?.()) throw new Error('tracing.start: browser context is closed')
       if (this.#active) throw new Error('Tracing has been already started')
+      this.#sessionGen += 1
       this.#active = true
       this.#screenshots = Boolean(opts.screenshots)
       this.#snapshots = Boolean(opts.snapshots)
+      this.#sources = Boolean(opts.sources)
       this.#originPerf = performance.now()
       this.#originWall = Date.now()
       this.#resetChunk(opts.name, opts.title)
@@ -774,10 +835,10 @@ class Tracing {
         if (opts.path != null) throw new Error('Tracing has not been started')
         return
       }
-      if (opts.path != null && !this.#chunkActive) {
-        throw new Error('No active trace chunk; call startChunk() before stop({ path })')
-      }
       try {
+        if (opts.path != null && !this.#chunkActive) {
+          throw new Error('No active trace chunk; call startChunk() before stop({ path })')
+        }
         if (this.#chunkActive) await this.#finalizeChunk(opts.path)
       } finally {
         await this._dispose()

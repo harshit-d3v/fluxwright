@@ -274,13 +274,16 @@ export async function typed(): Promise<void> {
   await locAssert.toHaveClass('active')
   await locAssert.toHaveCount(1)
   await fluxwright.expect(item).not.toHaveText('nope')
+  await expect.soft(page).toHaveTitle('Home')
+  await expect.soft(item).toBeVisible()
+  await softExpect.soft(page).toHaveURL(/example\.com/)
   // @ts-expect-error toBeVisible is only on LocatorAssertions, not PageAssertions
   await expect(page).toBeVisible()
   // @ts-expect-error toHaveURL is only on PageAssertions, not LocatorAssertions
   await expect(item).toHaveURL('https://example.com')
 
   const tracing: Tracing = context.tracing
-  await tracing.start({ name: 'suite', title: 'smoke', screenshots: true, snapshots: true })
+  await tracing.start({ name: 'suite', title: 'smoke', screenshots: true, snapshots: true, sources: true })
   await tracing.startChunk({ name: 'chunk-1', title: 'first chunk' })
   await tracing.stopChunk({ path: 'chunk.zip' })
   await tracing.stop({ path: 'trace.zip' })
@@ -333,7 +336,13 @@ export function typedRunner(): void {
   })
   void cfg
 
-  test.use({ baseURL: 'https://example.com', screenshot: 'only-on-failure', trace: 'retain-on-failure', video: 'retain-on-failure' })
+  test.use({
+    baseURL: 'https://example.com',
+    screenshot: 'only-on-failure',
+    trace: 'retain-on-failure',
+    video: 'retain-on-failure',
+    recordVideo: { dir: 'videos' },
+  })
   // @ts-expect-error bogus option is not allowed in test.use
   test.use({ bogusUseOption: 1 })
 
@@ -353,9 +362,12 @@ export function typedRunner(): void {
     })
 
     test('basic runner test', async ({ page, context, browser }, info: TestInfo) => {
-      void [context, browser, info.outputPath('shot.png')]
+      void [context, browser, info.outputPath('shot.png'), info.errors]
       await runnerExpect(page).toHaveTitle('Home')
       await runnerExpect(page.locator('#btn')).toBeVisible()
+      await runnerExpect.soft(page).toHaveTitle('Home')
+      await runnerExpect.soft(page.locator('#btn')).toBeVisible()
+      runnerExpect.soft(1 + 1).toBe(2)
       runnerExpect(1 + 1).toBe(2)
       runnerExpect(['a', 'b']).toContain('a')
       await runnerExpect.configure({ timeout: 500 })(page).toHaveURL(/example/)

@@ -743,6 +743,7 @@ class CDPSession {
   #page
   #id
   #emitter = new EventEmitter()
+  #detachListeners = new Set()
   #started = false
   #detached = false
 
@@ -751,6 +752,19 @@ class CDPSession {
     this.#id = id
     this.#emitter.setMaxListeners(0)
     cdpSessionRegistry.register(this, { page, id }, this)
+  }
+
+  _onDetach(listener) {
+    if (this.#detached) {
+      try {
+        listener()
+      } catch {}
+      return () => {}
+    }
+    this.#detachListeners.add(listener)
+    return () => {
+      this.#detachListeners.delete(listener)
+    }
   }
 
   #ensureEvents() {
@@ -806,6 +820,13 @@ class CDPSession {
     if (this.#detached) return
     this.#detached = true
     cdpSessionRegistry.unregister(this)
+    const listeners = [...this.#detachListeners]
+    this.#detachListeners.clear()
+    for (const cb of listeners) {
+      try {
+        cb()
+      } catch {}
+    }
     this.#emitter.removeAllListeners()
     await this.#page._cdpDetach(this.#id)
   }
@@ -1549,35 +1570,62 @@ const pageVideos = new WeakMap()
 const pageVideoRecorders = new WeakMap()
 const browserVideoRecorders = new WeakMap()
 
-async function startPageVideo(page, recordVideo, browser) {
-  const id = await page._newCdpSession(null)
-  const session = new CDPSession(page, id)
-  const recorder = await VideoRecorder.start(session, recordVideo)
+function registerPageVideo(page, recorder, browser, videoPagesSet = null) {
   const video = new Video(recorder)
+  const entry = { recorder, browser, videoPagesSet, page, stopPromise: null }
   pageVideos.set(page, video)
-  pageVideoRecorders.set(page, { recorder, browser })
+  pageVideoRecorders.set(page, entry)
+  if (videoPagesSet) videoPagesSet.add(page)
   if (browser) {
     let set = browserVideoRecorders.get(browser)
     if (!set) {
       set = new Set()
       browserVideoRecorders.set(browser, set)
     }
-    set.add(recorder)
+    set.add(entry)
   }
   return video
+}
+
+async function startPageVideo(page, recordVideo, browser, videoPagesSet = null) {
+  const id = await page._newCdpSession(null)
+  const session = new CDPSession(page, id)
+  let recorder
+  try {
+    recorder = await VideoRecorder.start(session, recordVideo)
+  } catch (err) {
+    await session.detach().catch(() => {})
+    throw err
+  }
+  return registerPageVideo(page, recorder, browser, videoPagesSet)
+}
+
+function startPageVideoDeferred(page, recordVideo, browser, videoPagesSet = null) {
+  const recorder = VideoRecorder.startDeferred(recordVideo, async () => {
+    const id = await page._newCdpSession(null)
+    return new CDPSession(page, id)
+  })
+  return registerPageVideo(page, recorder, browser, videoPagesSet)
 }
 
 async function stopPageVideo(page) {
   const entry = pageVideoRecorders.get(page)
   if (!entry) return
-  pageVideoRecorders.delete(page)
-  try {
-    await entry.recorder.stop()
-  } finally {
-    if (entry.browser) {
-      browserVideoRecorders.get(entry.browser)?.delete(entry.recorder)
-    }
+  if (!entry.stopPromise) {
+    entry.stopPromise = (async () => {
+      try {
+        await entry.recorder.stop()
+      } finally {
+        if (entry.browser) {
+          browserVideoRecorders.get(entry.browser)?.delete(entry)
+        }
+        if (entry.videoPagesSet) {
+          entry.videoPagesSet.delete(entry.page)
+        }
+      }
+    })()
   }
+  await entry.stopPromise
 }
 
 // browser.newContext() and context.newPage(), as in Playwright. Each context can hold multiple
@@ -1588,6 +1636,8 @@ class BrowserContext {
   #ensurePopup
   #closed = false
   #pages = new Set()
+  #videoPages = new Set()
+  #allVideoHandles = new Set()
   #routes = []
   #routeStart = null
   #bindings = new Map()
@@ -1629,13 +1679,22 @@ class BrowserContext {
     return this.#tracing?._isActive() ? this.#tracing : null
   }
 
+  _videoHandles() {
+    return [...this.#allVideoHandles]
+  }
+
   browser() {
     return this.#browser
   }
 
   pages() {
     for (const p of this.#pages) {
-      if (p.isClosed()) this.#pages.delete(p)
+      if (p.isClosed()) {
+        this.#pages.delete(p)
+        if (this.#videoPages.has(p)) {
+          stopPageVideo(p).catch(() => {})
+        }
+      }
     }
     return [...this.#pages]
   }
@@ -1652,7 +1711,8 @@ class BrowserContext {
     this._adoptPage(popup)
     this.#tracing?._onPageCreated(popup).catch(() => {})
     if (this.#recordVideo) {
-      startPageVideo(popup, this.#recordVideo, this.#browser).catch(() => {})
+      const video = startPageVideoDeferred(popup, this.#recordVideo, this.#browser, this.#videoPages)
+      this.#allVideoHandles.add(video)
     }
   }
 
@@ -1670,7 +1730,14 @@ class BrowserContext {
     this._adoptPage(page)
     await this.#tracing?._onPageCreated(page)
     if (this.#recordVideo) {
-      await startPageVideo(page, this.#recordVideo, this.#browser)
+      try {
+        const video = await startPageVideo(page, this.#recordVideo, this.#browser, this.#videoPages)
+        this.#allVideoHandles.add(video)
+      } catch (err) {
+        this.#videoPages.delete(page)
+        await page.close().catch(() => {})
+        throw err
+      }
     }
     return page
   }
@@ -1863,8 +1930,12 @@ class BrowserContext {
     if (this.#closed) return
     this.#closed = true
     contextRegistry.unregister(this)
-    await Promise.allSettled([...this.#pages].map((p) => (p.isClosed() ? Promise.resolve() : p.close())))
+    const pages = [...this.#pages]
+    const videoPages = [...this.#videoPages]
+    await Promise.allSettled(pages.map((p) => (p.isClosed() ? stopPageVideo(p) : p.close())))
+    await Promise.allSettled(videoPages.map((p) => stopPageVideo(p)))
     this.#pages.clear()
+    this.#videoPages.clear()
     await this.#tracing?._dispose()
     await this.#browser._closeContext(this.#id)
     await flushPendingHarFilters(this)
@@ -2275,7 +2346,14 @@ try {
     const page = await newPage.call(this, opts)
     if (regexHar) addPendingHarFilter(page, regexHar.path, regexHar.regex)
     trackTarget(page)
-    if (recordVideo) await startPageVideo(page, recordVideo, this)
+    if (recordVideo) {
+      try {
+        await startPageVideo(page, recordVideo, this)
+      } catch (err) {
+        await page.close().catch(() => {})
+        throw err
+      }
+    }
     return page
   }
   const storageState = native.Page.prototype.storageState
@@ -2760,7 +2838,7 @@ function applyFilter(loc, options, label) {
     if (recs && recs.size > 0) {
       const list = [...recs]
       recs.clear()
-      await Promise.allSettled(list.map((r) => r.stop()))
+      await Promise.allSettled(list.map((entry) => stopPageVideo(entry.page)))
     }
     return origBrowserClose.call(this)
   }
@@ -2836,7 +2914,11 @@ function applyFilter(loc, options, label) {
     native.Locator.prototype[name] = function (...args) {
       if (suppressLocatorDepth > 0) return orig.apply(this, args)
       const page = ownerPage(this)
-      return traceAction(page, 'Locator', name, `locator.${name}`, {}, () => orig.apply(this, args))
+      const frames = typeof this._frames === 'function' ? this._frames() : []
+      const query = typeof this._query === 'function' ? this._query() : ''
+      const selector = [...frames, query].filter(Boolean).join(' >> ')
+      const params = selector ? { selector } : {}
+      return traceAction(page, 'Locator', name, `locator.${name}`, params, () => orig.apply(this, args))
     }
   }
   const origPageCloseWithBindings = native.Page.prototype.close
@@ -2857,7 +2939,7 @@ function applyFilter(loc, options, label) {
       return native.Chromium.connectOverCDP(endpointURL)
     },
   }
-  module.exports.expect = createExpect(native.Page, native.Locator)
+  module.exports.expect = createExpect(native.Page, native.Locator, undefined, ownerPage)
   module.exports.default = module.exports
 } catch (err) {
   // Keep why: no prebuild for this platform, a missing optional dependency, or a checkout that

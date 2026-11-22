@@ -81,6 +81,8 @@ export interface PageAssertions {
 export interface Expect {
   (page: Page): PageAssertions
   (locator: Locator): LocatorAssertions
+  soft(page: Page): PageAssertions
+  soft(locator: Locator): LocatorAssertions
   configure(options: ExpectOptions): Expect
 }
 
@@ -435,6 +437,8 @@ export interface TracingStartOptions {
   screenshots?: boolean
   /** Whether to record DOM snapshot metadata. */
   snapshots?: boolean
+  /** Whether to include source metadata in trace options. */
+  sources?: boolean
 }
 
 export interface TracingChunkOptions {

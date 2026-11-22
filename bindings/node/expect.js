@@ -24,7 +24,9 @@ function normalizeWhitespace(s) {
 }
 
 function compileRegExp(re) {
-  return new RegExp(re.source, re.flags.replace(/[gy]/g, ''))
+  const copy = new RegExp(re.source, re.flags.replace(/g/g, ''))
+  copy.lastIndex = 0
+  return copy
 }
 
 function validatePattern(expected, method) {
@@ -33,18 +35,18 @@ function validatePattern(expected, method) {
   }
 }
 
-function validateOptions(method, options, extraAllowed = {}) {
+function validateOptions(method, options, extraAllowed = {}, includeTimeout = true) {
   if (options == null) return {}
   if (typeof options !== 'object' || Array.isArray(options)) {
     throw new TypeError(`${method}: options must be an object`)
   }
-  const allowed = { timeout: true, ...extraAllowed }
+  const allowed = includeTimeout ? { timeout: true, ...extraAllowed } : { ...extraAllowed }
   for (const [key, value] of Object.entries(options)) {
     if (value === undefined) continue
     if (!Object.hasOwn(allowed, key)) {
       throw new TypeError(`${method}: option '${key}' is not supported`)
     }
-    if (key === 'timeout' && value != null) {
+    if (includeTimeout && key === 'timeout' && value != null) {
       if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
         throw new TypeError(`${method}: timeout must be a non-negative number`)
       }
@@ -89,7 +91,12 @@ function isFatalError(err) {
     /browser process exited/i.test(msg) ||
     /session .* is gone/i.test(msg) ||
     /target crashed/i.test(msg) ||
-    /invalid selector:/i.test(msg)
+    /invalid selector:/i.test(msg) ||
+    /devtools websocket:/i.test(msg) ||
+    /engine is shut down/i.test(msg) ||
+    /browser context is closed/i.test(msg) ||
+    /target closed/i.test(msg) ||
+    /session with given id not found/i.test(msg)
   )
 }
 
@@ -97,10 +104,26 @@ function resolveUrl(page, expected) {
   if (typeof expected !== 'string') return expected
   const baseUrl = typeof page._baseUrl === 'function' ? page._baseUrl() : null
   if (baseUrl != null && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(expected)) {
-    if (expected.startsWith('/')) return new URL(baseUrl).origin + expected
     return new URL(expected, baseUrl).href
   }
   return expected
+}
+
+async function raceTimeout(promise, limitMs, label) {
+  const p = Promise.resolve(promise)
+  if (!Number.isFinite(limitMs) || limitMs <= 0) return p
+  p.catch(() => {})
+  let timer = null
+  try {
+    return await Promise.race([
+      p,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label}: timed out after ${limitMs}ms`)), limitMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 async function pollUntil({ targetLabel, matcher, expectedDesc, negated, timeoutMs, probe }) {
@@ -152,24 +175,48 @@ class LocatorAssertions {
   #locator
   #defaultTimeout
   #negated
+  #getOwnerPage
+  #onSoftError
 
-  constructor(locator, defaultTimeout, negated = false) {
+  constructor(locator, defaultTimeout, negated = false, getOwnerPage = null, onSoftError = null) {
     this.#locator = locator
     this.#defaultTimeout = defaultTimeout
     this.#negated = negated
+    this.#getOwnerPage = getOwnerPage
+    this.#onSoftError = onSoftError
   }
 
   get not() {
-    return new LocatorAssertions(this.#locator, this.#defaultTimeout, !this.#negated)
+    return new LocatorAssertions(this.#locator, this.#defaultTimeout, !this.#negated, this.#getOwnerPage, this.#onSoftError)
   }
 
   #timeout(options) {
     return options?.timeout ?? this.#defaultTimeout
   }
 
+  async #run(fn) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (this.#onSoftError && !(err instanceof TypeError)) {
+        this.#onSoftError(err)
+        return
+      }
+      throw err
+    }
+  }
+
+  #countWithTimeout(limitMs) {
+    const target =
+      typeof this.#locator._withTimeout === 'function' && Number.isFinite(limitMs) && limitMs > 0
+        ? this.#locator._withTimeout(limitMs)
+        : this.#locator
+    return raceTimeout(target.count(), limitMs, 'locator.count')
+  }
+
   async #ensureAttached(limitMs) {
     try {
-      const n = await this.#locator.count()
+      const n = await this.#countWithTimeout(limitMs)
       if (n === 0) return { kind: 'not-attached' }
       return null
     } catch (err) {
@@ -181,21 +228,23 @@ class LocatorAssertions {
   async #boolCheck({ matcher, expected, trueLabel, falseLabel, requireAttached, options, fn }) {
     const opts = validateOptions(`expect(locator).${matcher}`, options)
     const timeoutMs = this.#timeout(opts)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher,
-      expectedDesc: expected,
-      negated: this.#negated,
-      timeoutMs,
-      probe: async (limitMs) => {
-        if (requireAttached) {
-          const early = await this.#ensureAttached(limitMs)
-          if (early) return early
-        }
-        const val = await fn(limitMs)
-        return { kind: 'value', matched: val, actual: val ? trueLabel : falseLabel }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher,
+        expectedDesc: expected,
+        negated: this.#negated,
+        timeoutMs,
+        probe: async (limitMs) => {
+          if (requireAttached) {
+            const early = await this.#ensureAttached(limitMs)
+            if (early) return early
+          }
+          const val = await fn(limitMs)
+          return { kind: 'value', matched: val, actual: val ? trueLabel : falseLabel }
+        },
+      }),
+    )
   }
 
   async toBeVisible(options) {
@@ -224,20 +273,22 @@ class LocatorAssertions {
 
   async toBeAttached(options) {
     const opts = validateOptions('expect(locator).toBeAttached', options)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toBeAttached',
-      expectedDesc: 'attached',
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async (limitMs) => {
-        const n = await this.#locator.count()
-        if (n === 0) return { kind: 'value', matched: false, actual: 'detached (count: 0)' }
-        if (n === 1) return { kind: 'value', matched: true, actual: 'attached' }
-        await this.#locator.isVisible({ timeout: limitMs })
-        return { kind: 'value', matched: true, actual: `attached (count: ${n})` }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toBeAttached',
+        expectedDesc: 'attached',
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const n = await this.#countWithTimeout(limitMs)
+          if (n === 0) return { kind: 'value', matched: false, actual: 'detached (count: 0)' }
+          if (n === 1) return { kind: 'value', matched: true, actual: 'attached' }
+          await this.#locator.isVisible({ timeout: limitMs })
+          return { kind: 'value', matched: true, actual: `attached (count: ${n})` }
+        },
+      }),
+    )
   }
 
   async toBeEnabled(options) {
@@ -267,23 +318,25 @@ class LocatorAssertions {
   async toBeChecked(options) {
     const opts = validateOptions('expect(locator).toBeChecked', options, { checked: true })
     const wantChecked = opts.checked ?? true
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toBeChecked',
-      expectedDesc: wantChecked ? 'checked' : 'unchecked',
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async (limitMs) => {
-        const early = await this.#ensureAttached(limitMs)
-        if (early) return early
-        const val = await this.#locator.isChecked({ timeout: limitMs })
-        return {
-          kind: 'value',
-          matched: val === wantChecked,
-          actual: val ? 'checked' : 'unchecked',
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toBeChecked',
+        expectedDesc: wantChecked ? 'checked' : 'unchecked',
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const early = await this.#ensureAttached(limitMs)
+          if (early) return early
+          const val = await this.#locator.isChecked({ timeout: limitMs })
+          return {
+            kind: 'value',
+            matched: val === wantChecked,
+            actual: val ? 'checked' : 'unchecked',
+          }
+        },
+      }),
+    )
   }
 
   async toBeEditable(options) {
@@ -301,69 +354,75 @@ class LocatorAssertions {
   async toHaveText(expected, options) {
     validatePattern(expected, 'expect(locator).toHaveText')
     const opts = validateOptions('expect(locator).toHaveText', options)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toHaveText',
-      expectedDesc: formatExpected(expected, true),
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async (limitMs) => {
-        const early = await this.#ensureAttached(limitMs)
-        if (early) return early
-        const raw = (await this.#locator.textContent({ timeout: limitMs })) ?? ''
-        const actualNorm = normalizeWhitespace(raw)
-        return {
-          kind: 'value',
-          matched: matchPattern(raw, expected, { normalize: true, substring: false }),
-          actual: JSON.stringify(actualNorm),
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toHaveText',
+        expectedDesc: formatExpected(expected, true),
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const early = await this.#ensureAttached(limitMs)
+          if (early) return early
+          const raw = (await this.#locator.textContent({ timeout: limitMs })) ?? ''
+          const actualNorm = normalizeWhitespace(raw)
+          return {
+            kind: 'value',
+            matched: matchPattern(raw, expected, { normalize: true, substring: false }),
+            actual: JSON.stringify(actualNorm),
+          }
+        },
+      }),
+    )
   }
 
   async toContainText(expected, options) {
     validatePattern(expected, 'expect(locator).toContainText')
     const opts = validateOptions('expect(locator).toContainText', options)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toContainText',
-      expectedDesc: `substring ${formatExpected(expected, true)}`,
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async (limitMs) => {
-        const early = await this.#ensureAttached(limitMs)
-        if (early) return early
-        const raw = (await this.#locator.textContent({ timeout: limitMs })) ?? ''
-        const actualNorm = normalizeWhitespace(raw)
-        return {
-          kind: 'value',
-          matched: matchPattern(raw, expected, { normalize: true, substring: true }),
-          actual: JSON.stringify(actualNorm),
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toContainText',
+        expectedDesc: `substring ${formatExpected(expected, true)}`,
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const early = await this.#ensureAttached(limitMs)
+          if (early) return early
+          const raw = (await this.#locator.textContent({ timeout: limitMs })) ?? ''
+          const actualNorm = normalizeWhitespace(raw)
+          return {
+            kind: 'value',
+            matched: matchPattern(raw, expected, { normalize: true, substring: true }),
+            actual: JSON.stringify(actualNorm),
+          }
+        },
+      }),
+    )
   }
 
   async toHaveValue(expected, options) {
     validatePattern(expected, 'expect(locator).toHaveValue')
     const opts = validateOptions('expect(locator).toHaveValue', options)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toHaveValue',
-      expectedDesc: formatExpected(expected, false),
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async (limitMs) => {
-        const early = await this.#ensureAttached(limitMs)
-        if (early) return early
-        const val = await this.#locator.inputValue({ timeout: limitMs })
-        return {
-          kind: 'value',
-          matched: matchPattern(val, expected, { normalize: false, substring: false }),
-          actual: JSON.stringify(val),
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toHaveValue',
+        expectedDesc: formatExpected(expected, false),
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const early = await this.#ensureAttached(limitMs)
+          if (early) return early
+          const val = await this.#locator.inputValue({ timeout: limitMs })
+          return {
+            kind: 'value',
+            matched: matchPattern(val, expected, { normalize: false, substring: false }),
+            actual: JSON.stringify(val),
+          }
+        },
+      }),
+    )
   }
 
   async toHaveAttribute(name, expected, options) {
@@ -372,48 +431,52 @@ class LocatorAssertions {
     }
     validatePattern(expected, 'expect(locator).toHaveAttribute')
     const opts = validateOptions('expect(locator).toHaveAttribute', options)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toHaveAttribute',
-      expectedDesc: `${name}=${formatExpected(expected, false)}`,
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async (limitMs) => {
-        const early = await this.#ensureAttached(limitMs)
-        if (early) return early
-        const val = await this.#locator.getAttribute(name, { timeout: limitMs })
-        if (val === null) {
-          return { kind: 'value', matched: false, actual: `${name}=<absent>` }
-        }
-        return {
-          kind: 'value',
-          matched: matchPattern(val, expected, { normalize: false, substring: false }),
-          actual: `${name}=${JSON.stringify(val)}`,
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toHaveAttribute',
+        expectedDesc: `${name}=${formatExpected(expected, false)}`,
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const early = await this.#ensureAttached(limitMs)
+          if (early) return early
+          const val = await this.#locator.getAttribute(name, { timeout: limitMs })
+          if (val === null) {
+            return { kind: 'value', matched: false, actual: `${name}=<absent>` }
+          }
+          return {
+            kind: 'value',
+            matched: matchPattern(val, expected, { normalize: false, substring: false }),
+            actual: `${name}=${JSON.stringify(val)}`,
+          }
+        },
+      }),
+    )
   }
 
   async toHaveClass(expected, options) {
     validatePattern(expected, 'expect(locator).toHaveClass')
     const opts = validateOptions('expect(locator).toHaveClass', options)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toHaveClass',
-      expectedDesc: formatExpected(expected, false),
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async (limitMs) => {
-        const early = await this.#ensureAttached(limitMs)
-        if (early) return early
-        const cls = (await this.#locator.getAttribute('class', { timeout: limitMs })) ?? ''
-        return {
-          kind: 'value',
-          matched: matchPattern(cls, expected, { normalize: false, substring: false }),
-          actual: JSON.stringify(cls),
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toHaveClass',
+        expectedDesc: formatExpected(expected, false),
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const early = await this.#ensureAttached(limitMs)
+          if (early) return early
+          const cls = (await this.#locator.getAttribute('class', { timeout: limitMs })) ?? ''
+          return {
+            kind: 'value',
+            matched: matchPattern(cls, expected, { normalize: false, substring: false }),
+            actual: JSON.stringify(cls),
+          }
+        },
+      }),
+    )
   }
 
   async toHaveCount(expected, options) {
@@ -421,17 +484,19 @@ class LocatorAssertions {
       throw new TypeError('expect(locator).toHaveCount: count must be a non-negative integer')
     }
     const opts = validateOptions('expect(locator).toHaveCount', options)
-    return pollUntil({
-      targetLabel: formatLocator(this.#locator),
-      matcher: 'toHaveCount',
-      expectedDesc: String(expected),
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async () => {
-        const n = await this.#locator.count()
-        return { kind: 'value', matched: n === expected, actual: String(n) }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: formatLocator(this.#locator),
+        matcher: 'toHaveCount',
+        expectedDesc: String(expected),
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          const n = await this.#countWithTimeout(limitMs)
+          return { kind: 'value', matched: n === expected, actual: String(n) }
+        },
+      }),
+    )
   }
 
   async toHaveScreenshot(nameOrPath, options) {
@@ -440,22 +505,44 @@ class LocatorAssertions {
     }
     const opts = validateScreenshotCall(`${formatLocator(this.#locator)}.toHaveScreenshot`, nameOrPath, options, false)
     const timeoutMs = opts.timeout ?? this.#defaultTimeout
-    return runToHaveScreenshot({
-      targetLabel: formatLocator(this.#locator),
-      nameOrPath,
-      opts,
-      timeoutMs,
-      isClosed: () => false,
-      disableAnimations: (limitMs) =>
-        this.#locator.evaluate(DISABLE_ANIMATIONS_LOCATOR_FN, undefined, { timeout: Math.min(limitMs, 500) }).catch(() => {}),
-      restoreAnimations: () =>
-        this.#locator.evaluate(RESTORE_ANIMATIONS_LOCATOR_FN, undefined, { timeout: 250 }).catch(() => {}),
-      captureShot: (limitMs) =>
-        this.#locator.screenshot({
-          omitBackground: opts.omitBackground,
-          timeout: limitMs,
-        }),
-    })
+    const ownerPage = typeof this.#getOwnerPage === 'function' ? this.#getOwnerPage(this.#locator) : null
+    const inFrame = typeof this.#locator._frames === 'function' && this.#locator._frames().length > 0
+    return this.#run(() =>
+      runToHaveScreenshot({
+        targetLabel: formatLocator(this.#locator),
+        nameOrPath,
+        opts,
+        timeoutMs,
+        isClosed: () => Boolean(ownerPage && typeof ownerPage.isClosed === 'function' && ownerPage.isClosed()),
+        disableAnimations: async (limitMs) => {
+          if (ownerPage && !inFrame) {
+            await ownerPage.evaluate(DISABLE_ANIMATIONS_PAGE_FN).catch(() => {})
+            return
+          }
+          await this.#locator.evaluate(DISABLE_ANIMATIONS_LOCATOR_FN, undefined, { timeout: Math.min(limitMs, 500) }).catch(() => {})
+          if (ownerPage) {
+            await ownerPage.evaluate(DISABLE_ANIMATIONS_PAGE_FN).catch(() => {})
+          }
+        },
+        restoreAnimations: async () => {
+          if (ownerPage) {
+            await ownerPage.evaluate(RESTORE_ANIMATIONS_PAGE_FN).catch(() => {})
+            if (inFrame && typeof ownerPage.frames === 'function') {
+              await Promise.allSettled(
+                ownerPage.frames().map((f) => f.evaluate(RESTORE_ANIMATIONS_PAGE_FN).catch(() => {})),
+              )
+            }
+            return
+          }
+          await this.#locator.evaluate(RESTORE_ANIMATIONS_LOCATOR_FN, undefined, { timeout: 250 }).catch(() => {})
+        },
+        captureShot: (limitMs) =>
+          this.#locator.screenshot({
+            omitBackground: opts.omitBackground,
+            timeout: limitMs,
+          }),
+      }),
+    )
   }
 }
 
@@ -463,63 +550,81 @@ class PageAssertions {
   #page
   #defaultTimeout
   #negated
+  #onSoftError
 
-  constructor(page, defaultTimeout, negated = false) {
+  constructor(page, defaultTimeout, negated = false, onSoftError = null) {
     this.#page = page
     this.#defaultTimeout = defaultTimeout
     this.#negated = negated
+    this.#onSoftError = onSoftError
   }
 
   get not() {
-    return new PageAssertions(this.#page, this.#defaultTimeout, !this.#negated)
+    return new PageAssertions(this.#page, this.#defaultTimeout, !this.#negated, this.#onSoftError)
   }
 
   #timeout(options) {
     return options?.timeout ?? this.#defaultTimeout
   }
 
+  async #run(fn) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (this.#onSoftError && !(err instanceof TypeError)) {
+        this.#onSoftError(err)
+        return
+      }
+      throw err
+    }
+  }
+
   async toHaveTitle(expected, options) {
     validatePattern(expected, 'expect(page).toHaveTitle')
     const opts = validateOptions('expect(page).toHaveTitle', options)
-    return pollUntil({
-      targetLabel: 'expect(page)',
-      matcher: 'toHaveTitle',
-      expectedDesc: formatExpected(expected, true),
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async () => {
-        if (this.#page.isClosed()) throw new Error('page is closed')
-        const raw = await this.#page.title()
-        const actualNorm = normalizeWhitespace(raw)
-        return {
-          kind: 'value',
-          matched: matchPattern(raw, expected, { normalize: true, substring: false }),
-          actual: JSON.stringify(actualNorm),
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: 'expect(page)',
+        matcher: 'toHaveTitle',
+        expectedDesc: formatExpected(expected, true),
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async (limitMs) => {
+          if (this.#page.isClosed()) throw new Error('page is closed')
+          const raw = await raceTimeout(this.#page.title(), limitMs, 'page.title')
+          const actualNorm = normalizeWhitespace(raw)
+          return {
+            kind: 'value',
+            matched: matchPattern(raw, expected, { normalize: true, substring: false }),
+            actual: JSON.stringify(actualNorm),
+          }
+        },
+      }),
+    )
   }
 
   async toHaveURL(expected, options) {
     validatePattern(expected, 'expect(page).toHaveURL')
     const opts = validateOptions('expect(page).toHaveURL', options)
     const target = resolveUrl(this.#page, expected)
-    return pollUntil({
-      targetLabel: 'expect(page)',
-      matcher: 'toHaveURL',
-      expectedDesc: formatExpected(target, false),
-      negated: this.#negated,
-      timeoutMs: this.#timeout(opts),
-      probe: async () => {
-        if (this.#page.isClosed()) throw new Error('page is closed')
-        const actual = this.#page.url()
-        return {
-          kind: 'value',
-          matched: matchPattern(actual, target, { normalize: false, substring: false }),
-          actual: JSON.stringify(actual),
-        }
-      },
-    })
+    return this.#run(() =>
+      pollUntil({
+        targetLabel: 'expect(page)',
+        matcher: 'toHaveURL',
+        expectedDesc: formatExpected(target, false),
+        negated: this.#negated,
+        timeoutMs: this.#timeout(opts),
+        probe: async () => {
+          if (this.#page.isClosed()) throw new Error('page is closed')
+          const actual = this.#page.url()
+          return {
+            kind: 'value',
+            matched: matchPattern(actual, target, { normalize: false, substring: false }),
+            actual: JSON.stringify(actual),
+          }
+        },
+      }),
+    )
   }
 
   async toHaveScreenshot(nameOrPath, options) {
@@ -528,22 +633,24 @@ class PageAssertions {
     }
     const opts = validateScreenshotCall('expect(page).toHaveScreenshot', nameOrPath, options, true)
     const timeoutMs = opts.timeout ?? this.#defaultTimeout
-    return runToHaveScreenshot({
-      targetLabel: 'expect(page)',
-      nameOrPath,
-      opts,
-      timeoutMs,
-      isClosed: () => this.#page.isClosed(),
-      disableAnimations: () => this.#page.evaluate(DISABLE_ANIMATIONS_PAGE_FN).catch(() => {}),
-      restoreAnimations: () => this.#page.evaluate(RESTORE_ANIMATIONS_PAGE_FN).catch(() => {}),
-      captureShot: (limitMs) =>
-        this.#page.screenshot({
-          fullPage: opts.fullPage,
-          clip: opts.clip,
-          omitBackground: opts.omitBackground,
-          timeout: limitMs,
-        }),
-    })
+    return this.#run(() =>
+      runToHaveScreenshot({
+        targetLabel: 'expect(page)',
+        nameOrPath,
+        opts,
+        timeoutMs,
+        isClosed: () => this.#page.isClosed(),
+        disableAnimations: () => this.#page.evaluate(DISABLE_ANIMATIONS_PAGE_FN).catch(() => {}),
+        restoreAnimations: () => this.#page.evaluate(RESTORE_ANIMATIONS_PAGE_FN).catch(() => {}),
+        captureShot: (limitMs) =>
+          this.#page.screenshot({
+            fullPage: opts.fullPage,
+            clip: opts.clip,
+            omitBackground: opts.omitBackground,
+            timeout: limitMs,
+          }),
+      }),
+    )
   }
 }
 
@@ -598,7 +705,7 @@ function validateScreenshotCall(method, nameOrPath, options, isPage) {
     }
   }
   if (opts.clip != null) {
-    const clip = validateOptions(`${method} clip`, opts.clip, { x: true, y: true, width: true, height: true })
+    const clip = validateOptions(`${method} clip`, opts.clip, { x: true, y: true, width: true, height: true }, false)
     for (const k of ['x', 'y', 'width', 'height']) {
       if (typeof clip[k] !== 'number' || !Number.isFinite(clip[k])) {
         throw new TypeError(`${method}: clip.${k} must be a finite number`)
@@ -608,13 +715,14 @@ function validateScreenshotCall(method, nameOrPath, options, isPage) {
       throw new TypeError(`${method}: clip.width and clip.height must be positive`)
     }
   }
+  artifactPaths(nameOrPath)
   return {
     timeout: opts.timeout,
     threshold,
     maxDiffPixels: opts.maxDiffPixels,
     maxDiffPixelRatio: opts.maxDiffPixelRatio,
     animations,
-    update: opts.update ?? false,
+    update: opts.update,
     omitBackground: opts.omitBackground ?? false,
     fullPage: opts.fullPage ?? false,
     clip: opts.clip,
@@ -651,6 +759,7 @@ async function runToHaveScreenshot({
         if (isClosed()) throw new Error('page is closed')
         const remaining = unlimited ? Infinity : Math.max(0, timeoutMs - (Date.now() - start))
         if (disableAnim) await disableAnimations(shotLimit(remaining))
+        let stabilizedBytes = null
         try {
           const bytes = await captureShot(shotLimit(remaining))
           attempts++
@@ -658,12 +767,8 @@ async function runToHaveScreenshot({
           if (prevImg) {
             const diff = compareImages(prevImg, img, opts.threshold, false)
             if (isWithinTolerance(diff, opts)) {
-              await writeArtifact(baselinePath, bytes)
-              return
+              stabilizedBytes = bytes
             }
-          } else if (unlimited) {
-            await writeArtifact(baselinePath, bytes)
-            return
           }
           prevImg = img
           lastErr = null
@@ -671,19 +776,27 @@ async function runToHaveScreenshot({
           if (isFatalError(err)) throw err
           lastErr = String(err?.message ?? err)
         }
+        if (stabilizedBytes) {
+          await writeArtifact(baselinePath, stabilizedBytes)
+          return
+        }
 
         const elapsed = Date.now() - start
         if (!unlimited && elapsed >= timeoutMs) {
           if (attempts === 1 && prevImg) {
+            let finalBytes = null
             try {
               const bytes = await captureShot(1000)
               const img = decodePng(bytes)
               const diff = compareImages(prevImg, img, opts.threshold, false)
               if (isWithinTolerance(diff, opts)) {
-                await writeArtifact(baselinePath, bytes)
-                return
+                finalBytes = bytes
               }
             } catch {}
+            if (finalBytes) {
+              await writeArtifact(baselinePath, finalBytes)
+              return
+            }
           }
           throw new Error(
             `${targetLabel}.toHaveScreenshot: ${
@@ -762,24 +875,55 @@ async function runToHaveScreenshot({
   }
 }
 
-function createExpect(PageClass, LocatorClass, defaultTimeout = DEFAULT_TIMEOUT_MS) {
+let activeSoftErrorCollector = null
+
+function setSoftErrorCollector(fn) {
+  const prev = activeSoftErrorCollector
+  activeSoftErrorCollector = typeof fn === 'function' ? fn : null
+  return prev
+}
+
+function createExpect(PageClass, LocatorClass, defaultTimeout = DEFAULT_TIMEOUT_MS, getOwnerPage = null) {
+  const recordSoftError = (err) => {
+    if (activeSoftErrorCollector) {
+      activeSoftErrorCollector(err)
+    }
+  }
+
   function expect(target) {
     if (PageClass && target instanceof PageClass) {
-      return new PageAssertions(target, defaultTimeout, false)
+      return new PageAssertions(target, defaultTimeout, false, null)
     }
     if (LocatorClass && target instanceof LocatorClass) {
-      return new LocatorAssertions(target, defaultTimeout, false)
+      return new LocatorAssertions(target, defaultTimeout, false, getOwnerPage, null)
     }
     throw new TypeError('expect: argument must be a Page or Locator')
+  }
+
+  expect.soft = (target) => {
+    if (PageClass && target instanceof PageClass) {
+      return new PageAssertions(target, defaultTimeout, false, recordSoftError)
+    }
+    if (LocatorClass && target instanceof LocatorClass) {
+      return new LocatorAssertions(target, defaultTimeout, false, getOwnerPage, recordSoftError)
+    }
+    throw new TypeError('expect.soft: argument must be a Page or Locator')
   }
 
   expect.configure = (options) => {
     const opts = validateOptions('expect.configure', options)
     const nextTimeout = opts.timeout ?? defaultTimeout
-    return createExpect(PageClass, LocatorClass, nextTimeout)
+    return createExpect(PageClass, LocatorClass, nextTimeout, getOwnerPage)
   }
 
   return expect
 }
 
-module.exports = { createExpect, LocatorAssertions, PageAssertions }
+module.exports = {
+  createExpect,
+  setSoftErrorCollector,
+  LocatorAssertions,
+  PageAssertions,
+  isFatalError,
+  resolveUrl,
+}

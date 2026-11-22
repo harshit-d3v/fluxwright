@@ -2,9 +2,13 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import http from 'node:http'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { chromium } from '../addon.js'
+
+const require = createRequire(import.meta.url)
+const { Tracing } = require('../tracing.js')
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256)
@@ -123,6 +127,7 @@ async function run() {
       title: 'Initial Trace',
       screenshots: true,
       snapshots: true,
+      sources: true,
     })
     await assert.rejects(() => context.tracing.start(), /already started/)
     await assert.rejects(() => context.tracing.stop({ path: '' }), /non-empty string/)
@@ -131,6 +136,7 @@ async function run() {
     await prePage.click('#btn')
     await prePage.evaluate(() => fetch('/api/ping').then((r) => r.json()))
     await prePage.click('#err-btn')
+    await assert.rejects(() => prePage.locator('#nonexistent-for-trace').hover({ timeout: 120 }))
     await new Promise((r) => setTimeout(r, 80))
 
     const subPage = await context.newPage()
@@ -150,13 +156,23 @@ async function run() {
     assert.equal(ctxOpts.contextId, 'e2e-ctx')
     assert.equal(ctxOpts.options?.screenshots, true)
     assert.equal(ctxOpts.options?.snapshots, true)
+    assert.equal(ctxOpts.options?.sources, true)
 
     const befores = traceEvents.filter((e) => e.type === 'before')
     const afters = traceEvents.filter((e) => e.type === 'after')
-    assert.ok(
-      befores.some((e) => e.apiName === 'locator.fill'),
-      'missing locator.fill action',
+    const locatorFillBefore = befores.find((e) => e.apiName === 'locator.fill')
+    assert.ok(locatorFillBefore, 'missing locator.fill action')
+    assert.equal(locatorFillBefore.params?.selector, '#name', 'locator traced action must populate params.selector')
+
+    const failedHoverBefore = befores.find(
+      (e) => e.apiName === 'locator.hover' && e.params?.selector === '#nonexistent-for-trace',
     )
+    assert.ok(failedHoverBefore, 'missing failed locator.hover action')
+    const failedHoverAfter = afters.find((e) => e.callId === failedHoverBefore.callId)
+    assert.ok(failedHoverAfter?.error, 'failed traced action must record after.error')
+    assert.equal(typeof failedHoverAfter.error.name, 'string')
+    assert.ok(failedHoverAfter.error.message.length > 0)
+    assert.equal(typeof failedHoverAfter.error.stack, 'string')
     assert.ok(
       befores.some((e) => e.apiName === 'page.click'),
       'missing page.click action',
@@ -218,6 +234,73 @@ async function run() {
     assert.equal(c2.find((e) => e.type === 'context-options')?.title, 'Chunk Two')
     assert.ok(c2.some((e) => e.type === 'before' && e.apiName === 'page.goto'))
     assert.ok(!c2.some((e) => e.type === 'before' && e.apiName === 'page.click'))
+
+    // Regression: cross-chunk action isolation (action spanning stopChunk -> startChunk must not emit orphan after).
+    const cross1 = path.join(tmpDir, 'cross1.zip')
+    const cross2 = path.join(tmpDir, 'cross2.zip')
+    await context.tracing.start({ title: 'Cross 1', screenshots: false })
+    const slowEval = prePage.evaluate(() => new Promise((r) => setTimeout(() => r('done'), 220)))
+    await new Promise((r) => setTimeout(r, 30))
+    await context.tracing.stopChunk({ path: cross1 })
+    await context.tracing.startChunk({ title: 'Cross 2' })
+    assert.equal(await slowEval, 'done')
+    await context.tracing.stopChunk({ path: cross2 })
+    // Regression: stop({ path }) after stopChunk() throws AND tears down session cleanly so restart succeeds.
+    await assert.rejects(() => context.tracing.stop({ path: path.join(tmpDir, 'bad-stop.zip') }), /No active trace chunk/)
+    assert.equal(context.tracing._isActive(), false, 'stop({ path }) after stopChunk() must dispose tracing session')
+
+    const cross2Events = parseNdjson(parseZipStore(await fs.readFile(cross2)).get('trace.trace'), 'cross2')
+    const cross2BeforeIds = new Set(cross2Events.filter((e) => e.type === 'before').map((e) => e.callId))
+    for (const ev of cross2Events.filter((e) => e.type === 'after')) {
+      assert.ok(cross2BeforeIds.has(ev.callId), `orphaned after event ${ev.callId} leaked into next chunk`)
+    }
+
+    // Regression: failed ZIP write preserves chunk so retrying stopChunk with a valid path succeeds.
+    const dirTarget = path.join(tmpDir, 'dir-as-zip')
+    await fs.mkdir(dirTarget, { recursive: true })
+    const retryZip = path.join(tmpDir, 'retry-ok.zip')
+    await context.tracing.start({ title: 'Retry Chunk', screenshots: false })
+    await prePage.click('#btn')
+    await assert.rejects(() => context.tracing.stopChunk({ path: dirTarget }))
+    await context.tracing.stopChunk({ path: retryZip })
+    await context.tracing.stop()
+    const retryEvents = parseNdjson(parseZipStore(await fs.readFile(retryZip)).get('trace.trace'), 'retry')
+    assert.ok(retryEvents.some((e) => e.type === 'before' && e.apiName === 'page.click'))
+
+    // Regression: multi-page fallback screenshot captures ALL open pages via page.screenshot() when watcher.cdp is null.
+    {
+      const tinyJpeg = Buffer.from([
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+      ])
+      const makeMockPage = (tag) => ({
+        isClosed: () => false,
+        on() {},
+        off() {},
+        async screenshot(opts) {
+          assert.equal(opts?.type, 'jpeg')
+          return Buffer.concat([tinyJpeg.subarray(0, tinyJpeg.length - 2), Buffer.from(tag), Buffer.from([0xff, 0xd9])])
+        },
+      })
+      const p1 = makeMockPage('P1')
+      const p2 = makeMockPage('P2')
+      const mockCtx = {
+        _isClosed: () => false,
+        pages: () => [p1, p2],
+        async newCDPSession() {
+          throw new Error('no cdp')
+        },
+      }
+      const tr = new Tracing(mockCtx)
+      const multiZip = path.join(tmpDir, 'multi-fallback.zip')
+      await tr.start({ screenshots: true })
+      await tr.stop({ path: multiZip })
+      const multiEntries = parseZipStore(await fs.readFile(multiZip))
+      const multiEvents = parseNdjson(multiEntries.get('trace.trace'), 'multi-fallback')
+      const multiFrames = multiEvents.filter((e) => e.type === 'screencast-frame')
+      assert.equal(multiFrames.length, 2, 'multi-page fallback must capture screenshots for all open pages')
+      assert.notEqual(multiFrames[0].pageId, multiFrames[1].pageId)
+    }
 
     await context.close()
     console.log('tracing.mjs: ALL PASS')

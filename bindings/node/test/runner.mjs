@@ -6,8 +6,12 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import http from 'node:http'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
 import { createFluxwrightFixtures, expect as runnerExpect, _internals } from 'fluxwright/test'
+
+const require = createRequire(import.meta.url)
+const { runCli, compileGrepMatcher } = require('../cli_test.js')
 
 const execFileAsync = promisify(execFile)
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -29,10 +33,10 @@ await once(server, 'listening')
 server.unref()
 const base = `http://127.0.0.1:${server.address().port}`
 
-async function runCliSubprocess(args, extraEnv = {}) {
+async function runCliSubprocess(args, extraEnv = {}, cwd = nodeRoot) {
   try {
     const { stdout, stderr } = await execFileAsync(process.execPath, [cliPath, ...args], {
-      cwd: nodeRoot,
+      cwd,
       env: { ...process.env, ...extraEnv },
       timeout: 120_000,
     })
@@ -69,8 +73,65 @@ runnerExpect('ok').not.toBe('no')
 runnerExpect(() => {
   throw new Error('boom')
 }).toThrow('boom')
+
+// Regression: toEqual is strict structural equality (no 1 == '1' or 0 == false loose coercion).
+runnerExpect({ a: 1 }).not.toEqual({ a: '1' })
+runnerExpect({ a: 0 }).not.toEqual({ a: false })
+runnerExpect(1).not.toEqual('1')
+runnerExpect(0).not.toEqual(false)
+assert.throws(() => runnerExpect({ a: 1 }).toEqual({ a: '1' }))
+assert.throws(() => runnerExpect({ a: 0 }).toEqual({ a: false }))
+
+// Regression: toThrow clones/resets /g regex across repeated calls.
+{
+  const re = /boom/g
+  const boomFn = () => {
+    throw new Error('boom')
+  }
+  runnerExpect(boomFn).toThrow(re)
+  runnerExpect(boomFn).toThrow(re)
+  runnerExpect(boomFn).toThrow(re)
+}
+
+// Regression: requestedFixtures does not strip `//` inside string/template literals.
 assert.deepEqual([..._internals.requestedFixtures(async ({ page, context }) => [page, context])].sort(), ['context', 'page'])
+assert.deepEqual(
+  [..._internals.requestedFixtures(async ({ baseURL = 'http://localhost:3000', page }) => [baseURL, page])].sort(),
+  ['baseURL', 'page'],
+)
+assert.deepEqual(
+  [..._internals.requestedFixtures(async ({ baseURL = `https://example.com/a,b)`, context }) => [baseURL, context])].sort(),
+  ['baseURL', 'context'],
+)
 assert.deepEqual([..._internals.requestedFixtures(async () => {})], [])
+
+// Regression: sanitizePathSegment avoids collisions, strips trailing dots/spaces, neutralizes ./.. & Windows reserved names.
+{
+  const s1 = _internals.sanitizePathSegment('a/b')
+  const s2 = _internals.sanitizePathSegment('a:b')
+  assert.notEqual(s1, s2, 'distinct sanitized names a/b vs a:b must not collide')
+  assert.ok(!_internals.sanitizePathSegment('trailing...').endsWith('.'))
+  assert.ok(!_internals.sanitizePathSegment('trailing   ').endsWith(' '))
+  assert.notEqual(_internals.sanitizePathSegment('.'), '.')
+  assert.notEqual(_internals.sanitizePathSegment('..'), '..')
+  assert.ok(!/^CON$/i.test(_internals.sanitizePathSegment('CON')))
+  assert.ok(!/^NUL(\..*)?$/i.test(_internals.sanitizePathSegment('nul.txt')))
+  assert.ok(!/^COM1$/i.test(_internals.sanitizePathSegment('COM1')))
+  assert.ok(!/^LPT9$/i.test(_internals.sanitizePathSegment('LPT9')))
+}
+
+// Regression: compileGrepMatcher compiles real RegExp and throws clean error on invalid regex.
+{
+  const r1 = compileGrepMatcher('item-\\d+')
+  assert.equal(r1.test('item-42'), true)
+  assert.equal(r1.test('item-ab'), false)
+  const r2 = compileGrepMatcher('(alpha|beta)-[a-z]+')
+  assert.equal(r2.test('beta-xyz'), true)
+  assert.equal(r2.test('gamma-xyz'), false)
+  const r3 = compileGrepMatcher('/CASE/i')
+  assert.equal(r3.test('mixed case here'), true)
+  assert.throws(() => compileGrepMatcher('[unclosed'), /Invalid --grep regex/)
+}
 
 const tmpBase = await mkdtemp(join(__dirname, '.tmp-runner-'))
 try {
@@ -355,6 +416,355 @@ test('update snapshots env check', async () => {
   assert.match(failHtml, /trace\.zip/)
   assert.match(failHtml, /video\.(?:avi|webm)/)
   assert.match(failHtml, /data:image\/png;base64,[A-Za-z0-9+/=]+/)
+
+  // 6. Regression: fluxwright.config.mjs auto-discovery, test.use({ trace, video, recordVideo }),
+  //    explicit CLI override precedence, and combined --reporter=list,json valid stdout JSON.
+  {
+    const cfgDir = join(tmpBase, 'cfg-project')
+    const cfgTestsDir = join(cfgDir, 'e2e')
+    const customRecDir = join(tmpBase, 'custom-rec')
+    await mkdir(cfgTestsDir, { recursive: true })
+    await writeFile(
+      join(cfgDir, 'fluxwright.config.mjs'),
+      `
+import { defineConfig } from 'fluxwright/test'
+export default defineConfig({
+  testDir: './e2e',
+  retries: 1,
+  outputDir: './cfg-results',
+  reportDir: './cfg-report',
+  reporter: ['json'],
+  use: {
+    baseURL: ${JSON.stringify(base)},
+    screenshot: 'off',
+    trace: 'on',
+    video: 'on',
+  },
+})
+`,
+      'utf8',
+    )
+    await writeFile(
+      join(cfgTestsDir, 'cfg.test.mjs'),
+      `
+import { test, expect } from 'fluxwright/test'
+
+test('config use honored and multi-page early close video retained', async ({ context, page }, info) => {
+  await page.goto('/page-a')
+  await expect(page).toHaveTitle('Page A')
+  // Secondary page opened and closed before test finishes must still have its video retained!
+  const p2 = await context.newPage()
+  await p2.goto('/page-b')
+  await expect(p2).toHaveTitle('Page B')
+  await p2.close()
+  await info.attach('debug-note', { body: 'persisted-body-payload', contentType: 'text/plain' })
+})
+`,
+      'utf8',
+    )
+    const cfgRun = await runCliSubprocess([], {}, cfgDir)
+    assert.equal(cfgRun.code, 0, `config run failed:\n${cfgRun.stdout}\n${cfgRun.stderr}`)
+    const cfgJson = JSON.parse(cfgRun.stdout)
+    assert.equal(cfgJson.results.length, 1)
+    assert.equal(cfgJson.results[0].status, 'passed')
+    const cfgOut = join(cfgDir, 'cfg-results')
+    assert.equal((await findFiles(cfgOut, '.zip')).length, 1, 'config.use.trace=on should produce trace.zip')
+    const cfgVideos = [...(await findFiles(cfgOut, '.avi')), ...(await findFiles(cfgOut, '.webm'))]
+    assert.equal(cfgVideos.length, 2, `expected 2 videos (main + early-closed secondary page), got ${cfgVideos.length}`)
+    const noteAtt = cfgJson.results[0].attachments.find((a) => a.name === 'debug-note')
+    assert.ok(noteAtt?.path, 'non-image testInfo.attach body must be persisted to disk')
+    assert.equal(await readFile(noteAtt.path, 'utf8'), 'persisted-body-payload')
+
+    // Combined list,json must keep stdout as pure valid JSON and send list output to stderr.
+    const comboRun = await runCliSubprocess(['--reporter=list,json'], {}, cfgDir)
+    assert.equal(comboRun.code, 0, comboRun.stderr)
+    const comboJson = JSON.parse(comboRun.stdout)
+    assert.equal(comboJson.results.length, 1)
+    assert.match(comboRun.stderr, /1 passed/)
+
+    // Suite test.use({ trace: 'on', video: 'on' }) must NOT be clobbered when CLI omits --trace/--video;
+    // explicit CLI --trace=off MUST override suite test.use({ trace: 'on' }).
+    const useDir = join(tmpBase, 'use-precedence')
+    const useOut1 = join(tmpBase, 'use-out-1')
+    const useOut2 = join(tmpBase, 'use-out-2')
+    await mkdir(useDir, { recursive: true })
+    await writeFile(
+      join(useDir, 'use.test.mjs'),
+      `
+import { test, expect } from 'fluxwright/test'
+test.use({ baseURL: ${JSON.stringify(base)}, trace: 'on', video: 'on' })
+test('suite use preserved', async ({ page }) => {
+  await page.goto('/page-a')
+  await expect(page).toHaveTitle('Page A')
+})
+`,
+      'utf8',
+    )
+    const useRun1 = await runCliSubprocess([useDir, `--output=${useOut1}`, '--reporter=json'])
+    assert.equal(useRun1.code, 0, useRun1.stderr)
+    assert.equal((await findFiles(useOut1, '.zip')).length, 1, 'suite test.use({ trace: "on" }) must not be clobbered')
+    const useVids1 = [...(await findFiles(useOut1, '.avi')), ...(await findFiles(useOut1, '.webm'))]
+    assert.equal(useVids1.length, 1, 'suite test.use({ video: "on" }) must not be clobbered')
+
+    const useRun2 = await runCliSubprocess([useDir, `--output=${useOut2}`, '--trace=off', '--reporter=json'])
+    assert.equal(useRun2.code, 0, useRun2.stderr)
+    assert.equal((await findFiles(useOut2, '.zip')).length, 0, 'explicit --trace=off must override suite test.use')
+    const useVids2 = [...(await findFiles(useOut2, '.avi')), ...(await findFiles(useOut2, '.webm'))]
+    assert.equal(useVids2.length, 1, 'unset --video must keep suite test.use({ video: "on" })')
+
+    // test.use({ recordVideo }) forwarded directly without runner deleting it when video='off'.
+    const recDir = join(tmpBase, 'rec-use')
+    await mkdir(recDir, { recursive: true })
+    await writeFile(
+      join(recDir, 'rec.test.mjs'),
+      `
+import { test, expect } from 'fluxwright/test'
+test.use({ baseURL: ${JSON.stringify(base)}, recordVideo: { dir: ${JSON.stringify(customRecDir)} } })
+test('custom recordVideo forwarded', async ({ page }) => {
+  await page.goto('/page-a')
+  await expect(page).toHaveTitle('Page A')
+})
+`,
+      'utf8',
+    )
+    const recRun = await runCliSubprocess([recDir, `--output=${join(tmpBase, 'rec-out')}`, '--reporter=json'])
+    assert.equal(recRun.code, 0, recRun.stderr)
+    const customVids = [...(await findFiles(customRecDir, '.avi')), ...(await findFiles(customRecDir, '.webm'))]
+    assert.equal(customVids.length, 1, 'test.use({ recordVideo }) must forward to context and not delete video')
+  }
+
+  // 7. Regression: .spec.ts loading + repeated in-process runCli() cache busting + env restoration.
+  {
+    const tsDir = join(tmpBase, 'ts-tests')
+    await mkdir(tsDir, { recursive: true })
+    await writeFile(
+      join(tsDir, 'typed.spec.ts'),
+      `
+import { test, expect } from 'fluxwright/test'
+
+test('ts spec test 1', async () => {
+  const value: number = 21 * 2
+  expect(value).toBe(42)
+})
+`,
+      'utf8',
+    )
+    const tsRun = await runCliSubprocess([tsDir, '--reporter=json'])
+    assert.equal(tsRun.code, 0, `TS spec failed:\n${tsRun.stdout}\n${tsRun.stderr}`)
+    const tsJson = JSON.parse(tsRun.stdout)
+    assert.equal(tsJson.results.length, 1)
+    assert.equal(tsJson.results[0].status, 'passed')
+
+    // Repeated in-process runCli() on the same file must re-register tests every time AND restore env!
+    const repeatDir = join(tmpBase, 'repeat-inproc')
+    const repeatCounter = join(tmpBase, 'repeat-hits.txt')
+    await mkdir(repeatDir, { recursive: true })
+    await writeFile(repeatCounter, '0', 'utf8')
+    await writeFile(
+      join(repeatDir, 'rep.test.mjs'),
+      `
+import { readFileSync, writeFileSync } from 'node:fs'
+import { test, expect } from 'fluxwright/test'
+test('repeated test', async () => {
+  const n = Number(readFileSync(${JSON.stringify(repeatCounter)}, 'utf8')) + 1
+  writeFileSync(${JSON.stringify(repeatCounter)}, String(n), 'utf8')
+  expect(n).toBeGreaterThan(0)
+})
+`,
+      'utf8',
+    )
+    const prevSnap = process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS
+    delete process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS
+    try {
+      const code1 = await runCli([repeatDir, '--update-snapshots', '--reporter=html', `--report-dir=${join(tmpBase, 'rep-h1')}`], nodeRoot)
+      assert.equal(code1, 0)
+      assert.equal(process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS, undefined, 'FLUXWRIGHT_UPDATE_SNAPSHOTS must be restored in finally')
+      const code2 = await runCli([repeatDir, '--reporter=html', `--report-dir=${join(tmpBase, 'rep-h2')}`], nodeRoot)
+      assert.equal(code2, 0)
+      assert.equal(Number(await readFile(repeatCounter, 'utf8')), 2, 'repeated runCli() must re-execute cached ESM test file')
+    } finally {
+      if (prevSnap !== undefined) process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS = prevSnap
+      else delete process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS
+    }
+  }
+
+  // 8. Regression: test.afterAll() runs without beforeAll AND surfaces errors as failures.
+  {
+    const hookDir = join(tmpBase, 'after-all')
+    const hookMarker = join(tmpBase, 'after-all-ran.txt')
+    await mkdir(hookDir, { recursive: true })
+    await writeFile(
+      join(hookDir, 'after_only.test.mjs'),
+      `
+import { writeFileSync } from 'node:fs'
+import { test, expect } from 'fluxwright/test'
+
+test.describe('suite without beforeAll', () => {
+  test.afterAll(async () => {
+    writeFileSync(${JSON.stringify(hookMarker)}, 'RAN', 'utf8')
+  })
+  test('passes', async () => {
+    expect(1).toBe(1)
+  })
+})
+`,
+      'utf8',
+    )
+    const hookOkRun = await runCliSubprocess([join(hookDir, 'after_only.test.mjs'), '--reporter=json'])
+    assert.equal(hookOkRun.code, 0, hookOkRun.stderr)
+    assert.equal(await readFile(hookMarker, 'utf8'), 'RAN', 'afterAll must execute even when suite has no beforeAll')
+
+    await writeFile(
+      join(hookDir, 'after_throws.test.mjs'),
+      `
+import { test, expect } from 'fluxwright/test'
+
+test.describe('suite with failing afterAll', () => {
+  test.afterAll(async () => {
+    throw new Error('afterAll teardown exploded')
+  })
+  test('body passes', async () => {
+    expect(true).toBeTruthy()
+  })
+})
+`,
+      'utf8',
+    )
+    const hookFailRun = await runCliSubprocess([join(hookDir, 'after_throws.test.mjs'), '--reporter=json'])
+    assert.equal(hookFailRun.code, 1, 'failing afterAll must cause CLI to exit 1')
+    const hookFailJson = JSON.parse(hookFailRun.stdout)
+    assert.ok(
+      hookFailJson.results.some((r) => r.status === 'failed' && /afterAll teardown exploded/.test(r.error?.message || '')),
+      'afterAll error must be surfaced as a failed result',
+    )
+  }
+
+  // 9. Regression: flaky test preserves prior failure error & attachments, plus expect.soft in runner, plus --grep regex.
+  {
+    const miscDir = join(tmpBase, 'misc-reg')
+    const miscOut = join(tmpBase, 'misc-out')
+    const flakyCount2 = join(tmpBase, 'flaky2.txt')
+    await mkdir(miscDir, { recursive: true })
+    await writeFile(flakyCount2, '0', 'utf8')
+    await writeFile(
+      join(miscDir, 'misc.test.mjs'),
+      `
+import { readFileSync, writeFileSync } from 'node:fs'
+import { test, expect } from 'fluxwright/test'
+
+test('flaky-item-42', async ({ page }) => {
+  const c = Number(readFileSync(${JSON.stringify(flakyCount2)}, 'utf8')) + 1
+  writeFileSync(${JSON.stringify(flakyCount2)}, String(c), 'utf8')
+  await page.goto(${JSON.stringify(base)} + '/page-a')
+  if (c === 1) throw new Error('attempt-0-failure-reason')
+  await expect(page).toHaveTitle('Page A')
+})
+
+test('soft-item-99', async ({ page }) => {
+  await page.goto(${JSON.stringify(base)} + '/page-a')
+  expect.soft(1).toBe(2)
+  await expect.soft(page.locator('#msg')).toHaveText('WrongSoft', { timeout: 120 })
+  // Must still execute after soft failures:
+  await expect(page).toHaveTitle('Page A')
+})
+`,
+      'utf8',
+    )
+
+    // --grep with real regex (\d+) selects flaky-item-42 only.
+    const flakyRun = await runCliSubprocess([miscDir, '--grep=flaky-item-\\d+', '--retries=1', `--output=${miscOut}`, '--reporter=json'])
+    assert.equal(flakyRun.code, 0, flakyRun.stderr)
+    const flakyJson = JSON.parse(flakyRun.stdout)
+    assert.equal(flakyJson.results.length, 1)
+    assert.equal(flakyJson.results[0].status, 'flaky')
+    assert.match(flakyJson.results[0].error?.message || '', /attempt-0-failure-reason/, 'flaky result must preserve prior failure error')
+    assert.ok(
+      flakyJson.results[0].attachments.some((a) => a.name === 'screenshot' && a.path),
+      'flaky result must preserve prior failure screenshot attachment',
+    )
+
+    // Invalid --grep regex exits 1 cleanly.
+    const badGrepRun = await runCliSubprocess([miscDir, '--grep=[unclosed'])
+    assert.equal(badGrepRun.code, 1)
+    assert.match(badGrepRun.stderr, /Invalid --grep regex/)
+
+    // expect.soft collects both value and locator failures and fails test at end (with failure screenshot).
+    const softRun = await runCliSubprocess([miscDir, '--grep=(soft)-item-[0-9]+', `--output=${miscOut}`, '--reporter=json'])
+    assert.equal(softRun.code, 1)
+    const softJson = JSON.parse(softRun.stdout)
+    assert.equal(softJson.results.length, 1)
+    assert.equal(softJson.results[0].status, 'failed')
+    assert.match(softJson.results[0].error?.message || '', /2 soft assertion failures/)
+    assert.match(softJson.results[0].error?.message || '', /WrongSoft/)
+    assert.ok(
+      softJson.results[0].attachments.some((a) => a.name === 'screenshot' && a.path),
+      'soft assertion failure must trigger only-on-failure screenshot capture',
+    )
+  }
+
+  // 10. Regression: worker SIGKILL exits non-zero (never 0!) and terminates sibling workers cleanly.
+  {
+    const killDir = join(tmpBase, 'sigkill')
+    await mkdir(killDir, { recursive: true })
+    await writeFile(
+      join(killDir, 'w1.test.mjs'),
+      `
+import { test } from 'fluxwright/test'
+test('kills worker', async () => {
+  process.kill(process.pid, 'SIGKILL')
+})
+`,
+      'utf8',
+    )
+    await writeFile(
+      join(killDir, 'w2.test.mjs'),
+      `
+import { test, expect } from 'fluxwright/test'
+test('sibling test', async () => {
+  await new Promise((r) => setTimeout(r, 300))
+  expect(1).toBe(1)
+})
+`,
+      'utf8',
+    )
+    const killRun = await runCliSubprocess([killDir, '--workers=2', '--reporter=json'])
+    assert.notEqual(killRun.code, 0, 'SIGKILL-terminated worker must NOT exit 0')
+    assert.match(killRun.stderr, /Worker (terminated by signal SIGKILL|exited with code)/)
+  }
+
+  // 11. Regression: createFluxwrightFixtures wires trace and video in withPage() & vitest.context.
+  {
+    const fxTvDir = join(tmpBase, 'fx-trace-video')
+    const fxTv = createFluxwrightFixtures({
+      maxBrowsers: 1,
+      baseURL: base,
+      outputDir: fxTvDir,
+      trace: 'on',
+      video: 'on',
+      screenshot: 'off',
+    })
+    try {
+      await fxTv.withPage(async ({ page }) => {
+        await page.goto('/page-a')
+        await runnerExpect(page).toHaveTitle('Page A')
+      }, { name: 'fx-tv-with-page' })
+
+      await fxTv.vitest.browser({}, async (b) => {
+        await fxTv.vitest.context({ browser: b }, async (ctx) => {
+          await fxTv.vitest.page({ context: ctx }, async (p) => {
+            await p.goto('/page-b')
+            await runnerExpect(p).toHaveTitle('Page B')
+          })
+        }, { name: 'fx-tv-vitest' })
+      })
+    } finally {
+      await fxTv.close()
+    }
+    const tvTraces = await findFiles(fxTvDir, '.zip')
+    const tvVideos = [...(await findFiles(fxTvDir, '.avi')), ...(await findFiles(fxTvDir, '.webm'))]
+    assert.equal(tvTraces.length, 2, `expected 2 traces from withPage + vitest, got ${tvTraces.length}`)
+    assert.equal(tvVideos.length, 2, `expected 2 videos from withPage + vitest, got ${tvVideos.length}`)
+  }
 } finally {
   await rm(tmpBase, { recursive: true, force: true })
   server.close()

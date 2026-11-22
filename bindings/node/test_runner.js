@@ -7,6 +7,7 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { isDeepStrictEqual } = require('node:util')
 const fluxwright = require('./addon.js')
+const { setSoftErrorCollector } = require('./expect.js')
 
 const DEFAULT_TEST_TIMEOUT_MS = 30_000
 
@@ -45,6 +46,7 @@ const CONTEXT_OPTION_KEYS = new Set([
   'bypassCSP',
   'storageState',
   'recordHar',
+  'recordVideo',
   'resourcePreset',
   'blockResources',
   'blockUrlPatterns',
@@ -71,26 +73,33 @@ function formatVal(v) {
 class ValueAssertions {
   #actual
   #negated
+  #onSoftError
 
-  constructor(actual, negated = false) {
+  constructor(actual, negated = false, onSoftError = null) {
     this.#actual = actual
     this.#negated = negated
+    this.#onSoftError = onSoftError
   }
 
   get not() {
-    return new ValueAssertions(this.#actual, !this.#negated)
+    return new ValueAssertions(this.#actual, !this.#negated, this.#onSoftError)
   }
 
   #assert(pass, matcher, expectedDesc, actualDesc = formatVal(this.#actual)) {
     const ok = this.#negated ? !pass : pass
     if (ok) return
     const prefix = this.#negated ? 'not ' : ''
-    throw new assert.AssertionError({
+    const err = new assert.AssertionError({
       message: `expect(received).${this.#negated ? 'not.' : ''}${matcher}\nExpected: ${prefix}${expectedDesc}\nReceived: ${actualDesc}`,
       actual: this.#actual,
       expected: expectedDesc,
       operator: matcher,
     })
+    if (this.#onSoftError) {
+      this.#onSoftError(err)
+      return
+    }
+    throw err
   }
 
   toBe(expected) {
@@ -98,16 +107,7 @@ class ValueAssertions {
   }
 
   toEqual(expected) {
-    let eq = isDeepStrictEqual(this.#actual, expected)
-    if (!eq && typeof this.#actual === 'object' && this.#actual !== null && typeof expected === 'object' && expected !== null) {
-      try {
-        assert.deepEqual(this.#actual, expected)
-        eq = true
-      } catch {
-        eq = false
-      }
-    }
-    this.#assert(eq, 'toEqual', formatVal(expected))
+    this.#assert(isDeepStrictEqual(this.#actual, expected), 'toEqual', formatVal(expected))
   }
 
   toStrictEqual(expected) {
@@ -129,8 +129,14 @@ class ValueAssertions {
   }
 
   toMatch(pattern) {
-    const re = pattern instanceof RegExp ? new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, '')) : null
-    const ok = re ? re.test(String(this.#actual)) : String(this.#actual).includes(String(pattern))
+    let ok
+    if (pattern instanceof RegExp) {
+      const re = new RegExp(pattern.source, pattern.flags.replace(/g/g, ''))
+      re.lastIndex = 0
+      ok = re.test(String(this.#actual))
+    } else {
+      ok = String(this.#actual).includes(String(pattern))
+    }
     this.#assert(ok, 'toMatch', formatVal(pattern))
   }
 
@@ -215,7 +221,9 @@ class ValueAssertions {
     if (pass && expected !== undefined) {
       const msg = caught instanceof Error ? caught.message : String(caught)
       if (expected instanceof RegExp) {
-        pass = expected.test(msg)
+        const re = new RegExp(expected.source, expected.flags.replace(/g/g, ''))
+        re.lastIndex = 0
+        pass = re.test(msg)
       } else if (typeof expected === 'string') {
         pass = msg.includes(expected)
       } else if (typeof expected === 'function') {
@@ -227,6 +235,12 @@ class ValueAssertions {
 }
 
 function wrapExpect(baseExpect) {
+  const recordSoftValueError = (err) => {
+    if (state.activeSoftErrors) {
+      state.activeSoftErrors.push(err)
+    }
+  }
+
   function expect(target) {
     if (target != null && (typeof target === 'object' || typeof target === 'function')) {
       try {
@@ -237,7 +251,20 @@ function wrapExpect(baseExpect) {
         }
       }
     }
-    return new ValueAssertions(target, false)
+    return new ValueAssertions(target, false, null)
+  }
+
+  expect.soft = (target) => {
+    if (target != null && (typeof target === 'object' || typeof target === 'function')) {
+      try {
+        return baseExpect.soft(target)
+      } catch (err) {
+        if (!(err instanceof TypeError) || err.message !== 'expect.soft: argument must be a Page or Locator') {
+          throw err
+        }
+      }
+    }
+    return new ValueAssertions(target, false, recordSoftValueError)
   }
 
   expect.configure = (options) => wrapExpect(baseExpect.configure(options))
@@ -265,7 +292,10 @@ function createSuite(title, parent = null, file = null) {
 
 function mergeUseOptions(base, extra) {
   if (!extra || typeof extra !== 'object') return { ...base }
-  const out = { ...base, ...extra }
+  const out = { ...base }
+  for (const [k, v] of Object.entries(extra)) {
+    if (v !== undefined) out[k] = v
+  }
   if (base.launchOptions || extra.launchOptions) {
     out.launchOptions = { ...base.launchOptions, ...extra.launchOptions }
   }
@@ -279,6 +309,7 @@ const state = {
   rootSuite: null,
   suiteStack: [],
   activeTestInfo: null,
+  activeSoftErrors: null,
   nextId: 1,
 }
 
@@ -412,7 +443,149 @@ function defineConfig(config) {
 }
 
 function stripComments(src) {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+  let out = ''
+  let i = 0
+  const n = src.length
+  const templateBraceStack = []
+
+  while (i < n) {
+    const ch = src[i]
+    const next = i + 1 < n ? src[i + 1] : ''
+
+    if (ch === "'" || ch === '"') {
+      const quote = ch
+      out += ch
+      i += 1
+      while (i < n) {
+        const c = src[i]
+        out += c
+        i += 1
+        if (c === '\\' && i < n) {
+          out += src[i]
+          i += 1
+        } else if (c === quote) {
+          break
+        }
+      }
+      continue
+    }
+
+    if (ch === '`') {
+      out += ch
+      i += 1
+      while (i < n) {
+        const c = src[i]
+        if (c === '\\' && i + 1 < n) {
+          out += c + src[i + 1]
+          i += 2
+          continue
+        }
+        if (c === '$' && i + 1 < n && src[i + 1] === '{') {
+          out += '${'
+          i += 2
+          templateBraceStack.push(1)
+          break
+        }
+        out += c
+        i += 1
+        if (c === '`') break
+      }
+      continue
+    }
+
+    if (templateBraceStack.length > 0) {
+      if (ch === '{') {
+        templateBraceStack[templateBraceStack.length - 1] += 1
+      } else if (ch === '}') {
+        templateBraceStack[templateBraceStack.length - 1] -= 1
+        if (templateBraceStack[templateBraceStack.length - 1] === 0) {
+          templateBraceStack.pop()
+          out += '}'
+          i += 1
+          while (i < n) {
+            const c = src[i]
+            if (c === '\\' && i + 1 < n) {
+              out += c + src[i + 1]
+              i += 2
+              continue
+            }
+            if (c === '$' && i + 1 < n && src[i + 1] === '{') {
+              out += '${'
+              i += 2
+              templateBraceStack.push(1)
+              break
+            }
+            out += c
+            i += 1
+            if (c === '`') break
+          }
+          continue
+        }
+      }
+    }
+
+    if (ch === '/' && next === '/') {
+      i += 2
+      while (i < n && src[i] !== '\n') i += 1
+      continue
+    }
+
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i + 1 < n && !(src[i] === '*' && src[i + 1] === '/')) i += 1
+      i = i + 1 < n ? i + 2 : n
+      out += ' '
+      continue
+    }
+
+    out += ch
+    i += 1
+  }
+  return out
+}
+
+function skipStringLiteral(text, startIdx) {
+  const quote = text[startIdx]
+  let i = startIdx + 1
+  const n = text.length
+  if (quote === "'" || quote === '"') {
+    while (i < n) {
+      if (text[i] === '\\') {
+        i += 2
+        continue
+      }
+      if (text[i] === quote) return i
+      i += 1
+    }
+    return n - 1
+  }
+  if (quote === '`') {
+    let exprDepth = 0
+    while (i < n) {
+      if (text[i] === '\\') {
+        i += 2
+        continue
+      }
+      if (exprDepth === 0) {
+        if (text[i] === '`') return i
+        if (text[i] === '$' && i + 1 < n && text[i + 1] === '{') {
+          exprDepth = 1
+          i += 2
+          continue
+        }
+      } else {
+        if (text[i] === "'" || text[i] === '"' || text[i] === '`') {
+          i = skipStringLiteral(text, i) + 1
+          continue
+        }
+        if (text[i] === '{') exprDepth += 1
+        else if (text[i] === '}') exprDepth -= 1
+      }
+      i += 1
+    }
+    return n - 1
+  }
+  return startIdx
 }
 
 function requestedFixtures(fn) {
@@ -428,6 +601,10 @@ function requestedFixtures(fn) {
     let closeParen = -1
     for (let i = openParen; i < src.length; i++) {
       const ch = src[i]
+      if (ch === "'" || ch === '"' || ch === '`') {
+        i = skipStringLiteral(src, i)
+        continue
+      }
       if (ch === '(') depth += 1
       else if (ch === ')') {
         depth -= 1
@@ -447,6 +624,10 @@ function requestedFixtures(fn) {
       let end = paramsText.length
       for (let i = 0; i < paramsText.length; i++) {
         const c = paramsText[i]
+        if (c === "'" || c === '"' || c === '`') {
+          i = skipStringLiteral(paramsText, i)
+          continue
+        }
         if (c === '{') bDepth += 1
         else if (c === '}') bDepth -= 1
         else if (c === '(') pDepth += 1
@@ -469,8 +650,13 @@ function requestedFixtures(fn) {
     let braceDepth = 0
     let closeBrace = -1
     for (let i = 0; i < firstParam.length; i++) {
-      if (firstParam[i] === '{') braceDepth += 1
-      else if (firstParam[i] === '}') {
+      const c = firstParam[i]
+      if (c === "'" || c === '"' || c === '`') {
+        i = skipStringLiteral(firstParam, i)
+        continue
+      }
+      if (c === '{') braceDepth += 1
+      else if (c === '}') {
         braceDepth -= 1
         if (braceDepth === 0) {
           closeBrace = i
@@ -484,6 +670,10 @@ function requestedFixtures(fn) {
     const tokens = []
     for (let i = 0; i < inner.length; i++) {
       const c = inner[i]
+      if (c === "'" || c === '"' || c === '`') {
+        i = skipStringLiteral(inner, i)
+        continue
+      }
       if (c === '{' || c === '[' || c === '(') depth += 1
       else if (c === '}' || c === ']' || c === ')') depth -= 1
       else if (c === ',' && depth === 0) {
@@ -507,15 +697,51 @@ function requestedFixtures(fn) {
   return result
 }
 
+const WINDOWS_RESERVED_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i
+
+function trimEdgeChars(str, leadingSet, trailingSet) {
+  let start = 0
+  let end = str.length
+  while (start < end && leadingSet.has(str[start])) start += 1
+  while (end > start && trailingSet.has(str[end - 1])) end -= 1
+  return str.slice(start, end)
+}
+
+const TRIM_LEADING_SEGMENT = new Set(['-', ' ', '\t', '\r', '\n'])
+const TRIM_TRAILING_SEGMENT = new Set(['-', '.', ' ', '\t', '\r', '\n'])
+const TRIM_TRAILING_PREFIX = new Set(['-', '.'])
+
 function sanitizePathSegment(name) {
-  const cleaned = String(name || 'test')
-    .replace(/[^a-zA-Z0-9._-]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-  if (!cleaned) return 'test'
-  if (cleaned.length <= 100) return cleaned
-  const hash = crypto.createHash('sha1').update(String(name)).digest('hex').slice(0, 8)
-  return `${cleaned.slice(0, 91)}-${hash}`
+  const raw = String(name ?? '')
+  if (!raw) return 'test'
+  const hash = crypto.createHash('sha1').update(raw).digest('hex').slice(0, 8)
+  let cleaned = trimEdgeChars(
+    raw.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-+/g, '-'),
+    TRIM_LEADING_SEGMENT,
+    TRIM_TRAILING_SEGMENT,
+  )
+  let modified = cleaned !== raw
+  if (!cleaned || cleaned === '.' || cleaned === '..') {
+    cleaned = 'test'
+    modified = true
+  }
+  if (WINDOWS_RESERVED_RE.test(cleaned)) {
+    cleaned = `_${cleaned}`
+    modified = true
+  }
+  if (cleaned.length > 100) {
+    const prefix = trimEdgeChars(cleaned.slice(0, 91), TRIM_TRAILING_PREFIX, TRIM_TRAILING_PREFIX) || 'test'
+    return `${prefix}-${hash}`
+  }
+  if (modified) {
+    const maxPrefix = 100 - 1 - hash.length
+    const prefix =
+      cleaned.length > maxPrefix
+        ? trimEdgeChars(cleaned.slice(0, maxPrefix), TRIM_TRAILING_PREFIX, TRIM_TRAILING_PREFIX) || 'test'
+        : cleaned
+    return `${prefix}-${hash}`
+  }
+  return cleaned
 }
 
 function pickKeys(obj, allowed) {
@@ -651,6 +877,53 @@ function flattenSuiteTests(rootSuite, relFile) {
   return out
 }
 
+let loadSeq = 0
+
+function parseNodeVersion(v = process.versions.node) {
+  const [major = 0, minor = 0, patch = 0] = String(v).split('.').map((n) => parseInt(n, 10) || 0)
+  return { major, minor, patch }
+}
+
+function isTypeScriptFile(filePath) {
+  return /\.(?:ts|mts|cts)$/i.test(String(filePath))
+}
+
+function supportsNativeTypeScript(version = process.versions.node) {
+  const { major, minor } = parseNodeVersion(version)
+  return major > 22 || (major === 22 && minor >= 6)
+}
+
+function needsStripTypesFlag(version = process.versions.node) {
+  const { major, minor } = parseNodeVersion(version)
+  if (major === 22 && minor >= 6 && minor < 18) {
+    return !process.features?.typescript && !process.execArgv.includes('--experimental-strip-types')
+  }
+  return false
+}
+
+async function importFreshModule(absPath) {
+  if (isTypeScriptFile(absPath) && !supportsNativeTypeScript()) {
+    throw new Error(
+      `Cannot load TypeScript file "${absPath}" on Node.js ${process.versions.node}: native TypeScript support requires Node.js >= 22.6.0.`,
+    )
+  }
+  try {
+    delete require.cache[absPath]
+  } catch {}
+  const url = `${pathToFileURL(absPath).href}?fw=${++loadSeq}`
+  try {
+    return await import(url)
+  } catch (err) {
+    if (isTypeScriptFile(absPath) && err && (err.code === 'ERR_UNKNOWN_FILE_EXTENSION' || /unknown file extension/i.test(String(err.message)))) {
+      throw new Error(
+        `Failed to load TypeScript file "${absPath}" on Node.js ${process.versions.node}. Run with --experimental-strip-types (Node 22.6-22.17) or upgrade to Node >= 22.18.`,
+        { cause: err },
+      )
+    }
+    throw err
+  }
+}
+
 async function loadTestFile(filePath, cwd = process.cwd()) {
   const absPath = path.resolve(filePath)
   const relPath = path.relative(cwd, absPath).replace(/\\/g, '/')
@@ -662,8 +935,7 @@ async function loadTestFile(filePath, cwd = process.cwd()) {
   state.suiteStack = [fileSuite]
   state.nextId = 1
   try {
-    const url = pathToFileURL(absPath).href
-    await import(url)
+    await importFreshModule(absPath)
     return {
       file: relPath,
       absPath,
@@ -693,17 +965,45 @@ async function capturePageScreenshot(page, targetPath) {
   }
 }
 
-async function saveOrDiscardVideo(videoHandle, keep, destDir, index) {
-  if (!videoHandle) return null
-  if (keep) {
-    let ext = '.webm'
-    if (typeof videoHandle.path === 'function') {
+function collectContextVideoHandles(context, extraPage = null) {
+  const handles = new Set()
+  if (context && typeof context._videoHandles === 'function') {
+    try {
+      for (const v of context._videoHandles()) {
+        if (v) handles.add(v)
+      }
+    } catch {}
+  }
+  const pages = new Set()
+  if (extraPage) pages.add(extraPage)
+  if (context && typeof context.pages === 'function') {
+    try {
+      for (const p of context.pages()) pages.add(p)
+    } catch {}
+  }
+  for (const p of pages) {
+    if (p && typeof p.video === 'function') {
       try {
-        const srcPath = await videoHandle.path()
-        const parsedExt = srcPath ? path.extname(srcPath) : ''
-        if (parsedExt) ext = parsedExt
+        const v = p.video()
+        if (v) handles.add(v)
       } catch {}
     }
+  }
+  return [...handles]
+}
+
+async function saveOrDiscardVideo(videoHandle, keep, destDir, index, tempDir = null) {
+  if (!videoHandle) return null
+  if (keep) {
+    let srcPath = null
+    if (typeof videoHandle.path === 'function') {
+      try {
+        srcPath = await videoHandle.path()
+      } catch {
+        srcPath = null
+      }
+    }
+    const ext = (srcPath && path.extname(srcPath)) || '.webm'
     const filename = index === 0 ? `video${ext}` : `video-${index + 1}${ext}`
     const destPath = path.join(destDir, filename)
     await fs.mkdir(destDir, { recursive: true })
@@ -720,17 +1020,30 @@ async function saveOrDiscardVideo(videoHandle, keep, destDir, index) {
         }
       } catch {}
     }
-    if (typeof videoHandle.path === 'function') {
+    if (srcPath) {
       try {
-        const srcPath = await videoHandle.path()
-        if (srcPath) {
-          return {
-            name: 'video',
-            contentType: ext === '.avi' ? 'video/x-msvideo' : 'video/webm',
-            path: srcPath,
-          }
+        await fs.copyFile(srcPath, destPath)
+        if (typeof videoHandle.delete === 'function') {
+          await videoHandle.delete().catch(() => {})
+        }
+        return {
+          name: 'video',
+          contentType: ext === '.avi' ? 'video/x-msvideo' : 'video/webm',
+          path: destPath,
         }
       } catch {}
+      const resolvedTemp = tempDir ? path.resolve(tempDir) : null
+      const resolvedSrc = path.resolve(srcPath)
+      const inTemp =
+        resolvedTemp &&
+        (resolvedSrc === resolvedTemp || resolvedSrc.startsWith(`${resolvedTemp}${path.sep}`))
+      if (!inTemp) {
+        return {
+          name: 'video',
+          contentType: ext === '.avi' ? 'video/x-msvideo' : 'video/webm',
+          path: srcPath,
+        }
+      }
     }
     return null
   }
@@ -740,22 +1053,116 @@ async function saveOrDiscardVideo(videoHandle, keep, destDir, index) {
   return null
 }
 
+async function finalizeTestVideos(videoHandles, keepVideo, destDir, videoTempDir) {
+  const attachments = []
+  const uniqueHandles = [...new Set(videoHandles)]
+  let nextIdx = 0
+  for (const handle of uniqueHandles) {
+    const att = await saveOrDiscardVideo(handle, keepVideo, destDir, nextIdx, videoTempDir)
+    if (att) {
+      attachments.push(att)
+      nextIdx += 1
+    }
+  }
+  if (keepVideo && videoTempDir) {
+    try {
+      const entries = await fs.readdir(videoTempDir, { withFileTypes: true })
+      const leftovers = entries
+        .filter((e) => e.isFile() && /\.(?:webm|avi)$/i.test(e.name))
+        .map((e) => e.name)
+        .sort()
+      for (const file of leftovers) {
+        const src = path.join(videoTempDir, file)
+        const ext = path.extname(file) || '.webm'
+        const filename = nextIdx === 0 ? `video${ext}` : `video-${nextIdx + 1}${ext}`
+        const destPath = path.join(destDir, filename)
+        try {
+          await fs.mkdir(destDir, { recursive: true })
+          await fs.copyFile(src, destPath)
+          attachments.push({
+            name: 'video',
+            contentType: ext.toLowerCase() === '.avi' ? 'video/x-msvideo' : 'video/webm',
+            path: destPath,
+          })
+          nextIdx += 1
+        } catch {}
+      }
+    } catch {}
+  }
+  if (videoTempDir) {
+    await fs.rm(videoTempDir, { recursive: true, force: true }).catch(() => {})
+  }
+  return attachments
+}
+
+function extensionForContentType(contentType, name) {
+  const existingExt = path.extname(String(name || ''))
+  if (existingExt && /^\.[a-zA-Z0-9]{1,8}$/.test(existingExt)) return ''
+  const mime = String(contentType || '').split(';')[0].trim().toLowerCase()
+  if (mime === 'application/json') return '.json'
+  if (mime === 'text/plain') return '.txt'
+  if (mime === 'text/html') return '.html'
+  if (mime === 'text/csv') return '.csv'
+  if (mime === 'application/xml' || mime === 'text/xml') return '.xml'
+  if (mime === 'application/zip') return '.zip'
+  if (mime === 'application/pdf') return '.pdf'
+  return '.bin'
+}
+
+function resolveMergedUse(ancestors, runOptions = {}) {
+  const defaults = {
+    screenshot: 'only-on-failure',
+    trace: 'off',
+    video: 'off',
+    headless: true,
+    timeout: DEFAULT_TEST_TIMEOUT_MS,
+  }
+  let merged = { ...defaults }
+  if (runOptions.configUse) {
+    merged = mergeUseOptions(merged, runOptions.configUse)
+  }
+  for (const s of ancestors) {
+    merged = mergeUseOptions(merged, s.useOptions)
+  }
+  const explicitCli = runOptions.cliUse !== undefined ? runOptions.cliUse : runOptions
+  merged = mergeUseOptions(merged, explicitCli)
+  return merged
+}
+
+function resolveLaunchOptions(mergedUse) {
+  return {
+    ...(mergedUse.launchOptions || {}),
+    ...(mergedUse.headless !== undefined ? { headless: mergedUse.headless } : {}),
+    ...(mergedUse.maxBrowsers !== undefined ? { maxBrowsers: mergedUse.maxBrowsers } : {}),
+  }
+}
+
+function combineSoftErrors(softErrors) {
+  if (softErrors.length === 1) return softErrors[0]
+  const details = softErrors
+    .map((e, i) => `${i + 1}) ${e instanceof Error ? e.message : String(e)}`)
+    .join('\n\n')
+  const err = new Error(`${softErrors.length} soft assertion failures:\n\n${details}`)
+  err.stack = softErrors
+    .map((e, i) => `${i + 1}) ${e instanceof Error ? e.stack || e.message : String(e)}`)
+    .join('\n\n')
+  return err
+}
+
 async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
   const startedAt = Date.now()
   const ancestors = collectSuiteAncestors(testCase.suite)
-  let mergedUse = {}
-  for (const s of ancestors) {
-    mergedUse = mergeUseOptions(mergedUse, s.useOptions)
-  }
-  mergedUse = mergeUseOptions(mergedUse, runOptions)
+  const mergedUse = resolveMergedUse(ancestors, runOptions)
 
   const screenshotMode = mergedUse.screenshot || 'only-on-failure'
   const traceMode = mergedUse.trace || 'off'
   const videoMode = mergedUse.video || 'off'
   const testTimeout = mergedUse.timeout ?? DEFAULT_TEST_TIMEOUT_MS
-  const outputRoot = path.resolve(mergedUse.outputDir || 'test-results')
+  const outputRoot = path.resolve(runOptions.outputDir || mergedUse.outputDir || 'test-results')
   const retrySuffix = retryIndex > 0 ? `-retry${retryIndex}` : ''
   const testOutputDir = path.join(outputRoot, `${sanitizePathSegment(testCase.fullTitle)}${retrySuffix}`)
+  const softErrors = []
+  let attachSeq = 0
 
   const testInfo = {
     title: testCase.title,
@@ -766,15 +1173,31 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
     outputPath: (...segments) => path.join(testOutputDir, ...segments),
     status: 'passed',
     error: undefined,
+    errors: softErrors,
     attachments: [],
     async attach(name, options = {}) {
+      const contentType = options.contentType || 'application/octet-stream'
+      const body =
+        options.body !== undefined
+          ? Buffer.isBuffer(options.body)
+            ? options.body
+            : Buffer.from(String(options.body))
+          : undefined
+      let attPath = options.path
+      if (body !== undefined && !attPath && !contentType.startsWith('image/')) {
+        attachSeq += 1
+        const safeName = sanitizePathSegment(name || `attachment-${attachSeq}`)
+        const ext = extensionForContentType(contentType, name)
+        const base = attachSeq === 1 ? `${safeName}${ext}` : `${safeName}-${attachSeq}${ext}`
+        await fs.mkdir(testOutputDir, { recursive: true })
+        attPath = path.join(testOutputDir, base)
+        await fs.writeFile(attPath, body)
+      }
       const att = {
         name,
-        contentType: options.contentType || 'application/octet-stream',
-        path: options.path,
-        body: options.body !== undefined
-          ? (Buffer.isBuffer(options.body) ? options.body : Buffer.from(String(options.body)))
-          : undefined,
+        contentType,
+        path: attPath,
+        body,
       }
       testInfo.attachments.push(att)
     },
@@ -806,11 +1229,7 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
   const needContext = needPage || needed.has('context')
   const needBrowser = needContext || needed.has('browser')
 
-  const launchOpts = {
-    ...(mergedUse.launchOptions || {}),
-    ...(mergedUse.headless !== undefined ? { headless: mergedUse.headless } : {}),
-    ...(mergedUse.maxBrowsers !== undefined ? { maxBrowsers: mergedUse.maxBrowsers } : {}),
-  }
+  const launchOpts = resolveLaunchOptions(mergedUse)
 
   let browser = null
   let context = null
@@ -818,12 +1237,17 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
   let tracing = null
   let tracingStarted = false
   let videoTempDir = null
-  const videoHandles = []
+  let videoHandles = []
   let skippedDynamically = false
   let caughtError = null
 
   const prevActiveInfo = state.activeTestInfo
+  const prevActiveSoftErrors = state.activeSoftErrors
   state.activeTestInfo = testInfo
+  state.activeSoftErrors = softErrors
+  const prevSoftCollector = setSoftErrorCollector((err) => {
+    softErrors.push(err instanceof Error ? err : new Error(String(err)))
+  })
 
   try {
     if (needBrowser) {
@@ -836,7 +1260,10 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
       if (videoMode === 'on' || videoMode === 'retain-on-failure') {
         videoTempDir = path.join(testOutputDir, '.video-tmp')
         await fs.mkdir(videoTempDir, { recursive: true })
-        videoConfig = { dir: videoTempDir }
+        videoConfig = {
+          dir: videoTempDir,
+          ...(ctxOpts.recordVideo?.size ? { size: ctxOpts.recordVideo.size } : {}),
+        }
       }
       context = await openContextWithFeatureDetection(browser, ctxOpts, videoConfig)
 
@@ -876,6 +1303,12 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
       }
       await testCase.fn(fixtures, testInfo)
     }, testTimeout, testCase.title)
+
+    if (!skippedDynamically && softErrors.length > 0) {
+      caughtError = combineSoftErrors(softErrors)
+      testInfo.status = 'failed'
+      testInfo.error = caughtError
+    }
   } catch (err) {
     if (err instanceof SkipSignal) {
       skippedDynamically = true
@@ -911,7 +1344,7 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
       }
     }
 
-    // Run afterEach hooks even on failure (unless dynamically skipped in beforeEach? run anyway safely).
+    // Run afterEach hooks even on failure.
     const fixturesForAfter = {
       browser,
       context,
@@ -929,24 +1362,17 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
         }
       }
     }
+    if (!caughtError && !skippedDynamically && softErrors.length > 0) {
+      caughtError = combineSoftErrors(softErrors)
+      testInfo.status = 'failed'
+      testInfo.error = caughtError
+    }
 
     const finalFailed = Boolean(caughtError)
 
-    // Collect video handles before closing context.
-    if (context) {
-      const seenPages = new Set()
-      if (page) seenPages.add(page)
-      if (typeof context.pages === 'function') {
-        for (const p of context.pages()) seenPages.add(p)
-      }
-      for (const p of seenPages) {
-        if (p && typeof p.video === 'function') {
-          try {
-            const v = p.video()
-            if (v) videoHandles.push(v)
-          } catch {}
-        }
-      }
+    // Collect video handles only when runner owns video recording (videoMode !== 'off').
+    if (context && videoTempDir) {
+      videoHandles = collectContextVideoHandles(context, page)
     }
 
     if (tracing && tracingStarted) {
@@ -967,15 +1393,14 @@ async function executeSingleAttempt(testCase, pool, runOptions, retryIndex) {
       await context.close().catch(() => {})
     }
 
-    const keepVideo = videoMode === 'on' || (videoMode === 'retain-on-failure' && finalFailed)
-    for (let i = 0; i < videoHandles.length; i++) {
-      const videoAtt = await saveOrDiscardVideo(videoHandles[i], keepVideo, testOutputDir, i)
-      if (videoAtt) testInfo.attachments.push(videoAtt)
-    }
     if (videoTempDir) {
-      await fs.rm(videoTempDir, { recursive: true, force: true }).catch(() => {})
+      const keepVideo = videoMode === 'on' || (videoMode === 'retain-on-failure' && finalFailed)
+      const videoAtts = await finalizeTestVideos(videoHandles, keepVideo, testOutputDir, videoTempDir)
+      testInfo.attachments.push(...videoAtts)
     }
 
+    setSoftErrorCollector(prevSoftCollector)
+    state.activeSoftErrors = prevActiveSoftErrors
     state.activeTestInfo = prevActiveInfo
   }
 
@@ -1004,17 +1429,28 @@ async function runTestsForFile(fileEntry, selectedIds, pool, runOptions = {}, on
   const retries = Math.max(0, Number(runOptions.retries || 0))
   const results = []
 
-  // Determine suites that have at least one non-skipped test to run beforeAll/afterAll hooks.
-  const activeSuites = new Set()
-  for (const t of testsToRun) {
-    if (!t.skipped) {
-      for (const s of collectSuiteAncestors(t.suite)) activeSuites.add(s)
+  const enteredSuites = []
+  const enteredSet = new Set()
+  const startedBeforeAll = new Set()
+  const failedBeforeAll = new Map()
+
+  const markEntered = (suite) => {
+    if (!enteredSet.has(suite)) {
+      enteredSet.add(suite)
+      enteredSuites.push(suite)
     }
   }
 
-  const startedBeforeAll = new Set()
-  const failedBeforeAll = new Map()
-  const orderedSuitesWithAll = [...activeSuites]
+  const suiteTitlePath = (suite, hookName) => {
+    const ancestors = collectSuiteAncestors(suite)
+    const parts = []
+    if (fileEntry.file) parts.push(fileEntry.file)
+    for (const a of ancestors) {
+      if (a.title) parts.push(a.title)
+    }
+    parts.push(hookName)
+    return parts
+  }
 
   try {
     for (const testCase of testsToRun) {
@@ -1026,11 +1462,13 @@ async function runTestsForFile(fileEntry, selectedIds, pool, runOptions = {}, on
             suiteSetupErr = failedBeforeAll.get(s)
             break
           }
+          markEntered(s)
           if (s.beforeAll.length && !startedBeforeAll.has(s)) {
             startedBeforeAll.add(s)
             try {
               const needsBrowser = s.beforeAll.some((fn) => requestedFixtures(fn).has('browser'))
-              const browser = needsBrowser ? await pool.getBrowser(runOptions) : null
+              const suiteLaunchOpts = resolveLaunchOptions(resolveMergedUse(collectSuiteAncestors(s), runOptions))
+              const browser = needsBrowser ? await pool.getBrowser(suiteLaunchOpts) : null
               for (const hook of s.beforeAll) {
                 await hook({ browser })
               }
@@ -1061,15 +1499,27 @@ async function runTestsForFile(fileEntry, selectedIds, pool, runOptions = {}, on
       }
 
       let finalResult = null
+      let lastFailureError = null
+      const priorFailureAttachments = []
       const maxAttempts = testCase.skipped ? 1 : retries + 1
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const res = await executeSingleAttempt(testCase, pool, runOptions, attempt)
         finalResult = res
         if (res.status === 'passed' || res.status === 'skipped') {
           if (attempt > 0 && res.status === 'passed') {
-            finalResult = { ...res, status: 'flaky', retries: attempt }
+            finalResult = {
+              ...res,
+              status: 'flaky',
+              retries: attempt,
+              error: res.error ?? lastFailureError,
+              attachments: [...priorFailureAttachments, ...(res.attachments || [])],
+            }
           }
           break
+        }
+        if (res.error) lastFailureError = res.error
+        if (Array.isArray(res.attachments) && res.attachments.length > 0) {
+          priorFailureAttachments.push(...res.attachments)
         }
       }
       results.push(finalResult)
@@ -1078,12 +1528,52 @@ async function runTestsForFile(fileEntry, selectedIds, pool, runOptions = {}, on
       }
     }
   } finally {
-    for (const s of orderedSuitesWithAll.reverse()) {
-      if (s.afterAll.length && startedBeforeAll.has(s)) {
-        const needsBrowser = s.afterAll.some((fn) => requestedFixtures(fn).has('browser'))
-        const browser = needsBrowser ? await pool.getBrowser(runOptions).catch(() => null) : null
-        for (const hook of s.afterAll) {
-          await hook({ browser }).catch(() => {})
+    for (const s of enteredSuites.slice().reverse()) {
+      if (!s.afterAll.length) continue
+      const suiteLaunchOpts = resolveLaunchOptions(resolveMergedUse(collectSuiteAncestors(s), runOptions))
+      const needsBrowser = s.afterAll.some((fn) => requestedFixtures(fn).has('browser'))
+      let browser = null
+      let browserErr = null
+      if (needsBrowser) {
+        try {
+          browser = await pool.getBrowser(suiteLaunchOpts)
+        } catch (err) {
+          browserErr = err instanceof Error ? err : new Error(String(err))
+        }
+      }
+      if (browserErr) {
+        const failRes = {
+          title: 'afterAll',
+          titlePath: suiteTitlePath(s, 'afterAll'),
+          file: fileEntry.file,
+          status: 'failed',
+          durationMs: 0,
+          retries: 0,
+          error: { message: browserErr.message, stack: browserErr.stack },
+          attachments: [],
+        }
+        results.push(failRes)
+        if (typeof onResult === 'function') await onResult(failRes)
+        continue
+      }
+      for (const hook of s.afterAll) {
+        const hookStart = Date.now()
+        try {
+          await hook({ browser })
+        } catch (err) {
+          const wrapped = err instanceof Error ? err : new Error(String(err))
+          const failRes = {
+            title: 'afterAll',
+            titlePath: suiteTitlePath(s, 'afterAll'),
+            file: fileEntry.file,
+            status: 'failed',
+            durationMs: Date.now() - hookStart,
+            retries: 0,
+            error: { message: wrapped.message, stack: wrapped.stack },
+            attachments: [],
+          }
+          results.push(failRes)
+          if (typeof onResult === 'function') await onResult(failRes)
         }
       }
     }
@@ -1099,10 +1589,16 @@ function createFluxwrightFixtures(options = {}) {
     ...(options.maxBrowsers !== undefined ? { maxBrowsers: options.maxBrowsers } : {}),
   }
   const baseContextOpts = pickKeys(
-    { ...(options.contextOptions || {}), ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}), ...(options.viewport !== undefined ? { viewport: options.viewport } : {}) },
+    {
+      ...(options.contextOptions || {}),
+      ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}),
+      ...(options.viewport !== undefined ? { viewport: options.viewport } : {}),
+    },
     CONTEXT_OPTION_KEYS,
   )
   const screenshotMode = options.screenshot ?? 'only-on-failure'
+  const traceMode = options.trace ?? 'off'
+  const videoMode = options.video ?? 'off'
   const outputDir = path.resolve(options.outputDir || 'test-results')
   const pool = createBrowserPool(launchOpts)
 
@@ -1118,22 +1614,63 @@ function createFluxwrightFixtures(options = {}) {
     const isNodeTestCtx = testContextOrOpts && typeof testContextOrOpts.after === 'function'
     const testName = isNodeTestCtx ? (testContextOrOpts.name || 'node-test') : (testContextOrOpts?.name || 'fixture-test')
     const extraCtxOpts = isNodeTestCtx ? {} : pickKeys(testContextOrOpts || {}, CONTEXT_OPTION_KEYS)
+    const testOutputDir = path.join(outputDir, sanitizePathSegment(testName))
+    const mergedCtxOpts = { ...baseContextOpts, ...extraCtxOpts }
     const browser = await getBrowser()
-    const context = await browser.newContext({ ...baseContextOpts, ...extraCtxOpts })
+
+    let videoTempDir = null
+    let videoConfig = null
+    if (videoMode === 'on' || videoMode === 'retain-on-failure') {
+      videoTempDir = path.join(testOutputDir, '.video-tmp')
+      await fs.mkdir(videoTempDir, { recursive: true })
+      videoConfig = {
+        dir: videoTempDir,
+        ...(mergedCtxOpts.recordVideo?.size ? { size: mergedCtxOpts.recordVideo.size } : {}),
+      }
+    }
+
+    const context = await openContextWithFeatureDetection(browser, mergedCtxOpts, videoConfig)
+    let tracingStarted = false
+    if (
+      context?.tracing &&
+      typeof context.tracing.start === 'function' &&
+      typeof context.tracing.stop === 'function' &&
+      (traceMode === 'on' || traceMode === 'retain-on-failure')
+    ) {
+      await context.tracing.start({ screenshots: true, snapshots: true })
+      tracingStarted = true
+    }
+
     const page = await context.newPage()
 
     let disposed = false
     async function dispose(failed = false) {
       if (disposed) return
       disposed = true
+      const videoHandles = videoTempDir ? collectContextVideoHandles(context, page) : []
       try {
         const shouldShot = screenshotMode === 'on' || (screenshotMode === 'only-on-failure' && failed)
         if (shouldShot && !page.isClosed()) {
-          const shotPath = path.join(outputDir, sanitizePathSegment(testName), failed ? 'test-failed-1.png' : 'test-finished-1.png')
+          const shotPath = path.join(testOutputDir, failed ? 'test-failed-1.png' : 'test-finished-1.png')
           await capturePageScreenshot(page, shotPath)
+        }
+        if (tracingStarted) {
+          const keepTrace = traceMode === 'on' || (traceMode === 'retain-on-failure' && failed)
+          try {
+            if (keepTrace) {
+              await fs.mkdir(testOutputDir, { recursive: true })
+              await context.tracing.stop({ path: path.join(testOutputDir, 'trace.zip') })
+            } else {
+              await context.tracing.stop()
+            }
+          } catch {}
         }
       } finally {
         await context.close().catch(() => {})
+        if (videoTempDir) {
+          const keepVideo = videoMode === 'on' || (videoMode === 'retain-on-failure' && failed)
+          await finalizeTestVideos(videoHandles, keepVideo, testOutputDir, videoTempDir)
+        }
       }
     }
 
@@ -1161,17 +1698,73 @@ function createFluxwrightFixtures(options = {}) {
     }
   }
 
+  let vitestSeq = 0
   const vitest = {
     browser: async ({}, use) => {
       const browser = await getBrowser()
       await use(browser)
     },
-    context: async ({ browser }, use) => {
-      const context = await browser.newContext(baseContextOpts)
+    context: async ({ browser }, use, task) => {
+      const testName = task?.name || `vitest-${++vitestSeq}`
+      const testOutputDir = path.join(outputDir, sanitizePathSegment(testName))
+      let videoTempDir = null
+      let videoConfig = null
+      if (videoMode === 'on' || videoMode === 'retain-on-failure') {
+        videoTempDir = path.join(testOutputDir, '.video-tmp')
+        await fs.mkdir(videoTempDir, { recursive: true })
+        videoConfig = {
+          dir: videoTempDir,
+          ...(baseContextOpts.recordVideo?.size ? { size: baseContextOpts.recordVideo.size } : {}),
+        }
+      }
+      const context = await openContextWithFeatureDetection(browser, baseContextOpts, videoConfig)
+      let tracingStarted = false
+      if (
+        context?.tracing &&
+        typeof context.tracing.start === 'function' &&
+        typeof context.tracing.stop === 'function' &&
+        (traceMode === 'on' || traceMode === 'retain-on-failure')
+      ) {
+        await context.tracing.start({ screenshots: true, snapshots: true })
+        tracingStarted = true
+      }
+      let failed = false
       try {
         await use(context)
+        if (task?.result?.state === 'fail') failed = true
+      } catch (err) {
+        failed = true
+        throw err
       } finally {
-        await context.close().catch(() => {})
+        const videoHandles = videoTempDir ? collectContextVideoHandles(context) : []
+        try {
+          const shouldShot = screenshotMode === 'on' || (screenshotMode === 'only-on-failure' && failed)
+          if (shouldShot && typeof context.pages === 'function') {
+            let shotIdx = 1
+            for (const pg of context.pages()) {
+              const shotPath = path.join(testOutputDir, failed ? `test-failed-${shotIdx}.png` : `test-finished-${shotIdx}.png`)
+              const saved = await capturePageScreenshot(pg, shotPath)
+              if (saved) shotIdx += 1
+            }
+          }
+          if (tracingStarted) {
+            const keepTrace = traceMode === 'on' || (traceMode === 'retain-on-failure' && failed)
+            try {
+              if (keepTrace) {
+                await fs.mkdir(testOutputDir, { recursive: true })
+                await context.tracing.stop({ path: path.join(testOutputDir, 'trace.zip') })
+              } else {
+                await context.tracing.stop()
+              }
+            } catch {}
+          }
+        } finally {
+          await context.close().catch(() => {})
+          if (videoTempDir) {
+            const keepVideo = videoMode === 'on' || (videoMode === 'retain-on-failure' && failed)
+            await finalizeTestVideos(videoHandles, keepVideo, testOutputDir, videoTempDir)
+          }
+        }
       }
     },
     page: async ({ context }, use) => {
@@ -1195,10 +1788,14 @@ function createFluxwrightFixtures(options = {}) {
 
 const _internals = {
   createBrowserPool,
+  importFreshModule,
+  isTypeScriptFile,
   loadTestFile,
+  needsStripTypesFlag,
   requestedFixtures,
   runTestsForFile,
   sanitizePathSegment,
+  supportsNativeTypeScript,
 }
 
 module.exports = {
