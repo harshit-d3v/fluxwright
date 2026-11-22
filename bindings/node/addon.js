@@ -5,6 +5,7 @@ const fs = require('node:fs/promises')
 const { dirname } = require('node:path')
 const { Script } = require('node:vm')
 const { createExpect } = require('./expect.js')
+const { Tracing } = require('./tracing.js')
 
 // Like Playwright, `{ path }` creates missing folders (`.auth/state.json`).
 async function save(path, data) {
@@ -230,9 +231,11 @@ function guard(Class, label, sync, methods) {
             const forwarded = opts && Object.hasOwn(opts, 'strict')
               ? (({ strict: _, ...rest }) => rest)(opts)
               : opts
-            return args.length > at
-              ? loc[via](...args.slice(1, at), forwarded)
-              : loc[via](...args.slice(1))
+            return withoutLocatorTrace(() =>
+              args.length > at
+                ? loc[via](...args.slice(1, at), forwarded)
+                : loc[via](...args.slice(1)),
+            )
           }
           if (timeout != null && this._withTimeout) return call.apply(this._withTimeout(timeout), args)
           return call.apply(this, args)
@@ -352,7 +355,37 @@ async function answerDialog(listeners, native) {
 
 const popupWired = new WeakSet()
 const pageContext = new WeakMap()
+const targetPage = new WeakMap()
 const contextRouteGetters = new WeakMap()
+let suppressLocatorDepth = 0
+
+function withoutLocatorTrace(fn) {
+  suppressLocatorDepth += 1
+  try {
+    return fn()
+  } finally {
+    suppressLocatorDepth -= 1
+  }
+}
+
+function traceAction(page, className, methodName, apiName, params, fn) {
+  const tracing = page ? pageContext.get(page)?.deref()?._activeTracing() : null
+  if (!tracing) return fn()
+  return tracing._runAction(page, className, methodName, apiName, params, fn)
+}
+
+function traceActionParams(methodName, args, hasSelectorArg) {
+  if (methodName === 'goto' || methodName === 'waitForURL') {
+    return typeof args[0] === 'string' ? { url: args[0] } : {}
+  }
+  if (methodName === 'dragAndDrop') {
+    return { source: String(args[0] ?? ''), target: String(args[1] ?? '') }
+  }
+  if (hasSelectorArg && typeof args[0] === 'string') {
+    return { selector: args[0] }
+  }
+  return {}
+}
 const pagesByTarget = new Map()
 const contextRegistry = new FinalizationRegistry(({ browser, id }) => {
   browser._dropContext(id)
@@ -1063,7 +1096,8 @@ function installEvents(Page) {
     checkOptions('page.close', options, NONE)
     closing.add(this)
     pagesByTarget.delete(this._targetId())
-    pageContext.get(this)?.deref()?._removePage(this)
+    const ctx = pageContext.get(this)?.deref()
+    ctx?._removePage(this)
     const st = emitters.get(this)
     st?.closeSockets?.()
     const wmap = workerMaps.get(this)
@@ -1072,6 +1106,7 @@ function installEvents(Page) {
       wmap.clear()
     }
     for (const closed of st?.waits ?? []) closed()
+    await ctx?._activeTracing()?._onPageClosing(this)
     await close.call(this)
     await flushPendingHarFilters(this)
   }
@@ -1522,6 +1557,7 @@ class BrowserContext {
   #bindingStarted = false
   #routeGetter
   #request
+  #tracing
 
   constructor(browser, id, ensurePopup) {
     this.#browser = browser
@@ -1539,6 +1575,19 @@ class BrowserContext {
       () => this.#closed,
     )
     return this.#request
+  }
+
+  get tracing() {
+    this.#tracing ??= new Tracing(this)
+    return this.#tracing
+  }
+
+  _isClosed() {
+    return this.#closed
+  }
+
+  _activeTracing() {
+    return this.#tracing?._isActive() ? this.#tracing : null
   }
 
   browser() {
@@ -1562,6 +1611,7 @@ class BrowserContext {
   _adoptPopup(popup) {
     if (this.#closed) return
     this._adoptPage(popup)
+    this.#tracing?._onPageCreated(popup).catch(() => {})
   }
 
   _removePage(page) {
@@ -1576,6 +1626,7 @@ class BrowserContext {
       throw new Error('browserContext.newPage: the context is closed')
     }
     this._adoptPage(page)
+    await this.#tracing?._onPageCreated(page)
     return page
   }
 
@@ -1769,6 +1820,7 @@ class BrowserContext {
     contextRegistry.unregister(this)
     await Promise.allSettled([...this.#pages].map((p) => (p.isClosed() ? Promise.resolve() : p.close())))
     this.#pages.clear()
+    await this.#tracing?._dispose()
     await this.#browser._closeContext(this.#id)
     await flushPendingHarFilters(this)
   }
@@ -1979,11 +2031,15 @@ function installFrames(Page, applyFilter) {
 
     async goto(url, options) {
       checkOptions('frame.goto', options, NAV_OPTIONS)
-      return this.#page._frameGoto(this.#id, url, options)
+      return traceAction(this.#page, 'Frame', 'goto', 'frame.goto', url != null ? { url: String(url) } : {}, () =>
+        this.#page._frameGoto(this.#id, url, options),
+      )
     }
 
     async evaluate(pageFunction, arg) {
-      return this.#page._frameEvaluate(this.#id, toExpression(pageFunction, arg))
+      return traceAction(this.#page, 'Frame', 'evaluate', 'frame.evaluate', {}, () =>
+        this.#page._frameEvaluate(this.#id, toExpression(pageFunction, arg)),
+      )
     }
 
     async title() {
@@ -2364,6 +2420,54 @@ function applyFilter(loc, options, label) {
   guard(native.Page, 'page', true, builders)
   guard(native.FrameLocator, 'frameLocator', true, builders)
   guard(native.Locator, 'locator', true, builders)
+  const ownerPage = (obj) => {
+    if (!obj || typeof obj !== 'object') return null
+    if (obj instanceof native.Page) return obj
+    return targetPage.get(obj)?.deref() ?? null
+  }
+  const linkPage = (source, target) => {
+    const page = ownerPage(source)
+    if (page && target && (target instanceof native.Locator || target instanceof native.FrameLocator)) {
+      targetPage.set(target, new WeakRef(page))
+    }
+    return target
+  }
+  for (const Class of [native.Page, native.FrameLocator, native.Locator]) {
+    for (const name of [
+      'locator',
+      'getByText',
+      'getByLabel',
+      'getByPlaceholder',
+      'getByAltText',
+      'getByTitle',
+      'getByRole',
+      'getByTestId',
+      'frameLocator',
+      'contentFrame',
+      'owner',
+      'first',
+      'last',
+      'nth',
+      'filter',
+      'and',
+      'or',
+      '_frameById',
+      '_strict',
+      '_withTimeout',
+      '_hasText',
+      '_hasTextRegex',
+      '_hasNotText',
+      '_hasNotTextRegex',
+      '_has',
+      '_hasNot',
+    ]) {
+      const orig = Class.prototype[name]
+      if (typeof orig !== 'function') continue
+      Class.prototype[name] = function (...args) {
+        return linkPage(this, orig.apply(this, args))
+      }
+    }
+  }
   native.Page.prototype.waitForLoadState = async function (state, options) {
     if (state != null && !['load', 'domcontentloaded', 'networkidle'].includes(state)) {
       throw new TypeError(`page.waitForLoadState: state ${JSON.stringify(state)} is not supported`)
@@ -2497,7 +2601,9 @@ function applyFilter(loc, options, label) {
     const forwarded = options && Object.hasOwn(options, 'strict')
       ? (({ strict: _, ...rest }) => rest)(options)
       : options
-    return this.locator(source)._strict(strict).dragTo(this.locator(target)._strict(strict), forwarded)
+    return withoutLocatorTrace(() =>
+      this.locator(source)._strict(strict).dragTo(this.locator(target)._strict(strict), forwarded),
+    )
   }
   const devices = new WeakMap()
   const deviceState = (page) => {
@@ -2507,41 +2613,70 @@ function applyFilter(loc, options, label) {
         mouse: {
           move: async (x, y, options) => {
             checkOptions('mouse.move', options, MOUSE_MOVE)
-            return page._mouseMove(x, y, options?.steps)
+            return traceAction(page, 'Mouse', 'move', 'mouse.move', { x, y }, () =>
+              page._mouseMove(x, y, options?.steps),
+            )
           },
           down: async (options) => {
             checkOptions('mouse.down', options, MOUSE_BUTTON)
-            return page._mouseDown(options?.button, options?.clickCount)
+            return traceAction(page, 'Mouse', 'down', 'mouse.down', {}, () =>
+              page._mouseDown(options?.button, options?.clickCount),
+            )
           },
           up: async (options) => {
             checkOptions('mouse.up', options, MOUSE_BUTTON)
-            return page._mouseUp(options?.button, options?.clickCount)
+            return traceAction(page, 'Mouse', 'up', 'mouse.up', {}, () =>
+              page._mouseUp(options?.button, options?.clickCount),
+            )
           },
           click: async (x, y, options) => {
             checkOptions('mouse.click', options, MOUSE_CLICK)
-            return page._mouseClick(x, y, options?.button, options?.clickCount, options?.delay)
+            return traceAction(page, 'Mouse', 'click', 'mouse.click', { x, y }, () =>
+              page._mouseClick(x, y, options?.button, options?.clickCount, options?.delay),
+            )
           },
           dblclick: async (x, y, options) => {
             checkOptions('mouse.dblclick', options, MOUSE_DBLCLICK)
-            return page._mouseDblclick(x, y, options?.button, options?.delay)
+            return traceAction(page, 'Mouse', 'dblclick', 'mouse.dblclick', { x, y }, () =>
+              page._mouseDblclick(x, y, options?.button, options?.delay),
+            )
           },
-          wheel: async (deltaX, deltaY) => page._mouseWheel(deltaX, deltaY),
+          wheel: async (deltaX, deltaY) =>
+            traceAction(page, 'Mouse', 'wheel', 'mouse.wheel', { deltaX, deltaY }, () =>
+              page._mouseWheel(deltaX, deltaY),
+            ),
         },
         keyboard: {
-          down: async (key) => page._keyboardDown(key),
-          up: async (key) => page._keyboardUp(key),
+          down: async (key) =>
+            traceAction(page, 'Keyboard', 'down', 'keyboard.down', { key: String(key ?? '') }, () =>
+              page._keyboardDown(key),
+            ),
+          up: async (key) =>
+            traceAction(page, 'Keyboard', 'up', 'keyboard.up', { key: String(key ?? '') }, () =>
+              page._keyboardUp(key),
+            ),
           press: async (key, options) => {
             checkOptions('keyboard.press', options, { delay: true })
-            return page._keyboardPress(key, options?.delay)
+            return traceAction(page, 'Keyboard', 'press', 'keyboard.press', { key: String(key ?? '') }, () =>
+              page._keyboardPress(key, options?.delay),
+            )
           },
           type: async (text, options) => {
             checkOptions('keyboard.type', options, { delay: true })
-            return page._keyboardType(text, options?.delay)
+            return traceAction(page, 'Keyboard', 'type', 'keyboard.type', {}, () =>
+              page._keyboardType(text, options?.delay),
+            )
           },
-          insertText: async (text) => page._keyboardInsertText(text),
+          insertText: async (text) =>
+            traceAction(page, 'Keyboard', 'insertText', 'keyboard.insertText', {}, () =>
+              page._keyboardInsertText(text),
+            ),
         },
         touchscreen: {
-          tap: async (x, y) => page._touchscreenTap(x, y),
+          tap: async (x, y) =>
+            traceAction(page, 'Touchscreen', 'tap', 'touchscreen.tap', { x, y }, () =>
+              page._touchscreenTap(x, y),
+            ),
         },
       }
       devices.set(page, d)
@@ -2569,6 +2704,77 @@ function applyFilter(loc, options, label) {
   installDownloads(native.Page)
   installBindings(native.Page)
   installFrames(native.Page, applyFilter)
+  for (const [name, hasSelector] of [
+    ['goto', false],
+    ['reload', false],
+    ['goBack', false],
+    ['goForward', false],
+    ['setContent', false],
+    ['evaluate', false],
+    ['waitForURL', false],
+    ['waitForLoadState', false],
+    ['waitForFunction', false],
+    ['screenshot', false],
+    ['pdf', false],
+    ['emulateMedia', false],
+    ['addInitScript', false],
+    ['addScriptTag', false],
+    ['addStyleTag', false],
+    ['dragAndDrop', false],
+    ['click', true],
+    ['dblclick', true],
+    ['hover', true],
+    ['focus', true],
+    ['fill', true],
+    ['press', true],
+    ['type', true],
+    ['check', true],
+    ['uncheck', true],
+    ['setChecked', true],
+    ['selectOption', true],
+    ['setInputFiles', true],
+    ['tap', true],
+    ['waitForSelector', true],
+  ]) {
+    const orig = native.Page.prototype[name]
+    if (typeof orig !== 'function') continue
+    native.Page.prototype[name] = function (...args) {
+      return traceAction(this, 'Page', name, `page.${name}`, traceActionParams(name, args, hasSelector), () =>
+        orig.apply(this, args),
+      )
+    }
+  }
+  for (const name of [
+    'click',
+    'dblclick',
+    'hover',
+    'focus',
+    'blur',
+    'scrollIntoViewIfNeeded',
+    'dragTo',
+    'fill',
+    'press',
+    'pressSequentially',
+    'type',
+    'clear',
+    'check',
+    'uncheck',
+    'setChecked',
+    'selectOption',
+    'setInputFiles',
+    'tap',
+    'waitFor',
+    'evaluate',
+    'screenshot',
+  ]) {
+    const orig = native.Locator.prototype[name]
+    if (typeof orig !== 'function') continue
+    native.Locator.prototype[name] = function (...args) {
+      if (suppressLocatorDepth > 0) return orig.apply(this, args)
+      const page = ownerPage(this)
+      return traceAction(page, 'Locator', name, `locator.${name}`, {}, () => orig.apply(this, args))
+    }
+  }
   module.exports = native
   // Chromium.launch is read-only on the native class, so `chromium` is a checked stand-in.
   module.exports.chromium = {

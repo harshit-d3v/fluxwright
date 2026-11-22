@@ -44,6 +44,7 @@ from . import _native
 from ._errors import Error, TimeoutError
 from ._expect import LocatorAssertions, PageAssertions, expect
 from ._native import ConsoleMessage, Download, FrameLocator, Locator
+from ._tracing import AsyncTracing as Tracing
 from ._types import (
     FilePayload,
     FloatRect,
@@ -93,6 +94,7 @@ __all__ = [
     "StorageState",
     "TimeoutError",
     "Touchscreen",
+    "Tracing",
     "ViewportSize",
     "WebSocket",
     "Worker",
@@ -299,7 +301,9 @@ class Mouse:
         self._page = page
 
     async def move(self, x: float, y: float, *, steps: int | None = None) -> None:
-        await self._page._mouse_move(x, y, steps=steps)
+        await self._page._trace_action(
+            "move", "mouse.move", {"x": x, "y": y}, lambda: self._page._mouse_move(x, y, steps=steps), class_name="Mouse"
+        )
 
     async def down(
         self,
@@ -307,7 +311,13 @@ class Mouse:
         button: Literal["left", "right", "middle"] | None = None,
         click_count: int | None = None,
     ) -> None:
-        await self._page._mouse_down(button=button, click_count=click_count)
+        await self._page._trace_action(
+            "down",
+            "mouse.down",
+            {},
+            lambda: self._page._mouse_down(button=button, click_count=click_count),
+            class_name="Mouse",
+        )
 
     async def up(
         self,
@@ -315,7 +325,13 @@ class Mouse:
         button: Literal["left", "right", "middle"] | None = None,
         click_count: int | None = None,
     ) -> None:
-        await self._page._mouse_up(button=button, click_count=click_count)
+        await self._page._trace_action(
+            "up",
+            "mouse.up",
+            {},
+            lambda: self._page._mouse_up(button=button, click_count=click_count),
+            class_name="Mouse",
+        )
 
     async def click(
         self,
@@ -326,7 +342,13 @@ class Mouse:
         button: Literal["left", "right", "middle"] | None = None,
         click_count: int | None = None,
     ) -> None:
-        await self._page._mouse_click(x, y, delay=delay, button=button, click_count=click_count)
+        await self._page._trace_action(
+            "click",
+            "mouse.click",
+            {"x": x, "y": y},
+            lambda: self._page._mouse_click(x, y, delay=delay, button=button, click_count=click_count),
+            class_name="Mouse",
+        )
 
     async def dblclick(
         self,
@@ -336,10 +358,22 @@ class Mouse:
         delay: float | None = None,
         button: Literal["left", "right", "middle"] | None = None,
     ) -> None:
-        await self._page._mouse_dblclick(x, y, delay=delay, button=button)
+        await self._page._trace_action(
+            "dblclick",
+            "mouse.dblclick",
+            {"x": x, "y": y},
+            lambda: self._page._mouse_dblclick(x, y, delay=delay, button=button),
+            class_name="Mouse",
+        )
 
     async def wheel(self, delta_x: float, delta_y: float) -> None:
-        await self._page._mouse_wheel(delta_x, delta_y)
+        await self._page._trace_action(
+            "wheel",
+            "mouse.wheel",
+            {"deltaX": delta_x, "deltaY": delta_y},
+            lambda: self._page._mouse_wheel(delta_x, delta_y),
+            class_name="Mouse",
+        )
 
 
 class Keyboard:
@@ -349,19 +383,41 @@ class Keyboard:
         self._page = page
 
     async def down(self, key: str) -> None:
-        await self._page._keyboard_down(key)
+        await self._page._trace_action(
+            "down", "keyboard.down", {"key": key}, lambda: self._page._keyboard_down(key), class_name="Keyboard"
+        )
 
     async def up(self, key: str) -> None:
-        await self._page._keyboard_up(key)
+        await self._page._trace_action(
+            "up", "keyboard.up", {"key": key}, lambda: self._page._keyboard_up(key), class_name="Keyboard"
+        )
 
     async def press(self, key: str, *, delay: float | None = None) -> None:
-        await self._page._keyboard_press(key, delay=delay)
+        await self._page._trace_action(
+            "press",
+            "keyboard.press",
+            {"key": key},
+            lambda: self._page._keyboard_press(key, delay=delay),
+            class_name="Keyboard",
+        )
 
     async def type(self, text: str, *, delay: float | None = None) -> None:
-        await self._page._keyboard_type(text, delay=delay)
+        await self._page._trace_action(
+            "type",
+            "keyboard.type",
+            {},
+            lambda: self._page._keyboard_type(text, delay=delay),
+            class_name="Keyboard",
+        )
 
     async def insert_text(self, text: str) -> None:
-        await self._page._keyboard_insert_text(text)
+        await self._page._trace_action(
+            "insert_text",
+            "keyboard.insert_text",
+            {},
+            lambda: self._page._keyboard_insert_text(text),
+            class_name="Keyboard",
+        )
 
 
 class Touchscreen:
@@ -371,7 +427,13 @@ class Touchscreen:
         self._page = page
 
     async def tap(self, x: float, y: float) -> None:
-        await self._page._touchscreen_tap(x, y)
+        await self._page._trace_action(
+            "tap",
+            "touchscreen.tap",
+            {"x": x, "y": y},
+            lambda: self._page._touchscreen_tap(x, y),
+            class_name="Touchscreen",
+        )
 
 
 def _save_storage_json_private(path: str | PathLike[str], data: dict[str, Any]) -> None:
@@ -1246,10 +1308,22 @@ class Frame:
         wait_until: Literal["load", "domcontentloaded", "networkidle", "commit"] | None = None,
         timeout: float | None = None,
     ) -> None:
-        await self._page._frame_goto(self._id, url, wait_until=wait_until, timeout=timeout)
+        await self._page._trace_action(
+            "goto",
+            "frame.goto",
+            {"url": url},
+            lambda: self._page._frame_goto(self._id, url, wait_until=wait_until, timeout=timeout),
+            class_name="Frame",
+        )
 
     async def evaluate(self, expression: str, arg: Any = None) -> Any:
-        return await self._page._frame_evaluate(self._id, expression, arg)
+        return await self._page._trace_action(
+            "evaluate",
+            "frame.evaluate",
+            {},
+            lambda: self._page._frame_evaluate(self._id, expression, arg),
+            class_name="Frame",
+        )
 
     async def title(self) -> str:
         return str(await self._page._frame_evaluate(self._id, "document.title"))
@@ -1385,7 +1459,40 @@ class Page(_native.Page):
     def touchscreen(self) -> Touchscreen:
         return Touchscreen(self)
 
+    def _active_tracer(self) -> Tracing | None:
+        ctx = self._context_ref() if self._context_ref is not None else None
+        return ctx._active_tracer() if ctx is not None else None
+
+    async def _trace_action(
+        self,
+        method_name: str,
+        api_name: str,
+        params: dict[str, Any] | None,
+        fn: Callable[[], Awaitable[Any]],
+        *,
+        class_name: str = "Page",
+    ) -> Any:
+        tracer = self._active_tracer()
+        if tracer is None:
+            return await fn()
+        return await tracer._run_action(self, class_name, method_name, api_name, params, fn)
+
     async def wait_for_url(
+        self,
+        url: URLMatch,
+        *,
+        timeout: float | None = None,
+        wait_until: Literal["load", "domcontentloaded", "networkidle", "commit"] | None = None,
+    ) -> None:
+        params: dict[str, Any] = {"url": url} if isinstance(url, str) else {}
+        return await self._trace_action(
+            "wait_for_url",
+            "page.wait_for_url",
+            params,
+            lambda: self._wait_for_url_impl(url, timeout=timeout, wait_until=wait_until),
+        )
+
+    async def _wait_for_url_impl(
         self,
         url: URLMatch,
         *,
@@ -1484,7 +1591,9 @@ class Page(_native.Page):
     ) -> None:
         """Adds a script evaluated whenever the page navigates or reloads."""
         source = _resolve_init_script("page.add_init_script", script, path)
-        await self._add_init_script(source)
+        await self._trace_action(
+            "add_init_script", "page.add_init_script", {}, lambda: self._add_init_script(source)
+        )
 
     async def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
         """Exposes ``callback`` on ``window.<name>``; calls from the page return a Promise."""
@@ -1520,7 +1629,12 @@ class Page(_native.Page):
         if (url is not None) + (path is not None) + (content is not None) != 1:
             raise ValueError("page.add_script_tag: provide exactly one of url, path, or content")
         text = Path(path).read_text(encoding="utf-8") if path is not None else content
-        await self._add_script_tag(url=url, content=text, script_type=type)
+        await self._trace_action(
+            "add_script_tag",
+            "page.add_script_tag",
+            {},
+            lambda: self._add_script_tag(url=url, content=text, script_type=type),
+        )
 
     async def add_style_tag(
         self,
@@ -1533,7 +1647,12 @@ class Page(_native.Page):
         if (url is not None) + (path is not None) + (content is not None) != 1:
             raise ValueError("page.add_style_tag: provide exactly one of url, path, or content")
         text = Path(path).read_text(encoding="utf-8") if path is not None else content
-        await self._add_style_tag(url=url, content=text)
+        await self._trace_action(
+            "add_style_tag",
+            "page.add_style_tag",
+            {},
+            lambda: self._add_style_tag(url=url, content=text),
+        )
 
     def on(self, event: str, handler: Listener) -> None:
         """Calls ``handler`` from now on with each ``"console"`` message (a ``ConsoleMessage``),
@@ -1758,6 +1877,9 @@ class Page(_native.Page):
         ctx = self._context_ref() if self._context_ref is not None else None
         if ctx is not None:
             ctx._remove_page(self)
+        tracer = ctx._active_tracer() if ctx is not None else None
+        if tracer is not None:
+            await tracer._on_page_closing(self)
         self._routes.clear()
         self._listeners.clear()
         self._bindings.clear()
@@ -1773,7 +1895,12 @@ class Page(_native.Page):
         """Changes CSS ``media`` and/or ``prefers-color-scheme``; ``None`` resets either."""
         m = None if media is _UNSET else ("" if media is None else media)
         cs = None if color_scheme is _UNSET else ("" if color_scheme is None else color_scheme)
-        await self._emulate_media(media=m, color_scheme=cs)
+        await self._trace_action(
+            "emulate_media",
+            "page.emulate_media",
+            {},
+            lambda: self._emulate_media(media=m, color_scheme=cs),
+        )
 
     @asynccontextmanager
     async def _expect(
@@ -1861,6 +1988,69 @@ class Page(_native.Page):
             self._network_task = asyncio.ensure_future(_serve_network(self._network(), weakref.ref(self), self._tasks))
             _keep(self._tasks, self._network_task)
         self._listeners.setdefault(event, []).append((added, call))
+
+
+def _wrap_native_page_actions() -> None:
+    specs: tuple[tuple[str, bool], ...] = (
+        ("goto", False),
+        ("reload", False),
+        ("go_back", False),
+        ("go_forward", False),
+        ("set_content", False),
+        ("wait_for_load_state", False),
+        ("wait_for_function", False),
+        ("evaluate", False),
+        ("screenshot", False),
+        ("pdf", False),
+        ("drag_and_drop", False),
+        ("click", True),
+        ("dblclick", True),
+        ("hover", True),
+        ("tap", True),
+        ("focus", True),
+        ("blur", True),
+        ("scroll_into_view_if_needed", True),
+        ("fill", True),
+        ("clear", True),
+        ("press", True),
+        ("press_sequentially", True),
+        ("type", True),
+        ("check", True),
+        ("uncheck", True),
+        ("set_checked", True),
+        ("select_option", True),
+        ("set_input_files", True),
+        ("wait_for_selector", True),
+    )
+    for name, has_selector in specs:
+        native_fn = getattr(_native.Page, name, None)
+        if native_fn is None:
+            continue
+
+        def _make_wrapper(fn: Any, method_name: str, with_sel: bool) -> Any:
+            async def _wrapped(self: Page, *args: Any, **kwargs: Any) -> Any:
+                tracer = self._active_tracer()
+                if tracer is None:
+                    return await fn(self, *args, **kwargs)
+                params: dict[str, Any] = {}
+                if method_name == "goto" and args:
+                    params = {"url": str(args[0])}
+                elif method_name == "drag_and_drop" and len(args) >= 2:
+                    params = {"source": str(args[0]), "target": str(args[1])}
+                elif with_sel and args:
+                    params = {"selector": str(args[0])}
+                return await tracer._run_action(
+                    self, "Page", method_name, f"page.{method_name}", params, lambda: fn(self, *args, **kwargs)
+                )
+
+            _wrapped.__name__ = method_name
+            _wrapped.__qualname__ = f"Page.{method_name}"
+            return _wrapped
+
+        setattr(Page, name, _make_wrapper(native_fn, name, has_selector))
+
+
+_wrap_native_page_actions()
 
 
 _NETWORK_EVENTS = ("request", "response", "requestfinished", "requestfailed")
@@ -2382,6 +2572,7 @@ class BrowserContext:
         self._tasks: set[asyncio.Future[Any]] = set()
         self._pending_har_filters: list[tuple[Path, re.Pattern[str]]] = []
         self._request: APIRequestContext | None = None
+        self._tracing: Tracing | None = None
 
     @property
     def request(self) -> APIRequestContext:
@@ -2392,6 +2583,20 @@ class BrowserContext:
                 lambda: self._closed,
             )
         return self._request
+
+    @property
+    def tracing(self) -> Tracing:
+        if self._tracing is None:
+            self._tracing = Tracing(self)
+        return self._tracing
+
+    def _is_closed(self) -> bool:
+        return self._closed
+
+    def _active_tracer(self) -> Tracing | None:
+        if self._tracing is not None and self._tracing._is_active():
+            return self._tracing
+        return None
 
     @property
     def browser(self) -> Browser:
@@ -2413,6 +2618,9 @@ class BrowserContext:
         if self._closed:
             return
         self._adopt_page(popup)
+        tracer = self._active_tracer()
+        if tracer is not None:
+            _keep(self._tasks, asyncio.ensure_future(tracer._on_page_created(popup)))
 
     def _remove_page(self, page: Page) -> None:
         with suppress(ValueError):
@@ -2427,6 +2635,9 @@ class BrowserContext:
             await page.close()
             raise Error("browser_context.new_page: the context is closed")
         self._adopt_page(page)
+        tracer = self._active_tracer()
+        if tracer is not None:
+            await tracer._on_page_created(page)
         return page
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
@@ -2597,6 +2808,8 @@ class BrowserContext:
                 with suppress(Error):
                     await p.close()
         self._pages.clear()
+        if self._tracing is not None:
+            await self._tracing._dispose()
         with suppress(Error):
             await self._ctx.close()
         await _flush_har_filters(self._pending_har_filters)

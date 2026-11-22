@@ -32,6 +32,7 @@ from . import _expect, _native
 from . import async_api as _a
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage
+from ._tracing import SyncTracing as Tracing
 from ._types import (
     AriaSnapshot,
     FilePayload,
@@ -82,6 +83,7 @@ __all__ = [
     "StorageState",
     "TimeoutError",
     "Touchscreen",
+    "Tracing",
     "ViewportSize",
     "WebSocket",
     "Worker",
@@ -271,6 +273,9 @@ class _Finders:
 
     _impl: Any
 
+    def _owner_page_ref(self) -> weakref.ref[Page] | None:
+        return None
+
     def locator(
         self,
         selector: str,
@@ -288,11 +293,12 @@ class _Finders:
                 has_not=_native_loc(has_not) if has_not is not None else None,
                 has_text=has_text,
                 has_not_text=has_not_text,
-            )
+            ),
+            self._owner_page_ref(),
         )
 
     def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator:
-        return Locator(self._impl.get_by_text(text, exact=exact))
+        return Locator(self._impl.get_by_text(text, exact=exact), self._owner_page_ref())
 
     def get_by_role(
         self,
@@ -320,23 +326,24 @@ class _Finders:
                 name=name,
                 pressed=pressed,
                 selected=selected,
-            )
+            ),
+            self._owner_page_ref(),
         )
 
     def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator:
-        return Locator(self._impl.get_by_label(text, exact=exact))
+        return Locator(self._impl.get_by_label(text, exact=exact), self._owner_page_ref())
 
     def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator:
-        return Locator(self._impl.get_by_placeholder(text, exact=exact))
+        return Locator(self._impl.get_by_placeholder(text, exact=exact), self._owner_page_ref())
 
     def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator:
-        return Locator(self._impl.get_by_alt_text(text, exact=exact))
+        return Locator(self._impl.get_by_alt_text(text, exact=exact), self._owner_page_ref())
 
     def get_by_title(self, text: str, *, exact: bool | None = None) -> Locator:
-        return Locator(self._impl.get_by_title(text, exact=exact))
+        return Locator(self._impl.get_by_title(text, exact=exact), self._owner_page_ref())
 
     def get_by_test_id(self, test_id: str) -> Locator:
-        return Locator(self._impl.get_by_test_id(test_id))
+        return Locator(self._impl.get_by_test_id(test_id), self._owner_page_ref())
 
 
 class Locator(_Finders):
@@ -344,8 +351,28 @@ class Locator(_Finders):
 
     _impl: _native.Locator
 
-    def __init__(self, impl: _native.Locator) -> None:
+    def __init__(self, impl: _native.Locator, page_ref: weakref.ref[Page] | None = None) -> None:
         self._impl = impl
+        self._page_ref = page_ref
+
+    def _owner_page_ref(self) -> weakref.ref[Page] | None:
+        return self._page_ref
+
+    def _trace(
+        self,
+        method_name: str,
+        fn: Callable[[], Awaitable[Any]],
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        page = self._page_ref() if self._page_ref is not None else None
+        impl = page._impl if page is not None else None
+        if impl is None or impl._active_tracer() is None:
+            return _run(fn)
+        return _run(
+            lambda: impl._trace_action(
+                method_name, f"locator.{method_name}", params, fn, class_name="Locator"
+            )
+        )
 
     def __repr__(self) -> str:
         return repr(self._impl)
@@ -363,16 +390,18 @@ class Locator(_Finders):
         timeout: float | None = None,
     ) -> None:
         """``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
-        _run(
-            self._impl.click,
-            button=button,
-            click_count=click_count,
-            delay=delay,
-            position=position,
-            modifiers=list(modifiers) if modifiers is not None else None,
-            force=force,
-            trial=trial,
-            timeout=timeout,
+        self._trace(
+            "click",
+            lambda: self._impl.click(
+                button=button,
+                click_count=click_count,
+                delay=delay,
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
         )
 
     def dblclick(
@@ -386,15 +415,17 @@ class Locator(_Finders):
         trial: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(
-            self._impl.dblclick,
-            button=button,
-            delay=delay,
-            position=position,
-            modifiers=list(modifiers) if modifiers is not None else None,
-            force=force,
-            trial=trial,
-            timeout=timeout,
+        self._trace(
+            "dblclick",
+            lambda: self._impl.dblclick(
+                button=button,
+                delay=delay,
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
         )
 
     def hover(
@@ -406,13 +437,15 @@ class Locator(_Finders):
         trial: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(
-            self._impl.hover,
-            position=position,
-            modifiers=list(modifiers) if modifiers is not None else None,
-            force=force,
-            trial=trial,
-            timeout=timeout,
+        self._trace(
+            "hover",
+            lambda: self._impl.hover(
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
         )
 
     def tap(
@@ -424,41 +457,46 @@ class Locator(_Finders):
         trial: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(
-            self._impl.tap,
-            position=position,
-            modifiers=list(modifiers) if modifiers is not None else None,
-            force=force,
-            trial=trial,
-            timeout=timeout,
+        self._trace(
+            "tap",
+            lambda: self._impl.tap(
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
         )
 
     def focus(self, *, timeout: float | None = None) -> None:
-        _run(self._impl.focus, timeout=timeout)
+        self._trace("focus", lambda: self._impl.focus(timeout=timeout))
 
     def blur(self, *, timeout: float | None = None) -> None:
-        _run(self._impl.blur, timeout=timeout)
+        self._trace("blur", lambda: self._impl.blur(timeout=timeout))
 
     def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:
-        _run(self._impl.scroll_into_view_if_needed, timeout=timeout)
+        self._trace("scroll_into_view_if_needed", lambda: self._impl.scroll_into_view_if_needed(timeout=timeout))
 
     def drag_to(self, target: Locator, *, force: bool | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.drag_to, target._impl, force=force, timeout=timeout)
+        self._trace("drag_to", lambda: self._impl.drag_to(target._impl, force=force, timeout=timeout))
 
     def fill(self, value: str, *, timeout: float | None = None) -> None:
-        _run(self._impl.fill, value, timeout=timeout)
+        self._trace("fill", lambda: self._impl.fill(value, timeout=timeout))
 
     def clear(self, *, force: bool | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.clear, force=force, timeout=timeout)
+        self._trace("clear", lambda: self._impl.clear(force=force, timeout=timeout))
 
     def press(self, key: str, *, delay: float | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.press, key, delay=delay, timeout=timeout)
+        self._trace("press", lambda: self._impl.press(key, delay=delay, timeout=timeout), {"key": key})
 
     def press_sequentially(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.press_sequentially, text, delay=delay, timeout=timeout)
+        self._trace(
+            "press_sequentially",
+            lambda: self._impl.press_sequentially(text, delay=delay, timeout=timeout),
+        )
 
     def type(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
-        _run(self._impl.type, text, delay=delay, timeout=timeout)
+        self._trace("type", lambda: self._impl.type(text, delay=delay, timeout=timeout))
 
     def check(
         self,
@@ -468,7 +506,7 @@ class Locator(_Finders):
         trial: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.check, position=position, force=force, trial=trial, timeout=timeout)
+        self._trace("check", lambda: self._impl.check(position=position, force=force, trial=trial, timeout=timeout))
 
     def uncheck(
         self,
@@ -478,7 +516,9 @@ class Locator(_Finders):
         trial: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.uncheck, position=position, force=force, trial=trial, timeout=timeout)
+        self._trace(
+            "uncheck", lambda: self._impl.uncheck(position=position, force=force, trial=trial, timeout=timeout)
+        )
 
     def set_checked(
         self,
@@ -489,7 +529,10 @@ class Locator(_Finders):
         trial: bool | None = None,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.set_checked, checked, position=position, force=force, trial=trial, timeout=timeout)
+        self._trace(
+            "set_checked",
+            lambda: self._impl.set_checked(checked, position=position, force=force, trial=trial, timeout=timeout),
+        )
 
     def select_option(
         self,
@@ -501,14 +544,11 @@ class Locator(_Finders):
         force: bool | None = None,
         timeout: float | None = None,
     ) -> list[str]:
-        return _run(
-            self._impl.select_option,
-            value,
-            index=index,
-            label=label,
-            element=element,
-            force=force,
-            timeout=timeout,
+        return self._trace(
+            "select_option",
+            lambda: self._impl.select_option(
+                value, index=index, label=label, element=element, force=force, timeout=timeout
+            ),
         )
 
     def set_input_files(
@@ -517,7 +557,7 @@ class Locator(_Finders):
         *,
         timeout: float | None = None,
     ) -> None:
-        _run(self._impl.set_input_files, files, timeout=timeout)
+        self._trace("set_input_files", lambda: self._impl.set_input_files(files, timeout=timeout))
 
     def wait_for(
         self,
@@ -526,7 +566,7 @@ class Locator(_Finders):
         timeout: float | None = None,
     ) -> None:
         """Waits until ``state``: visible by default."""
-        _run(self._impl.wait_for, state=state, timeout=timeout)
+        self._trace("wait_for", lambda: self._impl.wait_for(state=state, timeout=timeout))
 
     def text_content(self, *, timeout: float | None = None) -> str | None:
         return _run(self._impl.text_content, timeout=timeout)
@@ -547,7 +587,7 @@ class Locator(_Finders):
         return _run(self._impl.count)
 
     def all(self) -> list[Locator]:
-        return [Locator(item) for item in _run(self._impl.all)]
+        return [Locator(item, self._page_ref) for item in _run(self._impl.all)]
 
     def all_text_contents(self) -> list[str]:
         return _run(self._impl.all_text_contents)
@@ -587,30 +627,32 @@ class Locator(_Finders):
         timeout: float | None = None,
     ) -> bytes:
         """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""
-        return _run(
-            self._impl.screenshot,
-            path=path,
-            type=type,
-            quality=quality,
-            omit_background=omit_background,
-            timeout=timeout,
+        return self._trace(
+            "screenshot",
+            lambda: self._impl.screenshot(
+                path=path,
+                type=type,
+                quality=quality,
+                omit_background=omit_background,
+                timeout=timeout,
+            ),
         )
 
     def evaluate(self, expression: str, arg: Any = None, *, timeout: float | None = None) -> Any:
         """Calls the JavaScript function ``expression`` with the element and ``arg``."""
-        return _run(self._impl.evaluate, expression, arg, timeout=timeout)
+        return self._trace("evaluate", lambda: self._impl.evaluate(expression, arg, timeout=timeout))
 
     def nth(self, index: int) -> Locator:
         """The ``index``-th match (0-based; negative counts from the end)."""
-        return Locator(self._impl.nth(index))
+        return Locator(self._impl.nth(index), self._page_ref)
 
     @property
     def first(self) -> Locator:
-        return Locator(self._impl.first)
+        return Locator(self._impl.first, self._page_ref)
 
     @property
     def last(self) -> Locator:
-        return Locator(self._impl.last)
+        return Locator(self._impl.last, self._page_ref)
 
     def filter(
         self,
@@ -627,14 +669,15 @@ class Locator(_Finders):
                 has_not=_native_loc(has_not) if has_not is not None else None,
                 has_text=has_text,
                 has_not_text=has_not_text,
-            )
+            ),
+            self._page_ref,
         )
 
     def and_(self, locator: Locator) -> Locator:
-        return Locator(self._impl.and_(_native_loc(locator)))
+        return Locator(self._impl.and_(_native_loc(locator)), self._page_ref)
 
     def or_(self, locator: Locator) -> Locator:
-        return Locator(self._impl.or_(_native_loc(locator)))
+        return Locator(self._impl.or_(_native_loc(locator)), self._page_ref)
 
 
 class FrameLocator(_Finders):
@@ -642,12 +685,16 @@ class FrameLocator(_Finders):
 
     _impl: _native.FrameLocator
 
-    def __init__(self, impl: _native.FrameLocator) -> None:
+    def __init__(self, impl: _native.FrameLocator, page_ref: weakref.ref[Page] | None = None) -> None:
         self._impl = impl
+        self._page_ref = page_ref
+
+    def _owner_page_ref(self) -> weakref.ref[Page] | None:
+        return self._page_ref
 
     def frame_locator(self, selector: str) -> FrameLocator:
         """A nested iframe inside this one."""
-        return FrameLocator(self._impl.frame_locator(selector))
+        return FrameLocator(self._impl.frame_locator(selector), self._page_ref)
 
 
 class Frame(_Finders):
@@ -661,6 +708,9 @@ class Frame(_Finders):
     @property
     def page(self) -> Page:
         return _wrap_page(self._impl.page)
+
+    def _owner_page_ref(self) -> weakref.ref[Page] | None:
+        return weakref.ref(self.page)
 
     @property
     def url(self) -> str:
@@ -695,7 +745,7 @@ class Frame(_Finders):
         return _run(self._impl.content)
 
     def frame_locator(self, selector: str) -> FrameLocator:
-        return FrameLocator(self._impl.frame_locator(selector))
+        return FrameLocator(self._impl.frame_locator(selector), self._owner_page_ref())
 
 
 class CDPSession:
@@ -1331,6 +1381,9 @@ class Page(_Finders):
     def url(self) -> str:
         return self._impl.url
 
+    def _owner_page_ref(self) -> weakref.ref[Page] | None:
+        return weakref.ref(self)
+
     def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None) -> None:
         """Navigates; ``wait_until`` is ``load`` (the default), ``domcontentloaded``,
         ``networkidle`` or ``commit``. ``timeout`` is in milliseconds; 0 for none."""
@@ -1825,7 +1878,7 @@ class Page(_Finders):
         return _run(self._impl.page_errors)
 
     def frame_locator(self, selector: str) -> FrameLocator:
-        return FrameLocator(self._impl.frame_locator(selector))
+        return FrameLocator(self._impl.frame_locator(selector), self._owner_page_ref())
 
     @property
     def frames(self) -> list[Frame]:
@@ -2239,10 +2292,17 @@ class BrowserContext:
         self._browser = browser
         self._impl = impl
         self._route_bridges: list[tuple[URLMatch, Callable[..., Any], Callable[..., Any]]] = []
+        self._tracing: Tracing | None = None
 
     @property
     def browser(self) -> Browser:
         return self._browser
+
+    @property
+    def tracing(self) -> Tracing:
+        if self._tracing is None:
+            self._tracing = Tracing(self._impl.tracing, _run)
+        return self._tracing
 
     @property
     def pages(self) -> list[Page]:

@@ -1,5 +1,5 @@
 // Compile-only check of the published typings: `npm run test:types`.
-import fluxwright, { chromium, expect, type LocatorAssertions, type PageAssertions, type StorageState } from '../addon'
+import fluxwright, { chromium, expect, type LocatorAssertions, type PageAssertions, type StorageState, type Tracing } from '../addon'
 
 export async function typed(): Promise<void> {
   const browser = await chromium.launch({ maxBrowsers: 2 })
@@ -259,6 +259,17 @@ export async function typed(): Promise<void> {
   await expect(page).toBeVisible()
   // @ts-expect-error toHaveURL is only on PageAssertions, not LocatorAssertions
   await expect(item).toHaveURL('https://example.com')
+
+  const tracing: Tracing = context.tracing
+  await tracing.start({ name: 'suite', title: 'smoke', screenshots: true, snapshots: true })
+  await tracing.startChunk({ name: 'chunk-1', title: 'first chunk' })
+  await tracing.stopChunk({ path: 'chunk.zip' })
+  await tracing.stop({ path: 'trace.zip' })
+  await tracing.stop()
+  // @ts-expect-error tracing.start does not accept path
+  await tracing.start({ path: 'bad.zip' })
+  // @ts-expect-error tracing.stopChunk does not accept screenshots
+  await tracing.stopChunk({ screenshots: true })
 
   await context.close()
   await browser.close()
