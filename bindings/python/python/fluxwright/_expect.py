@@ -189,6 +189,7 @@ async def _poll_until(
 ) -> None:
     unlimited = timeout_ms == 0.0
     deadline = None if unlimited else time.monotonic() + (timeout_ms / 1000.0)
+    last_known_desc: str | None = None
     while True:
         remaining_ms = None if deadline is None else max(0.0, (deadline - time.monotonic()) * 1000.0)
         try:
@@ -202,8 +203,12 @@ async def _poll_until(
             ok = (not matched) if negated else matched
             if ok:
                 return
+            last_known_desc = actual_desc
         elif kind == "not-attached":
             actual_desc = "element not found (count: 0)"
+            last_known_desc = actual_desc
+        elif last_known_desc is not None:
+            actual_desc = last_known_desc
 
         if deadline is not None:
             rem_s = deadline - time.monotonic()

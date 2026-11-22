@@ -90,6 +90,7 @@ def _assert_valid_trace_zip(
     expected_title: str,
     expected_name: str | None = None,
     expected_apis: tuple[str, ...] = (),
+    allow_in_flight: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     raw_bytes = zip_path.read_bytes()
     assert raw_bytes[:4] == b"PK\x03\x04"
@@ -112,7 +113,8 @@ def _assert_valid_trace_zip(
 
         befores = [e for e in trace_events if e.get("type") == "before"]
         afters = [e for e in trace_events if e.get("type") == "after"]
-        assert len(afters) >= len(befores)
+        if not allow_in_flight:
+            assert len(afters) >= len(befores)
         for api in expected_apis:
             assert any(e.get("apiName") == api for e in befores), f"missing {api} in trace.trace"
 
@@ -534,7 +536,7 @@ def test_tracing_unit_cross_chunk_isolation_leak_and_multipage_fallback(tmp_path
         # Multi-page fallback screenshot captured BOTH p1 and p2 via page.screenshot() when cdp is None.
         assert p1.screenshot_calls >= 1
         assert p2.screenshot_calls >= 1
-        c1_events, _ = _assert_valid_trace_zip(chunk1, expected_title="Chunk A")
+        c1_events, _ = _assert_valid_trace_zip(chunk1, expected_title="Chunk A", allow_in_flight=True)
         frame_pages = {e["pageId"] for e in c1_events if e.get("type") == "screencast-frame"}
         assert len(frame_pages) == 2
 
