@@ -271,6 +271,18 @@ impl JobRequest {
                         validate_selector(sel)?;
                     }
                 }
+                Step::PauseForHuman { message, timeout_ms } => {
+                    if let Some(msg) = message {
+                        if msg.chars().count() > 512 {
+                            return Err("pause_for_human message must be at most 512 characters".into());
+                        }
+                    }
+                    if let Some(ms) = timeout_ms {
+                        if !(1..=600_000).contains(ms) {
+                            return Err("pause_for_human timeout_ms must be between 1 and 600000".into());
+                        }
+                    }
+                }
                 Step::Screenshot { .. } => {
                     step.screenshot_options().and_then(|o| o.validate().map_err(|e| e.to_string()))?;
                 }
@@ -594,6 +606,12 @@ pub enum Step {
         include_links: bool,
         #[serde(default)]
         include_images: bool,
+    },
+    PauseForHuman {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     Screenshot {
         #[serde(default)]
@@ -1248,6 +1266,9 @@ impl Step {
                     .await?;
                 Ok(Value::String(md))
             }
+            Step::PauseForHuman { .. } => Err(fluxwright::Error::Other(
+                "pause_for_human requires a live server session".into(),
+            )),
             Step::Screenshot { kind, .. } => {
                 let opts = self.screenshot_options().map_err(fluxwright::Error::Other)?;
                 let bytes = page.screenshot_with(&opts).await?;
@@ -1307,6 +1328,7 @@ impl Step {
             Step::Content {} => "content",
             Step::Snapshot { .. } => "snapshot",
             Step::Markdown { .. } => "markdown",
+            Step::PauseForHuman { .. } => "pause_for_human",
             Step::Screenshot { .. } => "screenshot",
             Step::Pdf { .. } => "pdf",
         }
@@ -1596,7 +1618,8 @@ mod tests {
         assert!(serde_json::from_value::<JobRequest>(json!({
             "steps": [
                 { "action": "snapshot", "interactive_only": true, "max_depth": 4, "max_nodes": 500 },
-                { "action": "markdown", "main_content_only": true, "include_images": true }
+                { "action": "markdown", "main_content_only": true, "include_images": true },
+                { "action": "pause_for_human", "message": "Solve captcha", "timeout_ms": 120000 }
             ]
         }))
         .unwrap()
@@ -1606,6 +1629,9 @@ mod tests {
             json!({ "steps": [{ "action": "snapshot", "max_depth": 0 }] }),
             json!({ "steps": [{ "action": "snapshot", "max_nodes": 5001 }] }),
             json!({ "steps": [{ "action": "markdown", "selector": "   " }] }),
+            json!({ "steps": [{ "action": "pause_for_human", "timeout_ms": 0 }] }),
+            json!({ "steps": [{ "action": "pause_for_human", "timeout_ms": 600001 }] }),
+            json!({ "steps": [{ "action": "pause_for_human", "message": "x".repeat(513) }] }),
         ] {
             let job: JobRequest = serde_json::from_value(bad).unwrap();
             assert!(job.validate().is_err());

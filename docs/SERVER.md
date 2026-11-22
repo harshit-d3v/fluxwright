@@ -202,6 +202,7 @@ failed job returns **409**.
 | `content` | None | HTML string |
 | `snapshot` | Optional `interactive_only`, `compact` (default `true`), `max_depth` (`1–64`), `max_nodes` (`1–5000`) | `{ "tree": "…", "refs": [{ "id", "role", "name" }], "truncated": bool }` |
 | `markdown` | Optional `selector`, `main_content_only`, `include_links` (default `true`), `include_images` | Markdown string |
+| `pause_for_human` | Optional `message` (max 512 chars), `timeout_ms` (`1–600000`) | Pauses live job execution until resumed via `/dashboard` or API; resolves `{ "resumed": true }` |
 | `screenshot` | Optional `full_page` (default `false`), `type` (`"png"` \| `"jpeg"` \| `"webp"`), `quality` (0–100, JPEG/WebP only), `clip` (`{ x, y, width, height }`), `omit_background` | `{ "mime_type": "image/png" \| "image/jpeg" \| "image/webp", "base64": "…" }` |
 | `pdf` | Optional `format`, `width`, `height`, `margin` (`{ top, right, bottom, left }`), `landscape`, `print_background`, `scale` (0.1–2), `page_ranges`, `prefer_css_page_size`, `display_header_footer`, `header_template`, `footer_template`, `outline`, `tagged` | `{ "mime_type": "application/pdf", "base64": "…" }` |
 
@@ -247,10 +248,23 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | GET | `/dashboard` | None | Live HTML fleet dashboard |
 | GET | `/` | None | Live HTML fleet dashboard (alias for `/dashboard`) |
 | GET | `/v1/events` | Bearer token | Server-Sent Events (SSE) stream of fleet and job snapshots |
+| GET | `/v1/live` | Bearer token | List active live browser sessions (jobs and `/cdp` gateway sessions) (standalone only) |
+| POST | `/v1/live/{id}/ticket` | Bearer token | Mint a single-use 30-second WebSocket ticket bound to `{id}` (standalone only) |
+| GET (WS) | `/v1/live/{id}/ws` | Bearer token or single-use `?ticket=` | Live JPEG screencast stream + HITL mouse/keyboard/navigate/pause forwarding (standalone only) |
+| POST | `/v1/jobs/{id}/pause` | Bearer token | Pause a running live job before its next step (standalone only) |
+| POST | `/v1/jobs/{id}/resume` | Bearer token | Resume a paused live job (standalone only) |
 | GET | `/json/version` | Bearer (or `?token=` with `--allow-query-token`) | Standard DevTools discovery JSON pointing at `ws(s)://<host>/cdp` (standalone only) |
 | GET (WS) | `/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Pooled, context-isolated Chrome DevTools Protocol WebSocket gateway (standalone only) |
 
-The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp` and `/json/version`, never `/v1/*` or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally.
+The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp` and `/json/version`, never `/v1/*` or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally. Browser `/dashboard` live streams authenticate WebSocket upgrades with single-use `?ticket=` tokens from `POST /v1/live/{id}/ticket`.
+
+## Live screencast viewer & human-in-the-loop
+
+In standalone mode (`fluxwright serve`), `/dashboard` displays active browser jobs and `/cdp` gateway sessions in **Live Browser Sessions** with a **Watch Live** action:
+
+- **Screencast transport:** `GET /v1/live/{id}/ws` attaches an observer CDP session and streams `Page.startScreencast` JPEG frames (`quality` `20–95`, `max_width` `320–1920`, `max_height` `240–1200`), automatically acking each frame for backpressure and capturing an immediate fallback frame when viewing an idle/paused page.
+- **Human takeover:** With **Interactive** enabled in the dashboard modal, pointer clicks, movement, mouse wheel, keyboard input, `Send Esc`, and URL navigation forward directly to the remote tab (URL navigation enforces SSRF checks unless `FLUXWRIGHT_SERVER_ANY_URL=1`).
+- **Pause & resume:** Jobs can include a `{ "action": "pause_for_human", "message": "Solve CAPTCHA", "timeout_ms": 120000 }` step or be paused/resumed manually via `POST /v1/jobs/{id}/pause`, `POST /v1/jobs/{id}/resume`, or the dashboard viewer.
 
 ## Pooled CDP WebSocket gateway (`GET /cdp`, `GET /json/version`)
 
@@ -350,7 +364,8 @@ The dashboard reads `GET /v1/events`, a Server-Sent Events (SSE) stream, to rece
 Every 1000 ms, the server emits an event named `snapshot` with a JSON payload containing:
 - `fleet`: Current engine `MetricsSnapshot` (active leases, browsers, contexts, pages, memory, recycle/crash counts, reuse rate).
 - `server`: Current job totals (`queued_jobs`, `running_jobs`, `succeeded_jobs`, `failed_jobs`, `cancelled_jobs`, `max_jobs`).
-- `jobs`: The 100 most recent job records, newest first, with `id`, `status`, `submitted_at`, `started_at`, `finished_at`, `attempts`, `step_index`, `error`, and `trace_id` (the counts in `server` cover every retained job).
+- `live_sessions`: Active live browser sessions (`id`, `kind`, `url`, `started_at`, `paused`, `pause_reason`, `can_pause`).
+- `jobs`: The 100 most recent job records, newest first, with `id`, `status`, `submitted_at`, `started_at`, `finished_at`, `attempts`, `step_index`, `error`, `trace_id`, `live`, and `paused` (the counts in `server` cover every retained job).
 
 ### Distributed tracing (W3C TraceContext & OpenTelemetry)
 

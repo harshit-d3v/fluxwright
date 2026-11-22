@@ -179,7 +179,7 @@ fn percent_decode_bytes(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn percent_decode_str(input: &str) -> Option<String> {
+pub(crate) fn percent_decode_str(input: &str) -> Option<String> {
     let bytes = percent_decode_bytes(input.as_bytes())?;
     String::from_utf8(bytes).ok()
 }
@@ -310,10 +310,16 @@ struct GatewayState {
     auto_attached_targets: HashSet<String>,
     discover_targets: bool,
     auto_attach: bool,
+    live_target: Arc<std::sync::Mutex<Option<String>>>,
+    live_url: Arc<std::sync::Mutex<String>>,
 }
 
 impl GatewayState {
-    fn new(primary_context: String) -> Self {
+    fn new(
+        primary_context: String,
+        live_target: Arc<std::sync::Mutex<Option<String>>>,
+        live_url: Arc<std::sync::Mutex<String>>,
+    ) -> Self {
         let mut allowed_contexts = HashSet::new();
         allowed_contexts.insert(primary_context.clone());
         Self {
@@ -325,6 +331,8 @@ impl GatewayState {
             auto_attached_targets: HashSet::new(),
             discover_targets: false,
             auto_attach: false,
+            live_target,
+            live_url,
         }
     }
 }
@@ -339,7 +347,20 @@ async fn run_gateway(
     let conn = lease.cdp_connection();
     let lease = Arc::new(lease);
     let primary_context = lease.context_id().to_string();
-    let state = Arc::new(Mutex::new(GatewayState::new(primary_context.clone())));
+    let live_target = Arc::new(std::sync::Mutex::new(None));
+    let live_url = Arc::new(std::sync::Mutex::new(String::from("about:blank")));
+    let _live_guard = inner.live.register_cdp(
+        format!("cdp-{}", uuid::Uuid::new_v4().simple()),
+        conn.clone(),
+        live_target.clone(),
+        live_url.clone(),
+        crate::now_ms(),
+    );
+    let state = Arc::new(Mutex::new(GatewayState::new(
+        primary_context.clone(),
+        live_target,
+        live_url,
+    )));
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -365,7 +386,9 @@ async fn run_gateway(
             .await
         {
             if let Some(tid) = res["targetId"].as_str() {
-                state.lock().await.owned_targets.insert(tid.to_string());
+                let mut g = state.lock().await;
+                g.owned_targets.insert(tid.to_string());
+                *g.live_target.lock().unwrap() = Some(tid.to_string());
             }
         }
     }
@@ -432,6 +455,17 @@ async fn run_gateway(
                             } else {
                                 g.owned_targets.insert(tid.to_string());
                                 let ty = info["type"].as_str().unwrap_or("");
+                                if ty == "page" {
+                                    let mut slot = g.live_target.lock().unwrap();
+                                    if slot.is_none() || ev.method == "Target.targetCreated" {
+                                        *slot = Some(tid.to_string());
+                                    }
+                                    if slot.as_deref() == Some(tid) {
+                                        if let Some(u) = info["url"].as_str().filter(|s| !s.is_empty()) {
+                                            *g.live_url.lock().unwrap() = u.to_string();
+                                        }
+                                    }
+                                }
                                 let attach = ev.method == "Target.targetCreated"
                                     && g.auto_attach
                                     && matches!(ty, "page" | "iframe" | "worker")
@@ -473,6 +507,11 @@ async fn run_gateway(
                             let mut g = state.lock().await;
                             let was_owned = g.owned_targets.remove(tid);
                             g.auto_attached_targets.remove(tid);
+                            let mut slot = g.live_target.lock().unwrap();
+                            if slot.as_deref() == Some(tid) {
+                                *slot = None;
+                                g.live_url.lock().unwrap().clear();
+                            }
                             (was_owned, g.discover_targets)
                         };
                         if was_owned && discover {
@@ -770,6 +809,12 @@ async fn handle_browser_command(
                     let maybe_attach = if let Some(tid) = result["targetId"].as_str() {
                         let mut g = state.lock().await;
                         g.owned_targets.insert(tid.to_string());
+                        {
+                            let mut slot = g.live_target.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(tid.to_string());
+                            }
+                        }
                         if g.auto_attach && g.auto_attached_targets.insert(tid.to_string()) {
                             Some(tid.to_string())
                         } else {
