@@ -337,7 +337,14 @@ async function runDashboardHitlE2E(baseUrl, token, fixtureUrl, chromePath) {
     page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
     page.on('console', (msg) => {
       if (msg.type() === 'error') {
-        errors.push(`console.error: ${msg.text()}`);
+        const locUrl = msg.location()?.url || '';
+        if (locUrl.endsWith('/favicon.ico')) return;
+        errors.push(`console.error (${locUrl}): ${msg.text()}`);
+      }
+    });
+    page.on('response', (res) => {
+      if (res.status() >= 400 && !res.url().endsWith('/favicon.ico')) {
+        errors.push(`http ${res.status()}: ${res.url()}`);
       }
     });
 
