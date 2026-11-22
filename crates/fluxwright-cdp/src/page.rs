@@ -580,6 +580,21 @@ pub(crate) fn js_error(res: &Value) -> Option<Error> {
     Some(Error::JavaScript(msg))
 }
 
+fn is_destroyed_context_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Command { message, .. }
+            if message.contains("Cannot find context")
+                || message.contains("Execution context was destroyed")
+                || message.contains("Inspected target navigated")
+    )
+}
+
+fn is_stale_context_error(err: &Error) -> bool {
+    is_destroyed_context_error(err)
+        || matches!(err, Error::Command { message, .. } if message.contains("-32000"))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScriptTagOptions {
     pub url: Option<String>,
@@ -612,8 +627,8 @@ pub struct CdpPage {
     pub opener_id: Option<TargetId>,
     pub session_id: SessionId,
     pub(crate) targets: Arc<Mutex<HashMap<String, TargetState>>>,
-    /// Isolated worlds made for same-process iframes, by frame id.
-    pub(crate) worlds: Arc<Mutex<HashMap<String, i64>>>,
+    /// Isolated worlds made for frames on this page, by frame id.
+    pub(crate) worlds: Arc<std::sync::Mutex<HashMap<String, i64>>>,
     pub(crate) setups: Arc<Mutex<HashMap<String, ContextSetup>>>,
     pub(crate) page_setups: Arc<Mutex<HashMap<String, PageSetup>>>,
     pub(crate) frames: Arc<std::sync::Mutex<FrameTree>>,
@@ -625,6 +640,13 @@ pub struct CdpPage {
     pub(crate) net: Arc<std::sync::Mutex<NetActivity>>,
     /// Maps the latest accessibility snapshot's short ref (`"e1"`, `"e2"`, ...) to `backendDOMNodeId`.
     pub(crate) ax_refs: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// Pre-subscribed CDP event stream for popups so early console/network events aren't missed.
+    #[allow(clippy::type_complexity)]
+    pub(crate) early_log_events: Arc<
+        std::sync::Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<Arc<crate::connection::CdpEvent>>>,
+        >,
+    >,
 }
 
 impl CdpPage {
@@ -633,7 +655,7 @@ impl CdpPage {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.closed.load(Ordering::SeqCst) || self.browser.is_dead()
     }
 
     pub fn target_id(&self) -> &str {
@@ -682,13 +704,13 @@ impl CdpPage {
     }
 
     async fn attach_cdp_session(&self, target_id: &str, timeout: Duration) -> Result<CdpSession> {
-        if self.is_closed() {
-            return Err(Error::Other("page is closed".into()));
-        }
         if self.browser.is_dead() {
             return Err(Error::BrowserDead {
                 pid: self.browser_pid,
             });
+        }
+        if self.is_closed() {
+            return Err(Error::Other("page is closed".into()));
         }
         let res = self
             .browser
@@ -760,6 +782,7 @@ impl CdpPage {
                 match ev.method.as_str() {
                     "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
                         self.ax_refs.lock().unwrap().clear();
+                        self.worlds.lock().unwrap().clear();
                         let full = crate::browser::frame_url(&ev.params["frame"]);
                         if !full.is_empty() {
                             self.set_url(&full);
@@ -794,6 +817,7 @@ impl CdpPage {
     /// Navigates and waits for the main frame's lifecycle event, like Playwright's `waitUntil`.
     pub async fn goto(&self, url: &str, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
         self.ax_refs.lock().unwrap().clear();
+        self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         // Subscribed before navigating, so no lifecycle event can slip past; unbounded, so a
         // busy browser cannot make it lag.
@@ -844,6 +868,7 @@ impl CdpPage {
 
     pub async fn reload(&self, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
         self.ax_refs.lock().unwrap().clear();
+        self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         let events = self.browser.subscribe_unbounded();
         self.call("Page.reload", json!({}), timeout).await?;
@@ -862,6 +887,7 @@ impl CdpPage {
 
     async fn navigate_history(&self, delta: isize, wait_until: WaitUntil, timeout: Duration) -> Result<bool> {
         self.ax_refs.lock().unwrap().clear();
+        self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         let hist = self.call("Page.getNavigationHistory", json!({}), timeout).await?;
         let current = hist["currentIndex"].as_i64().unwrap_or(0) as isize;
@@ -899,6 +925,7 @@ impl CdpPage {
 
     pub async fn set_content(&self, html: &str, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
         self.ax_refs.lock().unwrap().clear();
+        self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         {
             let mut net = self.net.lock().unwrap();
@@ -957,6 +984,7 @@ impl CdpPage {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             self.wait_for_load_state(WaitUntil::NetworkIdle, remaining).await?;
         }
+        self.worlds.lock().unwrap().clear();
         Ok(())
     }
 
@@ -1310,6 +1338,7 @@ impl CdpPage {
                 }
                 "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
                     self.ax_refs.lock().unwrap().clear();
+                    self.worlds.lock().unwrap().clear();
                     let full = crate::browser::frame_url(&ev.params["frame"]);
                     if !full.is_empty() {
                         self.set_url(&full);
@@ -1657,6 +1686,7 @@ impl CdpPage {
         if frame_id == self.target_id.0 {
             return self.goto(url, wait_until, timeout).await;
         }
+        self.worlds.lock().unwrap().remove(frame_id);
         let deadline = tokio::time::Instant::now() + timeout;
         let mut events = self.browser.subscribe_unbounded();
         let mut res = None;
@@ -1729,6 +1759,7 @@ impl CdpPage {
                 }
                 match ev.method.as_str() {
                     "Page.frameNavigated" if ev.params["frame"]["id"] == frame_id => {
+                        self.worlds.lock().unwrap().remove(frame_id);
                         committed = true;
                         loader = ev.params["frame"]["loaderId"].as_str().map(str::to_owned).or(loader);
                         if wait_until == WaitUntil::Commit {
@@ -1779,6 +1810,7 @@ impl CdpPage {
                     }
                     match ev.method.as_str() {
                         "Page.frameNavigated" if ev.params["frame"]["id"] == frame_id => {
+                            self.worlds.lock().unwrap().remove(frame_id);
                             committed = true;
                             loader = ev.params["frame"]["loaderId"].as_str().map(str::to_owned).or(loader);
                             if wait_until == WaitUntil::Commit {
@@ -1904,7 +1936,7 @@ impl CdpPage {
             .await
         {
             Ok(v) => Some(v),
-            Err(e) if e.is_retryable() => return Err(e),
+            Err(e) if e.is_retryable() || is_destroyed_context_error(&e) => return Err(e),
             Err(_) => None,
         };
         let obj_id = resolved
@@ -1914,7 +1946,14 @@ impl CdpPage {
         let Some(obj_id) = obj_id else {
             let reason = format!("element ref @{ref_key} is stale or detached; take a new snapshot");
             return if return_by_value {
-                Ok(json!({ "value": { "ok": false, "fatal": true, "reason": reason } }))
+                Ok(json!({
+                    "value": {
+                        "ok": false,
+                        "fatal": true,
+                        "detached": true,
+                        "reason": reason
+                    }
+                }))
             } else {
                 Err(Error::NotActionable { selector: sel.to_string(), reason })
             };
@@ -2104,7 +2143,7 @@ impl CdpPage {
                 }
                 Err(e) if e.is_retryable() => return Err(e),
                 Err(e) => {
-                    self.forget_world(&scope).await;
+                    self.forget_world(&scope);
                     return Ok(Err(e.to_string()));
                 }
             };
@@ -2136,16 +2175,22 @@ impl CdpPage {
     /// A click inside an iframe lands only if nothing in a parent document covers the iframe
     /// at that point: the element's own hit test cannot see a parent's overlay.
     async fn covered(&self, hops: &[(Scope, Hop)], x: f64, y: f64, timeout: Duration) -> Option<String> {
+        let start = Instant::now();
         for (parent, hop) in hops {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Some("timed out checking frame coverage".into());
+            }
             let (px, py) = parent.map.invert(x, y);
             match hop {
                 Hop::Css(css) => {
                     let css = serde_json::to_string(css).unwrap();
                     let expr = format!(
-                        "(() => {{ const f = document.querySelector({css}); const h = document.elementFromPoint({px}, {py}); \
+                        "(() => {{ const f = document.querySelector({css}); let h = document.elementFromPoint({px}, {py}); \
+                         while (h && h !== f && h.shadowRoot) {{ const i = h.shadowRoot.elementFromPoint({px}, {py}); if (!i || i === h) break; h = i; }} \
                          return f && h === f ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over ' + {css}; }})()"
                     );
-                    match self.eval_in(parent, &expr, true, timeout).await {
+                    match self.eval_in(parent, &expr, true, remaining).await {
                         Ok(v) if v["value"] == "" => {}
                         Ok(v) => return Some(v["value"].as_str().unwrap_or("frame hit test failed").to_string()),
                         Err(e) => return Some(e.to_string()),
@@ -2157,7 +2202,7 @@ impl CdpPage {
                             &parent.session,
                             "DOM.resolveNode",
                             json!({ "backendNodeId": backend_node_id }),
-                            timeout,
+                            remaining,
                         )
                         .await
                     else {
@@ -2166,21 +2211,25 @@ impl CdpPage {
                     let Some(obj) = resolved["object"]["objectId"].as_str().map(String::from) else {
                         return Some("iframe went away".into());
                     };
-                    let res = self
-                        .session_call(
+                    let rem = timeout.saturating_sub(start.elapsed());
+                    let res = if rem.is_zero() {
+                        Err(Error::timeout("frame coverage", timeout.as_millis() as u64))
+                    } else {
+                        self.session_call(
                             &parent.session,
                             "Runtime.callFunctionOn",
                             json!({
                                 "objectId": obj,
                                 "returnByValue": true,
                                 "arguments": [{ "value": px }, { "value": py }],
-                                "functionDeclaration": "function(x, y) { const h = this.ownerDocument.elementFromPoint(x, y); return h === this ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over iframe'; }"
+                                "functionDeclaration": "function(x, y) { let h = this.ownerDocument.elementFromPoint(x, y); while (h && h !== this && h.shadowRoot) { const i = h.shadowRoot.elementFromPoint(x, y); if (!i || i === h) break; h = i; } return h === this ? '' : 'obscured by <' + (h ? h.tagName.toLowerCase() + (h.id ? '#' + h.id : '') : 'nothing') + '> over iframe'; }"
                             }),
-                            timeout,
+                            rem,
                         )
-                        .await;
+                        .await
+                    };
                     let _ = self
-                        .session_call(&parent.session, "Runtime.releaseObject", json!({ "objectId": obj }), timeout)
+                        .session_call(&parent.session, "Runtime.releaseObject", json!({ "objectId": obj }), Duration::from_secs(2))
                         .await;
                     match res {
                         Ok(v) if v["result"]["value"] == "" => {}
@@ -2195,7 +2244,7 @@ impl CdpPage {
 
     /// The isolated world of `frame_id`, made once per document and cached.
     async fn world(&self, session: &str, frame_id: &str, map: Affine, root: Affine, timeout: Duration) -> Option<Scope> {
-        let cached = self.worlds.lock().await.get(frame_id).copied();
+        let cached = self.worlds.lock().unwrap().get(frame_id).copied();
         let id = match cached {
             Some(id) => id,
             None => {
@@ -2205,7 +2254,7 @@ impl CdpPage {
                     .await
                     .ok()?;
                 let id = w["executionContextId"].as_i64()?;
-                self.worlds.lock().await.insert(frame_id.to_string(), id);
+                self.worlds.lock().unwrap().insert(frame_id.to_string(), id);
                 id
             }
         };
@@ -2213,9 +2262,9 @@ impl CdpPage {
     }
 
     /// Navigation destroys isolated worlds; drop a dead one so the next poll makes a new one.
-    async fn forget_world(&self, scope: &Scope) {
+    fn forget_world(&self, scope: &Scope) {
         if let Some(frame) = &scope.world_of {
-            self.worlds.lock().await.remove(frame);
+            self.worlds.lock().unwrap().remove(frame);
         }
     }
 
@@ -2727,8 +2776,8 @@ impl CdpPage {
     }
 
     /// Starts recording console messages, uncaught errors and finished downloads (saved under
-    /// `download_dir`) from this page, its popups and its iframes. Recording stops when the
-    /// returned task is aborted.
+    /// `download_dir`) from this page and its iframes. Recording stops when the returned task
+    /// is aborted.
     pub fn collect_logs(&self, download_dir: &Path) -> (Arc<std::sync::Mutex<PageLog>>, DownloadQueue, tokio::task::JoinHandle<()>) {
         let log = Arc::new(std::sync::Mutex::new(PageLog::default()));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2738,7 +2787,12 @@ impl CdpPage {
             context: self.context_id.0.clone(),
             download_dir: download_dir.to_path_buf(),
         };
-        let events = self.browser.subscribe_unbounded();
+        let events = self
+            .early_log_events
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| self.browser.subscribe_unbounded());
         let task = tokio::spawn(crate::log::collect(events, watch, log.clone(), tx, self.browser.clone()));
         (log, rx, task)
     }
@@ -2826,30 +2880,54 @@ impl CdpPage {
         }
         // Waiting for it to go: poll until the check that `mode` makes fails.
         let start = Instant::now();
+        let what = if mode == "attached" { "still attached" } else { "still visible" };
         loop {
             if self.browser.is_dead() {
                 return Err(Error::BrowserDead { pid: self.browser_pid });
             }
-            match self.scope(&sel.frames, false, timeout).await? {
-                // Its iframe is gone or not there yet, so the element is not there either.
-                Err(_) => return Ok(()),
-                Ok((scope, _)) => match self.eval_engine(&scope, sel, mode, &Value::Null, true, timeout).await {
-                    Ok(r) if r["value"]["ok"].as_bool() == Some(true) => {}
-                    Ok(r) if r["value"]["fatal"].as_bool() == Some(true) => {
-                        let reason = r["value"]["reason"].as_str().unwrap_or("unknown").to_string();
-                        return Err(Error::NotActionable { selector: sel.to_string(), reason });
-                    }
-                    Ok(_) => return Ok(()),
-                    Err(e) if e.is_retryable() => return Err(e),
-                    // Mid-navigation the context can vanish; ask the new document.
-                    Err(_) => self.forget_world(&scope).await,
-                },
-            }
-            if start.elapsed() > timeout {
-                let what = if mode == "attached" { "still attached" } else { "still visible" };
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
                 return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
             }
-            sleep(Duration::from_millis(50)).await;
+            match self.scope(&sel.frames, false, remaining).await {
+                Err(e) if e.is_timeout() => {
+                    return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
+                }
+                Err(e) => return Err(e),
+                // Its iframe is gone or not there yet, so the element is not there either.
+                Ok(Err(_)) => {
+                    if timeout.saturating_sub(start.elapsed()).is_zero() {
+                        return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
+                    }
+                    return Ok(());
+                }
+                Ok(Ok((scope, _))) => {
+                    let remaining = timeout.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
+                        return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
+                    }
+                    match self.eval_engine(&scope, sel, mode, &Value::Null, true, remaining).await {
+                        Ok(r) if r["value"]["ok"].as_bool() == Some(true) => {}
+                        Ok(r) if r["value"]["detached"].as_bool() == Some(true) => return Ok(()),
+                        Ok(r) if r["value"]["fatal"].as_bool() == Some(true) => {
+                            let reason = r["value"]["reason"].as_str().unwrap_or("unknown").to_string();
+                            return Err(Error::NotActionable { selector: sel.to_string(), reason });
+                        }
+                        Ok(_) => return Ok(()),
+                        Err(e) if e.is_retryable() => return Err(e),
+                        Err(e) if e.is_timeout() => {
+                            return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
+                        }
+                        // Mid-navigation the context can vanish; ask the new document.
+                        Err(_) => self.forget_world(&scope),
+                    }
+                }
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(Error::timeout(format!("{sel} (last: {what})"), timeout.as_millis() as u64));
+            }
+            sleep(Duration::from_millis(50).min(remaining)).await;
         }
     }
 
@@ -2907,22 +2985,44 @@ impl CdpPage {
 
     /// Single-shot evaluation without waiting; returns `None` when the frame does not exist yet.
     async fn query_once(&self, sel: &Selector, mode: &str, arg: &Value, timeout: Duration) -> Result<Option<Value>> {
-        if self.browser.is_dead() {
-            return Err(Error::BrowserDead { pid: self.browser_pid });
-        }
-        let Ok((scope, _)) = self.scope(&sel.frames, false, timeout).await? else {
+        let start = Instant::now();
+        for attempt in 0..2 {
+            if self.browser.is_dead() {
+                return Err(Error::BrowserDead { pid: self.browser_pid });
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(Error::timeout(sel.to_string(), timeout.as_millis() as u64));
+            }
+            let Ok((scope, _)) = self.scope(&sel.frames, false, remaining).await? else {
+                if timeout.saturating_sub(start.elapsed()).is_zero() {
+                    return Err(Error::timeout(sel.to_string(), timeout.as_millis() as u64));
+                }
+                return Ok(None);
+            };
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(Error::timeout(sel.to_string(), timeout.as_millis() as u64));
+            }
+            let v = match self.eval_engine(&scope, sel, mode, arg, true, remaining).await {
+                Ok(r) => r["value"].clone(),
+                Err(e) if attempt == 0 && !e.is_retryable() && is_stale_context_error(&e) => {
+                    self.forget_world(&scope);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if v["ok"].as_bool() == Some(true) {
+                return Ok(Some(v));
+            }
+            if v["detached"].as_bool() == Some(true) {
+                return Ok(None);
+            }
+            if v["fatal"].as_bool() == Some(true) {
+                let reason = v["reason"].as_str().unwrap_or("unknown").to_string();
+                return Err(Error::NotActionable { selector: sel.to_string(), reason });
+            }
             return Ok(None);
-        };
-        let v = match self.eval_engine(&scope, sel, mode, arg, true, timeout).await {
-            Ok(r) => r["value"].clone(),
-            Err(e) => return Err(e),
-        };
-        if v["ok"].as_bool() == Some(true) {
-            return Ok(Some(v));
-        }
-        if v["fatal"].as_bool() == Some(true) {
-            let reason = v["reason"].as_str().unwrap_or("unknown").to_string();
-            return Err(Error::NotActionable { selector: sel.to_string(), reason });
         }
         Ok(None)
     }
@@ -2972,27 +3072,43 @@ impl CdpPage {
             Wait::Box => ("box", true, false),
         };
         loop {
-            if start.elapsed() > timeout {
-                // A timeout like any other, so callers (Python's `except TimeoutError`) see one.
-                return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
-            }
             if self.browser.is_dead() {
                 return Err(Error::BrowserDead { pid: self.browser_pid });
             }
-            let (scope, hops) = match self.scope(&sel.frames, scroll, timeout).await? {
-                Ok(found) => found,
-                Err(reason) => {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                // A timeout like any other, so callers (Python's `except TimeoutError`) see one.
+                return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+            }
+            let (scope, hops) = match self.scope(&sel.frames, scroll, remaining).await {
+                Ok(Ok(found)) => found,
+                Ok(Err(reason)) => {
                     last_reason = reason;
-                    sleep(Duration::from_millis(50)).await;
+                    let rem = timeout.saturating_sub(start.elapsed());
+                    if rem.is_zero() {
+                        return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+                    }
+                    sleep(Duration::from_millis(50).min(rem)).await;
                     continue;
                 }
+                Err(e) if e.is_timeout() => {
+                    return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+                }
+                Err(e) => return Err(e),
             };
-            let v = match self.eval_engine(&scope, sel, mode, arg, true, timeout).await {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+            }
+            let v = match self.eval_engine(&scope, sel, mode, arg, true, remaining).await {
                 Ok(r) => r["value"].clone(),
                 Err(e) if e.is_retryable() => return Err(e),
+                Err(e) if e.is_timeout() => {
+                    return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+                }
                 // Mid-navigation the context can vanish; keep polling.
                 Err(e) => {
-                    self.forget_world(&scope).await;
+                    self.forget_world(&scope);
                     json!({ "ok": false, "reason": e.to_string() })
                 }
             };
@@ -3005,7 +3121,11 @@ impl CdpPage {
                     }
                     last_box = Some(rect);
                     last_reason = "still moving".into();
-                    sleep(Duration::from_millis(50)).await;
+                    let rem = timeout.saturating_sub(start.elapsed());
+                    if rem.is_zero() {
+                        return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+                    }
+                    sleep(Duration::from_millis(50).min(rem)).await;
                     continue;
                 }
                 if !matches!(wait, Wait::Click { .. }) {
@@ -3020,7 +3140,11 @@ impl CdpPage {
                 if !stable {
                     last_reason = "still moving".into();
                 } else {
-                    match self.covered(&hops, x, y, timeout).await {
+                    let remaining = timeout.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
+                        return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+                    }
+                    match self.covered(&hops, x, y, remaining).await {
                         None => return Ok((json!({ "x": x, "y": y }), scope)),
                         Some(reason) => last_reason = reason,
                     }
@@ -3031,7 +3155,11 @@ impl CdpPage {
                     return Err(Error::NotActionable { selector: sel.to_string(), reason: last_reason });
                 }
             }
-            sleep(Duration::from_millis(50)).await;
+            let rem = timeout.saturating_sub(start.elapsed());
+            if rem.is_zero() {
+                return Err(Error::timeout(format!("{sel} (last: {last_reason})"), timeout.as_millis() as u64));
+            }
+            sleep(Duration::from_millis(50).min(rem)).await;
         }
     }
 
@@ -3746,5 +3874,158 @@ mod tests {
         assert!(is_js_truthy(&json!({ "type": "bigint", "unserializableValue": "1n" })));
         assert!(!is_js_truthy(&json!({ "type": "object", "subtype": "null", "value": null })));
         assert!(is_js_truthy(&json!({ "type": "object", "objectId": "obj-1" })));
+    }
+
+    fn mock_page(conn: Arc<Connection>) -> CdpPage {
+        CdpPage {
+            browser: conn,
+            browser_pid: 0,
+            browser_id: BrowserId(uuid::Uuid::new_v4()),
+            headless: true,
+            is_remote: false,
+            context_id: ContextId("ctx".into()),
+            target_id: TargetId("main".into()),
+            opener_id: None,
+            session_id: SessionId("sid".into()),
+            targets: Default::default(),
+            worlds: Default::default(),
+            setups: Default::default(),
+            page_setups: Default::default(),
+            frames: Default::default(),
+            workers: Default::default(),
+            closed: Default::default(),
+            mouse: Default::default(),
+            keyboard: Default::default(),
+            url: Arc::new(tokio::sync::watch::Sender::new("about:blank".into())),
+            net: Default::default(),
+            ax_refs: Default::default(),
+            early_log_events: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn is_closed_reports_dead_browser_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = tokio_tungstenite::accept_async(stream).await;
+            }
+        });
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+        let page = mock_page(conn.clone());
+        assert!(!page.is_closed());
+        conn.mark_dead();
+        assert!(page.is_closed());
+    }
+
+    #[tokio::test]
+    async fn query_once_recovers_from_stale_isolated_world() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].clone();
+                let method = req["method"].as_str().unwrap_or("");
+                let reply = match method {
+                    "Page.createIsolatedWorld" => {
+                        json!({ "id": id, "result": { "executionContextId": 22 } })
+                    }
+                    "Runtime.evaluate" => {
+                        if req["params"]["contextId"].as_i64() == Some(11) {
+                            json!({
+                                "id": id,
+                                "error": { "code": -32000, "message": "Cannot find context with specified id" }
+                            })
+                        } else {
+                            json!({
+                                "id": id,
+                                "result": { "result": { "value": { "ok": true, "count": 3 } } }
+                            })
+                        }
+                    }
+                    _ => json!({ "id": id, "result": {} }),
+                };
+                if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+        let page = mock_page(conn);
+        // Seed a stale isolated world id (11) as would happen across navigation.
+        page.worlds.lock().unwrap().insert("main".into(), 11);
+
+        let count = page
+            .count(&Selector::new("h1"), Duration::from_secs(5))
+            .await
+            .expect("query_once should drop stale world 11 and retry in world 22");
+        assert_eq!(count, 3);
+        assert_eq!(page.worlds.lock().unwrap().get("main").copied(), Some(22));
+    }
+
+    #[tokio::test]
+    async fn wait_element_and_selector_state_enforce_remaining_timeout_budget() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut eval_calls = 0usize;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].clone();
+                let method = req["method"].as_str().unwrap_or("");
+                let reply = match method {
+                    "Page.createIsolatedWorld" => {
+                        json!({ "id": id, "result": { "executionContextId": 1 } })
+                    }
+                    "Runtime.evaluate" => {
+                        eval_calls += 1;
+                        if eval_calls == 1 {
+                            json!({
+                                "id": id,
+                                "result": { "result": { "value": { "ok": false, "reason": "no element matches selector" } } }
+                            })
+                        } else {
+                            // Stall the second poll well past the overall 250ms budget.
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            json!({
+                                "id": id,
+                                "result": { "result": { "value": { "ok": false, "reason": "late" } } }
+                            })
+                        }
+                    }
+                    _ => json!({ "id": id, "result": {} }),
+                };
+                if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+        let page = mock_page(conn);
+        let started = Instant::now();
+        let err = page
+            .wait_for_selector(&Selector::new("#never"), Duration::from_millis(250))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(err.is_timeout(), "expected timeout, got: {err}");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "timeout budget leaked across poll calls: {elapsed:?}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Console messages, uncaught errors and downloads from a page, its popups and its iframes,
+//! Console messages, uncaught errors and downloads from a page and its iframes,
 //! kept so a job can check them (Playwright's `page.consoleMessages()`, `page.pageErrors()` and
 //! download events).
 
@@ -215,8 +215,8 @@ pub(crate) struct Watch {
 }
 
 /// Runs until aborted: records console calls, uncaught exceptions and finished downloads from
-/// the page and every session that later attaches in its context (popups, iframes in other
-/// processes).
+/// the page and every child target session (iframes in other processes, workers) that attaches
+/// under it. Separate top-level popup page targets get their own `CdpPage` and `PageLog`.
 pub(crate) async fn collect(
     mut events: UnboundedReceiver<Arc<CdpEvent>>,
     watch: Watch,
@@ -228,8 +228,7 @@ pub(crate) async fn collect(
     let main_frame = watch.main_frame;
     let mut sessions = HashSet::from([watch.session]);
     // Download events are browser-wide; the frame that started one tells whose it is.
-    let mut frames = HashSet::from([main_frame.clone()]);
-    let mut popup_targets: HashSet<String> = HashSet::new();
+    let mut frames = HashSet::from([main_frame]);
     let mut started: HashMap<String, (String, String)> = HashMap::new();
     let mut started_order: VecDeque<String> = VecDeque::new();
     // Requests in flight, by session and request id, with the sender that marks their body
@@ -241,19 +240,19 @@ pub(crate) async fn collect(
         let browser_wide = e.session_id.is_none();
         let str_of = |k: &str| e.params[k].as_str().unwrap_or("").to_string();
         match e.method.as_str() {
-            "Target.attachedToTarget" if e.params["targetInfo"]["browserContextId"] == context.as_str() => {
+            "Target.attachedToTarget" => {
+                let ctx_matches = e.params["targetInfo"]["browserContextId"]
+                    .as_str()
+                    .is_none_or(|c| c == context.as_str());
                 let ty = e.params["targetInfo"]["type"].as_str().unwrap_or("");
-                let is_child_iframe = ty != "page" && e.session_id.as_ref().is_some_and(|s| sessions.contains(s));
-                let is_popup_of_ours = ty == "page"
-                    && e.params["targetInfo"]["openerId"].as_str() == Some(main_frame.as_str())
-                    && e.params["targetInfo"]["targetId"]
-                        .as_str()
-                        .is_some_and(|tid| popup_targets.insert(tid.to_string()));
-                if is_child_iframe || is_popup_of_ours {
+                let is_child_target = ctx_matches
+                    && matches!(ty, "iframe" | "worker")
+                    && e.session_id.as_ref().is_some_and(|s| sessions.contains(s));
+                if is_child_target {
                     if let Some(s) = e.params["sessionId"].as_str() {
                         sessions.insert(s.to_string());
                     }
-                    if is_child_iframe {
+                    if ty == "iframe" {
                         if let Some(t) = e.params["targetInfo"]["targetId"].as_str() {
                             frames.insert(t.to_string());
                         }
@@ -607,6 +606,146 @@ mod tests {
                 WebSocketEvent::Error { request_id: "s1:ws1".into(), error_message: "reset".into() },
                 WebSocketEvent::Closed { request_id: "s1:ws1".into() },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_isolates_popup_pages_while_tracking_child_iframes_and_workers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = tokio_tungstenite::accept_async(stream).await;
+            }
+        });
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = Arc::new(Mutex::new(PageLog::default()));
+        let mut net_rx = log.lock().unwrap().subscribe_network();
+        let (dl_tx, _dl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = Watch {
+            session: "s-opener".into(),
+            main_frame: "t-opener".into(),
+            context: "c1".into(),
+            download_dir: PathBuf::from("downloads"),
+        };
+        let handle = tokio::spawn(collect(events_rx, watch, log.clone(), dl_tx, conn));
+
+        // Popup page target with openerId == our main_frame must NOT be recorded on opener.
+        events_tx
+            .send(Arc::new(CdpEvent {
+                method: "Target.attachedToTarget".into(),
+                params: json!({
+                    "sessionId": "s-popup",
+                    "targetInfo": {
+                        "targetId": "t-popup",
+                        "type": "page",
+                        "openerId": "t-opener",
+                        "browserContextId": "c1"
+                    }
+                }),
+                session_id: None,
+            }))
+            .unwrap();
+        // Child OOPIF iframe under opener session MUST be recorded.
+        events_tx
+            .send(Arc::new(CdpEvent {
+                method: "Target.attachedToTarget".into(),
+                params: json!({
+                    "sessionId": "s-iframe",
+                    "targetInfo": {
+                        "targetId": "t-iframe",
+                        "type": "iframe",
+                        "browserContextId": "c1"
+                    }
+                }),
+                session_id: Some("s-opener".into()),
+            }))
+            .unwrap();
+        // Dedicated worker under opener session MUST be recorded.
+        events_tx
+            .send(Arc::new(CdpEvent {
+                method: "Target.attachedToTarget".into(),
+                params: json!({
+                    "sessionId": "s-worker",
+                    "targetInfo": {
+                        "targetId": "t-worker",
+                        "type": "worker"
+                    }
+                }),
+                session_id: Some("s-opener".into()),
+            }))
+            .unwrap();
+
+        for (sid, msg) in [
+            ("s-opener", "from-opener"),
+            ("s-popup", "from-popup"),
+            ("s-iframe", "from-iframe"),
+            ("s-worker", "from-worker"),
+        ] {
+            events_tx
+                .send(Arc::new(CdpEvent {
+                    method: "Runtime.consoleAPICalled".into(),
+                    params: json!({
+                        "type": "log",
+                        "args": [{ "type": "string", "value": msg }]
+                    }),
+                    session_id: Some(sid.into()),
+                }))
+                .unwrap();
+        }
+        events_tx
+            .send(Arc::new(CdpEvent {
+                method: "Runtime.exceptionThrown".into(),
+                params: json!({
+                    "exceptionDetails": {
+                        "exception": { "subtype": "error", "description": "Error: popup-boom" }
+                    }
+                }),
+                session_id: Some("s-popup".into()),
+            }))
+            .unwrap();
+        for (sid, url) in [
+            ("s-opener", "https://example.test/opener"),
+            ("s-popup", "https://example.test/popup"),
+            ("s-iframe", "https://example.test/iframe"),
+        ] {
+            events_tx
+                .send(Arc::new(CdpEvent {
+                    method: "Network.requestWillBeSent".into(),
+                    params: json!({
+                        "requestId": format!("r-{sid}"),
+                        "request": { "url": url, "method": "GET", "headers": {} },
+                        "type": "Document"
+                    }),
+                    session_id: Some(sid.into()),
+                }))
+                .unwrap();
+        }
+
+        drop(events_tx);
+        handle.await.unwrap();
+
+        let texts: Vec<String> = log
+            .lock()
+            .unwrap()
+            .console
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(texts, vec!["from-opener", "from-iframe", "from-worker"]);
+        assert!(log.lock().unwrap().errors.is_empty());
+
+        let mut net_urls = Vec::new();
+        while let Ok(ev) = net_rx.try_recv() {
+            if let NetEvent::Request(req) = ev {
+                net_urls.push(req.url);
+            }
+        }
+        assert_eq!(
+            net_urls,
+            vec!["https://example.test/opener", "https://example.test/iframe"]
         );
     }
 }

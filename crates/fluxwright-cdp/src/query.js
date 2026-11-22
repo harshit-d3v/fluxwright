@@ -13,6 +13,12 @@
     const r = box(el);
     return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
   };
+  const ownsNode = (ancestor, node) => {
+    for (let cur = node; cur; cur = cur.assignedSlot || cur.parentNode || cur.host) {
+      if (cur === ancestor) return true;
+    }
+    return false;
+  };
 
   // Splits on >> outside quotes, so text="a >> b" stays one part.
   const split = (s) => {
@@ -284,7 +290,7 @@
       return pick([...root.querySelectorAll('[data-testid]')], (el) => el.getAttribute('data-testid') === id, first);
     },
     ref: (_body, root) =>
-      refEl && refEl.nodeType === 1 && refEl.isConnected && (root === document || root.contains(refEl))
+      refEl && refEl.nodeType === 1 && refEl.isConnected && (root === document || ownsNode(root, refEl))
         ? [refEl]
         : [],
   };
@@ -609,10 +615,15 @@
     const x = opts.position ? r.x + opts.position.x : r.x + r.width / 2;
     const y = opts.position ? r.y + opts.position.y : r.y + r.height / 2;
     if (!opts.force) {
-      const hit = document.elementFromPoint(x, y);
+      let hit = document.elementFromPoint(x, y);
+      while (hit && hit !== el && hit.shadowRoot) {
+        const inner = hit.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
       if (!hit) return { ok: false, reason: 'centre is outside the viewport' };
       const hitLabel = hit.closest('label');
-      const owns = hit === el || el.contains(hit) || (hitLabel && hitLabel.control === el);
+      const owns = hit === el || ownsNode(el, hit) || (hitLabel && hitLabel.control === el);
       if (!owns) {
         return { ok: false, reason: 'obscured by <' + hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + '>' };
       }
