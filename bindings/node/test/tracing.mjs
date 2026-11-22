@@ -82,12 +82,59 @@ function parseNdjson(buf, label) {
   })
 }
 
+function findSnapshotElements(node, tag, out = []) {
+  if (!Array.isArray(node)) return out
+  if (node[0] === tag) out.push(node)
+  for (let i = 2; i < node.length; i++) {
+    findSnapshotElements(node[i], tag, out)
+  }
+  return out
+}
+
+function countSnapshotNodesAndText(node) {
+  if (typeof node === 'string') return { nodes: 1, chars: node.length }
+  if (!Array.isArray(node)) return { nodes: 0, chars: 0 }
+  let nodes = 1
+  let chars = 0
+  for (let i = 2; i < node.length; i++) {
+    const child = countSnapshotNodesAndText(node[i])
+    nodes += child.nodes
+    chars += child.chars
+  }
+  return { nodes, chars }
+}
+
 async function run() {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fluxwright-tracing-'))
   const server = http.createServer((req, res) => {
     if (req.url === '/api/ping') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end('{"ok":true}')
+      return
+    }
+    if (req.url === '/form') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(`<!doctype html>
+        <html>
+          <head><title>Form Snapshots</title></head>
+          <body>
+            <input id="name" type="text" />
+            <input id="agree" type="checkbox" />
+            <textarea id="bio"></textarea>
+            <select id="role">
+              <option value="dev">Dev</option>
+              <option value="ops">Ops</option>
+            </select>
+            <script>window.__node_secret__ = "SECRET_NODE_SCRIPT_123";</script>
+          </body>
+        </html>`)
+      return
+    }
+    if (req.url === '/large') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      const spans = Array.from({ length: 4500 }, (_, i) => `<span>n${i}</span>`).join('')
+      const bigText = 'Y'.repeat(25000)
+      res.end(`<!doctype html><html><body><div id="wrap">${spans}</div><pre id="big">${bigText}</pre></body></html>`)
       return
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -216,6 +263,33 @@ async function run() {
       'missing /api/ping network snapshot',
     )
 
+    // Verify frame-snapshot events when snapshots: true
+    const snapshotsByName = new Map(
+      traceEvents.filter((e) => e.type === 'frame-snapshot').map((e) => [e.snapshot.snapshotName, e.snapshot]),
+    )
+    assert.ok(snapshotsByName.size > 0, 'expected frame-snapshot events when snapshots: true')
+    const locatorFillAfter = afters.find((e) => e.callId === locatorFillBefore.callId)
+    assert.equal(locatorFillBefore.beforeSnapshot, `before@${locatorFillBefore.callId}`)
+    assert.equal(locatorFillAfter?.afterSnapshot, `after@${locatorFillBefore.callId}`)
+    const fillAfterSnap = snapshotsByName.get(locatorFillAfter.afterSnapshot)
+    assert.ok(fillAfterSnap, 'missing frame-snapshot for locator.fill afterSnapshot')
+    assert.equal(fillAfterSnap.callId, locatorFillBefore.callId)
+    assert.equal(fillAfterSnap.frameId, 'main')
+    assert.equal(fillAfterSnap.doctype, 'html')
+    assert.equal(fillAfterSnap.isMainFrame, true)
+    assert.deepEqual(fillAfterSnap.resourceOverrides, [])
+    assert.ok(fillAfterSnap.frameUrl.startsWith(baseUrl))
+    assert.ok(fillAfterSnap.viewport?.width > 0 && fillAfterSnap.viewport?.height > 0)
+    assert.equal(fillAfterSnap.html[0], 'HTML')
+    const filledInputs = findSnapshotElements(fillAfterSnap.html, 'INPUT')
+    assert.ok(
+      filledInputs.some((el) => el[1]?.id === 'name' && el[1]?.__playwright_value__ === 'fluxwright'),
+      'expected live filled input value as __playwright_value__ in afterSnapshot',
+    )
+    const strippedScripts = findSnapshotElements(fillAfterSnap.html, 'SCRIPT')
+    assert.ok(strippedScripts.length >= 1)
+    for (const sc of strippedScripts) assert.deepEqual(sc, ['SCRIPT', {}])
+
     // Multi-chunk workflow test
     const chunk1Path = path.join(tmpDir, 'chunk1.zip')
     const chunk2Path = path.join(tmpDir, 'chunk2.zip')
@@ -234,6 +308,11 @@ async function run() {
     assert.equal(c2.find((e) => e.type === 'context-options')?.title, 'Chunk Two')
     assert.ok(c2.some((e) => e.type === 'before' && e.apiName === 'page.goto'))
     assert.ok(!c2.some((e) => e.type === 'before' && e.apiName === 'page.click'))
+    // snapshots: false emits 0 frame-snapshot events
+    assert.equal(c1.filter((e) => e.type === 'frame-snapshot').length, 0)
+    assert.equal(c2.filter((e) => e.type === 'frame-snapshot').length, 0)
+    assert.ok(c1.filter((e) => e.type === 'before').every((e) => e.beforeSnapshot === undefined))
+    assert.ok(c1.filter((e) => e.type === 'after').every((e) => e.afterSnapshot === undefined))
 
     // Regression: cross-chunk action isolation (action spanning stopChunk -> startChunk must not emit orphan after).
     const cross1 = path.join(tmpDir, 'cross1.zip')
@@ -300,6 +379,135 @@ async function run() {
       const multiFrames = multiEvents.filter((e) => e.type === 'screencast-frame')
       assert.equal(multiFrames.length, 2, 'multi-page fallback must capture screenshots for all open pages')
       assert.notEqual(multiFrames[0].pageId, multiFrames[1].pageId)
+    }
+
+    // Regression: standalone DOM snapshots (snapshots: true, screenshots: false), form state, bounds, and cross-chunk isolation.
+    {
+      const standaloneZip = path.join(tmpDir, 'dom-standalone.zip')
+      await context.tracing.start({ screenshots: false, snapshots: true })
+      await prePage.goto(`${baseUrl}/form`)
+      await prePage.locator('#name').fill('Alice')
+      await prePage.locator('#agree').check()
+      await prePage.locator('#bio').fill('NodeTrace')
+      await prePage.locator('#role').selectOption('ops')
+      await context.tracing.stop({ path: standaloneZip })
+
+      const standaloneEntries = parseZipStore(await fs.readFile(standaloneZip))
+      const traceText = standaloneEntries.get('trace.trace').toString('utf8')
+      assert.ok(!traceText.includes('SECRET_NODE_SCRIPT_123'), 'script body must be stripped')
+      assert.ok(![...standaloneEntries.keys()].some((k) => k.endsWith('.jpeg')), 'screenshots: false must emit 0 JPEGs')
+
+      const stEvents = parseNdjson(standaloneEntries.get('trace.trace'), 'dom-standalone')
+      assert.equal(stEvents.filter((e) => e.type === 'screencast-frame').length, 0)
+      const snapMap = new Map(
+        stEvents.filter((e) => e.type === 'frame-snapshot').map((e) => [e.snapshot.snapshotName, e.snapshot]),
+      )
+      assert.ok(snapMap.size > 0)
+      for (const b of stEvents.filter((e) => e.type === 'before')) {
+        assert.ok(snapMap.has(b.beforeSnapshot), `missing beforeSnapshot ${b.beforeSnapshot}`)
+      }
+      for (const a of stEvents.filter((e) => e.type === 'after')) {
+        assert.ok(snapMap.has(a.afterSnapshot), `missing afterSnapshot ${a.afterSnapshot}`)
+      }
+      const lastAfter = stEvents.filter((e) => e.type === 'after').at(-1)
+      const finalHtml = snapMap.get(lastAfter.afterSnapshot).html
+      const inputs = findSnapshotElements(finalHtml, 'INPUT')
+      assert.ok(inputs.some((el) => el[1]?.id === 'name' && el[1]?.__playwright_value__ === 'Alice'))
+      assert.ok(inputs.some((el) => el[1]?.id === 'agree' && el[1]?.__playwright_checked__ === true))
+      assert.ok(
+        findSnapshotElements(finalHtml, 'TEXTAREA').some((el) => el[1]?.id === 'bio' && el[1]?.__playwright_value__ === 'NodeTrace'),
+      )
+      assert.ok(
+        findSnapshotElements(finalHtml, 'SELECT').some((el) => el[1]?.id === 'role' && el[1]?.__playwright_value__ === 'ops'),
+      )
+      const options = findSnapshotElements(finalHtml, 'OPTION')
+      assert.ok(options.some((el) => el[1]?.value === 'dev' && el[1]?.__playwright_selected__ === false))
+      assert.ok(options.some((el) => el[1]?.value === 'ops' && el[1]?.__playwright_selected__ === true))
+      for (const sc of findSnapshotElements(finalHtml, 'SCRIPT')) assert.deepEqual(sc, ['SCRIPT', {}])
+
+      // Bounded DOM caps (4000 nodes, 16384 text chars)
+      const boundsZip = path.join(tmpDir, 'dom-bounds.zip')
+      await context.tracing.start({ screenshots: false, snapshots: true })
+      await prePage.goto(`${baseUrl}/large`)
+      await prePage.evaluate(() => 1 + 1)
+      await context.tracing.stop({ path: boundsZip })
+      const boundsEvents = parseNdjson(parseZipStore(await fs.readFile(boundsZip)).get('trace.trace'), 'dom-bounds')
+      const evalBefore = boundsEvents.find((e) => e.type === 'before' && e.apiName === 'page.evaluate')
+      const largeSnap = boundsEvents.find((e) => e.type === 'frame-snapshot' && e.snapshot.snapshotName === evalBefore.beforeSnapshot)
+      const { nodes, chars } = countSnapshotNodesAndText(largeSnap.snapshot.html)
+      assert.ok(nodes <= 4000, `node count ${nodes} exceeded 4000`)
+      assert.ok(chars <= 16384, `text length ${chars} exceeded 16384`)
+
+      // Cross-chunk snapshot isolation with snapshots: true
+      const snapIso1 = path.join(tmpDir, 'snap-iso1.zip')
+      const snapIso2 = path.join(tmpDir, 'snap-iso2.zip')
+      await context.tracing.start({ screenshots: false, snapshots: true })
+      const slowSnapEval = prePage.evaluate(() => new Promise((r) => setTimeout(() => r('ok'), 220)))
+      await new Promise((r) => setTimeout(r, 40))
+      await context.tracing.stopChunk({ path: snapIso1 })
+      await context.tracing.startChunk({ title: 'Snap Iso 2' })
+      assert.equal(await slowSnapEval, 'ok')
+      await context.tracing.stopChunk({ path: snapIso2 })
+      await context.tracing.stop()
+
+      const s1Events = parseNdjson(parseZipStore(await fs.readFile(snapIso1)).get('trace.trace'), 'snap-iso1')
+      const s2Events = parseNdjson(parseZipStore(await fs.readFile(snapIso2)).get('trace.trace'), 'snap-iso2')
+      const s1Before = s1Events.find((e) => e.type === 'before')
+      assert.ok(s1Before)
+      assert.ok(!s2Events.some((e) => e.type === 'after' && e.callId === s1Before.callId))
+      assert.ok(!s2Events.some((e) => e.type === 'frame-snapshot' && e.snapshot.callId === s1Before.callId))
+    }
+
+    // Unit test: lightweight CDP session for snapshots: true, screenshots: false (no screencast calls) and timeout/error swallowing.
+    {
+      const cdpCalls = []
+      let sessionCount = 0
+      const mockPage = { isClosed: () => false, on() {}, off() {} }
+      const makeMockCtx = (evalImpl) => ({
+        _isClosed: () => false,
+        pages: () => [mockPage],
+        async newCDPSession() {
+          sessionCount += 1
+          return {
+            on() {},
+            off() {},
+            async send(method, params) {
+              cdpCalls.push({ method, params })
+              if (method === 'Runtime.evaluate') return evalImpl()
+              return {}
+            },
+            async detach() {
+              cdpCalls.push({ method: 'detach' })
+            },
+          }
+        },
+      })
+
+      // snapshots: false, screenshots: false opens 0 CDP sessions
+      const trZero = new Tracing(makeMockCtx(async () => ({})))
+      const zeroZip = path.join(tmpDir, 'unit-zero.zip')
+      await trZero.start({ screenshots: false, snapshots: false })
+      await trZero._runAction(mockPage, 'Page', 'click', 'page.click', { selector: '#a' }, async () => 'ok')
+      await trZero.stop({ path: zeroZip })
+      assert.equal(sessionCount, 0, 'snapshots: false, screenshots: false must open 0 CDP sessions')
+
+      // snapshots: true, screenshots: false opens CDP session without Page.enable/startScreencast/stopScreencast, and swallows errors/timeouts
+      const trSnapOnly = new Tracing(makeMockCtx(async () => new Promise(() => {}))) // stalls past 500ms timeout
+      const snapTimeoutZip = path.join(tmpDir, 'unit-snap-timeout.zip')
+      await trSnapOnly.start({ screenshots: false, snapshots: true })
+      const res = await trSnapOnly._runAction(mockPage, 'Page', 'click', 'page.click', { selector: '#a' }, async () => 'done')
+      assert.equal(res, 'done')
+      await trSnapOnly.stop({ path: snapTimeoutZip })
+      assert.equal(sessionCount, 1)
+      assert.ok(!cdpCalls.some((c) => c.method === 'Page.enable' || c.method === 'Page.startScreencast' || c.method === 'Page.stopScreencast'))
+      assert.ok(cdpCalls.some((c) => c.method === 'Runtime.evaluate' && c.params?.returnByValue === true))
+      assert.ok(cdpCalls.some((c) => c.method === 'detach'))
+      const tEvents = parseNdjson(parseZipStore(await fs.readFile(snapTimeoutZip)).get('trace.trace'), 'unit-snap-timeout')
+      assert.equal(tEvents.filter((e) => e.type === 'frame-snapshot').length, 0)
+      const tBefore = tEvents.find((e) => e.type === 'before')
+      const tAfter = tEvents.find((e) => e.type === 'after')
+      assert.equal(tBefore.beforeSnapshot, undefined)
+      assert.equal(tAfter.afterSnapshot, undefined)
     }
 
     await context.close()

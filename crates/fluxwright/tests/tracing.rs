@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::{response::Html, routing::get, Json, Router};
-use fluxwright::{BrowserEngine, TracingChunkOptions, TracingStartOptions};
+use fluxwright::{BrowserEngine, SelectEntry, TracingChunkOptions, TracingStartOptions};
 use serde_json::{json, Value};
 
 async fn engine() -> BrowserEngine {
@@ -142,6 +142,35 @@ fn parse_ndjson(bytes: &[u8]) -> Vec<Value> {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str::<Value>(l).expect("valid json line"))
         .collect()
+}
+
+fn find_snapshot_elements<'a>(node: &'a Value, tag: &str, out: &mut Vec<&'a Value>) {
+    let Some(arr) = node.as_array() else {
+        return;
+    };
+    if arr.first().and_then(Value::as_str) == Some(tag) {
+        out.push(node);
+    }
+    for child in arr.iter().skip(2) {
+        find_snapshot_elements(child, tag, out);
+    }
+}
+
+fn count_snapshot_nodes_and_text(node: &Value) -> (usize, usize) {
+    if let Some(s) = node.as_str() {
+        return (1, s.encode_utf16().count());
+    }
+    let Some(arr) = node.as_array() else {
+        return (0, 0);
+    };
+    let mut nodes = 1usize;
+    let mut chars = 0usize;
+    for child in arr.iter().skip(2) {
+        let (cn, cc) = count_snapshot_nodes_and_text(child);
+        nodes += cn;
+        chars += cc;
+    }
+    (nodes, chars)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -304,6 +333,63 @@ async fn tracing_start_stop_zip_bundle() {
         assert_eq!(format!("{}.jpeg", sha1_verify(jpeg)), sha);
     }
 
+    let snapshots_by_name: HashMap<&str, &Value> = trace_events
+        .iter()
+        .filter(|e| e["type"] == "frame-snapshot")
+        .map(|e| {
+            let s = &e["snapshot"];
+            (
+                s["snapshotName"].as_str().expect("snapshotName"),
+                s,
+            )
+        })
+        .collect();
+    assert!(
+        !snapshots_by_name.is_empty(),
+        "expected frame-snapshot events when snapshots: true"
+    );
+
+    let fill_before = trace_events
+        .iter()
+        .find(|e| e["type"] == "before" && e["apiName"] == "locator.fill")
+        .expect("fill before");
+    let fill_call_id = fill_before["callId"].as_str().unwrap();
+    let fill_before_snap_name = fill_before["beforeSnapshot"]
+        .as_str()
+        .expect("beforeSnapshot on locator.fill");
+    assert_eq!(fill_before_snap_name, format!("before@{fill_call_id}"));
+    let fill_after = trace_events
+        .iter()
+        .find(|e| e["type"] == "after" && e["callId"] == fill_call_id)
+        .expect("fill after");
+    let fill_after_snap_name = fill_after["afterSnapshot"]
+        .as_str()
+        .expect("afterSnapshot on locator.fill");
+    assert_eq!(fill_after_snap_name, format!("after@{fill_call_id}"));
+
+    let fill_after_snap = snapshots_by_name
+        .get(fill_after_snap_name)
+        .expect("matching frame-snapshot for afterSnapshot");
+    assert_eq!(fill_after_snap["callId"], fill_call_id);
+    assert_eq!(fill_after_snap["frameId"], "main");
+    assert_eq!(fill_after_snap["doctype"], "html");
+    assert_eq!(fill_after_snap["isMainFrame"], true);
+    assert_eq!(fill_after_snap["resourceOverrides"], json!([]));
+    assert!(fill_after_snap["frameUrl"]
+        .as_str()
+        .is_some_and(|u| u.ends_with("/app")));
+    assert_eq!(fill_after_snap["viewport"], json!({ "width": 800, "height": 600 }));
+    assert_eq!(fill_after_snap["html"][0], "HTML");
+
+    let mut inputs = Vec::new();
+    find_snapshot_elements(&fill_after_snap["html"], "INPUT", &mut inputs);
+    assert!(
+        inputs.iter().any(|el| {
+            el[1]["id"] == "name" && el[1]["__playwright_value__"] == "Fluxwright"
+        }),
+        "expected filled input value in afterSnapshot: {inputs:?}"
+    );
+
     let net_events = parse_ndjson(&files["trace.network"]);
     assert!(
         net_events.iter().any(|e| {
@@ -441,6 +527,24 @@ async fn tracing_chunks_and_validation() {
     assert!(f2
         .keys()
         .any(|k| k.starts_with("resources/") && k.ends_with(".jpeg")));
+    assert_eq!(
+        ev1.iter().filter(|e| e["type"] == "frame-snapshot").count(),
+        0,
+        "snapshots: false must emit 0 frame-snapshot events"
+    );
+    assert_eq!(
+        ev2.iter().filter(|e| e["type"] == "frame-snapshot").count(),
+        0,
+        "snapshots: false must emit 0 frame-snapshot events in chunk 2"
+    );
+    assert!(ev1
+        .iter()
+        .filter(|e| e["type"] == "before")
+        .all(|e| e.get("beforeSnapshot").is_none()));
+    assert!(ev1
+        .iter()
+        .filter(|e| e["type"] == "after")
+        .all(|e| e.get("afterSnapshot").is_none()));
 
     drop(page);
     ctx.close().await.unwrap();
@@ -660,6 +764,295 @@ async fn tracing_unsubscribed_popup_cancellation_and_chunk_isolation() {
             .any(|e| e["type"] == "after" && e["callId"] == slow_before["callId"]),
         "chunk 1 evaluate must not inject orphaned after into chunk 2: {ev2:?}"
     );
+
+    drop(page);
+    ctx.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tracing_dom_snapshots_standalone_form_state_and_bounds() {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let slow_entered = Arc::new(Notify::new());
+    let slow_release = Arc::new(Notify::new());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            "/form",
+            get(|| async {
+                Html(
+                    r#"<!doctype html>
+                    <html><head><title>DOM Snapshots</title></head>
+                    <body>
+                      <input id="name" type="text" />
+                      <input id="agree" type="checkbox" />
+                      <textarea id="bio"></textarea>
+                      <select id="role">
+                        <option value="dev">Dev</option>
+                        <option value="ops">Ops</option>
+                      </select>
+                      <script>window.__secret_script_marker__ = "SECRET_SCRIPT_BODY_123";</script>
+                    </body></html>"#,
+                )
+            }),
+        )
+        .route(
+            "/large",
+            get(|| async {
+                let mut body = String::from("<!doctype html><html><body><div id='wrap'>");
+                for i in 0..4500 {
+                    body.push_str(&format!("<span>n{i}</span>"));
+                }
+                body.push_str("</div><pre id='big'>");
+                body.push_str(&"X".repeat(25_000));
+                body.push_str("</pre></body></html>");
+                Html(body)
+            }),
+        )
+        .route(
+            "/slow",
+            get({
+                let slow_entered = Arc::clone(&slow_entered);
+                let slow_release = Arc::clone(&slow_release);
+                move || {
+                    let slow_entered = Arc::clone(&slow_entered);
+                    let slow_release = Arc::clone(&slow_release);
+                    async move {
+                        slow_entered.notify_one();
+                        slow_release.notified().await;
+                        "ok"
+                    }
+                }
+            }),
+        );
+    let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let tmp = std::env::temp_dir().join(format!("fw-rust-dom-snaps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let standalone_zip = tmp.join("standalone.zip");
+    let bounds_zip = tmp.join("bounds.zip");
+    let iso1_zip = tmp.join("iso1.zip");
+    let iso2_zip = tmp.join("iso2.zip");
+    let disabled_zip = tmp.join("disabled.zip");
+
+    let eng = engine().await;
+    let ctx = eng.acquire_context().await.unwrap();
+    let page = ctx.new_page().await.unwrap();
+
+    // 1. Standalone DOM snapshots: snapshots: true, screenshots: false.
+    ctx.tracing()
+        .start(TracingStartOptions {
+            name: Some("dom-only".into()),
+            screenshots: false,
+            snapshots: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    page.goto(&format!("{base}/form")).await.unwrap();
+    page.locator("#name").fill("Alice").await.unwrap();
+    page.locator("#agree").check().await.unwrap();
+    page.locator("#bio").fill("Systems").await.unwrap();
+    page.locator("#role")
+        .select_option(&[SelectEntry::Value("ops".into())], false)
+        .await
+        .unwrap();
+
+    ctx.tracing().stop(Some(&standalone_zip)).await.unwrap();
+
+    let standalone_files = parse_zip_store(&std::fs::read(&standalone_zip).unwrap());
+    let trace_raw = std::str::from_utf8(&standalone_files["trace.trace"]).unwrap();
+    assert!(
+        !trace_raw.contains("SECRET_SCRIPT_BODY_123"),
+        "script body must be stripped from DOM snapshots"
+    );
+    assert!(
+        !standalone_files.keys().any(|k| k.ends_with(".jpeg")),
+        "screenshots: false must not store JPEG frames"
+    );
+
+    let events = parse_ndjson(&standalone_files["trace.trace"]);
+    assert_eq!(
+        events.iter().filter(|e| e["type"] == "screencast-frame").count(),
+        0,
+        "screenshots: false must emit 0 screencast-frame events"
+    );
+    let snaps: HashMap<&str, &Value> = events
+        .iter()
+        .filter(|e| e["type"] == "frame-snapshot")
+        .map(|e| (e["snapshot"]["snapshotName"].as_str().unwrap(), &e["snapshot"]))
+        .collect();
+    assert!(!snaps.is_empty());
+
+    // Every before/after reference resolves to a frame-snapshot event, and SCRIPT nodes are stripped.
+    for b in events.iter().filter(|e| e["type"] == "before") {
+        let name = b["beforeSnapshot"].as_str().expect("beforeSnapshot");
+        assert!(snaps.contains_key(name), "missing snapshot {name}");
+    }
+    for a in events.iter().filter(|e| e["type"] == "after") {
+        let name = a["afterSnapshot"].as_str().expect("afterSnapshot");
+        assert!(snaps.contains_key(name), "missing snapshot {name}");
+    }
+
+    // Check final selectOption afterSnapshot has live form state on INPUT, CHECKBOX, TEXTAREA, SELECT, OPTION + stripped SCRIPT.
+    let sel_after = events
+        .iter()
+        .filter(|e| e["type"] == "after")
+        .last()
+        .expect("last after");
+    let final_snap = snaps[sel_after["afterSnapshot"].as_str().unwrap()];
+    let mut scripts = Vec::new();
+    find_snapshot_elements(&final_snap["html"], "SCRIPT", &mut scripts);
+    assert!(!scripts.is_empty());
+    for sc in scripts {
+        assert_eq!(*sc, json!(["SCRIPT", {}]));
+    }
+
+    let mut inputs = Vec::new();
+    find_snapshot_elements(&final_snap["html"], "INPUT", &mut inputs);
+    assert!(inputs.iter().any(|el| {
+        el[1]["id"] == "name" && el[1]["__playwright_value__"] == "Alice"
+    }));
+    assert!(inputs.iter().any(|el| {
+        el[1]["id"] == "agree" && el[1]["__playwright_checked__"] == true
+    }));
+
+    let mut textareas = Vec::new();
+    find_snapshot_elements(&final_snap["html"], "TEXTAREA", &mut textareas);
+    assert!(textareas.iter().any(|el| {
+        el[1]["id"] == "bio" && el[1]["__playwright_value__"] == "Systems"
+    }));
+
+    let mut selects = Vec::new();
+    find_snapshot_elements(&final_snap["html"], "SELECT", &mut selects);
+    assert!(selects.iter().any(|el| {
+        el[1]["id"] == "role" && el[1]["__playwright_value__"] == "ops"
+    }));
+
+    let mut options = Vec::new();
+    find_snapshot_elements(&final_snap["html"], "OPTION", &mut options);
+    assert!(options.iter().any(|el| {
+        el[1]["value"] == "dev" && el[1]["__playwright_selected__"] == false
+    }));
+    assert!(options.iter().any(|el| {
+        el[1]["value"] == "ops" && el[1]["__playwright_selected__"] == true
+    }));
+
+    // 2. Bounded node count (4000) and text length (16384 chars) on a large page.
+    ctx.tracing()
+        .start(TracingStartOptions {
+            snapshots: true,
+            screenshots: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    page.goto(&format!("{base}/large")).await.unwrap();
+    page.evaluate("1 + 1").await.unwrap();
+    ctx.tracing().stop(Some(&bounds_zip)).await.unwrap();
+
+    let bounds_events = parse_ndjson(&parse_zip_store(&std::fs::read(&bounds_zip).unwrap())["trace.trace"]);
+    let eval_before = bounds_events
+        .iter()
+        .find(|e| e["type"] == "before" && e["method"] == "evaluate")
+        .expect("eval before");
+    let large_snap = bounds_events
+        .iter()
+        .find(|e| {
+            e["type"] == "frame-snapshot"
+                && e["snapshot"]["snapshotName"] == eval_before["beforeSnapshot"]
+        })
+        .expect("large frame-snapshot");
+    let (node_count, text_chars) = count_snapshot_nodes_and_text(&large_snap["snapshot"]["html"]);
+    assert!(
+        node_count <= 4000,
+        "serialized node count {node_count} must be capped at 4000"
+    );
+    assert!(
+        text_chars <= 16384,
+        "serialized text length {text_chars} must be capped at 16384"
+    );
+
+    // 3. Cross-chunk isolation with snapshots: true (in-flight action spanning chunks must not leak afterSnapshot).
+    ctx.tracing()
+        .start(TracingStartOptions {
+            snapshots: true,
+            screenshots: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (eval_res, chunk_res) = tokio::join!(
+        page.evaluate("fetch('/slow').then(r => r.text())"),
+        async {
+            tokio::time::timeout(Duration::from_secs(10), slow_entered.notified())
+                .await
+                .expect("slow request entered");
+            ctx.tracing().stop_chunk(Some(&iso1_zip)).await?;
+            ctx.tracing()
+                .start_chunk(TracingChunkOptions {
+                    name: Some("iso2".into()),
+                    title: None,
+                })
+                .await?;
+            slow_release.notify_one();
+            Ok::<_, fluxwright::Error>(())
+        }
+    );
+    eval_res.unwrap();
+    chunk_res.unwrap();
+    ctx.tracing().stop(Some(&iso2_zip)).await.unwrap();
+
+    let iso1_ev = parse_ndjson(&parse_zip_store(&std::fs::read(&iso1_zip).unwrap())["trace.trace"]);
+    let iso2_ev = parse_ndjson(&parse_zip_store(&std::fs::read(&iso2_zip).unwrap())["trace.trace"]);
+    let slow_call_id = iso1_ev
+        .iter()
+        .find(|e| e["type"] == "before" && e["method"] == "evaluate")
+        .expect("slow before")["callId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !iso2_ev.iter().any(|e| {
+            (e["type"] == "after" && e["callId"] == slow_call_id)
+                || (e["type"] == "frame-snapshot" && e["snapshot"]["callId"] == slow_call_id)
+        }),
+        "cross-chunk snapshot or after leaked into chunk 2: {iso2_ev:?}"
+    );
+
+    // 4. snapshots: false emits 0 frame-snapshot events.
+    ctx.tracing()
+        .start(TracingStartOptions {
+            snapshots: false,
+            screenshots: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    page.locator("#name").fill("Bob").await.unwrap();
+    page.evaluate("2 + 2").await.unwrap();
+    ctx.tracing().stop(Some(&disabled_zip)).await.unwrap();
+    let disabled_ev = parse_ndjson(&parse_zip_store(&std::fs::read(&disabled_zip).unwrap())["trace.trace"]);
+    assert_eq!(
+        disabled_ev.iter().filter(|e| e["type"] == "frame-snapshot").count(),
+        0
+    );
+    assert!(disabled_ev
+        .iter()
+        .filter(|e| e["type"] == "before")
+        .all(|e| e.get("beforeSnapshot").is_none()));
+    assert!(disabled_ev
+        .iter()
+        .filter(|e| e["type"] == "after")
+        .all(|e| e.get("afterSnapshot").is_none()));
 
     drop(page);
     ctx.close().await.unwrap();

@@ -22,6 +22,87 @@ except ImportError:  # pragma: no cover
     _native = None  # type: ignore[assignment]
 from ._errors import Error
 
+_SNAPSHOT_TIMEOUT = 0.5
+
+_SNAPSHOT_JS = r"""(() => {
+  try {
+    const t0 = performance.now();
+    const doc = document;
+    const root = doc && doc.documentElement;
+    if (!root) return null;
+    const MAX_NODES = 4000;
+    const MAX_TEXT = 16384;
+    let nodeCount = 0;
+    let textRemaining = MAX_TEXT;
+    const ser = (n) => {
+      if (!n || nodeCount >= MAX_NODES) return null;
+      const nt = n.nodeType;
+      if (nt === 3) {
+        const v = n.nodeValue;
+        if (!v || textRemaining <= 0) return null;
+        nodeCount++;
+        if (v.length > textRemaining) {
+          const s = v.slice(0, textRemaining);
+          textRemaining = 0;
+          return s;
+        }
+        textRemaining -= v.length;
+        return v;
+      }
+      if (nt !== 1) return null;
+      nodeCount++;
+      const tag = n.tagName || '';
+      const upper = tag.toUpperCase();
+      if (upper === 'SCRIPT') return ['SCRIPT', {}];
+      const attrs = {};
+      const rawAttrs = n.attributes;
+      if (rawAttrs) {
+        for (let i = 0; i < rawAttrs.length; i++) {
+          const a = rawAttrs[i];
+          if (a.name === '__proto__') continue;
+          attrs[a.name] = a.value;
+        }
+      }
+      if (upper === 'INPUT') {
+        const t = (n.type || '').toLowerCase();
+        if (t === 'checkbox' || t === 'radio') {
+          attrs.__playwright_checked__ = Boolean(n.checked);
+        } else if (t !== 'file') {
+          attrs.__playwright_value__ = n.value != null ? String(n.value) : '';
+        }
+      } else if (upper === 'TEXTAREA' || upper === 'SELECT') {
+        attrs.__playwright_value__ = n.value != null ? String(n.value) : '';
+      } else if (upper === 'OPTION') {
+        attrs.__playwright_selected__ = Boolean(n.selected);
+      }
+      const out = [tag, attrs];
+      const ch = n.childNodes;
+      if (ch) {
+        for (let i = 0; i < ch.length; i++) {
+          if (nodeCount >= MAX_NODES) break;
+          const s = ser(ch[i]);
+          if (s !== null) out.push(s);
+        }
+      }
+      return out;
+    };
+    const html = ser(root);
+    if (!html) return null;
+    return {
+      frameUrl: String(doc.URL || (doc.location && doc.location.href) || ''),
+      doctype: doc.doctype ? String(doc.doctype.name || '') : '',
+      html,
+      viewport: {
+        width: Number(window.innerWidth) || 0,
+        height: Number(window.innerHeight) || 0
+      },
+      collectionTime: Math.max(0, performance.now() - t0)
+    };
+  } catch (_) {
+    return null;
+  }
+})()"""
+
 
 def _to_camel_method(name: str) -> str:
     if name == "wait_for_url":
@@ -521,6 +602,8 @@ class AsyncTracing:
             "page_ref": page_ref,
             "page_id": page_id,
             "cdp": None,
+            "cdp_ready": None,
+            "screencast_started": False,
             "cleanup": cleanup,
             "cleanup_cdp": None,
         }
@@ -534,86 +617,101 @@ class AsyncTracing:
                 or self._watchers.get(page_key) is not watcher
             )
 
-        if self._screenshots and not page.is_closed():
+        if (self._screenshots or self._snapshots) and not page.is_closed():
             cdp: Any = None
             cleanup_cdp: Callable[[], None] | None = None
             screencast_started = False
-            try:
-                cdp = await ctx.new_cdp_session(page)
-                if _is_stale():
-                    with suppress(Exception):
-                        await cdp.detach()
-                    return
 
-                async def on_frame(ev: dict[str, Any]) -> None:
-                    t = self_ref()
-                    data_b64 = ev.get("data") if isinstance(ev, dict) else None
-                    if (
-                        t is not None
-                        and t._session_gen == gen
-                        and isinstance(data_b64, str)
-                        and data_b64
-                    ):
+            async def _attach_cdp() -> None:
+                nonlocal cdp, cleanup_cdp, screencast_started
+                try:
+                    cdp = await ctx.new_cdp_session(page)
+                    if _is_stale():
                         with suppress(Exception):
-                            raw = base64.b64decode(data_b64)
-                            meta = ev.get("metadata") or {}
-                            ts = meta.get("timestamp")
-                            swap_wall = (
-                                int(ts * 1000)
-                                if isinstance(ts, (int, float))
-                                else int(time.time() * 1000)
-                            )
-                            t._record_jpeg_frame(
-                                page_id,
-                                raw,
-                                meta.get("deviceWidth"),
-                                meta.get("deviceHeight"),
-                                swap_wall,
-                            )
-                    session_id = ev.get("sessionId") if isinstance(ev, dict) else None
-                    if session_id is not None:
-                        with suppress(Exception):
-                            await cdp.send("Page.screencastFrameAck", {"sessionId": session_id})
+                            await cdp.detach()
+                        return
 
-                cdp.on("Page.screencastFrame", on_frame)
-                cleanup_cdp = lambda: cdp.remove_listener("Page.screencastFrame", on_frame)  # noqa: E731
-                with suppress(Exception):
-                    await cdp.send("Page.enable")
-                if _is_stale():
-                    cleanup_cdp()
-                    with suppress(Exception):
-                        await cdp.detach()
-                    return
-                await cdp.send(
-                    "Page.startScreencast",
-                    {
-                        "format": "jpeg",
-                        "quality": 80,
-                        "maxWidth": 1280,
-                        "maxHeight": 720,
-                        "everyNthFrame": 1,
-                    },
-                )
-                screencast_started = True
-                if _is_stale():
-                    cleanup_cdp()
-                    with suppress(Exception):
-                        await cdp.send("Page.stopScreencast")
-                    with suppress(Exception):
-                        await cdp.detach()
-                    return
-                watcher["cdp"] = cdp
-                watcher["cleanup_cdp"] = cleanup_cdp
-            except Exception:
-                if cleanup_cdp is not None:
-                    with suppress(Exception):
-                        cleanup_cdp()
-                if cdp is not None:
-                    if screencast_started:
+                    if self._screenshots:
+
+                        async def on_frame(ev: dict[str, Any]) -> None:
+                            t = self_ref()
+                            data_b64 = ev.get("data") if isinstance(ev, dict) else None
+                            if (
+                                t is not None
+                                and t._session_gen == gen
+                                and isinstance(data_b64, str)
+                                and data_b64
+                            ):
+                                with suppress(Exception):
+                                    raw = base64.b64decode(data_b64)
+                                    meta = ev.get("metadata") or {}
+                                    ts = meta.get("timestamp")
+                                    swap_wall = (
+                                        int(ts * 1000)
+                                        if isinstance(ts, (int, float))
+                                        else int(time.time() * 1000)
+                                    )
+                                    t._record_jpeg_frame(
+                                        page_id,
+                                        raw,
+                                        meta.get("deviceWidth"),
+                                        meta.get("deviceHeight"),
+                                        swap_wall,
+                                    )
+                            session_id = ev.get("sessionId") if isinstance(ev, dict) else None
+                            if session_id is not None:
+                                with suppress(Exception):
+                                    await cdp.send(
+                                        "Page.screencastFrameAck", {"sessionId": session_id}
+                                    )
+
+                        cdp.on("Page.screencastFrame", on_frame)
+                        cleanup_cdp = lambda: cdp.remove_listener("Page.screencastFrame", on_frame)  # noqa: E731
                         with suppress(Exception):
-                            await cdp.send("Page.stopScreencast")
-                    with suppress(Exception):
-                        await cdp.detach()
+                            await cdp.send("Page.enable")
+                        if _is_stale():
+                            cleanup_cdp()
+                            with suppress(Exception):
+                                await cdp.detach()
+                            return
+                        await cdp.send(
+                            "Page.startScreencast",
+                            {
+                                "format": "jpeg",
+                                "quality": 80,
+                                "maxWidth": 1280,
+                                "maxHeight": 720,
+                                "everyNthFrame": 1,
+                            },
+                        )
+                        screencast_started = True
+                        if _is_stale():
+                            cleanup_cdp()
+                            with suppress(Exception):
+                                await cdp.send("Page.stopScreencast")
+                            with suppress(Exception):
+                                await cdp.detach()
+                            return
+
+                    watcher["cdp"] = cdp
+                    watcher["screencast_started"] = screencast_started
+                    watcher["cleanup_cdp"] = cleanup_cdp
+                except Exception:
+                    if cleanup_cdp is not None:
+                        with suppress(Exception):
+                            cleanup_cdp()
+                    if cdp is not None:
+                        if screencast_started:
+                            with suppress(Exception):
+                                await cdp.send("Page.stopScreencast")
+                        with suppress(Exception):
+                            await cdp.detach()
+                finally:
+                    watcher["cdp_ready"] = None
+
+            attach_task = asyncio.ensure_future(_attach_cdp())
+            watcher["cdp_ready"] = attach_task
+            await attach_task
 
     async def _detach_page(self, page_key: str) -> None:
         watcher = self._watchers.pop(page_key, None)
@@ -624,8 +722,9 @@ class AsyncTracing:
             watcher["cleanup_cdp"]()
         cdp = watcher["cdp"]
         if cdp is not None:
-            with suppress(Exception):
-                await cdp.send("Page.stopScreencast")
+            if watcher.get("screencast_started"):
+                with suppress(Exception):
+                    await cdp.send("Page.stopScreencast")
             with suppress(Exception):
                 await cdp.detach()
 
@@ -713,6 +812,151 @@ class AsyncTracing:
         self._page_ids.clear()
         self._chunk_frames = 0
 
+    async def _capture_snapshot(
+        self,
+        page: Any,
+        page_id: str,
+        call_id: str,
+        phase: str,
+        chunk_seq: int,
+        session_gen: int,
+    ) -> dict[str, Any] | None:
+        if (
+            not self._active
+            or not self._chunk_active
+            or not self._snapshots
+            or self._chunk_seq != chunk_seq
+            or self._session_gen != session_gen
+        ):
+            return None
+        if page is None or page.is_closed():
+            return None
+        page_key = _page_key(page)
+        watcher = self._watchers.get(page_key)
+        if watcher is None:
+            return None
+        if watcher.get("cdp") is None and watcher.get("cdp_ready") is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(watcher["cdp_ready"]), timeout=_SNAPSHOT_TIMEOUT)
+            watcher = self._watchers.get(page_key)
+            if watcher is None:
+                return None
+        cdp = watcher.get("cdp")
+        if cdp is None:
+            return None
+        if (
+            not self._active
+            or not self._chunk_active
+            or self._chunk_seq != chunk_seq
+            or self._session_gen != session_gen
+        ):
+            return None
+        try:
+            res = await asyncio.wait_for(
+                cdp.send(
+                    "Runtime.evaluate",
+                    {"expression": _SNAPSHOT_JS, "returnByValue": True},
+                ),
+                timeout=_SNAPSHOT_TIMEOUT,
+            )
+        except Exception:
+            return None
+        if not isinstance(res, dict) or res.get("exceptionDetails"):
+            return None
+        val = (res.get("result") or {}).get("value")
+        if not isinstance(val, dict) or not isinstance(val.get("html"), list):
+            return None
+        if (
+            not self._active
+            or not self._chunk_active
+            or self._chunk_seq != chunk_seq
+            or self._session_gen != session_gen
+        ):
+            return None
+        vp = val.get("viewport")
+        if isinstance(vp, dict):
+            w = vp.get("width")
+            h = vp.get("height")
+            viewport = {
+                "width": w if isinstance(w, (int, float)) else 0,
+                "height": h if isinstance(h, (int, float)) else 0,
+            }
+        else:
+            viewport = {"width": 0, "height": 0}
+        coll = val.get("collectionTime")
+        collection_time = float(coll) if isinstance(coll, (int, float)) and coll >= 0 else 0.0
+        frame_url = val.get("frameUrl")
+        doctype = val.get("doctype")
+        return {
+            "callId": call_id,
+            "snapshotName": f"{phase}@{call_id}",
+            "pageId": page_id,
+            "frameId": "main",
+            "frameUrl": frame_url if isinstance(frame_url, str) else "",
+            "doctype": doctype if isinstance(doctype, str) else "",
+            "html": val["html"],
+            "viewport": viewport,
+            "timestamp": self._mono_ms(),
+            "collectionTime": collection_time,
+            "resourceOverrides": [],
+            "isMainFrame": True,
+        }
+
+    def _append_after(
+        self,
+        call_id: str,
+        chunk_seq: int,
+        session_gen: int,
+        error_info: dict[str, str] | None,
+        after_snapshot_name: str | None,
+    ) -> None:
+        if (
+            self._active
+            and self._chunk_active
+            and self._chunk_seq == chunk_seq
+            and self._session_gen == session_gen
+        ):
+            after: dict[str, Any] = {
+                "type": "after",
+                "callId": call_id,
+                "endTime": self._mono_ms(),
+            }
+            if after_snapshot_name is not None:
+                after["afterSnapshot"] = after_snapshot_name
+            if error_info is not None:
+                after["error"] = error_info
+            self._trace_lines.append(json.dumps(after, separators=(",", ":")))
+
+    async def _maybe_capture_after_snapshot(
+        self,
+        page: Any,
+        page_id: str,
+        call_id: str,
+        chunk_seq: int,
+        session_gen: int,
+    ) -> str | None:
+        if (
+            not self._snapshots
+            or not self._active
+            or not self._chunk_active
+            or self._chunk_seq != chunk_seq
+            or self._session_gen != session_gen
+        ):
+            return None
+        snap = await self._capture_snapshot(page, page_id, call_id, "after", chunk_seq, session_gen)
+        if (
+            snap is not None
+            and self._active
+            and self._chunk_active
+            and self._chunk_seq == chunk_seq
+            and self._session_gen == session_gen
+        ):
+            self._trace_lines.append(
+                json.dumps({"type": "frame-snapshot", "snapshot": snap}, separators=(",", ":"))
+            )
+            return str(snap["snapshotName"])
+        return None
+
     async def _run_action(
         self,
         page: Any,
@@ -730,48 +974,66 @@ class AsyncTracing:
         session_gen = self._session_gen
         camel_method = _to_camel_method(method_name)
         page_id = self._ensure_page_id(page)
+
+        before_snapshot_name: str | None = None
+        if self._snapshots:
+            snap = await self._capture_snapshot(page, page_id, call_id, "before", chunk_seq, session_gen)
+            if (
+                not self._active
+                or not self._chunk_active
+                or self._chunk_seq != chunk_seq
+                or self._session_gen != session_gen
+            ):
+                return await fn()
+            if snap is not None:
+                before_snapshot_name = snap["snapshotName"]
+                self._trace_lines.append(
+                    json.dumps({"type": "frame-snapshot", "snapshot": snap}, separators=(",", ":"))
+                )
+
         start_time = self._mono_ms()
-        self._trace_lines.append(
-            json.dumps(
-                {
-                    "type": "before",
-                    "callId": call_id,
-                    "startTime": start_time,
-                    "class": class_name,
-                    "method": camel_method,
-                    "apiName": api_name,
-                    "params": params or {},
-                    "pageId": page_id,
-                    "stepId": call_id,
-                },
-                separators=(",", ":"),
-            )
-        )
-        error_info: dict[str, str] | None = None
+        before_ev: dict[str, Any] = {
+            "type": "before",
+            "callId": call_id,
+            "startTime": start_time,
+            "class": class_name,
+            "method": camel_method,
+            "apiName": api_name,
+            "params": params or {},
+            "pageId": page_id,
+            "stepId": call_id,
+        }
+        if before_snapshot_name is not None:
+            before_ev["beforeSnapshot"] = before_snapshot_name
+        self._trace_lines.append(json.dumps(before_ev, separators=(",", ":")))
+
+        after_snapshot_name: str | None = None
         try:
-            return await fn()
+            result = await fn()
         except BaseException as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError)
             error_info = {
                 "name": getattr(exc, "name", None) or type(exc).__name__,
                 "message": str(exc),
                 "stack": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
             }
+            if not cancelled:
+                with suppress(asyncio.CancelledError):
+                    after_snapshot_name = await self._maybe_capture_after_snapshot(
+                        page, page_id, call_id, chunk_seq, session_gen
+                    )
+            self._append_after(call_id, chunk_seq, session_gen, error_info, after_snapshot_name)
             raise
-        finally:
-            if (
-                self._active
-                and self._chunk_active
-                and self._chunk_seq == chunk_seq
-                and self._session_gen == session_gen
-            ):
-                after: dict[str, Any] = {
-                    "type": "after",
-                    "callId": call_id,
-                    "endTime": self._mono_ms(),
-                }
-                if error_info is not None:
-                    after["error"] = error_info
-                self._trace_lines.append(json.dumps(after, separators=(",", ":")))
+
+        try:
+            after_snapshot_name = await self._maybe_capture_after_snapshot(
+                page, page_id, call_id, chunk_seq, session_gen
+            )
+        except asyncio.CancelledError:
+            self._append_after(call_id, chunk_seq, session_gen, None, None)
+            raise
+        self._append_after(call_id, chunk_seq, session_gen, None, after_snapshot_name)
+        return result
 
     async def _finalize_chunk(self, dest_path: str | None) -> None:
         await self._drain_pending_page_tasks()
