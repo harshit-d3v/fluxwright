@@ -152,10 +152,9 @@ async fn page_expect_title_url_and_diagnostics() {
 
     let eng = engine().await;
     let base = format!("http://127.0.0.1:{port}");
-    let page = eng
-        .acquire_job(&JobOptions::default().base_url(&base))
-        .await
-        .unwrap();
+    let mut opts = JobOptions::default();
+    opts.base_url = Some(base.clone());
+    let page = eng.acquire_job(&opts).await.unwrap();
     page.set_default_timeout(Duration::from_secs(10));
     page.goto("/start").await.unwrap();
 

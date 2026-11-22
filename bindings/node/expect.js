@@ -184,7 +184,7 @@ class LocatorAssertions {
     })
   }
 
-  toBeVisible(options) {
+  async toBeVisible(options) {
     return this.#boolCheck({
       matcher: 'toBeVisible',
       expected: 'visible',
@@ -196,7 +196,7 @@ class LocatorAssertions {
     })
   }
 
-  toBeHidden(options) {
+  async toBeHidden(options) {
     return this.#boolCheck({
       matcher: 'toBeHidden',
       expected: 'hidden',
@@ -208,7 +208,7 @@ class LocatorAssertions {
     })
   }
 
-  toBeAttached(options) {
+  async toBeAttached(options) {
     const opts = validateOptions('expect(locator).toBeAttached', options)
     return pollUntil({
       targetLabel: formatLocator(this.#locator),
@@ -226,7 +226,7 @@ class LocatorAssertions {
     })
   }
 
-  toBeEnabled(options) {
+  async toBeEnabled(options) {
     return this.#boolCheck({
       matcher: 'toBeEnabled',
       expected: 'enabled',
@@ -238,7 +238,7 @@ class LocatorAssertions {
     })
   }
 
-  toBeDisabled(options) {
+  async toBeDisabled(options) {
     return this.#boolCheck({
       matcher: 'toBeDisabled',
       expected: 'disabled',
@@ -250,7 +250,7 @@ class LocatorAssertions {
     })
   }
 
-  toBeChecked(options) {
+  async toBeChecked(options) {
     const opts = validateOptions('expect(locator).toBeChecked', options, { checked: true })
     const wantChecked = opts.checked ?? true
     return pollUntil({
@@ -272,7 +272,7 @@ class LocatorAssertions {
     })
   }
 
-  toBeEditable(options) {
+  async toBeEditable(options) {
     return this.#boolCheck({
       matcher: 'toBeEditable',
       expected: 'editable',
@@ -284,7 +284,7 @@ class LocatorAssertions {
     })
   }
 
-  toHaveText(expected, options) {
+  async toHaveText(expected, options) {
     validatePattern(expected, 'expect(locator).toHaveText')
     const opts = validateOptions('expect(locator).toHaveText', options)
     return pollUntil({
@@ -307,7 +307,7 @@ class LocatorAssertions {
     })
   }
 
-  toContainText(expected, options) {
+  async toContainText(expected, options) {
     validatePattern(expected, 'expect(locator).toContainText')
     const opts = validateOptions('expect(locator).toContainText', options)
     return pollUntil({
@@ -330,7 +330,7 @@ class LocatorAssertions {
     })
   }
 
-  toHaveValue(expected, options) {
+  async toHaveValue(expected, options) {
     validatePattern(expected, 'expect(locator).toHaveValue')
     const opts = validateOptions('expect(locator).toHaveValue', options)
     return pollUntil({
@@ -352,7 +352,7 @@ class LocatorAssertions {
     })
   }
 
-  toHaveAttribute(name, expected, options) {
+  async toHaveAttribute(name, expected, options) {
     if (typeof name !== 'string' || !name) {
       throw new TypeError('expect(locator).toHaveAttribute: name must be a non-empty string')
     }
@@ -380,7 +380,7 @@ class LocatorAssertions {
     })
   }
 
-  toHaveClass(expected, options) {
+  async toHaveClass(expected, options) {
     validatePattern(expected, 'expect(locator).toHaveClass')
     const opts = validateOptions('expect(locator).toHaveClass', options)
     return pollUntil({
@@ -402,7 +402,7 @@ class LocatorAssertions {
     })
   }
 
-  toHaveCount(expected, options) {
+  async toHaveCount(expected, options) {
     if (typeof expected !== 'number' || !Number.isInteger(expected) || expected < 0) {
       throw new TypeError('expect(locator).toHaveCount: count must be a non-negative integer')
     }
@@ -440,7 +440,7 @@ class PageAssertions {
     return options?.timeout ?? this.#defaultTimeout
   }
 
-  toHaveTitle(expected, options) {
+  async toHaveTitle(expected, options) {
     validatePattern(expected, 'expect(page).toHaveTitle')
     const opts = validateOptions('expect(page).toHaveTitle', options)
     return pollUntil({
@@ -462,7 +462,7 @@ class PageAssertions {
     })
   }
 
-  toHaveURL(expected, options) {
+  async toHaveURL(expected, options) {
     validatePattern(expected, 'expect(page).toHaveURL')
     const opts = validateOptions('expect(page).toHaveURL', options)
     const target = resolveUrl(this.#page, expected)
