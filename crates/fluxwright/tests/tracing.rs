@@ -1037,6 +1037,7 @@ async fn tracing_dom_snapshots_standalone_form_state_and_bounds() {
         })
         .await
         .unwrap();
+    page.goto(&format!("{base}/form")).await.unwrap();
     page.locator("#name").fill("Bob").await.unwrap();
     page.evaluate("2 + 2").await.unwrap();
     ctx.tracing().stop(Some(&disabled_zip)).await.unwrap();
