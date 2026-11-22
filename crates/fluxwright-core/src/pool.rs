@@ -1539,6 +1539,34 @@ impl ContextLease {
         self.guard.is_disposed()
     }
 
+    pub fn cdp_connection(&self) -> Arc<fluxwright_cdp::Connection> {
+        self.guard.browser.connection()
+    }
+
+    pub fn context_id(&self) -> &str {
+        &self.guard.context.0
+    }
+
+    pub async fn discard_warm_page(&self) {
+        self.guard.invalidate_warm_page().await;
+    }
+
+    pub fn mark_external_context(&self, ctx_id: &str) {
+        self.guard.browser.mark_external_context(ctx_id);
+    }
+
+    pub fn unmark_external_context(&self, ctx_id: &str) {
+        self.guard.browser.unmark_external_context(ctx_id);
+    }
+
+    pub fn mark_external_session(&self, session_id: &str) {
+        self.guard.browser.mark_external_session(session_id);
+    }
+
+    pub fn unmark_external_session(&self, session_id: &str) {
+        self.guard.browser.unmark_external_session(session_id);
+    }
+
     /// Opens a new tab in this context sharing cookies, routes, emulation, and storage.
     pub async fn new_page(&self) -> Result<PageLease> {
         if self.is_closed() {

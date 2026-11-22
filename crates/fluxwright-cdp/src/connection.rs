@@ -31,9 +31,13 @@ struct Incoming {
     session_id: Option<String>,
 }
 
+enum CdpReply {
+    Ok(Value),
+    Err(Value),
+}
+
 struct Pending {
-    method: String,
-    tx: oneshot::Sender<Result<Value>>,
+    tx: oneshot::Sender<Result<CdpReply>>,
 }
 
 /// Every subscriber of a connection, each handed a pointer to the same parsed event.
@@ -188,6 +192,31 @@ impl Connection {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value> {
+        match self.call_raw(method, params, session_id, timeout).await? {
+            Ok(val) => Ok(val),
+            Err(err) => {
+                let message = err
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cdp error")
+                    .to_string();
+                Err(Error::Command {
+                    method: method.to_string(),
+                    message,
+                })
+            }
+        }
+    }
+
+    /// Sends a CDP command and returns Chrome's raw JSON-RPC `result` (`Ok`) or `error` (`Err`)
+    /// object verbatim without stripping error codes/data.
+    pub async fn call_raw(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<std::result::Result<Value, Value>> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         {
@@ -197,13 +226,7 @@ impl Connection {
             if self.is_dead() {
                 return Err(Error::WebSocket("connection closed".into()));
             }
-            pending.insert(
-                id,
-                Pending {
-                    method: method.to_string(),
-                    tx,
-                },
-            );
+            pending.insert(id, Pending { tx });
         }
         let mut body = json!({ "id": id, "method": method, "params": params });
         if let Some(sid) = session_id {
@@ -213,7 +236,9 @@ impl Connection {
             .send(Outgoing::Json(body.to_string()))
             .map_err(|_| Error::WebSocket("writer gone".into()))?;
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(res)) => res,
+            Ok(Ok(Ok(CdpReply::Ok(val)))) => Ok(Ok(val)),
+            Ok(Ok(Ok(CdpReply::Err(err)))) => Ok(Err(err)),
+            Ok(Ok(Err(transport_err))) => Err(transport_err),
             Ok(Err(_)) => Err(Error::WebSocket("cancelled".into())),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
@@ -325,20 +350,11 @@ async fn dispatch(
     };
     if let Some(id) = msg.id {
         if let Some(p) = pending.lock().await.remove(&id) {
-            let res = if let Some(err) = msg.error {
-                let message = err
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("cdp error")
-                    .to_string();
-                Err(Error::Command {
-                    method: p.method,
-                    message,
-                })
-            } else {
-                Ok(msg.result.unwrap_or(Value::Null))
+            let reply = match msg.error {
+                Some(err) => CdpReply::Err(err),
+                None => CdpReply::Ok(msg.result.unwrap_or(Value::Null)),
             };
-            let _ = p.tx.send(res);
+            let _ = p.tx.send(Ok(reply));
         }
         return Ok(());
     }
@@ -439,5 +455,48 @@ mod tests {
             super::tls_connector(),
             tokio_tungstenite::Connector::Rustls(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn call_raw_preserves_cdp_error_code_and_data() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let reply = json!({
+                    "id": req["id"],
+                    "error": { "code": -32602, "message": "Invalid params", "data": "bad" }
+                });
+                if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let conn = super::Connection::connect(&format!("ws://{addr}")).await.unwrap();
+        let raw = conn
+            .call_raw("Bad.method", json!({}), None, std::time::Duration::from_secs(5))
+            .await
+            .expect("transport ok");
+        let err = raw.expect_err("expected CDP error payload");
+        assert_eq!(err["code"], -32602);
+        assert_eq!(err["message"], "Invalid params");
+        assert_eq!(err["data"], "bad");
+
+        let std_err = conn
+            .call("Bad.method", json!({}), None, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(std_err, crate::error::Error::Command { .. }));
+
+        conn.close();
+        let _ = server.await;
     }
 }
