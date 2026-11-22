@@ -44,7 +44,7 @@ Experimental cluster mode (`fluxwright coordinate` + `fluxwright serve --join <u
 - Publish the crates on crates.io.
 - Prebuilt MCP and CLI binaries workflow configured in `.github/workflows/release-binaries.yml`.
 - Node binding tests and type checks in CI, on all three operating systems.
-- CONTRIBUTING.md, issue templates and good first issues.
+- Good first issues (`CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, and issue/PR templates are in place).
 
 ## Not planned
 

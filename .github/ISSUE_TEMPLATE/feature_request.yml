@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a new capability or API improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What workload or workflow is blocked or painful today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API or behavior
+      description: How should this look across Rust / Node / Python / Server?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds or alternative designs you evaluated.
+    validations:
+      required: false
+  - type: checkboxes
+    id: roadmap_check
+    attributes:
+      label: Roadmap check
+      options:
+        - label: I checked ROADMAP.md (including the "Not planned" section) and confirmed this fits Fluxwright's scope.
+          required: true

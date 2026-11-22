@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Ideas
+    url: https://github.com/harshit-d3v/fluxwright/discussions
+    about: Ask usage questions or discuss new ideas before writing code.
+  - name: Report a Security Vulnerability
+    url: https://github.com/harshit-d3v/fluxwright/security/advisories/new
+    about: Privately report security vulnerabilities without disclosing them in public issues.
