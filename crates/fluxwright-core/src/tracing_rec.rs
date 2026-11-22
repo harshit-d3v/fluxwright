@@ -498,21 +498,23 @@ impl ContextTracing {
         }
     }
 
-    pub(crate) async fn trace_action<F, T>(
+    pub(crate) async fn trace_action<F, P, T>(
         &self,
         target_id: &str,
         class_name: &str,
         method_name: &str,
         api_name: &str,
-        params: Value,
+        params: P,
         fut: F,
     ) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
+        P: FnOnce() -> Value,
     {
         let (call_id, chunk_seq) = if self.is_active() {
             let mut st = self.state.lock().unwrap();
             if st.active && st.chunk_active {
+                let params_val = params();
                 st.next_call_seq += 1;
                 let seq = st.next_call_seq;
                 let chunk_seq = st.chunk_seq;
@@ -527,7 +529,7 @@ impl ContextTracing {
                         "class": class_name,
                         "method": method_name,
                         "apiName": api_name,
-                        "params": params,
+                        "params": params_val,
                         "pageId": page_id,
                         "stepId": call_id,
                     })
@@ -535,9 +537,11 @@ impl ContextTracing {
                 );
                 (Some(call_id), chunk_seq)
             } else {
+                drop(params);
                 (None, 0)
             }
         } else {
+            drop(params);
             (None, 0)
         };
 
@@ -1557,7 +1561,7 @@ mod tests {
             let release = Arc::clone(&release);
             async move {
                 tracer
-                    .trace_action("t1", "Page", "click", "page.click", json!({}), async {
+                    .trace_action("t1", "Page", "click", "page.click", || json!({}), async {
                         started.notify_one();
                         release.notified().await;
                         Ok::<_, Error>(())
@@ -1614,7 +1618,7 @@ mod tests {
                 "Locator",
                 "click",
                 "locator.click",
-                json!({ "selector": "#slow" }),
+                || json!({ "selector": "#slow" }),
                 async {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     Ok::<_, Error>(())
@@ -1631,7 +1635,7 @@ mod tests {
                 "Locator",
                 "fill",
                 "locator.fill",
-                json!({ "selector": "#bad" }),
+                || json!({ "selector": "#bad" }),
                 async { Err::<(), _>(Error::Other("boom".into())) },
             )
             .await;
@@ -1675,7 +1679,7 @@ mod tests {
         let tracer = ContextTracing::new();
         tracer.start(TracingStartOptions::default()).await.unwrap();
         tracer
-            .trace_action("t1", "Page", "goto", "page.goto", json!({}), async {
+            .trace_action("t1", "Page", "goto", "page.goto", || json!({}), async {
                 Ok::<_, Error>(())
             })
             .await

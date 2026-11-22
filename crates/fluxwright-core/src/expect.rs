@@ -721,7 +721,7 @@ impl<'a> LocatorExpect<'a> {
         options: &ToHaveScreenshotOptions,
     ) -> Result<()> {
         let target = self.target_label();
-        run_to_have_screenshot(
+        Box::pin(run_to_have_screenshot(
             &target,
             path.as_ref(),
             options,
@@ -730,7 +730,7 @@ impl<'a> LocatorExpect<'a> {
             self.poll_interval,
             self.locator.lease(),
             Some(self.locator),
-        )
+        ))
         .await
     }
 }
@@ -831,7 +831,7 @@ impl<'a> PageExpect<'a> {
         path: impl AsRef<Path>,
         options: &ToHaveScreenshotOptions,
     ) -> Result<()> {
-        run_to_have_screenshot(
+        Box::pin(run_to_have_screenshot(
             "expect(page)",
             path.as_ref(),
             options,
@@ -840,7 +840,7 @@ impl<'a> PageExpect<'a> {
             self.poll_interval,
             self.page,
             None,
-        )
+        ))
         .await
     }
 }
@@ -952,7 +952,7 @@ async fn run_to_have_screenshot(
     }
 
     let disable_animations = options.animations == Animations::Disabled;
-    let res = run_to_have_screenshot_inner(
+    let res = Box::pin(run_to_have_screenshot_inner(
         target,
         path,
         options,
@@ -961,9 +961,9 @@ async fn run_to_have_screenshot(
         page,
         locator,
         disable_animations,
-    )
+    ))
     .await;
-    clear_animation_guard(page, locator, disable_animations).await;
+    Box::pin(clear_animation_guard(page, locator, disable_animations)).await;
     res
 }
 
@@ -992,9 +992,9 @@ async fn run_to_have_screenshot_inner(
         let mut last_err: Option<String>;
         let mut attempts = 0usize;
         loop {
-            apply_animation_guard(page, locator, disable_animations).await;
+            Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
             let remaining = timeout.saturating_sub(start.elapsed());
-            match capture_png_shot(page, locator, options, shot_limit(remaining)).await {
+            match Box::pin(capture_png_shot(page, locator, options, shot_limit(remaining))).await {
                 Ok(bytes) => {
                     attempts += 1;
                     let img = decode_png(&bytes)?;
@@ -1029,7 +1029,7 @@ async fn run_to_have_screenshot_inner(
                 if attempts == 1 {
                     // Single shot exhausted a tight timeout; capture one confirmation shot.
                     let confirm_limit = Duration::from_secs(1);
-                    if let Ok(bytes) = capture_png_shot(page, locator, options, confirm_limit).await {
+                    if let Ok(bytes) = Box::pin(capture_png_shot(page, locator, options, confirm_limit)).await {
                         let img = decode_png(&bytes)?;
                         if let Some(ref prev) = prev_img {
                             let diff = compare_images(prev, &img, options.threshold, false)?;
@@ -1064,8 +1064,8 @@ async fn run_to_have_screenshot_inner(
     let baseline_bytes = match baseline_read {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            apply_animation_guard(page, locator, disable_animations).await;
-            if let Ok(actual) = capture_png_shot(page, locator, options, Duration::from_secs(2)).await {
+            Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
+            if let Ok(actual) = Box::pin(capture_png_shot(page, locator, options, Duration::from_secs(2))).await {
                 let _ = write_file_mkdir(actual_path.clone(), actual).await;
             }
             return Err(Error::Other(format!(
@@ -1088,9 +1088,9 @@ async fn run_to_have_screenshot_inner(
     let mut last_err: Option<String>;
 
     loop {
-        apply_animation_guard(page, locator, disable_animations).await;
+        Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
         let remaining = timeout.saturating_sub(start.elapsed());
-        match capture_png_shot(page, locator, options, shot_limit(remaining)).await {
+        match Box::pin(capture_png_shot(page, locator, options, shot_limit(remaining))).await {
             Ok(bytes) => {
                 let actual_img = decode_png(&bytes)?;
                 let diff = compare_images(&baseline_img, &actual_img, options.threshold, false)?;

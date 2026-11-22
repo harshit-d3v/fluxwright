@@ -2024,9 +2024,6 @@ impl PageLease {
         F: std::future::Future<Output = Result<T>>,
         P: FnOnce() -> serde_json::Value,
     {
-        if !self.context.tracing.is_active() {
-            return fut.await;
-        }
         self.context
             .tracing
             .trace_action(
@@ -2034,7 +2031,7 @@ impl PageLease {
                 class_name,
                 method_name,
                 api_name,
-                params(),
+                params,
                 fut,
             )
             .await
@@ -3830,7 +3827,16 @@ impl<'a> Locator<'a> {
         P: FnOnce() -> serde_json::Value,
     {
         self.lease
-            .traced("Locator", method_name, api_name, params, fut)
+            .context
+            .tracing
+            .trace_action(
+                &self.lease.page.target_id.0,
+                "Locator",
+                method_name,
+                api_name,
+                params,
+                fut,
+            )
             .await
     }
 
