@@ -6,7 +6,7 @@
 // Parts joined by >> narrow the match: each part is searched inside the previous matches, or is
 // nth=N (0-based, negative from the end) or has-text="Foo"i (keeps matches containing the text).
 // Modes: attached | visible | click | point | box | rect | element | clear | changed | focus | blur | scroll | check_state | select_options | check_file_input | set_files.
-((sel, mode, arg) => {
+((sel, mode, arg, refEl) => {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const box = (el) => el.getBoundingClientRect();
   const visible = (el) => {
@@ -283,6 +283,10 @@
       const id = body.startsWith('"') ? JSON.parse(body) : body;
       return pick([...root.querySelectorAll('[data-testid]')], (el) => el.getAttribute('data-testid') === id, first);
     },
+    ref: (_body, root) =>
+      refEl && refEl.nodeType === 1 && refEl.isConnected && (root === document || root.contains(refEl))
+        ? [refEl]
+        : [],
   };
   function parseRe(body) {
     const m = /^re:("(?:[^"\\]|\\.)*"),("(?:[^"\\]|\\.)*")$/.exec(body);
@@ -356,12 +360,14 @@
     const parts = split(selStr);
     let found = null; // null until the first part searched docRoot
     parts.forEach((part, i) => {
-      const m = /^(css|xpath|text|role|label|placeholder|alt|title|testid|nth|has-text|has-not-text|has|has-not|and|or)=([\s\S]*)$/.exec(part);
+      const m = /^(css|xpath|text|role|label|placeholder|alt|title|testid|ref|nth|has-text|has-not-text|has|has-not|and|or)=([\s\S]*)$/.exec(part);
       const [engine, body] = m
         ? [m[1], m[2]]
-        : part.startsWith('//') || part.startsWith('..')
-          ? ['xpath', part]
-          : ['css', part];
+        : /^@e\d+$/.test(part)
+          ? ['ref', part.slice(1)]
+          : part.startsWith('//') || part.startsWith('..')
+            ? ['xpath', part]
+            : ['css', part];
       if ((engine === 'nth' || engine === 'has-text' || engine === 'has-not-text' || engine === 'has' || engine === 'has-not' || engine === 'and' || engine === 'or') && found === null) {
         throw new SyntaxError(engine + '= needs a selector before it');
       }

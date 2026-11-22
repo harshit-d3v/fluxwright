@@ -2,7 +2,17 @@
 
 stdio MCP server so **Claude Desktop**, **Claude Code**, **Codex**, and **Cursor** can drive Fluxwright (Chromium leases).
 
-Tools: `open`, `goto`, `title`, `content`, `click`, `fill`, `evaluate`, `screenshot`, `close`.
+Tools (21):
+- **Navigation & Context**: `open`, `goto`, `back`, `forward`, `tabs`, `close`
+- **AI Inspection**: `snapshot` (compact ARIA tree with short `@eN` refs), `markdown` (clean Markdown), `title`, `content`, `screenshot`
+- **Actions**: `click`, `hover`, `fill`, `press`, `select`, `scroll`, `wait_for`, `evaluate`
+- **Diagnostics**: `console`, `network`
+
+### Recommended AI Workflow
+
+1. Call `snapshot()` (or `snapshot(interactive_only=true)`) to inspect controls and their `@eN` refs (`[ref=e1]`, `[ref=e2]`, ...).
+2. Act using short refs (`click("@e3")`, `fill("@e2", "query")`, `select("@e4", value="pro")`). `@eN` refs clear automatically on navigation — run `snapshot()` again after page loads.
+3. Call `markdown(main_content_only=true)` to read clean prose/tables instead of raw `content()` HTML or full screenshots.
 
 ## Install (this machine)
 

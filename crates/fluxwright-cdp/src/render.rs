@@ -412,6 +412,7 @@ mod tests {
             keyboard: Default::default(),
             url: Arc::new(tokio::sync::watch::Sender::new("about:blank".into())),
             net: Default::default(),
+            ax_refs: Default::default(),
         };
 
         let err = page

@@ -94,6 +94,36 @@ pub struct ApiResponseData {
 }
 
 #[napi(object)]
+pub struct AriaRef {
+    pub id: String,
+    pub role: String,
+    pub name: String,
+}
+
+#[napi(object)]
+pub struct AriaSnapshot {
+    pub tree: String,
+    pub refs: Vec<AriaRef>,
+    pub truncated: bool,
+}
+
+#[napi(object)]
+pub struct AriaSnapshotOptions {
+    pub interactive_only: Option<bool>,
+    pub compact: Option<bool>,
+    pub max_depth: Option<u32>,
+    pub max_nodes: Option<u32>,
+}
+
+#[napi(object)]
+pub struct MarkdownOptions {
+    pub selector: Option<String>,
+    pub main_content_only: Option<bool>,
+    pub include_links: Option<bool>,
+    pub include_images: Option<bool>,
+}
+
+#[napi(object)]
 pub struct RouteFetchOptions {
     pub url: Option<String>,
     pub method: Option<String>,
@@ -2357,6 +2387,58 @@ impl Page {
     #[napi]
     pub async fn content(&self) -> Result<String> {
         with_page(self.lease.clone(), |p| Box::pin(async move { p.content().await })).await
+    }
+
+    #[napi]
+    pub async fn aria_snapshot(&self, options: Option<AriaSnapshotOptions>) -> Result<AriaSnapshot> {
+        let o = options.unwrap_or(AriaSnapshotOptions {
+            interactive_only: None,
+            compact: None,
+            max_depth: None,
+            max_nodes: None,
+        });
+        let mut opts = fluxwright::SnapshotOptions {
+            interactive_only: o.interactive_only.unwrap_or(false),
+            compact: o.compact.unwrap_or(true),
+            max_depth: o.max_depth.map(|v| v as usize),
+            ..Default::default()
+        };
+        if let Some(limit) = o.max_nodes {
+            opts.max_nodes = limit as usize;
+        }
+        let snap = with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.aria_snapshot_with(&opts).await })
+        })
+        .await?;
+        Ok(AriaSnapshot {
+            tree: snap.tree,
+            refs: snap
+                .refs
+                .into_iter()
+                .map(|r| AriaRef { id: r.id, role: r.role, name: r.name })
+                .collect(),
+            truncated: snap.truncated,
+        })
+    }
+
+    #[napi]
+    pub async fn markdown(&self, options: Option<MarkdownOptions>) -> Result<String> {
+        let o = options.unwrap_or(MarkdownOptions {
+            selector: None,
+            main_content_only: None,
+            include_links: None,
+            include_images: None,
+        });
+        let opts = fluxwright::MarkdownOptions {
+            selector: o.selector,
+            main_content_only: o.main_content_only.unwrap_or(false),
+            include_links: o.include_links.unwrap_or(true),
+            include_images: o.include_images.unwrap_or(false),
+        };
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.markdown_with(&opts).await })
+        })
+        .await
     }
 
     #[napi]

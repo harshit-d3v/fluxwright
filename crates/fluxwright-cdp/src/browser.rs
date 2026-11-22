@@ -988,6 +988,7 @@ impl CdpBrowser {
                                             keyboard: Default::default(),
                                             url: url_tx,
                                             net,
+                                            ax_refs: Default::default(),
                                         };
                                         let _ = tx.send(page);
                                     }
@@ -1671,6 +1672,7 @@ impl CdpBrowser {
             keyboard: Default::default(),
             url,
             net,
+            ax_refs: Default::default(),
         })
     }
 

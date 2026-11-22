@@ -12,6 +12,7 @@ mod log;
 mod page;
 mod render;
 mod route;
+mod snapshot;
 mod worker;
 
 pub use browser::{BrowserId, CdpBrowser, ContextId, FrameInfo, Proxy, SessionId, TargetId};
@@ -43,4 +44,5 @@ pub use page::{
 };
 pub use render::{MAX_PDF_BYTES, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotOptions};
 pub use route::{Fulfill, InterceptedRequest, Overrides, RouteFetchHandle};
+pub use snapshot::{AriaRef, AriaSnapshot, MarkdownOptions, SnapshotOptions};
 pub use worker::{Worker, WorkerEvent};
