@@ -194,9 +194,11 @@ impl ProxyPool {
     }
 
     pub fn with_failure_policy(self, failure_threshold: u32, base_cooldown: Duration) -> Self {
-        let mut st = self.inner.lock().unwrap();
-        st.failure_threshold = failure_threshold.max(1);
-        st.base_cooldown = base_cooldown.max(Duration::from_millis(1));
+        {
+            let mut st = self.inner.lock().unwrap();
+            st.failure_threshold = failure_threshold.max(1);
+            st.base_cooldown = base_cooldown.max(Duration::from_millis(1));
+        }
         self
     }
 
