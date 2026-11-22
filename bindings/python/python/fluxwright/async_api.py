@@ -43,8 +43,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from . import _native
 from ._errors import Error, TimeoutError
 from ._expect import LocatorAssertions, PageAssertions, expect
-from ._native import ConsoleMessage, Download, FrameLocator, Locator
-from ._tracing import AsyncTracing as Tracing
+from ._native import ConsoleMessage, Download
+from ._tracing import AsyncTracing as Tracing, _to_camel_method
 from ._video import Video, VideoRecorder, normalize_record_video
 from ._types import (
     FilePayload,
@@ -414,7 +414,7 @@ class Keyboard:
 
     async def insert_text(self, text: str) -> None:
         await self._page._trace_action(
-            "insert_text",
+            "insertText",
             "keyboard.insert_text",
             {},
             lambda: self._page._keyboard_insert_text(text),
@@ -1242,6 +1242,498 @@ _UNSET: Any = object()
 _pages_by_target: weakref.WeakValueDictionary[str, Page] = weakref.WeakValueDictionary()
 
 
+def _locator_selector(native: Any) -> str:
+    rep = repr(native)
+    prefix = "<Locator selector="
+    if rep.startswith(prefix) and rep.endswith(">"):
+        inner = rep[len(prefix) : -1]
+        if len(inner) >= 2 and inner[0] == '"' and inner[-1] == '"':
+            try:
+                return str(_json.loads(inner))
+            except Exception:
+                body = inner[1:-1]
+                body = re.sub(r"\\u\{([0-9a-fA-F]+)\}", lambda m: chr(int(m.group(1), 16)), body)
+                return body.replace("\\'", "'").replace('\\"', '"').replace("\\\\", "\\")
+        return inner
+    return rep
+
+
+def _native_loc(loc: Locator | _native.Locator | Any) -> Any:
+    return loc._impl if isinstance(loc, Locator) else loc
+
+
+class _AsyncFinders:
+    """Shared locator finder constructors for ``Locator`` and ``FrameLocator``."""
+
+    _impl: Any
+    _page_ref: weakref.ref[Page] | None
+
+    def locator(
+        self,
+        selector: str,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        """CSS, ``text=``, ``xpath=``, or ``role=`` selector."""
+        return Locator(
+            self._impl.locator(
+                selector,
+                has=_native_loc(has) if has is not None else None,
+                has_not=_native_loc(has_not) if has_not is not None else None,
+                has_text=has_text,
+                has_not_text=has_not_text,
+            ),
+            self._page_ref,
+        )
+
+    def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(self._impl.get_by_text(text, exact=exact), self._page_ref)
+
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        checked: bool | None = None,
+        disabled: bool | None = None,
+        exact: bool | None = None,
+        expanded: bool | None = None,
+        include_hidden: bool | None = None,
+        level: int | None = None,
+        name: str | re.Pattern[str] | None = None,
+        pressed: bool | None = None,
+        selected: bool | None = None,
+    ) -> Locator:
+        return Locator(
+            self._impl.get_by_role(
+                role,
+                checked=checked,
+                disabled=disabled,
+                exact=exact,
+                expanded=expanded,
+                include_hidden=include_hidden,
+                level=level,
+                name=name,
+                pressed=pressed,
+                selected=selected,
+            ),
+            self._page_ref,
+        )
+
+    def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(self._impl.get_by_label(text, exact=exact), self._page_ref)
+
+    def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(self._impl.get_by_placeholder(text, exact=exact), self._page_ref)
+
+    def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(self._impl.get_by_alt_text(text, exact=exact), self._page_ref)
+
+    def get_by_title(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(self._impl.get_by_title(text, exact=exact), self._page_ref)
+
+    def get_by_test_id(self, test_id: str) -> Locator:
+        return Locator(self._impl.get_by_test_id(test_id), self._page_ref)
+
+
+class Locator(_AsyncFinders):
+    """Lazy, like Playwright's: every action runs the query again and traces when context tracing is active."""
+
+    _impl: _native.Locator
+
+    def __init__(self, impl: _native.Locator, page_ref: weakref.ref[Page] | None = None) -> None:
+        self._impl = impl
+        self._page_ref = page_ref
+
+    def _owner_page(self) -> Page | None:
+        return self._page_ref() if self._page_ref is not None else None
+
+    def _selector(self) -> str:
+        return _locator_selector(self._impl)
+
+    async def _trace(
+        self,
+        method_name: str,
+        fn: Callable[[], Awaitable[Any]],
+        extra_params: dict[str, Any] | None = None,
+    ) -> Any:
+        page = self._owner_page()
+        if page is None or page._active_tracer() is None:
+            return await fn()
+        params: dict[str, Any] = {"selector": self._selector()}
+        if extra_params:
+            params.update(extra_params)
+        return await page._trace_action(
+            _to_camel_method(method_name),
+            f"locator.{method_name}",
+            params,
+            fn,
+            class_name="Locator",
+        )
+
+    def __repr__(self) -> str:
+        return repr(self._impl)
+
+    async def click(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        click_count: int | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """``timeout`` is in milliseconds, for this call only; 0 waits as long as it takes."""
+        await self._trace(
+            "click",
+            lambda: self._impl.click(
+                button=button,
+                click_count=click_count,
+                delay=delay,
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
+        )
+
+    async def dblclick(
+        self,
+        *,
+        button: Literal["left", "right", "middle"] | None = None,
+        delay: float | None = None,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        await self._trace(
+            "dblclick",
+            lambda: self._impl.dblclick(
+                button=button,
+                delay=delay,
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
+        )
+
+    async def hover(
+        self,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        await self._trace(
+            "hover",
+            lambda: self._impl.hover(
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
+        )
+
+    async def tap(
+        self,
+        *,
+        position: Position | None = None,
+        modifiers: Sequence[Literal["Alt", "Control", "Meta", "Shift", "ControlOrMeta"]] | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        await self._trace(
+            "tap",
+            lambda: self._impl.tap(
+                position=position,
+                modifiers=list(modifiers) if modifiers is not None else None,
+                force=force,
+                trial=trial,
+                timeout=timeout,
+            ),
+        )
+
+    async def focus(self, *, timeout: float | None = None) -> None:
+        await self._trace("focus", lambda: self._impl.focus(timeout=timeout))
+
+    async def blur(self, *, timeout: float | None = None) -> None:
+        await self._trace("blur", lambda: self._impl.blur(timeout=timeout))
+
+    async def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:
+        await self._trace("scroll_into_view_if_needed", lambda: self._impl.scroll_into_view_if_needed(timeout=timeout))
+
+    async def drag_to(self, target: Locator, *, force: bool | None = None, timeout: float | None = None) -> None:
+        raw_target = _native_loc(target)
+        await self._trace(
+            "drag_to",
+            lambda: self._impl.drag_to(raw_target, force=force, timeout=timeout),
+            {"target": _locator_selector(raw_target)},
+        )
+
+    async def fill(self, value: str, *, timeout: float | None = None) -> None:
+        await self._trace("fill", lambda: self._impl.fill(value, timeout=timeout))
+
+    async def clear(self, *, force: bool | None = None, timeout: float | None = None) -> None:
+        await self._trace("clear", lambda: self._impl.clear(force=force, timeout=timeout))
+
+    async def press(self, key: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        await self._trace("press", lambda: self._impl.press(key, delay=delay, timeout=timeout), {"key": key})
+
+    async def press_sequentially(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        await self._trace(
+            "press_sequentially",
+            lambda: self._impl.press_sequentially(text, delay=delay, timeout=timeout),
+        )
+
+    async def type(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        await self._trace("type", lambda: self._impl.type(text, delay=delay, timeout=timeout))
+
+    async def check(
+        self,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        await self._trace("check", lambda: self._impl.check(position=position, force=force, trial=trial, timeout=timeout))
+
+    async def uncheck(
+        self,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        await self._trace(
+            "uncheck", lambda: self._impl.uncheck(position=position, force=force, trial=trial, timeout=timeout)
+        )
+
+    async def set_checked(
+        self,
+        checked: bool,
+        *,
+        position: Position | None = None,
+        force: bool | None = None,
+        trial: bool | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        await self._trace(
+            "set_checked",
+            lambda: self._impl.set_checked(checked, position=position, force=force, trial=trial, timeout=timeout),
+        )
+
+    async def select_option(
+        self,
+        value: str | Sequence[str] | Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+        *,
+        index: int | Sequence[int] | None = None,
+        label: str | Sequence[str] | None = None,
+        element: Any = None,
+        force: bool | None = None,
+        timeout: float | None = None,
+    ) -> list[str]:
+        return await self._trace(
+            "select_option",
+            lambda: self._impl.select_option(
+                value, index=index, label=label, element=element, force=force, timeout=timeout
+            ),
+        )
+
+    async def set_input_files(
+        self,
+        files: str | PathLike[str] | FilePayload | Sequence[str | PathLike[str] | FilePayload],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        await self._trace("set_input_files", lambda: self._impl.set_input_files(files, timeout=timeout))
+
+    async def wait_for(
+        self,
+        *,
+        state: Literal["attached", "detached", "visible", "hidden"] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Waits until ``state``: visible by default."""
+        await self._trace("wait_for", lambda: self._impl.wait_for(state=state, timeout=timeout))
+
+    async def text_content(self, *, timeout: float | None = None) -> str | None:
+        return await self._impl.text_content(timeout=timeout)
+
+    async def inner_text(self, *, timeout: float | None = None) -> str:
+        return await self._impl.inner_text(timeout=timeout)
+
+    async def inner_html(self, *, timeout: float | None = None) -> str:
+        return await self._impl.inner_html(timeout=timeout)
+
+    async def input_value(self, *, timeout: float | None = None) -> str:
+        return await self._impl.input_value(timeout=timeout)
+
+    async def get_attribute(self, name: str, *, timeout: float | None = None) -> str | None:
+        return await self._impl.get_attribute(name, timeout=timeout)
+
+    async def count(self) -> int:
+        return await self._impl.count()
+
+    async def all(self) -> list[Locator]:
+        return [Locator(item, self._page_ref) for item in await self._impl.all()]
+
+    async def all_text_contents(self) -> list[str]:
+        return await self._impl.all_text_contents()
+
+    async def all_inner_texts(self) -> list[str]:
+        return await self._impl.all_inner_texts()
+
+    async def is_visible(self, *, timeout: float | None = None) -> bool:
+        return await self._impl.is_visible(timeout=timeout)
+
+    async def is_hidden(self, *, timeout: float | None = None) -> bool:
+        return await self._impl.is_hidden(timeout=timeout)
+
+    async def is_enabled(self, *, timeout: float | None = None) -> bool:
+        return await self._impl.is_enabled(timeout=timeout)
+
+    async def is_disabled(self, *, timeout: float | None = None) -> bool:
+        return await self._impl.is_disabled(timeout=timeout)
+
+    async def is_checked(self, *, timeout: float | None = None) -> bool:
+        return await self._impl.is_checked(timeout=timeout)
+
+    async def is_editable(self, *, timeout: float | None = None) -> bool:
+        return await self._impl.is_editable(timeout=timeout)
+
+    async def bounding_box(self, *, timeout: float | None = None) -> FloatRect | None:
+        """Relative to the viewport, without scrolling; ``None`` when the element is not visible."""
+        return await self._impl.bounding_box(timeout=timeout)
+
+    async def screenshot(
+        self,
+        *,
+        path: str | PathLike[str] | None = None,
+        type: Literal["png", "jpeg"] | None = None,
+        quality: int | None = None,
+        omit_background: bool | None = None,
+        timeout: float | None = None,
+    ) -> bytes:
+        """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""
+        return await self._trace(
+            "screenshot",
+            lambda: self._impl.screenshot(
+                path=path,
+                type=type,
+                quality=quality,
+                omit_background=omit_background,
+                timeout=timeout,
+            ),
+        )
+
+    async def evaluate(self, expression: str, arg: Any = None, *, timeout: float | None = None) -> Any:
+        """Calls the JavaScript function ``expression`` with the element and ``arg``."""
+        return await self._trace("evaluate", lambda: self._impl.evaluate(expression, arg, timeout=timeout))
+
+    async def evaluate_all(self, expression: str, arg: Any = None) -> Any:
+        """Calls the JavaScript function ``expression`` with all matched elements and ``arg``."""
+        return await self._trace("evaluate_all", lambda: self._impl.evaluate_all(expression, arg))  # type: ignore[attr-defined]
+
+    async def dispatch_event(
+        self,
+        type: str,
+        event_init: Any = None,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Dispatches a DOM event of ``type`` on the matched element."""
+        native_fn = getattr(self._impl, "dispatch_event", None)
+        if callable(native_fn):
+            await self._trace(
+                "dispatch_event",
+                lambda: native_fn(type, event_init, timeout=timeout),
+                {"type": type},
+            )
+            return
+        await self._trace(
+            "dispatch_event",
+            lambda: self._impl.evaluate(
+                "(el, payload) => { const init = Object.assign({ bubbles: true, cancelable: true }, payload.init || {}); "
+                "const ev = payload.init && Object.prototype.hasOwnProperty.call(payload.init, 'detail') "
+                "? new CustomEvent(payload.type, init) : new Event(payload.type, init); "
+                "el.dispatchEvent(ev); }",
+                {"type": type, "init": event_init},
+                timeout=timeout,
+            ),
+            {"type": type},
+        )
+
+    def nth(self, index: int) -> Locator:
+        """The ``index``-th match (0-based; negative counts from the end)."""
+        return Locator(self._impl.nth(index), self._page_ref)
+
+    @property
+    def first(self) -> Locator:
+        return Locator(self._impl.first, self._page_ref)
+
+    @property
+    def last(self) -> Locator:
+        return Locator(self._impl.last, self._page_ref)
+
+    def filter(
+        self,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        """Narrow matching elements."""
+        return Locator(
+            self._impl.filter(
+                has=_native_loc(has) if has is not None else None,
+                has_not=_native_loc(has_not) if has_not is not None else None,
+                has_text=has_text,
+                has_not_text=has_not_text,
+            ),
+            self._page_ref,
+        )
+
+    def and_(self, locator: Locator) -> Locator:
+        return Locator(self._impl.and_(_native_loc(locator)), self._page_ref)
+
+    def or_(self, locator: Locator) -> Locator:
+        return Locator(self._impl.or_(_native_loc(locator)), self._page_ref)
+
+    def frame_locator(self, selector: str) -> FrameLocator:
+        return FrameLocator(self._impl.frame_locator(selector), self._page_ref)  # type: ignore[attr-defined]
+
+
+class FrameLocator(_AsyncFinders):
+    """An iframe, same- or cross-origin, to find elements in."""
+
+    _impl: _native.FrameLocator
+
+    def __init__(self, impl: _native.FrameLocator, page_ref: weakref.ref[Page] | None = None) -> None:
+        self._impl = impl
+        self._page_ref = page_ref
+
+    def frame_locator(self, selector: str) -> FrameLocator:
+        """A nested iframe inside this one."""
+        return FrameLocator(self._impl.frame_locator(selector), self._page_ref)
+
+
 class Frame:
     """An imperative handle to a main frame or iframe on a page."""
 
@@ -1272,7 +1764,7 @@ class Frame:
         return None
 
     def _root(self) -> FrameLocator:
-        return self._page._frame_by_id(self._id)
+        return FrameLocator(self._page._frame_by_id(self._id), weakref.ref(self._page))
 
     @property
     def page(self) -> Page:
@@ -1437,12 +1929,102 @@ class Page(_native.Page):
         self._video: Video | None = None
         self._video_recorder: VideoRecorder | None = None
         self._video_browser_ref: weakref.ref[Browser] | None = None
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
         _pages_by_target[self._target_id()] = self
+
+    def locator(
+        self,
+        selector: str,
+        *,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+        has_text: str | re.Pattern[str] | None = None,
+        has_not_text: str | re.Pattern[str] | None = None,
+    ) -> Locator:
+        """CSS, ``text=``, ``xpath=``, or ``role=`` selector."""
+        return Locator(
+            super().locator(
+                selector,
+                has=_native_loc(has) if has is not None else None,
+                has_not=_native_loc(has_not) if has_not is not None else None,
+                has_text=has_text,
+                has_not_text=has_not_text,
+            ),
+            weakref.ref(self),
+        )
+
+    def get_by_text(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(super().get_by_text(text, exact=exact), weakref.ref(self))
+
+    def get_by_role(
+        self,
+        role: str,
+        *,
+        checked: bool | None = None,
+        disabled: bool | None = None,
+        exact: bool | None = None,
+        expanded: bool | None = None,
+        include_hidden: bool | None = None,
+        level: int | None = None,
+        name: str | re.Pattern[str] | None = None,
+        pressed: bool | None = None,
+        selected: bool | None = None,
+    ) -> Locator:
+        return Locator(
+            super().get_by_role(
+                role,
+                checked=checked,
+                disabled=disabled,
+                exact=exact,
+                expanded=expanded,
+                include_hidden=include_hidden,
+                level=level,
+                name=name,
+                pressed=pressed,
+                selected=selected,
+            ),
+            weakref.ref(self),
+        )
+
+    def get_by_label(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(super().get_by_label(text, exact=exact), weakref.ref(self))
+
+    def get_by_placeholder(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(super().get_by_placeholder(text, exact=exact), weakref.ref(self))
+
+    def get_by_alt_text(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(super().get_by_alt_text(text, exact=exact), weakref.ref(self))
+
+    def get_by_title(self, text: str, *, exact: bool | None = None) -> Locator:
+        return Locator(super().get_by_title(text, exact=exact), weakref.ref(self))
+
+    def get_by_test_id(self, test_id: str) -> Locator:
+        return Locator(super().get_by_test_id(test_id), weakref.ref(self))
+
+    def frame_locator(self, selector: str) -> FrameLocator:
+        return FrameLocator(super().frame_locator(selector), weakref.ref(self))
 
     @property
     def video(self) -> Video | None:
         """Recorded video handle when ``record_video_dir`` was configured, else ``None``."""
         return self._video
+
+    def _make_video_stopped_cb(self, browser: Browser | None) -> Callable[[VideoRecorder], None]:
+        page_ref = weakref.ref(self)
+        browser_ref = weakref.ref(browser) if browser is not None else None
+
+        def _on_stopped(rec: VideoRecorder) -> None:
+            p = page_ref()
+            if p is not None and p._video_recorder is rec:
+                p._video_recorder = None
+            b = browser_ref() if browser_ref is not None else None
+            if b is not None:
+                b._video_recorders.discard(rec)
+
+        return _on_stopped
 
     async def _start_video(
         self,
@@ -1453,7 +2035,38 @@ class Page(_native.Page):
         if self._video_recorder is not None or self.is_closed():
             return
         session = CDPSession(await self._new_cdp_session(None))
-        rec = await VideoRecorder.start(session, video_dir, video_size)
+        on_stopped = self._make_video_stopped_cb(browser)
+        rec = await VideoRecorder.start(session, video_dir, video_size, on_stopped=on_stopped)
+        self._video_recorder = rec
+        self._video = Video(rec)
+        if browser is not None:
+            self._video_browser_ref = weakref.ref(browser)
+            browser._video_recorders.add(rec)
+
+    def _start_video_deferred(
+        self,
+        video_dir: Path,
+        video_size: tuple[int, int] | None,
+        browser: Browser | None = None,
+    ) -> None:
+        if self._video_recorder is not None:
+            return
+        page_ref = weakref.ref(self)
+
+        async def _session_factory() -> CDPSession:
+            p = page_ref()
+            if p is None or p.is_closed():
+                raise Error("page is closed")
+            return CDPSession(await p._new_cdp_session(None))
+
+        on_stopped = self._make_video_stopped_cb(browser)
+        rec = VideoRecorder.start_deferred(
+            _session_factory,
+            video_dir,
+            video_size,
+            is_closed=self.is_closed,
+            on_stopped=on_stopped,
+        )
         self._video_recorder = rec
         self._video = Video(rec)
         if browser is not None:
@@ -1471,6 +2084,26 @@ class Page(_native.Page):
             browser = self._video_browser_ref() if self._video_browser_ref is not None else None
             if browser is not None:
                 browser._video_recorders.discard(rec)
+
+    def _schedule_stop_video(self) -> None:
+        if self._video_recorder is None:
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and (self._loop is None or running is self._loop):
+            _keep(self._tasks, asyncio.ensure_future(self._stop_video()))
+        elif self._loop is not None and not self._loop.is_closed():
+            page_ref = weakref.ref(self)
+
+            def _kick() -> None:
+                p = page_ref()
+                if p is not None and p._video_recorder is not None:
+                    _keep(p._tasks, asyncio.ensure_future(p._stop_video()))
+
+            with suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(_kick)
 
     @property
     def request(self) -> APIRequestContext:
@@ -1524,7 +2157,7 @@ class Page(_native.Page):
     ) -> None:
         params: dict[str, Any] = {"url": url} if isinstance(url, str) else {}
         return await self._trace_action(
-            "wait_for_url",
+            "waitForURL",
             "page.wait_for_url",
             params,
             lambda: self._wait_for_url_impl(url, timeout=timeout, wait_until=wait_until),
@@ -1570,7 +2203,7 @@ class Page(_native.Page):
                 if state == "commit":
                     return
                 rem = None if deadline is None else max(1.0, (deadline - time.monotonic()) * 1000.0)
-                await self.wait_for_load_state(state, timeout=rem)
+                await _native.Page.wait_for_load_state(self, state, timeout=rem)
                 return
             if deadline is not None:
                 rem = (deadline - time.monotonic()) * 1000.0
@@ -1630,7 +2263,7 @@ class Page(_native.Page):
         """Adds a script evaluated whenever the page navigates or reloads."""
         source = _resolve_init_script("page.add_init_script", script, path)
         await self._trace_action(
-            "add_init_script", "page.add_init_script", {}, lambda: self._add_init_script(source)
+            "addInitScript", "page.add_init_script", {}, lambda: self._add_init_script(source)
         )
 
     async def expose_function(self, name: str, callback: Callable[..., Any]) -> None:
@@ -1668,7 +2301,7 @@ class Page(_native.Page):
             raise ValueError("page.add_script_tag: provide exactly one of url, path, or content")
         text = Path(path).read_text(encoding="utf-8") if path is not None else content
         await self._trace_action(
-            "add_script_tag",
+            "addScriptTag",
             "page.add_script_tag",
             {},
             lambda: self._add_script_tag(url=url, content=text, script_type=type),
@@ -1686,7 +2319,7 @@ class Page(_native.Page):
             raise ValueError("page.add_style_tag: provide exactly one of url, path, or content")
         text = Path(path).read_text(encoding="utf-8") if path is not None else content
         await self._trace_action(
-            "add_style_tag",
+            "addStyleTag",
             "page.add_style_tag",
             {},
             lambda: self._add_style_tag(url=url, content=text),
@@ -1935,7 +2568,7 @@ class Page(_native.Page):
         m = None if media is _UNSET else ("" if media is None else media)
         cs = None if color_scheme is _UNSET else ("" if color_scheme is None else color_scheme)
         await self._trace_action(
-            "emulate_media",
+            "emulateMedia",
             "page.emulate_media",
             {},
             lambda: self._emulate_media(media=m, color_scheme=cs),
@@ -2067,19 +2700,30 @@ def _wrap_native_page_actions() -> None:
             continue
 
         def _make_wrapper(fn: Any, method_name: str, with_sel: bool) -> Any:
+            camel_name = _to_camel_method(method_name)
+
             async def _wrapped(self: Page, *args: Any, **kwargs: Any) -> Any:
                 tracer = self._active_tracer()
                 if tracer is None:
                     return await fn(self, *args, **kwargs)
                 params: dict[str, Any] = {}
-                if method_name == "goto" and args:
-                    params = {"url": str(args[0])}
-                elif method_name == "drag_and_drop" and len(args) >= 2:
-                    params = {"source": str(args[0]), "target": str(args[1])}
-                elif with_sel and args:
-                    params = {"selector": str(args[0])}
+                if method_name == "goto":
+                    url_val = args[0] if args else kwargs.get("url")
+                    if url_val is not None:
+                        params["url"] = str(url_val)
+                elif method_name == "drag_and_drop":
+                    src_val = args[0] if len(args) >= 1 else kwargs.get("source")
+                    dst_val = args[1] if len(args) >= 2 else kwargs.get("target")
+                    if src_val is not None:
+                        params["source"] = str(src_val)
+                    if dst_val is not None:
+                        params["target"] = str(dst_val)
+                elif with_sel:
+                    sel_val = args[0] if args else kwargs.get("selector")
+                    if sel_val is not None:
+                        params["selector"] = str(sel_val)
                 return await tracer._run_action(
-                    self, "Page", method_name, f"page.{method_name}", params, lambda: fn(self, *args, **kwargs)
+                    self, "Page", camel_name, f"page.{method_name}", params, lambda: fn(self, *args, **kwargs)
                 )
 
             _wrapped.__name__ = method_name
@@ -2210,9 +2854,26 @@ class CDPSession:
     def __init__(self, impl: _native.CdpSession) -> None:
         self._impl = impl
         self._listeners: dict[str, list[tuple[Listener, Listener]]] = {}
+        self._close_callbacks: list[Callable[[], None]] = []
         self._serving = False
         self._detached = False
         self._tasks: set[asyncio.Future[Any]] = set()
+
+    def _on_close(self, cb: Callable[[], None]) -> None:
+        if self._detached:
+            with suppress(Exception):
+                cb()
+            return
+        self._ensure_events()
+        self._close_callbacks.append(cb)
+
+    def _notify_closed(self) -> None:
+        self._detached = True
+        cbs = list(self._close_callbacks)
+        self._close_callbacks.clear()
+        for cb in cbs:
+            with suppress(Exception):
+                cb()
 
     async def send(self, method: str, params: dict[str, Any] | None = None) -> Any:
         if self._detached:
@@ -2252,7 +2913,7 @@ class CDPSession:
     async def detach(self) -> None:
         if self._detached:
             return
-        self._detached = True
+        self._notify_closed()
         self._listeners.clear()
         await self._impl.detach()
 
@@ -2260,12 +2921,17 @@ class CDPSession:
 async def _serve_cdp_events(
     stream: _native.CdpEventStream, session: weakref.ref[CDPSession], tasks: set[asyncio.Future[Any]]
 ) -> None:
-    while (ev := await stream.next()) is not None:
+    try:
+        while (ev := await stream.next()) is not None:
+            s = session()
+            if s is None or s._detached:
+                return
+            params = _json.loads(ev.params_json) if ev.params_json else {}
+            _emit(s._listeners, ev.method, params, tasks)
+    finally:
         s = session()
-        if s is None or s._detached:
-            return
-        params = _json.loads(ev.params_json) if ev.params_json else {}
-        _emit(s._listeners, ev.method, params, tasks)
+        if s is not None:
+            s._notify_closed()
 
 
 async def _serve_popups(stream: _native.PopupStream, page: PageRef, tasks: set[asyncio.Future[Any]]) -> None:
@@ -2516,7 +3182,12 @@ class Browser:
         if pending_filter is not None:
             page._pending_har_filters.append(pending_filter)
         if record_video is not None:
-            await page._start_video(*record_video, browser=self)
+            try:
+                await page._start_video(*record_video, browser=self)
+            except BaseException:
+                with suppress(Exception):
+                    await page.close()
+                raise
         return page
 
     async def new_context(
@@ -2622,6 +3293,7 @@ class BrowserContext:
         self._ctx = ctx
         self._closed = False
         self._pages: list[Page] = []
+        self._video_pages: list[Page] = []
         self._routes: list[_RouteEntry] = []
         self._routing = False
         self._route_lock = asyncio.Lock()
@@ -2663,7 +3335,16 @@ class BrowserContext:
 
     @property
     def pages(self) -> list[Page]:
-        self._pages = [p for p in self._pages if not p.is_closed()]
+        alive: list[Page] = []
+        closed: list[Page] = []
+        for p in self._pages:
+            if p.is_closed():
+                closed.append(p)
+            else:
+                alive.append(p)
+        self._pages = alive
+        for p in closed:
+            p._schedule_stop_video()
         return list(self._pages)
 
     def _adopt_page(self, page: Page) -> None:
@@ -2679,9 +3360,11 @@ class BrowserContext:
         self._adopt_page(popup)
         tracer = self._active_tracer()
         if tracer is not None:
-            _keep(self._tasks, asyncio.ensure_future(tracer._on_page_created(popup)))
+            _keep(self._tasks, tracer._track_page_created(popup))
         if self._record_video is not None:
-            _keep(self._tasks, asyncio.ensure_future(popup._start_video(*self._record_video, browser=self._browser)))
+            popup._start_video_deferred(*self._record_video, browser=self._browser)
+            if popup not in self._video_pages:
+                self._video_pages.append(popup)
 
     def _remove_page(self, page: Page) -> None:
         with suppress(ValueError):
@@ -2696,11 +3379,18 @@ class BrowserContext:
             await page.close()
             raise Error("browser_context.new_page: the context is closed")
         self._adopt_page(page)
-        tracer = self._active_tracer()
-        if tracer is not None:
-            await tracer._on_page_created(page)
-        if self._record_video is not None:
-            await page._start_video(*self._record_video, browser=self._browser)
+        try:
+            tracer = self._active_tracer()
+            if tracer is not None:
+                await tracer._on_page_created(page)
+            if self._record_video is not None:
+                await page._start_video(*self._record_video, browser=self._browser)
+                if page not in self._video_pages:
+                    self._video_pages.append(page)
+        except BaseException:
+            with suppress(Exception):
+                await page.close()
+            raise
         return page
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
@@ -2866,10 +3556,18 @@ class BrowserContext:
         if self._closed:
             return
         self._closed = True
+        video_pages = list(self._video_pages)
+        self._video_pages.clear()
+        for p in video_pages:
+            with suppress(Exception):
+                await p._stop_video()
         for p in list(self._pages):
             if not p.is_closed():
                 with suppress(Error):
                     await p.close()
+            else:
+                with suppress(Exception):
+                    await p._stop_video()
         self._pages.clear()
         if self._tracing is not None:
             await self._tracing._dispose()

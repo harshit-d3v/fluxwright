@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 import struct
 import subprocess
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from os import PathLike
@@ -18,6 +19,7 @@ from typing import Any
 from ._errors import Error
 
 _SCREENCAP_SETTLE_S = 0.025
+_FFMPEG_TIMEOUT_S = 60.0
 
 # Valid 2x2 black baseline JPEG used only if a page closes before any frame can be captured.
 _FALLBACK_JPEG = bytes.fromhex(
@@ -263,13 +265,15 @@ def _try_mux_webm(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            timeout=_FFMPEG_TIMEOUT_S,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False
     if proc.returncode != 0 or not out_path.exists():
         return False
     try:
-        head = out_path.read_bytes()[:4]
+        with out_path.open("rb") as fh:
+            head = fh.read(4)
         return head == b"\x1a\x45\xdf\xa3"
     except OSError:
         return False
@@ -287,7 +291,7 @@ def _mux_frames(
     fps = _compute_fps(frames)
     f0 = frames[0]
     first_dims = jpeg_dimensions(f0.jpeg) or ((f0.width, f0.height) if f0.width and f0.height else None)
-    width, height = size or first_dims or (800, 600)
+    width, height = first_dims or size or (800, 600)
 
     webm_path = video_dir / f"{file_id}.webm"
     if _try_mux_webm(webm_path, frames, fps, size, first_dims):
@@ -321,7 +325,7 @@ class Video:
 
         def _copy() -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(src.read_bytes())
+            shutil.copyfile(src, dest)
 
         await asyncio.to_thread(_copy)
 
@@ -339,15 +343,31 @@ class VideoRecorder:
         video_dir: Path,
         size: tuple[int, int] | None,
         session: Any,
+        *,
+        on_stopped: Callable[[VideoRecorder], None] | None = None,
     ) -> None:
         self._dir = video_dir
         self._size = size
         self._id = uuid.uuid4().hex
         self._session = session
+        self._on_stopped = on_stopped
         self._frames: list[_RecordedFrame] = []
         self._ack_tasks: set[asyncio.Future[Any]] = set()
         self._done_future: asyncio.Future[Path] = asyncio.get_running_loop().create_future()
         self._stop_future: asyncio.Future[Path] | None = None
+        self._start_task: asyncio.Task[None] | None = None
+        self._stop_requested = False
+        self._accepting_frames = True
+
+    def _attach_session_close_hook(self, session: Any) -> None:
+        on_close = getattr(session, "_on_close", None)
+        if callable(on_close):
+            on_close(self._on_session_closed)
+
+    def _on_session_closed(self) -> None:
+        if self._stop_future is None:
+            with suppress(RuntimeError):
+                self._trigger_stop()
 
     @classmethod
     async def start(
@@ -355,24 +375,110 @@ class VideoRecorder:
         session: Any,
         video_dir: Path,
         size: tuple[int, int] | None,
+        *,
+        on_stopped: Callable[[VideoRecorder], None] | None = None,
     ) -> VideoRecorder:
         await asyncio.to_thread(video_dir.mkdir, parents=True, exist_ok=True)
-        rec = cls(video_dir, size, session)
+        rec = cls(video_dir, size, session, on_stopped=on_stopped)
         session.on("Page.screencastFrame", rec._on_frame)
-        with suppress(Exception):
-            await session.send("Page.enable")
-        params: dict[str, Any] = {
-            "format": "jpeg",
-            "quality": 80,
-            "everyNthFrame": 1,
-        }
-        if size is not None:
-            params["maxWidth"] = size[0]
-            params["maxHeight"] = size[1]
-        await session.send("Page.startScreencast", params)
+        try:
+            with suppress(Exception):
+                await session.send("Page.enable")
+            params: dict[str, Any] = {
+                "format": "jpeg",
+                "quality": 80,
+                "everyNthFrame": 1,
+            }
+            if size is not None:
+                params["maxWidth"] = size[0]
+                params["maxHeight"] = size[1]
+            await session.send("Page.startScreencast", params)
+        except BaseException:
+            with suppress(Exception):
+                session.remove_listener("Page.screencastFrame", rec._on_frame)
+            with suppress(Exception):
+                await session.detach()
+            raise
+        rec._attach_session_close_hook(session)
         return rec
 
+    @classmethod
+    def start_deferred(
+        cls,
+        session_factory: Callable[[], Awaitable[Any]],
+        video_dir: Path,
+        size: tuple[int, int] | None,
+        *,
+        is_closed: Callable[[], bool] | None = None,
+        on_stopped: Callable[[VideoRecorder], None] | None = None,
+    ) -> VideoRecorder:
+        """Synchronously creates a recorder whose CDP screencast starts asynchronously.
+
+        Used for popups so ``popup.video`` is immediately non-None before ``"popup"`` is emitted,
+        and ``stop()`` chains cleanly behind startup even if the popup closes immediately.
+        """
+        rec = cls(video_dir, size, session=None, on_stopped=on_stopped)
+        rec._start_task = asyncio.ensure_future(rec._startup(session_factory, is_closed))
+        return rec
+
+    async def _startup(
+        self,
+        session_factory: Callable[[], Awaitable[Any]],
+        is_closed: Callable[[], bool] | None,
+    ) -> None:
+        session: Any = None
+        attached_listener = False
+        try:
+            await asyncio.to_thread(self._dir.mkdir, parents=True, exist_ok=True)
+            if self._stop_requested or (is_closed is not None and is_closed()):
+                if is_closed is not None and is_closed():
+                    self._trigger_stop()
+                return
+            session = await session_factory()
+            if self._stop_requested or (is_closed is not None and is_closed()):
+                with suppress(Exception):
+                    await session.detach()
+                if is_closed is not None and is_closed():
+                    self._trigger_stop()
+                return
+            session.on("Page.screencastFrame", self._on_frame)
+            attached_listener = True
+            with suppress(Exception):
+                await session.send("Page.enable")
+            if self._stop_requested or (is_closed is not None and is_closed()):
+                with suppress(Exception):
+                    session.remove_listener("Page.screencastFrame", self._on_frame)
+                with suppress(Exception):
+                    await session.detach()
+                if is_closed is not None and is_closed():
+                    self._trigger_stop()
+                return
+            params: dict[str, Any] = {
+                "format": "jpeg",
+                "quality": 80,
+                "everyNthFrame": 1,
+            }
+            if self._size is not None:
+                params["maxWidth"] = self._size[0]
+                params["maxHeight"] = self._size[1]
+            await session.send("Page.startScreencast", params)
+            self._session = session
+            self._attach_session_close_hook(session)
+            if is_closed is not None and is_closed():
+                self._trigger_stop()
+        except Exception:
+            if session is not None:
+                if attached_listener:
+                    with suppress(Exception):
+                        session.remove_listener("Page.screencastFrame", self._on_frame)
+                with suppress(Exception):
+                    await session.detach()
+            if is_closed is not None and is_closed():
+                self._trigger_stop()
+
     def _on_frame(self, params: dict[str, Any]) -> None:
+        if not self._accepting_frames:
+            return
         data_b64 = params.get("data")
         if isinstance(data_b64, str):
             with suppress(Exception):
@@ -390,52 +496,77 @@ class VideoRecorder:
                     )
                 )
         ack_id = params.get("sessionId")
-        if ack_id is not None:
+        if ack_id is not None and self._session is not None:
             fut = asyncio.ensure_future(self._ack(ack_id))
             self._ack_tasks.add(fut)
             fut.add_done_callback(self._ack_tasks.discard)
 
     async def _ack(self, session_id: Any) -> None:
+        session = self._session
+        if session is None:
+            return
         with suppress(Exception):
-            await self._session.send("Page.screencastFrameAck", {"sessionId": session_id})
+            await session.send("Page.screencastFrameAck", {"sessionId": session_id})
 
     async def wait_for_finished(self) -> Path:
         return await asyncio.shield(self._done_future)
 
-    async def stop(self) -> Path:
+    def _trigger_stop(self) -> asyncio.Future[Path]:
+        self._stop_requested = True
         if self._stop_future is None:
-            self._stop_future = asyncio.ensure_future(self._finish())
-        return await asyncio.shield(self._stop_future)
+            fut = asyncio.ensure_future(self._finish())
+
+            def _consume_exc(done: asyncio.Future[Path]) -> None:
+                if not done.cancelled():
+                    done.exception()
+
+            fut.add_done_callback(_consume_exc)
+            self._stop_future = fut
+        return self._stop_future
+
+    async def stop(self) -> Path:
+        return await asyncio.shield(self._trigger_stop())
 
     async def _finish(self) -> Path:
+        self._stop_requested = True
         try:
-            with suppress(Exception):
-                await self._session.send("Page.stopScreencast")
-            await asyncio.sleep(_SCREENCAP_SETTLE_S)
-            self._session.remove_listener("Page.screencastFrame", self._on_frame)
-            if self._ack_tasks:
-                for t in list(self._ack_tasks):
-                    t.cancel()
-                self._ack_tasks.clear()
-
-            if not self._frames:
+            if self._start_task is not None and not self._start_task.done():
                 with suppress(Exception):
-                    shot = await self._session.send(
-                        "Page.captureScreenshot", {"format": "jpeg", "quality": 80}
-                    )
-                    if isinstance(shot, dict) and isinstance(shot.get("data"), str):
-                        self._frames.append(
-                            _RecordedFrame(
-                                jpeg=base64.b64decode(shot["data"]),
-                                timestamp=None,
-                                width=self._size[0] if self._size else None,
-                                height=self._size[1] if self._size else None,
-                            )
+                    await self._start_task
+
+            session = self._session
+            if session is not None:
+                with suppress(Exception):
+                    await session.send("Page.stopScreencast")
+                await asyncio.sleep(_SCREENCAP_SETTLE_S)
+                self._accepting_frames = False
+                with suppress(Exception):
+                    session.remove_listener("Page.screencastFrame", self._on_frame)
+                if self._ack_tasks:
+                    for t in list(self._ack_tasks):
+                        t.cancel()
+                    self._ack_tasks.clear()
+
+                if not self._frames:
+                    with suppress(Exception):
+                        shot = await session.send(
+                            "Page.captureScreenshot", {"format": "jpeg", "quality": 80}
                         )
-            with suppress(Exception):
-                await self._session.detach()
+                        if isinstance(shot, dict) and isinstance(shot.get("data"), str):
+                            self._frames.append(
+                                _RecordedFrame(
+                                    jpeg=base64.b64decode(shot["data"]),
+                                    timestamp=None,
+                                    width=self._size[0] if self._size else None,
+                                    height=self._size[1] if self._size else None,
+                                )
+                            )
+                with suppress(Exception):
+                    await session.detach()
+                self._session = None
 
             frames = list(self._frames)
+            self._frames.clear()
             out_path = await asyncio.to_thread(_mux_frames, self._dir, self._id, self._size, frames)
             if not self._done_future.done():
                 self._done_future.set_result(out_path)
@@ -444,3 +575,10 @@ class VideoRecorder:
             if not self._done_future.done():
                 self._done_future.set_exception(Error(str(exc)))
             raise
+        finally:
+            self._frames.clear()
+            if self._on_stopped is not None:
+                cb = self._on_stopped
+                self._on_stopped = None
+                with suppress(Exception):
+                    cb(self)

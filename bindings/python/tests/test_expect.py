@@ -9,6 +9,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from fluxwright import async_api, sync_api
+from fluxwright._expect import (
+    DEFAULT_TIMEOUT_MS,
+    LocatorAssertions as RawLocatorAssertions,
+    PageAssertions as RawPageAssertions,
+    _is_fatal_error,
+    _resolve_url,
+)
 from fluxwright.async_api import (
     LocatorAssertions as AsyncLocatorAssertions,
     PageAssertions as AsyncPageAssertions,
@@ -278,6 +285,109 @@ def test_sync_expect(base):
             with pytest.raises(AssertionError, match="element not found"):
                 sync_expect(page.locator("#missing")).not_to_have_text("x", timeout=150)
 
+            # Bytes regex rejected, strict bool on checked.
+            with pytest.raises(TypeError, match="bytes"):
+                sync_expect(page.locator("#txt")).to_have_text(re.compile(b"Loaded"))  # type: ignore[arg-type]
+            with pytest.raises(TypeError, match="bool"):
+                sync_expect(page.locator("#chk")).to_be_checked(checked="false")  # type: ignore[arg-type]
+
+            # expect.set_options(timeout=...) updates default timeout in place.
+            try:
+                sync_expect.set_options(timeout=150)
+                started = time.monotonic()
+                with pytest.raises(AssertionError, match="150ms"):
+                    sync_expect(page.locator("#txt")).to_have_text("Never")
+                assert time.monotonic() - started < 3.0
+            finally:
+                sync_expect.set_options(timeout=DEFAULT_TIMEOUT_MS)
+
+            # expect.soft accumulates failures without stopping execution.
+            sync_expect.clear_soft_errors()
+            sync_expect.soft(page.locator("#txt")).to_have_text("Wrong One", timeout=100)
+            sync_expect.soft(page).to_have_title("Wrong Title", timeout=100)
+            sync_expect.soft(page.locator("#txt")).to_have_text("Loaded 42 items", timeout=200)
+            assert len(sync_expect.soft_errors()) == 2
+            with pytest.raises(AssertionError) as soft_exc:
+                sync_expect.assert_no_soft_errors()
+            assert "Wrong One" in str(soft_exc.value)
+            assert "Wrong Title" in str(soft_exc.value)
+            assert sync_expect.soft_errors() == []
+
             page.close()
         finally:
             browser.close()
+
+
+def test_expect_unit_url_fatal_bounded_probes_and_async_soft():
+    # 1. _resolve_url handles protocol-relative //host/path via urljoin.
+    class _BasePage:
+        def _base_url(self) -> str:
+            return "http://127.0.0.1:8080/app/index.html"
+
+    bp = _BasePage()
+    assert _resolve_url(bp, "/done") == "http://127.0.0.1:8080/done"
+    assert _resolve_url(bp, "//other.example/path") == "http://other.example/path"
+    assert _resolve_url(bp, "next") == "http://127.0.0.1:8080/app/next"
+    assert _resolve_url(bp, "https://abs.example/x") == "https://abs.example/x"
+
+    # 2. Expanded _is_fatal_error patterns.
+    for msg in (
+        "devtools websocket: connection reset",
+        "engine is shut down",
+        "browser context is closed",
+        "Target closed",
+        "Session with given id not found",
+        "page is closed",
+    ):
+        assert _is_fatal_error(RuntimeError(msg)), f"expected fatal: {msg}"
+    assert not _is_fatal_error(RuntimeError("element is not visible"))
+
+    # 3. count() and title() probes are bounded by limit_ms (short timeout never hangs 30s).
+    class _SlowLocator:
+        async def count(self) -> int:
+            await asyncio.sleep(5.0)
+            return 0
+
+    class _SlowPage:
+        def is_closed(self) -> bool:
+            return False
+
+        async def title(self) -> str:
+            await asyncio.sleep(5.0)
+            return "never"
+
+    async def _run_unit() -> None:
+        t0 = time.monotonic()
+        with pytest.raises(AssertionError):
+            await RawLocatorAssertions(_SlowLocator()).to_have_count(1, timeout=150)  # type: ignore[arg-type]
+        assert time.monotonic() - t0 < 1.5
+
+        t1 = time.monotonic()
+        with pytest.raises(AssertionError):
+            await RawPageAssertions(_SlowPage()).to_have_title("ok", timeout=150)  # type: ignore[arg-type]
+        assert time.monotonic() - t1 < 1.5
+
+        # Bytes regex rejected on async assertions too.
+        with pytest.raises(TypeError, match="bytes"):
+            await RawPageAssertions(_SlowPage()).to_have_title(re.compile(b"ok"))  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="bool"):
+            await RawLocatorAssertions(_SlowLocator()).to_be_checked(checked="false")  # type: ignore[arg-type]
+
+        # Async expect.set_options + expect.soft with fake assertion objects.
+        try:
+            async_expect.set_options(timeout=120)
+            assert async_expect._default_timeout == 120.0
+        finally:
+            async_expect.set_options(timeout=DEFAULT_TIMEOUT_MS)
+
+        async_expect.clear_soft_errors()
+        await RawLocatorAssertions(_SlowLocator(), soft=True, message="soft-count").to_have_count(1, timeout=100)  # type: ignore[arg-type]
+        await RawPageAssertions(_SlowPage(), soft=True, message="soft-title").to_have_title("x", timeout=100)  # type: ignore[arg-type]
+        assert len(async_expect.soft_errors()) == 2
+        with pytest.raises(AssertionError) as soft_info:
+            async_expect.assert_no_soft_errors()
+        assert "soft-count" in str(soft_info.value)
+        assert "soft-title" in str(soft_info.value)
+        assert async_expect.soft_errors() == []
+
+    asyncio.run(_run_unit())
