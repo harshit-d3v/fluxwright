@@ -2,7 +2,7 @@
 //! Fluxwright across multiple machines.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
@@ -10,12 +10,15 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use fluxwright::BrowserEngine;
+use rustls::pki_types::ServerName;
+use rustls::ClientConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::AbortHandle;
+use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
 use crate::{
@@ -614,6 +617,7 @@ pub(crate) async fn remove_worker(
 
 #[derive(Clone)]
 pub(crate) struct CoordinatorEndpoint {
+    pub(crate) tls: bool,
     pub(crate) host: String,
     port: u16,
     host_header: String,
@@ -636,15 +640,16 @@ impl CoordinatorEndpoint {
                 "URL must not contain whitespace".into(),
             ));
         }
-        if trimmed.starts_with("https://") {
+        let (tls, rest) = if let Some(rest) = trimmed.strip_prefix("http://") {
+            (false, rest)
+        } else if let Some(rest) = trimmed.strip_prefix("https://") {
+            (true, rest)
+        } else {
             return Err(ConfigError::InvalidCoordinator(
-                "HTTPS coordinator URLs are not supported natively; terminate TLS in a local reverse proxy/tunnel or use http:// on a trusted private network"
-                    .into(),
+                "coordinator URL must start with http:// or https://".into(),
             ));
-        }
-        let rest = trimmed.strip_prefix("http://").ok_or_else(|| {
-            ConfigError::InvalidCoordinator("coordinator URL must start with http://".into())
-        })?;
+        };
+        let default_port = if tls { 443 } else { 80 };
         let (authority, path_raw) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
@@ -662,7 +667,7 @@ impl CoordinatorEndpoint {
             let ip = &after_bracket[..end];
             let tail = &after_bracket[end + 1..];
             let port = match tail {
-                "" => 80,
+                "" => default_port,
                 _ => tail
                     .strip_prefix(':')
                     .and_then(|p| p.parse::<u16>().ok())
@@ -678,7 +683,7 @@ impl CoordinatorEndpoint {
                 .ok_or_else(|| ConfigError::InvalidCoordinator("invalid port".into()))?;
             (h.to_string(), port)
         } else {
-            (authority.to_string(), 80)
+            (authority.to_string(), default_port)
         };
         if host.is_empty() {
             return Err(ConfigError::InvalidCoordinator(
@@ -686,6 +691,7 @@ impl CoordinatorEndpoint {
             ));
         }
         Ok(Self {
+            tls,
             host,
             port,
             host_header: authority.to_string(),
@@ -701,12 +707,18 @@ pub struct WorkerHandle {
     finished_rx: watch::Receiver<bool>,
     abort: AbortHandle,
     loopback: bool,
+    tls: bool,
 }
 
 impl WorkerHandle {
     /// Returns true when the configured coordinator host is a loopback address.
     pub fn coordinator_is_loopback(&self) -> bool {
         self.loopback
+    }
+
+    /// Returns true when `--join` targets an `https://` coordinator endpoint.
+    pub fn coordinator_uses_tls(&self) -> bool {
+        self.tls
     }
 
     /// Stops polling immediately and aborts active leased job tasks.
@@ -777,6 +789,7 @@ pub(crate) fn spawn_worker_with(
 ) -> Result<WorkerHandle, ConfigError> {
     let endpoint = CoordinatorEndpoint::parse(&coordinator_url)?;
     let loopback = endpoint.is_loopback();
+    let tls = endpoint.tls;
     let worker_id = match worker_id {
         Some(id) => {
             if validate_worker(&id).is_err() || id.contains(['/', '?', '#']) {
@@ -808,6 +821,7 @@ pub(crate) fn spawn_worker_with(
         finished_rx,
         abort: handle.abort_handle(),
         loopback,
+        tls,
     })
 }
 
@@ -936,9 +950,13 @@ async fn worker_loop(
     let mut pending_results: VecDeque<(Uuid, ResultRequest)> = VecDeque::new();
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(Uuid, ResultRequest)>();
 
-    let poll_timer = tokio::time::sleep(Duration::ZERO);
+    let jitter_ms = worker_id
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)))
+        % 50;
+    let poll_timer = tokio::time::sleep(Duration::from_millis(jitter_ms));
     tokio::pin!(poll_timer);
-    let mut can_lease = true;
+    let mut can_lease = jitter_ms == 0;
     let mut grace_deadline: Option<tokio::time::Instant> = (*drain_rx.borrow_and_update())
         .map(|grace| tokio::time::Instant::now() + grace);
     let mut backoff = poll_interval.max(Duration::from_millis(50));
@@ -1307,6 +1325,43 @@ async fn post_result(
     }
 }
 
+fn worker_tls_config() -> &'static Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let cfg = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports default TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Arc::new(cfg)
+    })
+}
+
+async fn exchange_http<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    head: &[u8],
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    stream.write_all(head).await.map_err(|e| e.to_string())?;
+    stream.write_all(body).await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    stream
+        .take((MAX_HTTP_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| e.to_string())?;
+    if raw.len() > MAX_HTTP_RESPONSE_BYTES {
+        return Err("coordinator HTTP response exceeded maximum size".into());
+    }
+    Ok(raw)
+}
+
 async fn post_json_raw(
     ep: &CoordinatorEndpoint,
     token: &str,
@@ -1321,28 +1376,22 @@ async fn post_json_raw(
         json_bytes.len()
     );
     let io = async {
-        let mut stream = TcpStream::connect((ep.host.as_str(), ep.port))
+        let stream = TcpStream::connect((ep.host.as_str(), ep.port))
             .await
             .map_err(|e| e.to_string())?;
-        stream
-            .write_all(head.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        stream
-            .write_all(&json_bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        stream.flush().await.map_err(|e| e.to_string())?;
-        let mut raw = Vec::new();
-        stream
-            .take((MAX_HTTP_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|e| e.to_string())?;
-        if raw.len() > MAX_HTTP_RESPONSE_BYTES {
-            return Err("coordinator HTTP response exceeded maximum size".into());
+        if ep.tls {
+            let server_name = ServerName::try_from(ep.host.clone())
+                .map_err(|_| format!("invalid TLS server name: {}", ep.host))?;
+            let connector = TlsConnector::from(worker_tls_config().clone());
+            let mut tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| e.to_string())?;
+            exchange_http(&mut tls_stream, head.as_bytes(), &json_bytes).await
+        } else {
+            let mut tcp = stream;
+            exchange_http(&mut tcp, head.as_bytes(), &json_bytes).await
         }
-        Ok::<Vec<u8>, String>(raw)
     };
     let raw = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, io)
         .await
@@ -1464,5 +1513,35 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, finishing);
         assert!(active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_http_and_https_coordinator_endpoints() {
+        let http_ep = CoordinatorEndpoint::parse("http://10.0.1.5/coord/").unwrap();
+        assert!(!http_ep.tls);
+        assert_eq!(http_ep.host, "10.0.1.5");
+        assert_eq!(http_ep.port, 80);
+        assert_eq!(http_ep.base_path, "/coord");
+
+        let https_ep = CoordinatorEndpoint::parse("https://coord.example.com").unwrap();
+        assert!(https_ep.tls);
+        assert_eq!(https_ep.host, "coord.example.com");
+        assert_eq!(https_ep.port, 443);
+
+        let v6 = CoordinatorEndpoint::parse("https://[::1]:8443/v1").unwrap();
+        assert!(v6.tls);
+        assert!(v6.is_loopback());
+        assert_eq!(v6.port, 8443);
+        assert_eq!(v6.base_path, "/v1");
+
+        for bad in [
+            "ftp://coord.example.com",
+            "https://user:pass@coord.example.com",
+            "https://coord.example.com?q=1",
+            "https://coord.example.com:0",
+            "https://",
+        ] {
+            assert!(CoordinatorEndpoint::parse(bad).is_err(), "{bad}");
+        }
     }
 }

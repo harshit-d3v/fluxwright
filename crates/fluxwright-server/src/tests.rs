@@ -1021,8 +1021,14 @@ async fn coordinator_expires_leases_requeues_retries_and_rejects_stale_worker_wi
     assert_eq!(done["attempts"], 2);
     assert_eq!(done["failure_evidence"]["console"][0]["text"], "boom");
 
+    assert_eq!(
+        cluster::CoordinatorEndpoint::parse("https://coordinator:7331")
+            .unwrap()
+            .host,
+        "coordinator"
+    );
     assert!(matches!(
-        cluster::CoordinatorEndpoint::parse("https://coordinator:7331"),
+        cluster::CoordinatorEndpoint::parse("ftp://coordinator:7331"),
         Err(ConfigError::InvalidCoordinator(_))
     ));
     assert!(matches!(
@@ -1626,4 +1632,100 @@ async fn profile_proxy_endpoints_enforce_auth_validation_and_adaptive_metric() {
 
     configured.shutdown(Duration::ZERO).await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cluster_worker_token_isolates_worker_and_client_routes() {
+    const WORKER_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    let config = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_worker_token(WORKER_TOKEN.into())
+        .unwrap();
+    let coord = HttpServer::coordinator(config).unwrap();
+
+    let call_with = |tok: &str, method: &str, path: &str, payload: &str| {
+        let router = coord.router();
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        async move { router.oneshot(req).await.unwrap() }
+    };
+
+    // Submit a job with client token -> 202.
+    let sub = call_with(
+        TOKEN,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}]}"#,
+    )
+    .await;
+    assert_eq!(sub.status(), StatusCode::ACCEPTED);
+    let job: Job = serde_json::from_value(body(sub).await).unwrap();
+
+    // Worker token cannot hit client or operator endpoints -> 401.
+    for (m, p, pl) in [
+        ("GET", &format!("/v1/jobs/{}", job.id) as &str, ""),
+        ("POST", "/v1/jobs", r#"{"steps":[{"action":"title"}]}"#),
+        ("GET", "/v1/workers", ""),
+    ] {
+        assert_eq!(call_with(WORKER_TOKEN, m, p, pl).await.status(), StatusCode::UNAUTHORIZED, "{m} {p}");
+    }
+
+    // Client token cannot call worker pull/result routes when worker_token is configured -> 401.
+    assert_eq!(
+        call_with(TOKEN, "POST", "/v1/workers/w1/lease", r#"{"max_jobs":1}"#)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Worker token leases, heartbeats, and reports result -> 200.
+    let lease = call_with(
+        WORKER_TOKEN,
+        "POST",
+        "/v1/workers/w1/lease",
+        r#"{"max_jobs":1}"#,
+    )
+    .await;
+    assert_eq!(lease.status(), StatusCode::OK);
+    let leased = body(lease).await;
+    assert_eq!(leased["jobs"].as_array().unwrap().len(), 1);
+
+    let hb = call_with(
+        WORKER_TOKEN,
+        "POST",
+        "/v1/workers/w1/heartbeat",
+        &json!({ "jobs": [{ "id": job.id, "step_index": 0, "attempts": 1 }] }).to_string(),
+    )
+    .await;
+    assert_eq!(hb.status(), StatusCode::OK);
+
+    let res = call_with(
+        WORKER_TOKEN,
+        "POST",
+        &format!("/v1/jobs/{}/result", job.id),
+        &json!({
+            "worker": "w1",
+            "status": "succeeded",
+            "attempts": 1,
+            "step_index": 0,
+            "results": ["Example"]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Client token reads the completed job and operator worker summary -> 200.
+    let status = call_with(TOKEN, "GET", &format!("/v1/jobs/{}", job.id), "").await;
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(body(status).await["status"], "succeeded");
+    assert_eq!(call_with(TOKEN, "GET", "/v1/workers", "").await.status(), StatusCode::OK);
+
+    coord.shutdown(Duration::ZERO).await.unwrap();
 }

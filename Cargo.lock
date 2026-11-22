@@ -546,14 +546,17 @@ dependencies = [
  "fluxwright",
  "fluxwright-cdp",
  "futures-util",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "tower",
  "tracing",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

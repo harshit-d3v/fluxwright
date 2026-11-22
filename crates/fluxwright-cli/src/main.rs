@@ -259,18 +259,33 @@ fn server_config(max_jobs: usize, journal: Option<std::path::PathBuf>) -> Result
     Ok((token, config))
 }
 
+fn worker_token_from_env() -> Option<String> {
+    std::env::var("FLUXWRIGHT_WORKER_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 async fn coordinator_daemon(
     address: SocketAddr,
     max_jobs: usize,
     journal: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let (_token, config) = server_config(max_jobs, journal)?;
+    let (_token, mut config) = server_config(max_jobs, journal)?;
+    let separate_worker_auth = if let Some(wt) = worker_token_from_env() {
+        config = config.with_worker_token(wt)?;
+        true
+    } else {
+        false
+    };
     let listener = tokio::net::TcpListener::bind(address).await?;
     let server = HttpServer::coordinator(config)?;
     eprintln!(
         "fluxwright coordinator listening on http://{} (bearer authentication required)",
         listener.local_addr()?
     );
+    if separate_worker_auth {
+        eprintln!("fluxwright coordinator: separate worker bearer authentication enabled");
+    }
     serve_http(listener, address, server, None).await
 }
 
@@ -346,15 +361,16 @@ async fn http_daemon(
                 .max_browsers
                 .saturating_mul(engine.config().max_contexts_per_browser)
                 .max(1);
+            let join_token = worker_token_from_env().unwrap_or(token);
             let handle = fluxwright_server::spawn_worker(
                 engine.clone(),
                 url.clone(),
-                token,
+                join_token,
                 worker_id,
                 slots,
             )?;
             eprintln!("fluxwright worker joined coordinator {url} ({slots} slots, experimental)");
-            if !handle.coordinator_is_loopback() {
+            if !handle.coordinator_uses_tls() && !handle.coordinator_is_loopback() {
                 eprintln!(
                     "warning: --join uses unencrypted HTTP; keep the coordinator link on a trusted private network or local TLS tunnel"
                 );
