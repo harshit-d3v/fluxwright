@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use base64::Engine;
 use fluxwright::{
-    netguard, parse_modifiers, CheckOptions, ClickOptions, Clip, HoverOptions, ImageFormat,
-    JobOptions, MarkdownOptions, MouseButton, PageLease, PdfMargin, PdfOptions, Priority,
-    ResourcePreset, ResourceType, ScreenshotOptions, SelectEntry, SnapshotOptions, WaitUntil,
+    netguard, parse_modifiers, validate_profile_name, CheckOptions, ClickOptions, Clip,
+    HoverOptions, ImageFormat, JobOptions, MarkdownOptions, MouseButton, PageLease, PdfMargin,
+    PdfOptions, Priority, ResourcePreset, ResourceType, ScreenshotOptions, SelectEntry,
+    SnapshotOptions, WaitUntil,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +41,12 @@ pub struct JobRequest {
     pub block_resources: Vec<ServerResourceType>,
     #[serde(default)]
     pub block_url_patterns: Vec<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default = "default_true")]
+    pub persist_profile: bool,
+    #[serde(default)]
+    pub proxy_session: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +119,19 @@ impl JobRequest {
         }
         if self.retries > 3 {
             return Err("retries must be between 0 and 3; retries replay the whole job".into());
+        }
+        if let Some(ref profile) = self.profile {
+            validate_profile_name(profile).map_err(|e| e.to_string())?;
+        }
+        if let Some(ref session) = self.proxy_session {
+            if session.trim().is_empty()
+                || session.len() > 128
+                || !session.bytes().all(|b| (0x20..=0x7e).contains(&b))
+            {
+                return Err(
+                    "proxy_session must be 1-128 printable ASCII characters".into(),
+                );
+            }
         }
         if self.block_url_patterns.len() > 64 {
             return Err("block_url_patterns must contain at most 64 patterns".into());
@@ -313,6 +333,13 @@ impl JobRequest {
         }
         if !self.block_url_patterns.is_empty() {
             opts = opts.block_url_patterns(self.block_url_patterns.iter().cloned());
+        }
+        opts = opts.persist_profile(self.persist_profile);
+        if let Some(ref profile) = self.profile {
+            opts = opts.profile(profile.clone());
+        }
+        if let Some(ref session) = self.proxy_session {
+            opts = opts.proxy_session(session.clone());
         }
         opts
     }
@@ -1632,9 +1659,28 @@ mod tests {
             json!({ "steps": [{ "action": "pause_for_human", "timeout_ms": 0 }] }),
             json!({ "steps": [{ "action": "pause_for_human", "timeout_ms": 600001 }] }),
             json!({ "steps": [{ "action": "pause_for_human", "message": "x".repeat(513) }] }),
+            json!({ "steps": [{ "action": "title" }], "profile": "../escape" }),
+            json!({ "steps": [{ "action": "title" }], "profile": "" }),
+            json!({ "steps": [{ "action": "title" }], "profile": "a".repeat(65) }),
+            json!({ "steps": [{ "action": "title" }], "proxy_session": "   " }),
+            json!({ "steps": [{ "action": "title" }], "proxy_session": "bad\nkey" }),
+            json!({ "steps": [{ "action": "title" }], "proxy_session": "s".repeat(129) }),
         ] {
             let job: JobRequest = serde_json::from_value(bad).unwrap();
             assert!(job.validate().is_err());
         }
+
+        let valid_prof: JobRequest = serde_json::from_value(json!({
+            "steps": [{ "action": "title" }],
+            "profile": "acct_1-prod",
+            "persist_profile": false,
+            "proxy_session": "sticky-user-42"
+        }))
+        .unwrap();
+        assert!(valid_prof.validate().is_ok());
+        let opts = valid_prof.options();
+        assert_eq!(opts.profile.as_deref(), Some("acct_1-prod"));
+        assert!(!opts.persist_profile);
+        assert_eq!(opts.proxy_session.as_deref(), Some("sticky-user-42"));
     }
 }

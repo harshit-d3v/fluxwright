@@ -5,10 +5,11 @@
 
 pub use fluxwright_core::netguard;
 pub use fluxwright_core::{
-    with_timeout, ApiRequestContext, BrowserInfo, BrowserSource, ContextLease, Downloads,
-    Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, Frame, FrameLocator, JobOptions,
-    LocalChromium, Locator, MetricsSnapshot, PageLease, Priority, QueueFullMode, RemoteCdp,
-    ResourcePreset, Result,
+    parse_proxy_url, validate_profile_name, with_timeout, AdaptiveConfig, ApiRequestContext,
+    BrowserInfo, BrowserSource, ContextLease, Downloads, Engine as BrowserEngine, EngineBuilder,
+    EngineConfig, Error, Frame, FrameLocator, JobOptions, LocalChromium, Locator, MetricsSnapshot,
+    PageLease, Priority, ProfileInfo, ProfileStore, ProxyLease, ProxyPool, ProxyRotation,
+    ProxyStatus, QueueFullMode, RemoteCdp, ResourcePreset, Result,
 };
 
 pub use fluxwright_cdp::{

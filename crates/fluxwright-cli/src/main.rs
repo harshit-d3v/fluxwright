@@ -7,7 +7,7 @@ mod install;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use fluxwright::{BrowserEngine, QueueFullMode};
+use fluxwright::{AdaptiveConfig, BrowserEngine, ProxyPool, QueueFullMode};
 use fluxwright_server::{HttpServer, ServerConfig, WorkerHandle};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -68,6 +68,15 @@ enum Cmd {
         /// Accept `?token=<token>` on `/cdp` and `/json/version` for CDP clients that cannot send Bearer headers.
         #[arg(long, default_value_t = false)]
         allow_query_token: bool,
+        /// Directory storing named persistent profiles (`storageState`) for `profile` jobs.
+        #[arg(long)]
+        profiles_dir: Option<PathBuf>,
+        /// Outbound proxy URL (`scheme://[user[:pass]@]host[:port]`, repeatable for pooled rotation).
+        #[arg(long = "proxy")]
+        proxies: Vec<String>,
+        /// Enable AIMD adaptive concurrency limiting driven by browser RSS pressure and failures.
+        #[arg(long, default_value_t = false)]
+        adaptive_concurrency: bool,
     },
     /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
     Coordinate {
@@ -157,6 +166,9 @@ async fn main() -> Result<()> {
             channel,
             chromium_args,
             allow_query_token,
+            profiles_dir,
+            proxies,
+            adaptive_concurrency,
         } => {
             let address = listen.unwrap_or_else(|| {
                 if join.is_some() {
@@ -181,6 +193,9 @@ async fn main() -> Result<()> {
                 channel,
                 chromium_args,
                 allow_query_token,
+                profiles_dir,
+                proxies,
+                adaptive_concurrency,
             )
             .await
         }
@@ -276,6 +291,9 @@ async fn http_daemon(
     channel: Option<String>,
     chromium_args: Vec<String>,
     allow_query_token: bool,
+    profiles_dir: Option<PathBuf>,
+    proxies: Vec<String>,
+    adaptive_concurrency: bool,
 ) -> Result<()> {
     let (token, mut config) = server_config(max_jobs, journal)?;
     config.allow_query_token = allow_query_token;
@@ -310,6 +328,15 @@ async fn http_daemon(
     }
     if let Some(ms) = min_host_delay_ms {
         builder = builder.min_delay_per_host(Duration::from_millis(ms.get()));
+    }
+    if let Some(dir) = profiles_dir {
+        builder = builder.profiles_dir(dir);
+    }
+    if !proxies.is_empty() {
+        builder = builder.proxy_pool(ProxyPool::from_urls(proxies)?);
+    }
+    if adaptive_concurrency {
+        builder = builder.adaptive_concurrency(AdaptiveConfig::default());
     }
     let engine = builder.build().await?;
     let worker = match join {
@@ -611,6 +638,9 @@ mod tests {
                 channel,
                 chromium_args,
                 allow_query_token,
+                profiles_dir,
+                proxies,
+                adaptive_concurrency,
             } => {
                 assert!(
                     max_per_host.is_none()
@@ -620,8 +650,11 @@ mod tests {
                         && worker_id.is_none()
                         && channel.is_none()
                         && chromium_args.is_empty()
+                        && profiles_dir.is_none()
+                        && proxies.is_empty()
                 );
                 assert!(!allow_query_token);
+                assert!(!adaptive_concurrency);
                 assert_eq!(prewarm_contexts, 0);
                 assert_eq!(listen, Some("0.0.0.0:7331".parse::<SocketAddr>().unwrap()));
                 assert!(max_browsers.is_none());
@@ -642,6 +675,13 @@ mod tests {
             "--chromium-arg",
             "--disable-gpu",
             "--allow-query-token",
+            "--profiles-dir",
+            "/tmp/fw-profiles",
+            "--proxy",
+            "http://127.0.0.1:8080",
+            "--proxy",
+            "socks5://127.0.0.1:1080",
+            "--adaptive-concurrency",
         ])
         .expect("serve launch/prewarm flags should parse");
         match custom.cmd {
@@ -650,12 +690,21 @@ mod tests {
                 channel,
                 chromium_args,
                 allow_query_token,
+                profiles_dir,
+                proxies,
+                adaptive_concurrency,
                 ..
             } => {
                 assert_eq!(prewarm_contexts, 2);
                 assert_eq!(channel.as_deref(), Some("chrome"));
                 assert_eq!(chromium_args, vec!["--disable-gpu"]);
                 assert!(allow_query_token);
+                assert_eq!(profiles_dir.as_deref(), Some(std::path::Path::new("/tmp/fw-profiles")));
+                assert_eq!(
+                    proxies,
+                    vec!["http://127.0.0.1:8080", "socks5://127.0.0.1:1080"]
+                );
+                assert!(adaptive_concurrency);
             }
             _ => panic!("expected Cmd::Serve"),
         }

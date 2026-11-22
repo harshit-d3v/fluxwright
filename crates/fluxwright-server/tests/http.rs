@@ -1457,3 +1457,72 @@ async fn live_screencast_attaches_to_cdp_gateway_session() {
     server.shutdown(Duration::ZERO).await.unwrap();
     srv_handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn persists_named_profile_across_http_jobs() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let profiles_dir =
+        std::env::temp_dir().join(format!("fluxwright-http-prof-{}", uuid::Uuid::new_v4()));
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .profiles_dir(&profiles_dir)
+        .build()
+        .await
+        .unwrap();
+    let server = HttpServer::new(engine, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+
+    let job1 = submit(
+        &server,
+        json!({
+            "profile": "session_a",
+            "steps": [
+                { "action": "goto", "url": format!("{}/forms", fixture.base_url) },
+                { "action": "evaluate", "expression": "document.cookie = 'fw_http=ok; Path=/'; localStorage.setItem('fw_k', 'v1'); 'set'" }
+            ]
+        }),
+    )
+    .await;
+    let done1 = finish(&server, job1).await;
+    assert_eq!(done1.status, JobStatus::Succeeded, "{:?}", done1.error);
+
+    let (st_list, list_body) = request(&server, "GET", "/v1/profiles", Value::Null).await;
+    assert_eq!(st_list, StatusCode::OK, "{list_body}");
+    let listed = list_body["profiles"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["name"], "session_a");
+    assert!(listed[0]["cookies"].as_u64().unwrap() >= 1);
+    assert!(listed[0]["origins"].as_u64().unwrap() >= 1);
+
+    let job2 = submit(
+        &server,
+        json!({
+            "profile": "session_a",
+            "steps": [
+                { "action": "goto", "url": format!("{}/forms", fixture.base_url) },
+                { "action": "evaluate", "expression": "({ cookie: document.cookie, ls: localStorage.getItem('fw_k') })" }
+            ]
+        }),
+    )
+    .await;
+    let done2 = finish(&server, job2).await;
+    assert_eq!(done2.status, JobStatus::Succeeded, "{:?}", done2.error);
+    let eval = &done2.results.as_ref().unwrap()[1];
+    assert!(eval["cookie"].as_str().unwrap().contains("fw_http=ok"), "{eval}");
+    assert_eq!(eval["ls"], "v1");
+
+    let (st_del, del_body) =
+        request(&server, "DELETE", "/v1/profiles/session_a", Value::Null).await;
+    assert_eq!(st_del, StatusCode::OK, "{del_body}");
+    assert_eq!(del_body["deleted"], true);
+    assert_eq!(del_body["name"], "session_a");
+
+    let (st_list2, list_body2) = request(&server, "GET", "/v1/profiles", Value::Null).await;
+    assert_eq!(st_list2, StatusCode::OK);
+    assert_eq!(list_body2["profiles"], json!([]));
+
+    server.shutdown(Duration::ZERO).await.unwrap();
+    let _ = std::fs::remove_dir_all(&profiles_dir);
+}
