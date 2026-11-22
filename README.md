@@ -68,8 +68,43 @@ Blocking code uses `fluxwright.sync_api` and `sync_playwright()` the same way. T
 | Emulate | `newPage({ userAgent, locale, timezoneId, geolocation, permissions, viewport, deviceScaleFactor, colorScheme, isMobile, hasTouch, extraHTTPHeaders, ignoreHTTPSErrors, javaScriptEnabled, offline, baseURL, bypassCSP, httpCredentials })`, `emulateMedia({ media, colorScheme })`, Playwright's option names |
 | Sessions | `page.storageState({ path })` saves cookies and localStorage; `newPage({ storageState })` starts from them, `context.addCookies()` / `clearCookies()`, so you log in once. Playwright's file format |
 | Network | a proxy per page, with a username and password; blocking by resource type or URL (Rust `JobOptions`) |
+| AI | `ariaSnapshot()` for compact ARIA trees with `@eN` interactive element refs and `markdown()` for clean HTML-to-Markdown extraction |
+| E2E testing | Auto-retrying `expect()`, Playwright-compatible `.zip` `context.tracing`, `recordVideo` / `page.video()`, visual `toHaveScreenshot()`, `fluxwright/test` (`fluxwright-test` CLI), and built-in `pytest` plugin |
 
 The full Node API is in [bindings/node/README.md](bindings/node/README.md) and the Python API, with the same features under Playwright's Python names (`get_by_role`, `wait_until`, `storage_state`, ...), in [bindings/python/README.md](bindings/python/README.md).
+
+## End-to-end testing
+
+Fluxwright ships E2E testing batteries across Rust, Node/TypeScript, and Python on top of the pooled Chrome fleet:
+
+- **Auto-retrying `expect()` assertions:** web-first page and locator matchers (`toBeVisible`, `toHaveText`, `toContainText`, `toHaveValue`, `toHaveAttribute`, `toHaveClass`, `toHaveCount`, `toHaveTitle`, `toHaveURL`, `.not`, custom timeouts) across Rust (`expect_page` / `expect_locator`), Node/TS (`expect`), and Python (`expect` and `expect.soft`).
+- **Playwright-compatible `.zip` tracing:** `context.tracing.start()` / `startChunk()` / `stopChunk()` / `stop({ path })` records actions, screencast frames, console logs, and network events into `.zip` archives that open in Playwright Trace Viewer (`npx playwright show-trace trace.zip`).
+- **Video recording & visual regression:** `recordVideo` (`record_video_dir` in Python) + `page.video()` records WebM (via `ffmpeg`) or MJPEG-in-AVI fallback; `expect(page | locator).toHaveScreenshot()` (`to_have_screenshot`) runs auto-retrying PNG pixel diffs with animation freezing and `FLUXWRIGHT_UPDATE_SNAPSHOTS=1`.
+- **Built-in test runners:** Node ships `fluxwright/test` (`test`, `expect`, `defineConfig`, `createFluxwrightFixtures` for `node:test`/Vitest) and the `fluxwright-test` CLI (parallel `--workers`, `--shard`, `--retries`, `--grep`, `--trace`, `--video`, `--screenshot`, HTML/JSON/list reporters). Python auto-loads a built-in `pytest` plugin (`pytest11`) providing `playwright`, `browser`, `context`, and `page` fixtures with failure artifacts.
+
+```ts
+// example.spec.mjs — run with: npx fluxwright-test --workers=4 --retries=1 --reporter=list,html
+import { test, expect } from "fluxwright/test";
+
+test.use({ trace: "retain-on-failure", video: "retain-on-failure" });
+
+test("homepage renders", async ({ page }) => {
+  await page.goto("https://example.com");
+  await expect(page).toHaveTitle(/Example/);
+  await expect(page.getByRole("heading")).toHaveText("Example Domain");
+  await expect(page).toHaveScreenshot("home.png");
+});
+```
+
+```python
+# test_example.py — run with: pytest --fluxwright-tracing=retain-on-failure
+from fluxwright.sync_api import Page, expect
+
+def test_homepage(page: Page) -> None:
+    page.goto("https://example.com")
+    expect(page).to_have_title("Example Domain")
+    expect(page.get_by_role("heading")).to_have_text("Example Domain")
+```
 
 ## What the fleet does
 
@@ -85,10 +120,10 @@ The full Node API is in [bindings/node/README.md](bindings/node/README.md) and t
 ## When to use Playwright instead
 
 - **Firefox or Safari (WebKit):** Fluxwright drives Chromium only.
-- **End-to-end tests:** Playwright Test gives you a runner, `expect`, fixtures, a trace viewer and a recorder. Fluxwright is an engine, not a test framework.
+- **Interactive GUI codegen or a hosted Trace Viewer UI:** Fluxwright includes `expect()`, `.zip` tracing (inspect with Playwright Trace Viewer), video recording, visual regression, `fluxwright/test`, and a `pytest` plugin, but has no interactive GUI recorder yet.
 - **Java or .NET:** Fluxwright has Node, Python and Rust.
 
-Use Fluxwright when you run many browser jobs, such as scraping, crawling, PDF and screenshot rendering, or automation at volume, and want the fleet handled for you.
+Use Fluxwright when you run many browser jobs — scraping, crawling, PDF and screenshot rendering, AI agent browsing, or parallel Chromium E2E test suites — and want the fleet handled for you.
 
 ## Speed
 
@@ -138,7 +173,7 @@ Requires Rust 1.95+ and Chrome or Chromium (found on the standard install paths,
 | `fluxwright-core` | Pool, scheduler, memory ceiling, recycling, metrics |
 | `fluxwright` | Public API |
 | `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `install` / `benchmark` / `serve` / `coordinate` |
-| `fluxwright-mcp` | 21-tool MCP server (`browser_*`: navigate, `@eN` accessibility snapshot, Markdown, tabs, cookies, storage, screenshots) |
+| `fluxwright-mcp` | 21-tool MCP server (`open`, `goto`, `back`, `forward`, `tabs`, `close`, `snapshot` with `@eN` refs, `markdown`, `title`, `content`, `click`, `hover`, `fill`, `press`, `select`, `scroll`, `wait_for`, `evaluate`, `console`, `network`, `screenshot`) |
 | `fluxwright-server` | Authenticated HTTP job API over one local or remote CDP fleet |
 
 ## MCP server

@@ -12,7 +12,7 @@ Requires a local Chrome/Chromium binary (`FLUXWRIGHT_CHROMIUM`, `CHROME`, `CHROM
 pip install fluxwright
 ```
 
-Wheels cover Windows x64, macOS (Intel and Apple Silicon) and Linux x86_64, for Python 3.10 and newer. Anywhere else, pip builds from source, which needs Rust.
+Wheels cover Windows x64, macOS (Intel and Apple Silicon), and Linux (x86_64 and ARM64/aarch64), for Python 3.10 and newer. Anywhere else, pip builds from source, which needs Rust.
 
 ## Use
 
@@ -71,10 +71,10 @@ The sync API runs every call on one event loop in a background thread, so its ob
 
 | Method | What it does |
 |---|---|
-| `chromium.launch(max_browsers=None, executable_path=None, headless=None, queue_timeout=None, memory_ceiling_mb=None, max_concurrency_per_host=None, min_delay_per_host=None)` | Start the pool: by default a browser per 4 CPUs with 8 pages each, and a memory budget (`memory_ceiling_mb`) of 75% of the memory free at launch: new pages wait while Chrome uses more. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executable_path` overrides. When every slot is busy, `new_page` waits its turn however long the queue is, so starting every job at once works; with `queue_timeout` (ms) it raises `TimeoutError` after that long instead, counting a browser start when one is needed. For polite crawling, `max_concurrency_per_host` caps the pages on one host at once across the fleet and `min_delay_per_host` (ms) spaces the `goto` calls to it: a `goto` waits its turn |
+| `chromium.launch(max_browsers=None, executable_path=None, headless=None, queue_timeout=None, memory_ceiling_mb=None, max_concurrency_per_host=None, min_delay_per_host=None, args=None, ignore_default_args=None, channel=None, prewarm_contexts=None)` | Start the pool: by default a browser per 4 CPUs with 8 pages each, and a memory budget (`memory_ceiling_mb`) of 75% of the memory free at launch: new pages wait while Chrome uses more. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM`, `executable_path`, or `channel` overrides. Customize Chromium flags with `args` / `ignore_default_args` and pre-warm blank slots with `prewarm_contexts`. When every slot is busy, `new_page` waits its turn however long the queue is, so starting every job at once works; with `queue_timeout` (ms) it raises `TimeoutError` after that long instead, counting a browser start when one is needed. For polite crawling, `max_concurrency_per_host` caps the pages on one host at once across the fleet and `min_delay_per_host` (ms) spaces the `goto` calls to it: a `goto` waits its turn |
 | `chromium.connect_over_cdp(endpoint_url)` | Connect to an already-running browser over CDP (`ws://...` or `http://...`) instead of launching local Chrome |
-| `browser.new_page(...)` | A fresh browser context. Every option applies to this page only: `proxy={"server", "bypass", "username", "password"}`, `user_agent`, `locale`, `timezone_id`, `geolocation={"latitude", "longitude", "accuracy"}` (with `permissions=["geolocation"]`), `permissions`, `viewport={"width", "height"}`, `device_scale_factor`, `color_scheme`, `is_mobile`, `has_touch`, `extra_http_headers`, `ignore_https_errors`, `java_script_enabled`, `offline`, `base_url`, `http_credentials={"username", "password"}`, `bypass_csp`, `storage_state` (a dict or a file path), `record_har_path`, `record_har_omit_content`, `record_har_content`, `record_har_mode`, `record_har_url_filter` |
-| `browser.new_context(...)` | A context with `new_page`'s options, as Playwright's `new_context`: multiple `context.new_page()` tabs and popups share cookies, storage, init scripts, exposed functions and routes; `pages`, `request` (`APIRequestContext`), `route` / `unroute`, `route_from_har`, `add_init_script`, `expose_function`, `storage_state(path=None, indexed_db=False)`, `cookies(urls=None)`, `add_cookies()`, `clear_cookies(name=None, domain=None, path=None)`, `new_cdp_session(page)`, `close()` |
+| `browser.new_page(...)` | A fresh browser context. Every option applies to this page only: `proxy={"server", "bypass", "username", "password"}`, `user_agent`, `locale`, `timezone_id`, `geolocation={"latitude", "longitude", "accuracy"}` (with `permissions=["geolocation"]`), `permissions`, `viewport={"width", "height"}`, `device_scale_factor`, `color_scheme`, `is_mobile`, `has_touch`, `extra_http_headers`, `ignore_https_errors`, `java_script_enabled`, `offline`, `base_url`, `http_credentials={"username", "password"}`, `bypass_csp`, `storage_state` (a dict or a file path), `record_har_path`, `record_har_omit_content`, `record_har_content`, `record_har_mode`, `record_har_url_filter`, `record_video_dir`, `record_video_size` |
+| `browser.new_context(...)` | A context with `new_page`'s options, as Playwright's `new_context`: multiple `context.new_page()` tabs and popups share cookies, storage, init scripts, exposed functions and routes; `pages`, `tracing`, `request` (`APIRequestContext`), `route` / `unroute`, `route_from_har`, `add_init_script`, `expose_function`, `storage_state(path=None, indexed_db=False)`, `cookies(urls=None)`, `add_cookies()`, `clear_cookies(name=None, domain=None, path=None)`, `new_cdp_session(page)`, `close()` |
 | `page.storage_state(path=None, indexed_db=False)` | Every cookie in the context plus localStorage (and IndexedDB when `indexed_db=True`) of the current origin, in Playwright's format. With `path`, also saved as JSON for `new_page(storage_state=path)` |
 | `page.goto(url, wait_until=None)` | Navigate. `wait_until`: `load` (default), `domcontentloaded`, `networkidle`, `commit` |
 | `page.title()` / `page.content()` | Read |
@@ -102,9 +102,50 @@ The sync API runs every call on one event loop in a background thread, so its ob
 | `page.set_viewport_size({"width", "height"})` | CSS-pixel viewport for this page |
 | `page.emulate_media(media=..., color_scheme=...)` | Changes CSS `media` (`"screen"` \| `"print"` \| `None`) and/or `prefers-color-scheme` (`"light"` \| `"dark"` \| `"no-preference"` \| `None`) |
 | `page.wait_for_selector(selector, state=None, timeout=None)` | Waits until `state`: `visible` (the default), `attached`, `hidden` or `detached`, as in Playwright |
+| `page.aria_snapshot(...)` / `page.markdown(...)` | Compact ARIA accessibility tree with short `@eN` interactive refs (`interactive_only`, `compact`, `max_depth`, `max_nodes`; pass `@eN` to `click` / `fill` / `locator`) and clean HTML-to-Markdown extraction (`selector`, `main_content_only`, `include_links`, `include_images`) |
+| `expect(page \| locator)` | Auto-retrying web-first assertions (`to_be_visible`, `to_be_hidden`, `to_be_attached`, `to_be_enabled`, `to_be_disabled`, `to_be_checked`, `to_be_editable`, `to_have_text`, `to_contain_text`, `to_have_value`, `to_have_attribute`, `to_have_class`, `to_have_count`, `to_have_title`, `to_have_url`, `to_have_screenshot`, `not_to_*`, plus `expect.soft` and `soft_assertions`) in both `fluxwright.async_api` and `fluxwright.sync_api` |
+| `context.tracing` | Playwright Trace Viewer-compatible `.zip` tracing (`start(name=..., title=..., screenshots=True, snapshots=True)`, `start_chunk()`, `stop_chunk(path=...)`, `stop(path=...)`) |
+| `page.video` | Handle for per-page video recording enabled via `record_video_dir` / `record_video_size` (`path()`, `save_as(path)`, `delete()`; WebM via `ffmpeg` or MJPEG-in-AVI fallback) |
 | `page.close()` / `browser.close()` | Dispose the context / shut down |
 
 Timeouts are in milliseconds, as in Playwright. `goto`, `click`, `fill`, `wait_for_selector`, `screenshot` and the locator actions take a per-call `timeout=` (0 for none), and `page.set_default_timeout(ms)` / `page.set_default_navigation_timeout(ms)` change the page's defaults (the engine's are 10 s for actions and 30 s for navigation). Errors are `fluxwright.Error`, and `fluxwright.TimeoutError` when something ran out of time.
+
+## End-to-end testing
+
+`fluxwright` ships auto-retrying `expect()`, Playwright Trace Viewer-compatible `.zip` tracing, video recording, visual screenshot regression, and an auto-loaded `pytest` plugin (`pytest11` entry point):
+
+```python
+# test_example.py — run with:
+# pytest --fluxwright-tracing=retain-on-failure --fluxwright-video=retain-on-failure
+from fluxwright.sync_api import Page, expect
+
+def test_homepage(page: Page) -> None:
+    page.goto("https://example.com")
+    expect(page).to_have_title("Example Domain")
+    expect(page.get_by_role("heading")).to_have_text("Example Domain")
+    expect(page).to_have_screenshot("home.png")  # --fluxwright-update-snapshots to update
+```
+
+Built-in `pytest` fixtures (`playwright`, `browser_type`, `browser`, `context`, `page`) reuse one pooled Chromium session and isolate each test in its own context. Useful CLI options: `--headed`, `--base-url`, `--fluxwright-max-browsers`, `--fluxwright-output`, `--fluxwright-screenshot`, `--fluxwright-tracing`, `--fluxwright-video`, and `--fluxwright-update-snapshots`.
+
+Standalone tracing and video recording work in both `sync_api` and `async_api`:
+
+```python
+from fluxwright.sync_api import expect, sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(max_browsers=2)
+    context = browser.new_context(record_video_dir="videos/")
+    context.tracing.start(screenshots=True, snapshots=True)
+    page = context.new_page()
+    page.goto("https://example.com")
+    expect(page.get_by_role("heading")).to_be_visible()
+    context.tracing.stop(path="trace.zip")  # open with: npx playwright show-trace trace.zip
+    video = page.video
+    context.close()  # finalizes the video file
+    video_path = video.path() if video else None
+    browser.close()
+```
 
 Close pages when a job is done, in a `finally`, so a job that raises gives its slot back too:
 

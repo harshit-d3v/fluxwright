@@ -12,13 +12,13 @@ napi would silently ignore an option the binding does not implement, so it throw
 
 - A per-call `timeout` on `title`, `content`, `evaluate`, `pdf` and `setViewportSize` (Playwright has none there either); `goto`, `click`, `dblclick`, `hover`, `focus`, `blur`, `scrollIntoViewIfNeeded`, `dragTo`, `dragAndDrop`, `fill`, `press`, `pressSequentially`, `clear`, `check`, `uncheck`, `setChecked`, `selectOption`, `setInputFiles`, `tap`, `waitForSelector`, `waitForFileChooser`, `screenshot` and the locator actions take one
 - Pointer/input options beyond the implemented subset (`noWaitAfter`, `sourcePosition` / `targetPosition` on `dragTo` / `dragAndDrop`)
-- Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and WebP (see `docs/DECISIONS.md`)
+- Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and `type: 'webp'` (WebP is supported in Rust and `fluxwright serve`, not yet exposed in Node `screenshot()`)
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)
-- `newPage` / `newContext` options the README does not list, and `launch` options other than the supported ones (`args`; for `proxy`, give `newPage` one)
+- `newPage` / `newContext` options the README does not list, and `launch` options other than the supported ones (`args`, `ignoreDefaultArgs`, `channel`, and `prewarmContexts` are supported; for `proxy`, pass it to `newPage` / `newContext`)
 - `page.route(url, handler, { times })`, `route.fallback(overrides)`, `page.close({ runBeforeUnload })`
 
 ## Out of scope
 
-- Firefox and WebKit
-- Playwright Test: the runner, fixtures and `expect`
-- Tracing, the trace viewer and codegen
+- Firefox and WebKit (Chromium only)
+- Trace viewer UI (Fluxwright writes Playwright-compatible `.zip` traces via `context.tracing` — inspect them with Playwright Trace Viewer)
+- Interactive GUI codegen
