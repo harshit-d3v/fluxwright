@@ -79,7 +79,8 @@ The full Node API is in [bindings/node/README.md](bindings/node/README.md) and t
 - **Recycling:** a browser restarts after a number of jobs, an age or a memory threshold, and finishes its running jobs first.
 - **Polite crawling:** a cap on the pages on one host at once and a minimum delay between navigations to it, kept across the whole fleet (`maxConcurrencyPerHost`, `minDelayPerHost`).
 - **Crash recovery:** a dead browser fails its jobs at once and they retry on a healthy one. Chrome is tied to the engine process, so it never outlives it.
-- **For AI agents:** an MCP server lets Claude, Codex or Cursor drive the fleet.
+- **Adaptive fleet control:** AIMD concurrency scaling under memory pressure or failures (`--adaptive-concurrency`), named persistent profiles (`--profiles-dir`), rotating proxy sessions with exponential cooldown (`--proxy`), pooled CDP WebSocket gateway (`GET /cdp`), and live `/dashboard` screencast with Human-in-the-Loop controls.
+- **For AI agents:** a 21-tool MCP server (`fluxwright-mcp`), `@eN` accessibility tree snapshots (`snapshot`), and clean Markdown extraction (`markdown`) let Claude, Codex or Cursor drive the fleet.
 
 ## When to use Playwright instead
 
@@ -137,7 +138,7 @@ Requires Rust 1.95+ and Chrome or Chromium (found on the standard install paths,
 | `fluxwright-core` | Pool, scheduler, memory ceiling, recycling, metrics |
 | `fluxwright` | Public API |
 | `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `install` / `benchmark` / `serve` / `coordinate` |
-| `fluxwright-mcp` | MCP server: open, goto, click, fill, evaluate, screenshot, close |
+| `fluxwright-mcp` | 21-tool MCP server (`browser_*`: navigate, `@eN` accessibility snapshot, Markdown, tabs, cookies, storage, screenshots) |
 | `fluxwright-server` | Authenticated HTTP job API over one local or remote CDP fleet |
 
 ## MCP server
