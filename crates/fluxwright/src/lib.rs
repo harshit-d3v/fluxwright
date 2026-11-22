@@ -14,8 +14,9 @@ pub use fluxwright_core::{
 pub use fluxwright_cdp::{
     download_to_file, fetch_url_bytes, filter_cookies, find_browser, find_channel, find_chrome,
     managed_browsers_dir, parse_modifiers, sweep_stale_profiles, url_glob_matches,
-    ApiRequestOptions, ApiResponse, BindingCall, BoundingBox, CdpSession, CdpSessionEvent,
-    CheckOptions, ClickOptions, Clip, ColorScheme, ConsoleMessage, Cookie, CookieFilter, Dialog,
+    ApiRequestOptions, ApiResponse, BindingCall, BoundingBox, CdpEvent, CdpSession,
+    CdpSessionEvent, CheckOptions, ClickOptions, Clip, ColorScheme, Connection, ConsoleMessage,
+    Cookie, CookieFilter, Dialog,
     Download, Emulation, FileChooser, FileInput, FilePayload, FrameInfo, Fulfill, Geolocation, Har,
     HarBrowser, HarContent, HarContentPolicy, HarCreator, HarEntry, HarHeader, HarLog, HarMode,
     HarNotFound, HarPostData, HarQueryParam, HarRecorder, HarRequest, HarResponse, HarRouteOptions,

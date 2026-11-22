@@ -425,6 +425,10 @@ pub struct CdpBrowser {
     /// any other context belong to someone else: attaching prepares their pages and our dialog
     /// and route handlers then answer theirs.
     contexts: Arc<Mutex<HashSet<String>>>,
+    /// Browser contexts delegated to external CDP gateway clients (not prepared by `CdpBrowser`).
+    external_contexts: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Sessions owned by external CDP gateway clients (child targets belong to those clients).
+    external_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Dedicated worker session_id -> (worker target_id, owning page worker registry).
     worker_sessions: Arc<std::sync::Mutex<HashMap<String, (String, Arc<std::sync::Mutex<WorkerRegistry>>)>>>,
 }
@@ -477,6 +481,8 @@ impl CdpBrowser {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            external_contexts: Default::default(),
+            external_sessions: Default::default(),
             worker_sessions: Default::default(),
         });
 
@@ -575,6 +581,8 @@ impl CdpBrowser {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            external_contexts: Default::default(),
+            external_sessions: Default::default(),
             worker_sessions: Default::default(),
         });
 
@@ -634,9 +642,42 @@ impl CdpBrowser {
         self.conn.is_dead()
     }
 
+    pub fn connection(&self) -> Arc<Connection> {
+        self.conn.clone()
+    }
+
+    pub fn mark_external_context(&self, ctx_id: &str) {
+        self.external_contexts
+            .lock()
+            .unwrap()
+            .insert(ctx_id.to_string());
+    }
+
+    pub fn unmark_external_context(&self, ctx_id: &str) {
+        self.external_contexts.lock().unwrap().remove(ctx_id);
+    }
+
+    pub fn mark_external_session(&self, session_id: &str) {
+        self.external_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string());
+    }
+
+    pub fn unmark_external_session(&self, session_id: &str) {
+        self.external_sessions.lock().unwrap().remove(session_id);
+    }
+
     async fn on_event(self: &Arc<Self>, ev: &CdpEvent) {
         match ev.method.as_str() {
             "Target.attachedToTarget" => {
+                if ev
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|s| self.external_sessions.lock().unwrap().contains(s))
+                {
+                    return;
+                }
                 let info = &ev.params["targetInfo"];
                 let target_id = info["targetId"].as_str().unwrap_or_default().to_string();
                 let session_id = ev.params["sessionId"]
@@ -650,6 +691,29 @@ impl CdpBrowser {
                 let opener_from_info = info["openerId"].as_str().map(|s| s.to_string());
                 let opener_frame = info["openerFrameId"].as_str().map(|s| s.to_string());
                 let waiting = ev.params["waitingForDebugger"].as_bool().unwrap_or(false);
+                if ctx
+                    .as_deref()
+                    .is_some_and(|c| self.external_contexts.lock().unwrap().contains(c))
+                {
+                    if waiting {
+                        let conn = self.conn.clone();
+                        tokio::spawn(async move {
+                            let t = Duration::from_secs(5);
+                            let _ = conn
+                                .call("Runtime.runIfWaitingForDebugger", json!({}), Some(&session_id), t)
+                                .await;
+                            let _ = conn
+                                .call(
+                                    "Target.detachFromTarget",
+                                    json!({ "sessionId": session_id }),
+                                    None,
+                                    t,
+                                )
+                                .await;
+                        });
+                    }
+                    return;
+                }
                 let already_attached = self.targets.lock().await.get(&target_id).is_some_and(|t| {
                     t.active_session_id.is_some()
                         && t.active_session_id.as_deref() != Some(session_id.as_str())
@@ -1001,6 +1065,7 @@ impl CdpBrowser {
             }
             "Target.detachedFromTarget" => {
                 if let Some(sid) = ev.params["sessionId"].as_str() {
+                    self.external_sessions.lock().unwrap().remove(sid);
                     let removed = self.worker_sessions.lock().unwrap().remove(sid);
                     if let Some((tid, workers)) = removed {
                         self.targets.lock().await.remove(&tid);
@@ -1478,6 +1543,7 @@ impl CdpBrowser {
 
     pub async fn dispose_context(&self, id: &ContextId) -> Result<()> {
         self.contexts.lock().await.remove(&id.0);
+        self.external_contexts.lock().unwrap().remove(&id.0);
         self.setups.lock().await.remove(&id.0);
         let removed_targets: Vec<String> = {
             let mut targets = self.targets.lock().await;
@@ -2611,6 +2677,8 @@ mod tests {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            external_contexts: Default::default(),
+            external_sessions: Default::default(),
             worker_sessions: Default::default(),
         };
 
@@ -2708,6 +2776,8 @@ mod tests {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            external_contexts: Default::default(),
+            external_sessions: Default::default(),
             worker_sessions: Default::default(),
         });
         let b = browser.clone();

@@ -65,6 +65,9 @@ enum Cmd {
         /// Extra CLI flags passed to Chromium on launch (repeatable).
         #[arg(long = "chromium-arg", allow_hyphen_values = true)]
         chromium_args: Vec<String>,
+        /// Accept `?token=<token>` on `/cdp` and `/json/version` for CDP clients that cannot send Bearer headers.
+        #[arg(long, default_value_t = false)]
+        allow_query_token: bool,
     },
     /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
     Coordinate {
@@ -153,6 +156,7 @@ async fn main() -> Result<()> {
             prewarm_contexts,
             channel,
             chromium_args,
+            allow_query_token,
         } => {
             let address = listen.unwrap_or_else(|| {
                 if join.is_some() {
@@ -176,6 +180,7 @@ async fn main() -> Result<()> {
                 prewarm_contexts,
                 channel,
                 chromium_args,
+                allow_query_token,
             )
             .await
         }
@@ -270,8 +275,11 @@ async fn http_daemon(
     prewarm_contexts: usize,
     channel: Option<String>,
     chromium_args: Vec<String>,
+    allow_query_token: bool,
 ) -> Result<()> {
-    let (token, config) = server_config(max_jobs, journal)?;
+    let (token, mut config) = server_config(max_jobs, journal)?;
+    config.allow_query_token = allow_query_token;
+    let is_worker = join.is_some();
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
     let mut builder = BrowserEngine::builder();
@@ -329,10 +337,11 @@ async fn http_daemon(
         None => None,
     };
     let server = HttpServer::new(engine, config)?;
-    eprintln!(
-        "fluxwright HTTP listening on http://{} (bearer authentication required)",
-        listener.local_addr()?
-    );
+    let bound = listener.local_addr()?;
+    eprintln!("fluxwright HTTP listening on http://{bound} (bearer authentication required)");
+    if !is_worker {
+        eprintln!("fluxwright CDP gateway listening on ws://{bound}/cdp");
+    }
     serve_http(listener, address, server, worker).await
 }
 
@@ -601,6 +610,7 @@ mod tests {
                 prewarm_contexts,
                 channel,
                 chromium_args,
+                allow_query_token,
             } => {
                 assert!(
                     max_per_host.is_none()
@@ -611,6 +621,7 @@ mod tests {
                         && channel.is_none()
                         && chromium_args.is_empty()
                 );
+                assert!(!allow_query_token);
                 assert_eq!(prewarm_contexts, 0);
                 assert_eq!(listen, Some("0.0.0.0:7331".parse::<SocketAddr>().unwrap()));
                 assert!(max_browsers.is_none());
@@ -630,6 +641,7 @@ mod tests {
             "chrome",
             "--chromium-arg",
             "--disable-gpu",
+            "--allow-query-token",
         ])
         .expect("serve launch/prewarm flags should parse");
         match custom.cmd {
@@ -637,11 +649,13 @@ mod tests {
                 prewarm_contexts,
                 channel,
                 chromium_args,
+                allow_query_token,
                 ..
             } => {
                 assert_eq!(prewarm_contexts, 2);
                 assert_eq!(channel.as_deref(), Some("chrome"));
                 assert_eq!(chromium_args, vec!["--disable-gpu"]);
+                assert!(allow_query_token);
             }
             _ => panic!("expected Cmd::Serve"),
         }

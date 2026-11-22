@@ -16,6 +16,8 @@ pub struct ServerMetrics {
     pub draining_workers: usize,
     pub stale_workers: usize,
     pub expired_leases: u64,
+    pub active_cdp_sessions: usize,
+    pub total_cdp_sessions: u64,
 }
 
 impl ServerMetrics {
@@ -174,6 +176,22 @@ impl ServerMetrics {
             self.expired_leases,
         );
 
+        write_metric(
+            &mut out,
+            "fluxwright_cdp_sessions_active",
+            "Number of currently connected pooled CDP WebSocket gateway sessions.",
+            "gauge",
+            self.active_cdp_sessions,
+        );
+
+        write_metric(
+            &mut out,
+            "fluxwright_cdp_sessions_total",
+            "Total number of pooled CDP WebSocket gateway sessions accepted.",
+            "counter",
+            self.total_cdp_sessions,
+        );
+
         out
     }
 }
@@ -229,6 +247,8 @@ mod tests {
             draining_workers: 1,
             stale_workers: 0,
             expired_leases: 3,
+            active_cdp_sessions: 2,
+            total_cdp_sessions: 7,
         };
 
         let text = metrics.to_prometheus_text();
@@ -245,5 +265,7 @@ mod tests {
         assert!(text.contains("fluxwright_cluster_workers{status=\"draining\"} 1\n"));
         assert!(text.contains("fluxwright_cluster_workers{status=\"stale\"} 0\n"));
         assert!(text.contains("fluxwright_cluster_lease_expirations_total 3\n"));
+        assert!(text.contains("fluxwright_cdp_sessions_active 2\n"));
+        assert!(text.contains("fluxwright_cdp_sessions_total 7\n"));
     }
 }
