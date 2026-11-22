@@ -18,7 +18,7 @@ use axum::Json;
 use fluxwright::{Connection, ContextLease, JobOptions, Priority, ResourcePreset};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinSet;
 
 use crate::{ApiError, Inner};
@@ -308,6 +308,7 @@ struct GatewayState {
     owned_targets: HashSet<String>,
     owned_sessions: HashMap<String, String>,
     auto_attached_targets: HashSet<String>,
+    auto_attach_waiters: HashMap<String, watch::Receiver<bool>>,
     discover_targets: bool,
     auto_attach: bool,
     live_target: Arc<std::sync::Mutex<Option<String>>>,
@@ -329,6 +330,7 @@ impl GatewayState {
             owned_targets: HashSet::new(),
             owned_sessions: HashMap::new(),
             auto_attached_targets: HashSet::new(),
+            auto_attach_waiters: HashMap::new(),
             discover_targets: false,
             auto_attach: false,
             live_target,
@@ -445,13 +447,13 @@ async fn run_gateway(
                             continue;
                         };
                         let ctx_id = info["browserContextId"].as_str();
-                        let (owned, discover, should_attach) = {
+                        let (owned, discover, attach_tx) = {
                             let mut g = state.lock().await;
                             let is_ours = ctx_id
                                 .is_some_and(|c| g.allowed_contexts.contains(c))
                                 || g.owned_targets.contains(tid);
                             if !is_ours {
-                                (false, false, false)
+                                (false, false, None)
                             } else {
                                 g.owned_targets.insert(tid.to_string());
                                 let ty = info["type"].as_str().unwrap_or("");
@@ -466,11 +468,18 @@ async fn run_gateway(
                                         }
                                     }
                                 }
-                                let attach = ev.method == "Target.targetCreated"
+                                let attach_tx = if ev.method == "Target.targetCreated"
                                     && g.auto_attach
                                     && matches!(ty, "page" | "iframe" | "worker")
-                                    && g.auto_attached_targets.insert(tid.to_string());
-                                (true, g.discover_targets, attach)
+                                    && g.auto_attached_targets.insert(tid.to_string())
+                                {
+                                    let (tx, rx) = watch::channel(false);
+                                    g.auto_attach_waiters.insert(tid.to_string(), rx);
+                                    Some(tx)
+                                } else {
+                                    None
+                                };
+                                (true, g.discover_targets, attach_tx)
                             }
                         };
                         if !owned {
@@ -479,7 +488,7 @@ async fn run_gateway(
                         if discover {
                             send_event(&out_tx, &ev.method, &ev.params, None);
                         }
-                        if should_attach {
+                        if let Some(tx) = attach_tx {
                             let conn = conn.clone();
                             let state = state.clone();
                             let lease = lease.clone();
@@ -496,6 +505,8 @@ async fn run_gateway(
                                     Some(info),
                                 )
                                 .await;
+                                state.lock().await.auto_attach_waiters.remove(&tid);
+                                let _ = tx.send(true);
                             });
                         }
                     }
@@ -507,6 +518,7 @@ async fn run_gateway(
                             let mut g = state.lock().await;
                             let was_owned = g.owned_targets.remove(tid);
                             g.auto_attached_targets.remove(tid);
+                            g.auto_attach_waiters.remove(tid);
                             let mut slot = g.live_target.lock().unwrap();
                             if slot.as_deref() == Some(tid) {
                                 *slot = None;
@@ -806,7 +818,12 @@ async fn handle_browser_command(
                 .await
             {
                 Ok(Ok(result)) => {
-                    let maybe_attach = if let Some(tid) = result["targetId"].as_str() {
+                    enum PostCreateAttach {
+                        AttachNow(String),
+                        WaitFor(watch::Receiver<bool>),
+                        None,
+                    }
+                    let post_attach = if let Some(tid) = result["targetId"].as_str() {
                         let mut g = state.lock().await;
                         g.owned_targets.insert(tid.to_string());
                         {
@@ -815,18 +832,36 @@ async fn handle_browser_command(
                                 *slot = Some(tid.to_string());
                             }
                         }
-                        if g.auto_attach && g.auto_attached_targets.insert(tid.to_string()) {
-                            Some(tid.to_string())
+                        if g.auto_attach {
+                            if g.auto_attached_targets.insert(tid.to_string()) {
+                                PostCreateAttach::AttachNow(tid.to_string())
+                            } else if let Some(rx) = g.auto_attach_waiters.get(tid).cloned() {
+                                PostCreateAttach::WaitFor(rx)
+                            } else {
+                                PostCreateAttach::None
+                            }
                         } else {
-                            None
+                            PostCreateAttach::None
                         }
                     } else {
-                        None
+                        PostCreateAttach::None
                     };
-                    send_result(out_tx, id, None, result);
-                    if let Some(tid) = maybe_attach {
-                        let _ = attach_target(conn, state, lease, out_tx, &tid, None).await;
+                    // Emit `Target.attachedToTarget` before the `Target.createTarget` result so
+                    // clients like Playwright `connectOverCDP` already have the page session registered.
+                    match post_attach {
+                        PostCreateAttach::AttachNow(tid) => {
+                            let _ = attach_target(conn, state, lease, out_tx, &tid, None).await;
+                        }
+                        PostCreateAttach::WaitFor(mut rx) => {
+                            while !*rx.borrow() {
+                                if rx.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        PostCreateAttach::None => {}
                     }
+                    send_result(out_tx, id, None, result);
                 }
                 other => relay_call_result(out_tx, id, None, other),
             }
@@ -849,22 +884,8 @@ async fn handle_browser_command(
                 send_error(out_tx, id, None, -32602, "missing targetId");
                 return;
             };
-            match verify_target_owned(conn, state, &tid).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    send_error(
-                        out_tx,
-                        id,
-                        None,
-                        -32000,
-                        "targetId not owned by this CDP lease",
-                    );
-                    return;
-                }
-                Err(e) => {
-                    send_error(out_tx, id, None, -32000, &e);
-                    return;
-                }
+            if !ensure_target_owned(conn, state, out_tx, id, &tid).await {
+                return;
             }
             match attach_target(conn, state, lease, out_tx, &tid, None).await {
                 Ok(sid) => send_result(out_tx, id, None, json!({ "sessionId": sid })),
@@ -898,29 +919,37 @@ async fn handle_browser_command(
                 .await;
             relay_call_result(out_tx, id, None, res);
         }
-        "Target.closeTarget" | "Target.activateTarget" | "Target.getTargetInfo" => {
+        "Target.closeTarget" | "Target.activateTarget" => {
             let Some(tid) = params["targetId"].as_str().map(str::to_owned) else {
                 send_error(out_tx, id, None, -32602, "missing targetId");
                 return;
             };
-            match verify_target_owned(conn, state, &tid).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    send_error(
-                        out_tx,
-                        id,
-                        None,
-                        -32000,
-                        "targetId not owned by this CDP lease",
-                    );
-                    return;
-                }
-                Err(e) => {
-                    send_error(out_tx, id, None, -32000, &e);
-                    return;
-                }
+            if !ensure_target_owned(conn, state, out_tx, id, &tid).await {
+                return;
             }
             let res = conn.call_raw(method, params, None, CDP_CMD_TIMEOUT).await;
+            relay_call_result(out_tx, id, None, res);
+        }
+        "Target.getTargetInfo" => {
+            let tid = match parse_optional_target_id(&params) {
+                Ok(tid) => tid.map(str::to_owned),
+                Err(msg) => {
+                    send_error(out_tx, id, None, -32602, msg);
+                    return;
+                }
+            };
+            let forward_params = if let Some(tid) = tid.as_deref() {
+                if !ensure_target_owned(conn, state, out_tx, id, tid).await {
+                    return;
+                }
+                params
+            } else {
+                // Omitted targetId queries the browser target itself (used by Playwright connectOverCDP).
+                json!({})
+            };
+            let res = conn
+                .call_raw("Target.getTargetInfo", forward_params, None, CDP_CMD_TIMEOUT)
+                .await;
             relay_call_result(out_tx, id, None, res);
         }
         "Target.setDiscoverTargets" => {
@@ -1045,6 +1074,40 @@ async fn filter_and_record_targets(
         }
     }
     out
+}
+
+fn parse_optional_target_id(params: &Value) -> Result<Option<&str>, &'static str> {
+    match params.get("targetId") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(tid)) => Ok(Some(tid.as_str())),
+        Some(_) => Err("invalid targetId"),
+    }
+}
+
+async fn ensure_target_owned(
+    conn: &Arc<Connection>,
+    state: &Arc<Mutex<GatewayState>>,
+    out_tx: &mpsc::UnboundedSender<Message>,
+    id: Option<&Value>,
+    target_id: &str,
+) -> bool {
+    match verify_target_owned(conn, state, target_id).await {
+        Ok(true) => true,
+        Ok(false) => {
+            send_error(
+                out_tx,
+                id,
+                None,
+                -32000,
+                "targetId not owned by this CDP lease",
+            );
+            false
+        }
+        Err(e) => {
+            send_error(out_tx, id, None, -32000, &e);
+            false
+        }
+    }
 }
 
 async fn verify_target_owned(
@@ -1386,5 +1449,20 @@ mod tests {
 
         srv_qt.shutdown(Duration::from_secs(2)).await.unwrap();
         let _ = mock.await;
+    }
+
+    #[test]
+    fn optional_target_id_parses_browser_and_target_queries() {
+        assert_eq!(parse_optional_target_id(&json!({})), Ok(None));
+        assert_eq!(parse_optional_target_id(&json!(null)), Ok(None));
+        assert_eq!(parse_optional_target_id(&json!({ "targetId": null })), Ok(None));
+        assert_eq!(
+            parse_optional_target_id(&json!({ "targetId": "T-1" })),
+            Ok(Some("T-1"))
+        );
+        assert_eq!(
+            parse_optional_target_id(&json!({ "targetId": 123 })),
+            Err("invalid targetId")
+        );
     }
 }
