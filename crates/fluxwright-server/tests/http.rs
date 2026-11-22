@@ -1195,3 +1195,48 @@ async fn cdp_gateway_isolates_concurrent_clients_and_blocks_escape() {
     server.shutdown(Duration::from_secs(5)).await.unwrap();
     srv_handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn executes_snapshot_and_markdown_steps() {
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            axum::response::Html(concat!(
+                "<!doctype html><header><a href='/nav'>Skip</a></header>",
+                "<main><h1>Server AI</h1><p style='display:none'>Hidden</p>",
+                "<button>Run</button></main>"
+            ))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let srv_handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let server = server().await;
+    let sub = submit(
+        &server,
+        json!({
+            "steps": [
+                { "action": "goto", "url": base },
+                { "action": "snapshot", "interactive_only": true },
+                { "action": "markdown", "main_content_only": true }
+            ]
+        }),
+    )
+    .await;
+
+    let job = finish(&server, sub).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+    let results = job.results.unwrap();
+    let snap = &results[1];
+    assert!(snap["tree"].as_str().unwrap_or("").contains("button \"Run\""), "{snap}");
+    let first_ref = &snap["refs"].as_array().unwrap()[0];
+    assert!(first_ref.get("backend_node_id").is_none(), "{first_ref}");
+    let md = results[2].as_str().unwrap();
+    assert!(md.contains("# Server AI"), "{md}");
+    assert!(!md.contains("Hidden"), "{md}");
+    assert!(!md.contains("Skip"), "{md}");
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_handle.abort();
+}

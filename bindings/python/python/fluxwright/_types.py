@@ -66,3 +66,15 @@ class FilePayload(TypedDict):
     name: str
     mimeType: str
     buffer: bytes
+
+
+class AriaRef(TypedDict):
+    id: str
+    role: str
+    name: str
+
+
+class AriaSnapshot(TypedDict):
+    tree: str
+    refs: list[AriaRef]
+    truncated: bool

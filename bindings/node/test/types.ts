@@ -13,10 +13,21 @@ export async function typed(): Promise<void> {
   const png: Buffer = await page.screenshot({ fullPage: true })
   const jpeg: Buffer = await page.screenshot({ type: 'jpeg', quality: 80, clip: { x: 0, y: 0, width: 10, height: 10 } })
   const pdf: Buffer = await page.pdf({ format: 'A4', margin: { top: '1cm', left: 20 }, printBackground: true, path: 'p.pdf' })
+  const snap = await page.ariaSnapshot()
+  const snapInteractive = await page.ariaSnapshot({ interactiveOnly: true, compact: true, maxDepth: 4, maxNodes: 500 })
+  const snapCheck: [string, string, string, string, boolean] = [
+    snap.tree,
+    snapInteractive.refs[0].id,
+    snapInteractive.refs[0].role,
+    snapInteractive.refs[0].name,
+    snap.truncated,
+  ]
+  const md1: string = await page.markdown()
+  const md2: string = await page.markdown({ selector: 'main', mainContentOnly: true, includeLinks: false, includeImages: true })
   // @ts-expect-error webp is not a screenshot type
   await page.screenshot({ type: 'webp' })
   await fluxwright.chromium.launch()
-  void [title, sum, upper, expression, wrong, png, jpeg, pdf]
+  void [title, sum, upper, expression, wrong, png, jpeg, pdf, snapCheck, md1, md2]
 
   const state: StorageState = await page.storageState({ path: 'state.json' })
   await browser.newPage({ storageState: state, locale: 'de-DE', colorScheme: 'dark', permissions: ['geolocation'] })

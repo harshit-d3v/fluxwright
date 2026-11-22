@@ -1504,6 +1504,63 @@ try {
     }
   }
 
+  // AI snapshots (@eN refs) and clean Markdown extraction
+  {
+    const aiSrv = http.createServer((req, res) => {
+      res.setHeader('Content-Type', 'text/html')
+      if (req.url === '/next') {
+        return res.end('<title>Next</title><p>Done</p>')
+      }
+      res.end(
+        '<title>AI Fixture</title>' +
+          '<header><a href="/about">Nav</a></header>' +
+          '<main>' +
+          '<h1>Welcome</h1>' +
+          '<p>Read <a href="https://example.com/docs">the docs</a> carefully.</p>' +
+          '<span style="display:none">SECRET HIDDEN TEXT</span>' +
+          '<ul><li>Alpha</li><li>Beta</li></ul>' +
+          '<pre><code>const x = 1;</code></pre>' +
+          '<table><tr><th>K</th><th>V</th></tr><tr><td>a</td><td>1</td></tr></table>' +
+          '<label for="name">Name</label><input id="name" aria-label="Name" type="text">' +
+          '<button onclick="document.getElementById(\'out\').textContent = document.getElementById(\'name\').value">Apply</button>' +
+          '<div id="out"></div>' +
+          '</main>',
+      )
+    })
+    await new Promise((resolve) => aiSrv.listen(0, '127.0.0.1', resolve))
+    const aiBase = `http://127.0.0.1:${aiSrv.address().port}`
+    const aiPage = await browser.newPage()
+    try {
+      await aiPage.goto(aiBase)
+      const fullSnap = await aiPage.ariaSnapshot()
+      assert.match(fullSnap.tree, /heading "Welcome"/)
+      assert.ok(fullSnap.refs.some((r) => r.role === 'button' && r.name === 'Apply'))
+
+      const snap = await aiPage.ariaSnapshot({ interactiveOnly: true })
+      const inputRef = snap.refs.find((r) => r.role === 'textbox' && r.name === 'Name')
+      const btnRef = snap.refs.find((r) => r.role === 'button' && r.name === 'Apply')
+      assert.ok(inputRef && btnRef)
+      await aiPage.fill(`@${inputRef.id}`, 'hello')
+      await aiPage.click(`ref=${btnRef.id}`)
+      assert.equal(await aiPage.textContent('#out'), 'hello')
+
+      const md = await aiPage.markdown({ mainContentOnly: true })
+      assert.match(md, /^# Welcome/m)
+      assert.match(md, /\[the docs\]\(https:\/\/example\.com\/docs\)/)
+      assert.match(md, /- Alpha/)
+      assert.match(md, /```\nconst x = 1;\n```/)
+      assert.match(md, /\| K \| V \|/)
+      assert.ok(!md.includes('SECRET HIDDEN TEXT'))
+      assert.ok(!md.includes('[Nav]'))
+
+      await aiPage.goto(`${aiBase}/next`)
+      await assert.rejects(() => aiPage.click(`@${btnRef.id}`), /unknown element ref|stale/)
+    } finally {
+      await aiPage.close()
+      aiSrv.close()
+    }
+  }
+
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
 } finally {

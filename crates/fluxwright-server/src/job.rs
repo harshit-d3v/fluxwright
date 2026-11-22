@@ -3,8 +3,8 @@ use std::time::Duration;
 use base64::Engine;
 use fluxwright::{
     netguard, parse_modifiers, CheckOptions, ClickOptions, Clip, HoverOptions, ImageFormat,
-    JobOptions, MouseButton, PageLease, PdfMargin, PdfOptions, Priority, ResourcePreset,
-    ResourceType, ScreenshotOptions, SelectEntry, WaitUntil,
+    JobOptions, MarkdownOptions, MouseButton, PageLease, PdfMargin, PdfOptions, Priority,
+    ResourcePreset, ResourceType, ScreenshotOptions, SelectEntry, SnapshotOptions, WaitUntil,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -85,6 +85,10 @@ impl ServerResourceType {
 
 fn default_timeout() -> u64 {
     60_000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -251,6 +255,21 @@ impl JobRequest {
                 }
                 Step::AddStyleTag { url, content } => {
                     validate_tag_source("add_style_tag", url.as_deref(), content.as_deref())?;
+                }
+                Step::Title {} => {}
+                Step::Content {} => {}
+                Step::Snapshot { max_depth, max_nodes, .. } => {
+                    if max_depth.is_some_and(|d| d == 0 || d > 64) {
+                        return Err("max_depth must be between 1 and 64".into());
+                    }
+                    if max_nodes.is_some_and(|n| n == 0 || n > 5000) {
+                        return Err("max_nodes must be between 1 and 5000".into());
+                    }
+                }
+                Step::Markdown { selector, .. } => {
+                    if let Some(sel) = selector {
+                        validate_selector(sel)?;
+                    }
                 }
                 Step::Screenshot { .. } => {
                     step.screenshot_options().and_then(|o| o.validate().map_err(|e| e.to_string()))?;
@@ -556,6 +575,26 @@ pub enum Step {
     },
     Title {},
     Content {},
+    Snapshot {
+        #[serde(default)]
+        interactive_only: bool,
+        #[serde(default = "default_true")]
+        compact: bool,
+        #[serde(default)]
+        max_depth: Option<usize>,
+        #[serde(default)]
+        max_nodes: Option<usize>,
+    },
+    Markdown {
+        #[serde(default)]
+        selector: Option<String>,
+        #[serde(default)]
+        main_content_only: bool,
+        #[serde(default = "default_true")]
+        include_links: bool,
+        #[serde(default)]
+        include_images: bool,
+    },
     Screenshot {
         #[serde(default)]
         full_page: bool,
@@ -1175,6 +1214,40 @@ impl Step {
             }
             Step::Title {} => Ok(Value::String(page.title().await?)),
             Step::Content {} => Ok(Value::String(page.content().await?)),
+            Step::Snapshot {
+                interactive_only,
+                compact,
+                max_depth,
+                max_nodes,
+            } => {
+                let mut opts = SnapshotOptions {
+                    interactive_only: *interactive_only,
+                    compact: *compact,
+                    max_depth: *max_depth,
+                    ..Default::default()
+                };
+                if let Some(limit) = max_nodes {
+                    opts.max_nodes = *limit;
+                }
+                let snap = page.aria_snapshot_with(&opts).await?;
+                Ok(serde_json::to_value(snap).unwrap_or(Value::Null))
+            }
+            Step::Markdown {
+                selector,
+                main_content_only,
+                include_links,
+                include_images,
+            } => {
+                let md = page
+                    .markdown_with(&MarkdownOptions {
+                        selector: selector.clone(),
+                        main_content_only: *main_content_only,
+                        include_links: *include_links,
+                        include_images: *include_images,
+                    })
+                    .await?;
+                Ok(Value::String(md))
+            }
             Step::Screenshot { kind, .. } => {
                 let opts = self.screenshot_options().map_err(fluxwright::Error::Other)?;
                 let bytes = page.screenshot_with(&opts).await?;
@@ -1232,6 +1305,8 @@ impl Step {
             Step::AddStyleTag { .. } => "add_style_tag",
             Step::Title {} => "title",
             Step::Content {} => "content",
+            Step::Snapshot { .. } => "snapshot",
+            Step::Markdown { .. } => "markdown",
             Step::Screenshot { .. } => "screenshot",
             Step::Pdf { .. } => "pdf",
         }
@@ -1517,5 +1592,23 @@ mod tests {
         }
         assert!(serde_json::from_value::<Step>(json!({ "action": "pdf", "format": "A4", "width": 800, "margin": { "top": "10mm", "left": 24 } })).is_ok());
         assert!(serde_json::from_value::<Step>(json!({ "action": "pdf", "margin": { "bogus": 1 } })).is_err());
+
+        assert!(serde_json::from_value::<JobRequest>(json!({
+            "steps": [
+                { "action": "snapshot", "interactive_only": true, "max_depth": 4, "max_nodes": 500 },
+                { "action": "markdown", "main_content_only": true, "include_images": true }
+            ]
+        }))
+        .unwrap()
+        .validate()
+        .is_ok());
+        for bad in [
+            json!({ "steps": [{ "action": "snapshot", "max_depth": 0 }] }),
+            json!({ "steps": [{ "action": "snapshot", "max_nodes": 5001 }] }),
+            json!({ "steps": [{ "action": "markdown", "selector": "   " }] }),
+        ] {
+            let job: JobRequest = serde_json::from_value(bad).unwrap();
+            assert!(job.validate().is_err());
+        }
     }
 }

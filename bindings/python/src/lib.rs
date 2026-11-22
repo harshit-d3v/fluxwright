@@ -1918,6 +1918,52 @@ impl Page {
         run(py, &self.lease, |p| Box::pin(p.content()))
     }
 
+    #[pyo3(signature = (*, interactive_only=None, compact=None, max_depth=None, max_nodes=None))]
+    fn aria_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        interactive_only: Option<bool>,
+        compact: Option<bool>,
+        max_depth: Option<usize>,
+        max_nodes: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut opts = fluxwright::SnapshotOptions {
+            interactive_only: interactive_only.unwrap_or(false),
+            compact: compact.unwrap_or(true),
+            max_depth,
+            ..Default::default()
+        };
+        if let Some(limit) = max_nodes {
+            opts.max_nodes = limit;
+        }
+        run(py, &self.lease, move |p| {
+            Box::pin(async move {
+                let snap = p.aria_snapshot_with(&opts).await?;
+                Ok(Json(serde_json::to_value(snap).unwrap_or_default()))
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, selector=None, main_content_only=None, include_links=None, include_images=None))]
+    fn markdown<'py>(
+        &self,
+        py: Python<'py>,
+        selector: Option<String>,
+        main_content_only: Option<bool>,
+        include_links: Option<bool>,
+        include_images: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = fluxwright::MarkdownOptions {
+            selector,
+            main_content_only: main_content_only.unwrap_or(false),
+            include_links: include_links.unwrap_or(true),
+            include_images: include_images.unwrap_or(false),
+        };
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.markdown_with(&opts).await })
+        })
+    }
+
     #[pyo3(signature = (
         selector,
         *,

@@ -179,6 +179,8 @@ export declare class Page {
   _waitForFunction(expression: string, pollingMs?: number | undefined | null, timeout?: number | undefined | null): Promise<any>
   title(): Promise<string>
   content(): Promise<string>
+  ariaSnapshot(options?: AriaSnapshotOptions | undefined | null): Promise<AriaSnapshot>
+  markdown(options?: MarkdownOptions | undefined | null): Promise<string>
   evaluate(expression: string): Promise<any>
   screenshot(options?: ScreenshotOptions | undefined | null): Promise<Buffer>
   /** The page printed to PDF (headless only). */
@@ -322,6 +324,25 @@ export interface ApiResponseData {
   statusText: string
   headers: Array<HeaderEntry>
   body: Buffer
+}
+
+export interface AriaRef {
+  id: string
+  role: string
+  name: string
+}
+
+export interface AriaSnapshot {
+  tree: string
+  refs: Array<AriaRef>
+  truncated: boolean
+}
+
+export interface AriaSnapshotOptions {
+  interactiveOnly?: boolean
+  compact?: boolean
+  maxDepth?: number
+  maxNodes?: number
 }
 
 export interface BindingCallEvent {
@@ -511,6 +532,13 @@ export interface LogEvent {
   event: string
   message?: ConsoleMessage
   error?: PageErrorInfo
+}
+
+export interface MarkdownOptions {
+  selector?: string
+  mainContentOnly?: boolean
+  includeLinks?: boolean
+  includeImages?: boolean
 }
 
 /** One network event, for `page.on`. */
