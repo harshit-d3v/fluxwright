@@ -13,7 +13,7 @@ members = [
 exclude = ["bindings/node", "bindings/python"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/harshit-d3v/fluxwright"
@@ -23,10 +23,10 @@ keywords = ["chromium", "cdp", "browser", "automation", "headless"]
 categories = ["web-programming", "asynchronous"]
 
 [workspace.dependencies]
-fluxwright-cdp = { path = "crates/fluxwright-cdp", version = "0.9.0" }
-fluxwright-core = { path = "crates/fluxwright-core", version = "0.9.0" }
-fluxwright = { path = "crates/fluxwright", version = "0.9.0" }
-fluxwright-server = { path = "crates/fluxwright-server", version = "0.9.0" }
+fluxwright-cdp = { path = "crates/fluxwright-cdp", version = "0.10.0" }
+fluxwright-core = { path = "crates/fluxwright-core", version = "0.10.0" }
+fluxwright = { path = "crates/fluxwright", version = "0.10.0" }
+fluxwright-server = { path = "crates/fluxwright-server", version = "0.10.0" }
 benchmark-server = { path = "benchmark-server" }
 
 tokio = { version = "1.47", features = ["full"] }

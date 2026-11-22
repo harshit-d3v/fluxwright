@@ -1,6 +1,6 @@
 # Many machines (experimental cluster mode)
 
-Status: experimental in `0.7.0` (hardened in `0.9.0` with separate `FLUXWRIGHT_WORKER_TOKEN` isolation, native `https://` TLS support on `--join`, SQLite durable job store `--store`, and coordinator-wide per-host limits `--max-per-host` / `--min-host-delay-ms`). Remaining item: multi-coordinator HA.
+Status: experimental in `0.7.0` (hardened in `0.9.0` with separate `FLUXWRIGHT_WORKER_TOKEN` isolation and native `https://` TLS support on `--join`, and in `0.10.0` with SQLite durable job store `--store` and coordinator-wide per-host limits `--max-per-host` / `--min-host-delay-ms`). Remaining item: multi-coordinator HA.
 
 ## Goal
 
@@ -58,9 +58,9 @@ Side effects can repeat. A job that clicked "buy" and then lost its worker, hit 
 
 ## Current limits vs planned hardening
 
-Implemented in `0.7.0` (experimental) and hardened in `0.9.0`:
-- One coordinator process with bounded job ring (`--max-jobs`), optional `--journal` JSONL replay for unfinished jobs, or `--store <FILE>` SQLite WAL persistence retaining both unfinished jobs and finished job results for `--result-ttl-secs` (default `3600`, newest finished results reloaded up to `--max-jobs`).
-- Pull-based leases (`POST /v1/workers/{worker}/lease`), priority + FIFO ordering, coordinator-wide `--max-per-host` concurrency and `--min-host-delay-ms` rate limiting without head-of-line blocking, 2 MiB batch size cap per lease response, 30 s lease expiration/requeue, dedicated 10 s heartbeat task (`POST /v1/workers/{worker}/heartbeat`), cancellation propagation, `409 Conflict` rejection on late worker results (`POST /v1/jobs/{id}/result`), and graceful worker drain with post-grace `POST /v1/workers/{worker}/release` back into `queued` without counting an attempt.
+Implemented in `0.7.0` (experimental) and hardened in `0.9.0`–`0.10.0`:
+- One coordinator process with bounded job ring (`--max-jobs`), optional `--journal` JSONL replay for unfinished jobs (`0.7.0`), or `--store <FILE>` SQLite WAL persistence retaining both unfinished jobs and finished job results for `--result-ttl-secs` (`0.10.0`, default `3600`, newest finished results reloaded up to `--max-jobs`).
+- Pull-based leases (`POST /v1/workers/{worker}/lease`), priority + FIFO ordering, coordinator-wide `--max-per-host` concurrency and `--min-host-delay-ms` rate limiting without head-of-line blocking (`0.10.0`), 2 MiB batch size cap per lease response, 30 s lease expiration/requeue, dedicated 10 s heartbeat task (`POST /v1/workers/{worker}/heartbeat`), cancellation propagation, `409 Conflict` rejection on late worker results (`POST /v1/jobs/{id}/result`), and graceful worker drain with post-grace `POST /v1/workers/{worker}/release` back into `queued` without counting an attempt.
 - Separate `FLUXWRIGHT_WORKER_TOKEN` bearer authentication isolating worker pull/result endpoints from client job/operator endpoints, plus native `https://` TLS support (`rustls` + WebPKI roots) on `fluxwright serve --join` (`0.9.0`).
 
 Planned for later versions:
