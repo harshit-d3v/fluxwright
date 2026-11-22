@@ -10,6 +10,15 @@ import fluxwright, {
   type Tracing,
   type Video,
 } from '../addon'
+import fluxwrightPkg, { chromium as pkgChromium, expect as pkgExpect } from 'fluxwright'
+import {
+  test,
+  expect as runnerExpect,
+  createFluxwrightFixtures,
+  defineConfig,
+  type FluxwrightFixtures,
+  type TestInfo,
+} from 'fluxwright/test'
 
 export async function typed(): Promise<void> {
   const browser = await chromium.launch({ maxBrowsers: 2 })
@@ -310,4 +319,65 @@ export async function typed(): Promise<void> {
 
   await context.close()
   await browser.close()
+}
+
+export function typedRunner(): void {
+  const pkgCheck = [fluxwrightPkg.chromium, pkgChromium, pkgExpect]
+  void pkgCheck
+
+  const cfg = defineConfig({
+    workers: 2,
+    retries: 1,
+    reporter: ['list', 'html'],
+    use: { baseURL: 'https://example.com', screenshot: 'only-on-failure' },
+  })
+  void cfg
+
+  test.use({ baseURL: 'https://example.com', screenshot: 'only-on-failure', trace: 'retain-on-failure', video: 'retain-on-failure' })
+  // @ts-expect-error bogus option is not allowed in test.use
+  test.use({ bogusUseOption: 1 })
+
+  test.describe('suite', () => {
+    test.beforeAll(async ({ browser }) => {
+      if (browser) void browser
+    })
+    test.afterAll(async ({ browser }) => {
+      if (browser) void browser
+    })
+    test.beforeEach(async ({ page, baseURL }) => {
+      void baseURL
+      await page.goto('/')
+    })
+    test.afterEach(async ({ context }) => {
+      void context.pages()
+    })
+
+    test('basic runner test', async ({ page, context, browser }, info: TestInfo) => {
+      void [context, browser, info.outputPath('shot.png')]
+      await runnerExpect(page).toHaveTitle('Home')
+      await runnerExpect(page.locator('#btn')).toBeVisible()
+      runnerExpect(1 + 1).toBe(2)
+      runnerExpect(['a', 'b']).toContain('a')
+      await runnerExpect.configure({ timeout: 500 })(page).toHaveURL(/example/)
+      // @ts-expect-error toBeVisible is only on LocatorAssertions, not PageAssertions
+      await runnerExpect(page).toBeVisible()
+      if (false) test.skip(true, 'conditional skip')
+    })
+
+    test.only('focused test', async ({ page }) => {
+      await test.expect(page).toHaveURL('https://example.com')
+    })
+
+    test.skip('skipped test', async () => {})
+  })
+
+  test.describe.only('only suite', () => {})
+  test.describe.skip('skipped suite', () => {})
+
+  const fx: FluxwrightFixtures = createFluxwrightFixtures({ maxBrowsers: 2, baseURL: 'https://example.com' })
+  void fx.vitest
+  void fx.withPage(async ({ page, context, browser }) => {
+    void [page, context, browser]
+  })
+  void fx.acquire({ name: 'node:test example' }).then(({ page, dispose }) => dispose(false))
 }

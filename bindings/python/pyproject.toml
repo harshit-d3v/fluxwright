@@ -31,6 +31,9 @@ Homepage = "https://fluxwright.vercel.app"
 Repository = "https://github.com/harshit-d3v/fluxwright"
 Issues = "https://github.com/harshit-d3v/fluxwright/issues"
 
+[project.entry-points."pytest11"]
+fluxwright = "fluxwright.pytest_plugin"
+
 [tool.maturin]
 python-source = "python"
 module-name = "fluxwright._native"
