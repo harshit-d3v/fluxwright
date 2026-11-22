@@ -38,7 +38,7 @@ const FEATURES: { name: string; text: string; api: string }[] = [
   },
   {
     name: "End-to-end testing built in",
-    text: "Auto-retrying web-first expect() assertions (Rust, Node/TS, Python), Playwright Trace Viewer-compatible .zip context tracing, page video recording, visual toHaveScreenshot() regression, the fluxwright/test CLI runner (parallel workers, sharding, retries, HTML reports), and an auto-loaded pytest plugin.",
+    text: "Auto-retrying web-first expect() assertions (Rust, Node/TS, Python), Playwright Trace Viewer-compatible .zip context tracing with DOM frame snapshots, page video recording, visual toHaveScreenshot() regression, open Shadow DOM CSS piercing, the fluxwright/test CLI runner (parallel workers, sharding, retries, HTML reports), and an auto-loaded pytest plugin.",
     api: "fluxwright/test",
   },
   {
@@ -58,7 +58,7 @@ const FEATURES: { name: string; text: string; api: string }[] = [
   },
   {
     name: "HTTP server & cluster mode",
-    text: "Bearer-authenticated job API, Prometheus /metrics, W3C traceparent spans, --journal persistence, Docker image, and pull-based fluxwright coordinate clusters with TLS.",
+    text: "Bearer-authenticated job API, Prometheus /metrics, W3C traceparent spans, --journal and SQLite --store persistence with result TTL, Docker image, and pull-based fluxwright coordinate clusters with TLS and cluster-wide per-host limits.",
     api: "fluxwright serve",
   },
   {
@@ -232,7 +232,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.9.0, open source under Apache-2.0. Prebuilt for Windows, macOS, and Linux (x64 &amp; ARM64) on npm, PyPI, and GitHub Releases.
+              Version 0.10.0, open source under Apache-2.0. Prebuilt for Windows, macOS, and Linux (x64 &amp; ARM64) on npm, PyPI, and GitHub Releases.
             </p>
           </div>
           <FleetBoard />
