@@ -320,6 +320,8 @@ test('update snapshots env check', async () => {
     failDir,
     '--grep=intentional failure|passing neighbor',
     '--reporter=list,html',
+    '--trace=retain-on-failure',
+    '--video=retain-on-failure',
     `--output=${failOut}`,
     `--report-dir=${failReport}`,
   ])
@@ -331,11 +333,27 @@ test('update snapshots env check', async () => {
   const shotBytes = await readFile(failShots[0])
   assert.deepEqual(shotBytes.subarray(0, 4), Buffer.from([0x89, 0x50, 0x4e, 0x47]))
 
+  const failTraces = await findFiles(failOut, '.zip')
+  assert.equal(failTraces.length, 1, 'expected exactly one failure trace zip')
+  const traceBytes = await readFile(failTraces[0])
+  assert.deepEqual(traceBytes.subarray(0, 4), Buffer.from([0x50, 0x4b, 0x03, 0x04]))
+
+  const failVideos = [...(await findFiles(failOut, '.avi')), ...(await findFiles(failOut, '.webm'))]
+  assert.equal(failVideos.length, 1, 'expected exactly one failure video')
+  const vidBytes = await readFile(failVideos[0])
+  const vidMagic = vidBytes.subarray(0, 4)
+  assert.ok(
+    vidMagic.equals(Buffer.from('RIFF', 'ascii')) || vidMagic.equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3])),
+    'failure video must have valid AVI or WebM header',
+  )
+
   const failHtml = await readFile(join(failReport, 'index.html'), 'utf8')
   assert.ok(failHtml.startsWith('<!DOCTYPE html>'))
   assert.match(failHtml, /intentional failure/)
   assert.match(failHtml, /passing neighbor/)
   assert.match(failHtml, /toHaveText/)
+  assert.match(failHtml, /trace\.zip/)
+  assert.match(failHtml, /video\.(?:avi|webm)/)
   assert.match(failHtml, /data:image\/png;base64,[A-Za-z0-9+/=]+/)
 } finally {
   await rm(tmpBase, { recursive: true, force: true })

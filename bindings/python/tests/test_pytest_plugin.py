@@ -191,6 +191,12 @@ def test_intentional_failure(page):
     pngs = list(out_dir.rglob("*.png"))
     assert len(pngs) == 1, f"expected 1 failure screenshot, found {pngs}\n{fail_res.stdout}\n{fail_res.stderr}"
     assert pngs[0].read_bytes()[:4] == b"\x89PNG"
+    traces = list(out_dir.rglob("*.zip"))
+    assert len(traces) == 1, f"expected 1 failure trace, found {traces}"
+    assert traces[0].read_bytes()[:4] == b"PK\x03\x04"
+    videos = list(out_dir.rglob("*.avi")) + list(out_dir.rglob("*.webm"))
+    assert len(videos) == 1, f"expected 1 failure video, found {videos}"
+    assert videos[0].read_bytes()[:4] in (b"RIFF", b"\x1a\x45\xdf\xa3")
 
     # With --fluxwright-screenshot=off, no screenshot should be written.
     off_dir = tmp_path / "artifacts-off"
