@@ -37,6 +37,11 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "page.getByRole()",
   },
   {
+    name: "End-to-end testing built in",
+    text: "Auto-retrying web-first expect() assertions (Rust, Node/TS, Python), Playwright Trace Viewer-compatible .zip context tracing, page video recording, visual toHaveScreenshot() regression, the fluxwright/test CLI runner (parallel workers, sharding, retries, HTML reports), and an auto-loaded pytest plugin.",
+    api: "fluxwright/test",
+  },
+  {
     name: "Profiles, proxies & AIMD",
     text: "Named persistent profiles, rotating proxy pools with sticky affinity and exponential cooldowns, per-host rate limits, and AIMD adaptive concurrency under memory pressure.",
     api: "--profiles-dir",
@@ -170,6 +175,20 @@ const browser = await chromium.connectOverCDP(
 const page = await browser.newPage();
 await page.goto("https://example.com");`;
 
+const E2E_EXAMPLE = `import { test, expect } from "fluxwright/test";
+
+test.use({ trace: "retain-on-failure", video: "retain-on-failure" });
+
+test("homepage renders", async ({ page }) => {
+  await page.goto("https://example.com");
+  await expect(page).toHaveTitle(/Example/);
+  await expect(page.getByRole("heading")).toHaveText("Example Domain");
+  await expect(page).toHaveScreenshot("home.png");
+});
+
+// Run in parallel with retries, sharding, and HTML report:
+// $ npx fluxwright-test --workers=4 --retries=1 --reporter=list,html`;
+
 function Code({ children, label }: { children: string; label: string }) {
   return (
     <pre className="code" aria-label={label}>
@@ -269,9 +288,15 @@ export default function Home() {
                 handles the fleet. Node and Python load a native module, so there is no driver process in between.
               </p>
               <p className="note">
-                The 21-tool MCP server exposes navigation, <code>snapshot</code> (<code>@eN</code>{" "}
-                refs), <code>markdown</code>, forms, downloads, storage state, screenshots, and PDFs.
-                Or connect Playwright/Puppeteer scripts over the pooled <code>/cdp</code> WebSocket gateway.
+                The 21-tool MCP server exposes navigation and tabs (<code>open</code>,{" "}
+                <code>goto</code>, <code>back</code>, <code>forward</code>, <code>tabs</code>,{" "}
+                <code>close</code>), AI inspection (<code>snapshot</code> with <code>@eN</code>{" "}
+                refs, <code>markdown</code>, <code>title</code>, <code>content</code>,{" "}
+                <code>screenshot</code>), page actions (<code>click</code>, <code>hover</code>,{" "}
+                <code>fill</code>, <code>press</code>, <code>select</code>, <code>scroll</code>,{" "}
+                <code>wait_for</code>, <code>evaluate</code>), and diagnostics (
+                <code>console</code>, <code>network</code>). Or connect Playwright/Puppeteer
+                scripts over the pooled <code>/cdp</code> WebSocket gateway.
               </p>
             </div>
             <Tabs
@@ -280,6 +305,7 @@ export default function Home() {
                 { title: "TypeScript", content: <Code label="TypeScript example">{TS_EXAMPLE}</Code> },
                 { title: "Python", content: <Code label="Python example">{PY_EXAMPLE}</Code> },
                 { title: "Rust", content: <Code label="Rust example">{RUST_EXAMPLE}</Code> },
+                { title: "E2E Test", content: <Code label="E2E test runner example">{E2E_EXAMPLE}</Code> },
                 { title: "Server / CDP", content: <Code label="Server and CDP gateway example">{GATEWAY_EXAMPLE}</Code> },
                 { title: "MCP", content: <Code label="Claude Desktop configuration">{MCP_EXAMPLE}</Code> },
               ]}
@@ -444,7 +470,17 @@ docker run --rm \\
                 <h3>What it does not do</h3>
                 <ul>
                   <li>Firefox or WebKit. Fluxwright is Chromium only.</li>
-                  <li>Test running: no @playwright/test runner, expect() assertions, Trace Viewer, or video recording. Bring your own test framework.</li>
+                  <li>
+                    Interactive GUI codegen or a built-in Trace Viewer UI. Fluxwright ships
+                    auto-retrying web-first <code>expect()</code> assertions (Rust, Node/TS,
+                    Python), Playwright Trace Viewer-compatible <code>.zip</code> context tracing (
+                    <code>context.tracing</code>), page video recording (<code>recordVideo</code> /{" "}
+                    <code>page.video()</code>), auto-retrying visual{" "}
+                    <code>toHaveScreenshot()</code> regression, the <code>fluxwright/test</code>{" "}
+                    CLI runner (<code>fluxwright-test</code> with parallel workers, sharding,
+                    retries, and HTML reports), and an auto-loaded <code>pytest</code> plugin (
+                    <code>pytest-fluxwright</code>) — without an interactive GUI recorder yet.
+                  </li>
                   <li>Java or .NET SDKs. Fluxwright targets Node, Python, and Rust.</li>
                   <li>Anti-bot evasion.</li>
                 </ul>

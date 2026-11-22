@@ -14,35 +14,39 @@ Tools (21):
 2. Act using short refs (`click("@e3")`, `fill("@e2", "query")`, `select("@e4", value="pro")`). `@eN` refs clear automatically on navigation — run `snapshot()` again after page loads.
 3. Call `markdown(main_content_only=true)` to read clean prose/tables instead of raw `content()` HTML or full screenshots.
 
-## Install (this machine)
+## Install
 
-```bat
-set PATH=%USERPROFILE%\.cargo\bin;%PATH%
-cd C:\harshitJet\fluxwright
+Install from GitHub (requires Rust 1.95+):
+
+```bash
+cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-mcp
+```
+
+Or from a local checkout:
+
+```bash
 cargo install --path crates/fluxwright-mcp --force
 ```
 
-Binary: `%USERPROFILE%\.cargo\bin\fluxwright-mcp.exe`
+Prebuilt archives are also available on [GitHub Releases](https://github.com/harshit-d3v/fluxwright/releases).
 
-Chrome must be installed. Visible window by default. Headless:
-
-```bat
-set FLUXWRIGHT_HEADLESS=1
-```
+Chrome must be installed. Visible window by default; set `FLUXWRIGHT_HEADLESS=1` for headless mode.
 
 ## Claude Desktop
 
-File: `%APPDATA%\Claude\claude_desktop_config.json`
+Add to your Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json` on Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
   "mcpServers": {
     "fluxwright": {
-      "command": "C:\\Users\\harsh\\.cargo\\bin\\fluxwright-mcp.exe"
+      "command": "fluxwright-mcp"
     }
   }
 }
 ```
+
+If `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin`) is not on your `PATH`, pass the full path to the binary (e.g. `/path/to/fluxwright-mcp`).
 
 Restart Claude Desktop. Ask: “Open Amazon and get iPhone 16 prices.”
 
@@ -52,7 +56,7 @@ Restart Claude Desktop. Ask: “Open Amazon and get iPhone 16 prices.”
 
 ```toml
 [mcp_servers.fluxwright]
-command = "C:\\Users\\harsh\\.cargo\\bin\\fluxwright-mcp.exe"
+command = "fluxwright-mcp"
 ```
 
 ## Cursor

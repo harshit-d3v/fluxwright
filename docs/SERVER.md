@@ -313,14 +313,15 @@ Responses include `Cache-Control: no-store`; there is no cross-origin browser ac
 
 ### Reaching internal networks (SSRF)
 
-Jobs cannot navigate to link-local, loopback or private addresses: `goto` URLs are checked at
-submission, and every request the page makes — redirects and subresources included — is resolved
-and aborted when its host answers with a blocked address. `FLUXWRIGHT_SERVER_ANY_URL=1` disables
-this for trusted workloads.
+By default, `netguard` blocks **link-local / cloud metadata** destinations and non-web schemes:
+- **Blocked:** IPv4 link-local (`169.254.0.0/16`, including integer/hex/octal host forms and cloud metadata `169.254.169.254`), IPv6 link-local (`fe80::/10`), AWS IPv6 metadata (`fd00:ec2::254`), IPv4-mapped link-local (`::ffff:169.254.0.0/112`), `metadata.google.internal` / `metadata`, and `file:` URLs.
+- **Checked on submission and runtime:** `goto` (and `add_script_tag` / `add_style_tag`) URLs are validated at job submission, and `netguard::guard_requests` intercepts every request the page makes — including redirects, script-initiated navigations, WebSockets, and subresources — aborting any literal match or DNS answer that resolves to a blocked address.
+- **Allowed by default:** Loopback (`127.0.0.1`, `::1`, `localhost`) and private RFC 1918 / ULA intranet ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`) remain reachable so local fixtures and intranet pages work out of the box.
+- **Opt-out:** Set `FLUXWRIGHT_SERVER_ANY_URL=1` to disable the runtime page-request guard and HITL live-navigation URL check for trusted workloads (explicit `goto` step submission still validates non-link-local `http://`, `https://`, or `about:blank` URLs).
 
 A DNS check alone can be beaten by **DNS rebinding**: a name can resolve to a safe address when
-Fluxwright checks it and to the metadata address when Chrome connects. Block these ranges at the
-network level too:
+Fluxwright checks it and to the metadata address when Chrome connects. Block link-local/metadata
+(and private ranges, if jobs should only reach the public internet) at the network level too:
 
 - **AWS:** require IMDSv2 with a hop limit of 1 on the instance metadata service, and/or add a
   security-group/NACL or host firewall rule dropping `169.254.169.254` and `fd00:ec2::254`.
@@ -440,32 +441,42 @@ To safeguard server memory against chatty page loops or large payloads:
 ## Security and deployment boundary
 
 This is a **single trusted-operator service**, not a multi-tenant or public scraping API.
-Anyone with its token can submit browser jobs and read/cancel every retained job. Pages and
-`evaluate` can make requests to any network resource reachable from Chrome, including private
-services and cloud metadata. URL validation does not prevent redirects, DNS rebinding, script
-navigation, or subresource requests. Isolate the fleet's network and filesystem accordingly.
+Anyone with `FLUXWRIGHT_SERVER_TOKEN` can submit browser jobs and read/cancel every retained job.
+By default, `netguard` blocks `file:` URLs and link-local / cloud metadata targets (`169.254.0.0/16`,
+`fe80::/10`, `fd00:ec2::254`, `metadata.google.internal`, `metadata`) at submission and across
+redirects, script navigations, and subresources via literal and DNS checks (unless disabled with
+`FLUXWRIGHT_SERVER_ANY_URL=1`). However, loopback and private intranet ranges remain reachable by
+default, and DNS rebinding can bypass a pre-connect DNS check — so pages and `evaluate` can still
+reach loopback or private services visible to Chrome unless restricted at the network/firewall
+level. Isolate the fleet's network and filesystem accordingly.
 
 Keep the default loopback listener, or bind to a private interface behind a TLS reverse proxy,
-firewall, and deployment-level access/rate controls. Do not send the token over untrusted
+firewall, and deployment-level access/rate controls. Do not send tokens over untrusted
 plaintext networks or expose this listener directly to the internet. No per-tenant isolation,
-DNS/IP egress filtering, durable queue, or idempotency key is provided in this first version.
+private-network egress firewalling, or idempotency key is provided; use `--journal` only for
+repeatable jobs that need restart recovery.
 The Chrome sandbox stays enabled by default; do not disable it just to run the server.
 
 ## Cluster mode (experimental: coordinator and workers)
 
-Run one coordinator without local browsers, and join one or more browser-running workers across machines on a **trusted private network** or encrypted tunnel (see [docs/CLUSTER.md](CLUSTER.md)):
+Run one coordinator without local browsers, and join one or more browser-running workers across machines over native `https://` TLS (behind a TLS reverse proxy) or a **trusted private network** (see [docs/CLUSTER.md](CLUSTER.md)):
 
 ```bash
-# On the coordinator host (bind a private interface or firewall-restricted IP, e.g. 10.0.1.10):
-FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright coordinate --listen 10.0.1.10:7331 --journal queue.jsonl
+# On the coordinator host (optional dedicated FLUXWRIGHT_WORKER_TOKEN isolates worker routes from client API routes):
+FLUXWRIGHT_SERVER_TOKEN="$CLIENT_TOKEN" \
+FLUXWRIGHT_WORKER_TOKEN="$WORKER_TOKEN" \
+  fluxwright coordinate --listen 10.0.1.10:7331 --journal queue.jsonl
 
-# On each worker host:
-FLUXWRIGHT_SERVER_TOKEN="$TOKEN" fluxwright serve --join http://10.0.1.10:7331
+# On each worker host (supports native https:// TLS or private-network http://;
+# FLUXWRIGHT_SERVER_TOKEN protects the worker's own local listener and need not match $CLIENT_TOKEN):
+FLUXWRIGHT_SERVER_TOKEN="$WORKER_LOCAL_TOKEN" \
+FLUXWRIGHT_WORKER_TOKEN="$WORKER_TOKEN" \
+  fluxwright serve --join https://coordinator.internal
 ```
 
 Workers pull up to their local capacity (`POST /v1/workers/{worker}/lease`), extend 30-second leases every 10 seconds (`POST /v1/workers/{worker}/heartbeat`), abort client-cancelled jobs, and post results or failure evidence (`POST /v1/jobs/{id}/result`). Those worker routes are exposed only by `fluxwright coordinate`. Expired leases requeue within `retries` or fail with `"worker lost"`. On Ctrl+C / SIGTERM, a worker drains already-leased jobs up to 10 seconds, then calls `POST /v1/workers/{worker}/release` so any still-unfinished jobs return to `queued` without losing an attempt.
 
-> **Security boundary:** `fluxwright serve --join` currently supports unencrypted `http://` only (no native `https://` client) and shares `FLUXWRIGHT_SERVER_TOKEN` with the client API. Do **not** point `--join` over the public internet or an untrusted network — keep the worker-to-coordinator link inside a private subnet/WireGuard VPN, or route it through a local TLS tunnel/proxy (such as `http://127.0.0.1:8443` via stunnel or Caddy).
+> **Security boundary:** `fluxwright serve --join` supports native `https://` TLS (`rustls` + WebPKI roots, e.g. via a TLS reverse proxy in front of `fluxwright coordinate`) as well as `http://` (non-loopback `http://` logs a warning). Set a dedicated `FLUXWRIGHT_WORKER_TOKEN` on both coordinator and workers so worker credentials cannot call client/operator routes (`POST /v1/jobs`, `/v1/stats`, `/metrics`, `/v1/workers/*` management) and client tokens cannot pull or post worker results; when `FLUXWRIGHT_WORKER_TOKEN` is unset, both fall back to `FLUXWRIGHT_SERVER_TOKEN`. Keep plaintext `http://` links strictly inside a private subnet or VPN.
 
 ## Development checks
 

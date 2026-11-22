@@ -12,7 +12,7 @@ Requires a local Chrome/Chromium binary (`FLUXWRIGHT_CHROMIUM`, `CHROME`, `CHROM
 npm install fluxwright
 ```
 
-Prebuilds cover Windows x64, macOS x64 and arm64, and Linux x64 (glibc). Elsewhere, `chromium.launch` rejects with the reason the addon did not load; build it from a source checkout instead (needs Rust):
+Prebuilds cover Windows x64, macOS x64 and arm64, and Linux x64 and arm64 (glibc). Elsewhere, `chromium.launch` rejects with the reason the addon did not load; build it from a source checkout instead (needs Rust):
 
 ```bash
 cd bindings/node
@@ -41,10 +41,10 @@ await browser.close();
 
 | Method | What it does |
 |---|---|
-| `chromium.launch({ maxBrowsers?, executablePath?, headless?, queueTimeout?, memoryCeilingMb?, maxConcurrencyPerHost?, minDelayPerHost? })` | Start the pool: by default a browser per 4 CPUs with 8 pages each, and a memory budget (`memoryCeilingMb`) of 75% of the memory free at launch: new pages wait while Chrome uses more. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM` or `executablePath` overrides. When every slot is busy, `newPage` waits its turn however long the queue is, so starting every job at once works; with `queueTimeout` (ms) it rejects after that long instead, counting a browser start when one is needed. For polite crawling, `maxConcurrencyPerHost` caps the pages on one host at once across the fleet and `minDelayPerHost` (ms) spaces the `goto`s to it: a `goto` waits its turn |
+| `chromium.launch({ maxBrowsers?, executablePath?, headless?, queueTimeout?, memoryCeilingMb?, maxConcurrencyPerHost?, minDelayPerHost?, args?, ignoreDefaultArgs?, channel?, prewarmContexts? })` | Start the pool: by default a browser per 4 CPUs with 8 pages each, and a memory budget (`memoryCeilingMb`) of 75% of the memory free at launch: new pages wait while Chrome uses more. Headless uses chrome-headless-shell when installed (as Playwright does), else Chrome; `FLUXWRIGHT_CHROMIUM`, `executablePath`, or `channel` overrides. Customize Chromium flags with `args` / `ignoreDefaultArgs` and pre-warm blank slots with `prewarmContexts`. When every slot is busy, `newPage` waits its turn however long the queue is, so starting every job at once works; with `queueTimeout` (ms) it rejects after that long instead, counting a browser start when one is needed. For polite crawling, `maxConcurrencyPerHost` caps the pages on one host at once across the fleet and `minDelayPerHost` (ms) spaces the `goto`s to it: a `goto` waits its turn |
 | `chromium.connectOverCDP(endpointURL)` | Connect to an already-running browser over CDP (`ws://...` or `http://...`) instead of launching local Chrome |
-| `browser.newPage(options?)` | Acquire a lease (a fresh context). Every option applies to this page only: `proxy: { server, bypass?, username?, password? }`, `userAgent`, `locale`, `timezoneId`, `geolocation: { latitude, longitude, accuracy? }` (with `permissions: ['geolocation']`), `permissions`, `viewport: { width, height }`, `deviceScaleFactor`, `colorScheme`, `isMobile`, `hasTouch`, `extraHTTPHeaders`, `ignoreHTTPSErrors`, `javaScriptEnabled`, `offline`, `baseURL`, `httpCredentials: { username, password }`, `bypassCSP`, `storageState` (an object or a file path), `recordHar: { path, omitContent?, content?, mode?, urlFilter? }` |
-| `browser.newContext(options?)` | A context with `newPage`'s options, as Playwright's `newContext`: multiple `context.newPage()` tabs and popups share cookies, storage, init scripts, exposed functions and routes; `pages()`, `request` (`APIRequestContext`), `route` / `unroute`, `routeFromHAR(har, options?)`, `addInitScript`, `exposeFunction`, `storageState({ path?, indexedDB? })`, `cookies(urls?)`, `addCookies()`, `clearCookies({ name?, domain?, path? })`, `newCDPSession(page)`, `close()` |
+| `browser.newPage(options?)` | Acquire a lease (a fresh context). Every option applies to this page only: `proxy: { server, bypass?, username?, password? }`, `userAgent`, `locale`, `timezoneId`, `geolocation: { latitude, longitude, accuracy? }` (with `permissions: ['geolocation']`), `permissions`, `viewport: { width, height }`, `deviceScaleFactor`, `colorScheme`, `isMobile`, `hasTouch`, `extraHTTPHeaders`, `ignoreHTTPSErrors`, `javaScriptEnabled`, `offline`, `baseURL`, `httpCredentials: { username, password }`, `bypassCSP`, `storageState` (an object or a file path), `recordHar: { path, omitContent?, content?, mode?, urlFilter? }`, `recordVideo: { dir, size? }` |
+| `browser.newContext(options?)` | A context with `newPage`'s options, as Playwright's `newContext`: multiple `context.newPage()` tabs and popups share cookies, storage, init scripts, exposed functions and routes; `pages()`, `tracing`, `request` (`APIRequestContext`), `route` / `unroute`, `routeFromHAR(har, options?)`, `addInitScript`, `exposeFunction`, `storageState({ path?, indexedDB? })`, `cookies(urls?)`, `addCookies()`, `clearCookies({ name?, domain?, path? })`, `newCDPSession(page)`, `close()` |
 | `page.storageState({ path?, indexedDB? })` | Every cookie in the context plus localStorage (and IndexedDB when `indexedDB: true`) of the current origin, in Playwright's format. With `path`, also saved as JSON for `newPage({ storageState: path })` |
 | `page.goto(url, { waitUntil? })` | Navigate. `waitUntil`: `load` (default), `domcontentloaded`, `networkidle`, `commit`. Event-driven, like Playwright |
 | `page.title()` / `page.content()` | Read |
@@ -70,6 +70,10 @@ await browser.close();
 | `page.setViewportSize({ width, height })` | CSS-pixel viewport for this page |
 | `page.emulateMedia({ media?, colorScheme? })` | Changes CSS `media` (`screen` \| `print` \| `null`) and/or `prefers-color-scheme` (`light` \| `dark` \| `no-preference` \| `null`) |
 | `page.waitForSelector(selector, { state?, timeout? })` | Waits until `state`: `visible` (the default), `attached`, `hidden` or `detached`, as in Playwright |
+| `page.ariaSnapshot(options?)` / `page.markdown(options?)` | Compact ARIA accessibility tree with short `@eN` interactive refs (`{ tree, refs, truncated }`; pass `@eN` to `click` / `fill` / `locator`) and clean HTML-to-Markdown extraction (`selector`, `mainContentOnly`, `includeLinks`, `includeImages`) |
+| `expect(page \| locator)` | Auto-retrying web-first assertions (`toBeVisible`, `toBeHidden`, `toBeAttached`, `toBeEnabled`, `toBeDisabled`, `toBeChecked`, `toBeEditable`, `toHaveText`, `toContainText`, `toHaveValue`, `toHaveAttribute`, `toHaveClass`, `toHaveCount`, `toHaveTitle`, `toHaveURL`, `toHaveScreenshot`, `.not`, `expect.configure({ timeout })`) |
+| `context.tracing` | Playwright Trace Viewer-compatible `.zip` tracing (`start({ name?, title?, screenshots?, snapshots? })`, `startChunk()`, `stopChunk({ path? })`, `stop({ path? })`) |
+| `page.video()` | Handle for per-page video recording enabled via `recordVideo: { dir, size? }` (`path()`, `saveAs(path)`, `delete()`; WebM via `ffmpeg` or MJPEG-in-AVI fallback) |
 | `page.close()` / `browser.close()` | Dispose context / shut down. `page.close()` does not wait for calls still running on the page: they reject with `page closed` |
 
 Close pages when a job is done. A page you forget is cleaned up when Node garbage-collects it, which may be much later, also when its listeners and routes use it.
@@ -77,6 +81,46 @@ Close pages when a job is done. A page you forget is cleaned up when Node garbag
 `goto`, `click`, `fill`, `waitForSelector`, `screenshot` and the locator actions take Playwright's per-call `timeout` (ms; 0 for none), and `page.setDefaultTimeout(ms)` / `page.setDefaultNavigationTimeout(ms)` change the page's defaults (the engine's are 10 s for actions and 30 s for navigation).
 
 An option Fluxwright does not implement (screenshot `mask`/`animations`/`caret`, `noWaitAfter`, ...) throws a TypeError rather than being ignored. See `MISSING.md` for these and the Playwright features that are planned or out of scope.
+
+## End-to-end testing
+
+`fluxwright` includes auto-retrying `expect()`, Playwright Trace Viewer-compatible `.zip` tracing, video recording, visual screenshot regression, and the built-in `fluxwright/test` runner (`fluxwright-test` CLI):
+
+```ts
+// Standalone: expect() + context.tracing + recordVideo + toHaveScreenshot()
+import { chromium, expect } from "fluxwright";
+
+const browser = await chromium.launch({ maxBrowsers: 2 });
+const context = await browser.newContext({ recordVideo: { dir: "videos/" } });
+await context.tracing.start({ screenshots: true, snapshots: true });
+
+const page = await context.newPage();
+await page.goto("https://example.com");
+await expect(page).toHaveTitle(/Example/);
+await expect(page.getByRole("heading")).toHaveText("Example Domain");
+await expect(page).toHaveScreenshot("home.png"); // FLUXWRIGHT_UPDATE_SNAPSHOTS=1 to update baselines
+
+await context.tracing.stop({ path: "trace.zip" }); // open with: npx playwright show-trace trace.zip
+const video = page.video();
+await context.close(); // finalizes the video file
+const videoPath = await video?.path();
+await browser.close();
+```
+
+```ts
+// Test runner (tests/example.spec.mjs):
+// Run with: npx fluxwright-test --workers=4 --retries=1 --trace=retain-on-failure --reporter=list,html
+import { test, expect } from "fluxwright/test";
+
+test.use({ trace: "retain-on-failure", video: "retain-on-failure", screenshot: "only-on-failure" });
+
+test("homepage renders", async ({ page }) => {
+  await page.goto("https://example.com");
+  await expect(page.getByRole("heading")).toHaveText("Example Domain");
+});
+```
+
+Use `createFluxwrightFixtures()` from `fluxwright/test` to reuse the same pooled browser fixtures inside `node:test` or Vitest.
 
 ## Develop
 
