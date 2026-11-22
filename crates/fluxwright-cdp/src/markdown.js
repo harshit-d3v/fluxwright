@@ -55,7 +55,7 @@
     const matrix = rows.map((tr) =>
       Array.from(tr.children)
         .filter((cell) => (cell.tagName === 'TH' || cell.tagName === 'TD') && !isHidden(cell))
-        .map((cell) => cleanInline(serializeChildren(cell, 0, false)).replace(/\|/g, '\\|'))
+        .map((cell) => cleanInline(serializeChildren(cell, 0, false)).replace(/\\/g, '\\\\').replace(/\|/g, '\\|'))
     ).filter((r) => r.length > 0);
     if (!matrix.length) return '';
     const cols = Math.max(...matrix.map((r) => r.length));
