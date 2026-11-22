@@ -8,6 +8,7 @@ mod cluster;
 pub mod dashboard;
 mod job;
 mod journal;
+mod live;
 pub mod prometheus;
 pub mod telemetry;
 
@@ -107,6 +108,7 @@ pub(crate) struct Inner {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     active_cdp_sessions: AtomicUsize,
     total_cdp_sessions: AtomicU64,
+    live: live::LiveRegistry,
     registry: Mutex<Registry>,
     journal: Option<journal::Journal>,
 }
@@ -229,6 +231,8 @@ impl Inner {
                 if jobs.len() == DASHBOARD_JOBS {
                     continue;
                 }
+                let id_str = r.job.id.to_string();
+                let (is_live, is_paused) = self.live.job_flags(&id_str);
                 jobs.push(json!({
                     "id": r.job.id,
                     "status": r.job.status,
@@ -241,6 +245,8 @@ impl Inner {
                     "trace_id": r.job.trace_id,
                     "worker": r.worker,
                     "has_evidence": r.job.failure_evidence.is_some(),
+                    "live": is_live,
+                    "paused": is_paused,
                 }));
             }
             let (workers, workers_summary) = cluster::workers_snapshot(reg, now, lease_ms);
@@ -259,6 +265,7 @@ impl Inner {
                 },
                 "workers": workers,
                 "workers_summary": workers_summary,
+                "live_sessions": self.live.snapshot(),
                 "jobs": jobs,
             })
         })
@@ -326,6 +333,7 @@ impl HttpServer {
             shutdown_tx,
             active_cdp_sessions: AtomicUsize::new(0),
             total_cdp_sessions: AtomicU64::new(0),
+            live: live::LiveRegistry::default(),
             registry: Mutex::new(Registry {
                 accepting: true,
                 jobs: VecDeque::new(),
@@ -408,10 +416,21 @@ impl HttpServer {
         let mut protected = small
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
             .merge(protected);
+        let mut live_ws = Router::new();
         if self.inner.engine.is_some() {
             protected = protected
                 .route("/cdp", get(cdp_gateway::ws_handler))
-                .route("/json/version", get(cdp_gateway::json_version));
+                .route("/json/version", get(cdp_gateway::json_version))
+                .route("/v1/live", get(live::list_sessions))
+                .route("/v1/live/{id}/ticket", post(live::create_ticket))
+                .route("/v1/jobs/{id}/pause", post(live::pause_job))
+                .route("/v1/jobs/{id}/resume", post(live::resume_job));
+            live_ws = Router::new()
+                .route("/v1/live/{id}/ws", get(live::ws_handler))
+                .route_layer(middleware::from_fn_with_state(
+                    self.inner.clone(),
+                    live::authorize_ws,
+                ));
         }
         let protected = protected.route_layer(middleware::from_fn_with_state(
             self.inner.clone(),
@@ -427,6 +446,7 @@ impl HttpServer {
             .route("/dashboard", get(dashboard::dashboard_html))
             .route("/", get(dashboard::dashboard_html))
             .merge(protected)
+            .merge(live_ws)
             .fallback(|| async {
                 ApiError::new(StatusCode::NOT_FOUND, "not_found", "endpoint not found")
             })
@@ -779,13 +799,32 @@ pub(crate) async fn execute_job(
                         fluxwright::netguard::guard_requests(&page).await?;
                     }
 
+                    let (pause_tx, mut pause_rx) = tokio::sync::watch::channel(false);
+                    let pause_reason = Arc::new(Mutex::new(None));
+                    let mut url_rx = page.subscribe_url();
+                    let live_guard = inner.as_ref().and_then(|w| w.upgrade()).map(|inn| {
+                        inn.live.register_job(
+                            id.to_string(),
+                            page.cdp_connection(),
+                            page.target_id().to_string(),
+                            url_rx.borrow().clone(),
+                            now_ms(),
+                            pause_tx.clone(),
+                            pause_reason.clone(),
+                        )
+                    });
+
                     let mut results = Vec::with_capacity(steps.len());
                     let mut bytes = 2;
                     let mut failure_screenshot: Option<String> = None;
                     let mut run_error: Option<fluxwright::Error> = None;
+                    let mut log_closed = false;
 
                     for (index, step) in steps.iter().enumerate() {
                         drain_evidence(&mut net_rx, &mut log_rx, &mut accumulator);
+                        if let Some(lg) = &live_guard {
+                            lg.set_url(url_rx.borrow_and_update().clone());
+                        }
                         progress.lock().unwrap().step_index = Some(index);
                         if let Some(weak) = &inner {
                             update(weak, id, |job| job.step_index = Some(index));
@@ -811,30 +850,88 @@ pub(crate) async fn execute_job(
                             d if d.is_zero() => remaining,
                             d => d,
                         };
-                        let step_exec =
-                            tokio::time::timeout(step_budget, step.execute(&page).instrument(step_span));
-                        tokio::pin!(step_exec);
-                        let mut log_closed = false;
-                        // Evidence is read while the step runs. Read only between steps, a page
-                        // logging in a loop kept everything it logged in memory until the step ended.
-                        let outcome = loop {
-                            tokio::select! {
-                                done = &mut step_exec => {
-                                    break done.map_err(|_| fluxwright::Error::JobTimeout).and_then(|r| r);
-                                }
-                                Some(event) = net_rx.recv() => accumulator.push_net(event),
-                                Some(entry) = log_rx.recv(), if !log_closed => {
-                                    accumulator.push_log(entry);
-                                    if accumulator.console_full() {
-                                        // Nothing more is kept: stop the page queueing it.
-                                        log_rx.close();
-                                        log_closed = true;
+                        if *pause_rx.borrow() {
+                            if let Err(err) = wait_while_paused(
+                                &mut pause_rx,
+                                &mut net_rx,
+                                &mut log_rx,
+                                &mut url_rx,
+                                live_guard.as_ref(),
+                                &mut accumulator,
+                                &mut log_closed,
+                                step_budget,
+                            )
+                            .await
+                            {
+                                run_error = Some(err);
+                                break;
+                            }
+                        }
+
+                        let outcome = if let Step::PauseForHuman { message, timeout_ms } = step {
+                            if let Some(lg) = &live_guard {
+                                lg.set_pause_reason(Some(
+                                    message
+                                        .clone()
+                                        .unwrap_or_else(|| "Paused for human action".into()),
+                                ));
+                            }
+                            let _ = pause_tx.send(true);
+                            let pause_budget = timeout_ms
+                                .map(Duration::from_millis)
+                                .map(|d| d.min(step_budget))
+                                .unwrap_or(step_budget);
+                            let wait_res = wait_while_paused(
+                                &mut pause_rx,
+                                &mut net_rx,
+                                &mut log_rx,
+                                &mut url_rx,
+                                live_guard.as_ref(),
+                                &mut accumulator,
+                                &mut log_closed,
+                                pause_budget,
+                            )
+                            .await;
+                            let _ = pause_tx.send(false);
+                            if let Some(lg) = &live_guard {
+                                lg.set_pause_reason(None);
+                            }
+                            wait_res.map(|()| json!({ "resumed": true }))
+                        } else {
+                            let step_exec = tokio::time::timeout(
+                                step_budget,
+                                step.execute(&page).instrument(step_span),
+                            );
+                            tokio::pin!(step_exec);
+                            // Evidence is read while the step runs. Read only between steps, a page
+                            // logging in a loop kept everything it logged in memory until the step ended.
+                            loop {
+                                tokio::select! {
+                                    done = &mut step_exec => {
+                                        break done.map_err(|_| fluxwright::Error::JobTimeout).and_then(|r| r);
+                                    }
+                                    Ok(()) = url_rx.changed() => {
+                                        if let Some(lg) = &live_guard {
+                                            lg.set_url(url_rx.borrow_and_update().clone());
+                                        }
+                                    }
+                                    Some(event) = net_rx.recv() => accumulator.push_net(event),
+                                    Some(entry) = log_rx.recv(), if !log_closed => {
+                                        accumulator.push_log(entry);
+                                        if accumulator.console_full() {
+                                            // Nothing more is kept: stop the page queueing it.
+                                            log_rx.close();
+                                            log_closed = true;
+                                        }
                                     }
                                 }
                             }
                         };
 
                         drain_evidence(&mut net_rx, &mut log_rx, &mut accumulator);
+                        if let Some(lg) = &live_guard {
+                            lg.set_url(url_rx.borrow_and_update().clone());
+                        }
 
                         match outcome {
                             Ok(result) => {
@@ -891,6 +988,7 @@ pub(crate) async fn execute_job(
                     // Drop schedules context disposal even if the enclosing deadline/cancellation fires.
                     // Do not await close() here: cancellation halfway through an async close would depend
                     // on that close's cancellation safety.
+                    drop(live_guard);
                     drop(page);
 
                     if let Some(err) = run_error {
@@ -906,6 +1004,45 @@ pub(crate) async fn execute_job(
     };
 
     execution.instrument(job_span).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_while_paused(
+    pause_rx: &mut tokio::sync::watch::Receiver<bool>,
+    net_rx: &mut tokio::sync::mpsc::UnboundedReceiver<fluxwright::NetEvent>,
+    log_rx: &mut tokio::sync::mpsc::UnboundedReceiver<fluxwright::LogEntry>,
+    url_rx: &mut tokio::sync::watch::Receiver<String>,
+    live_guard: Option<&live::LiveGuard>,
+    accumulator: &mut EvidenceAccumulator,
+    log_closed: &mut bool,
+    budget: Duration,
+) -> fluxwright::Result<()> {
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    while *pause_rx.borrow() {
+        tokio::select! {
+            _ = &mut deadline => return Err(fluxwright::Error::JobTimeout),
+            res = pause_rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+            }
+            Ok(()) = url_rx.changed() => {
+                if let Some(lg) = live_guard {
+                    lg.set_url(url_rx.borrow_and_update().clone());
+                }
+            }
+            Some(event) = net_rx.recv() => accumulator.push_net(event),
+            Some(entry) = log_rx.recv(), if !*log_closed => {
+                accumulator.push_log(entry);
+                if accumulator.console_full() {
+                    log_rx.close();
+                    *log_closed = true;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serialized byte length of a JSON-serializable value without materializing it.
