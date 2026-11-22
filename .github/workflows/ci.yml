@@ -146,3 +146,37 @@ jobs:
           cache-dependency-path: www/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  e2e:
+    name: black-box e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FLUXWRIGHT_NO_SANDBOX: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            www/package-lock.json
+            tests/e2e/package-lock.json
+      - name: Locate Chrome
+        run: |
+          echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          google-chrome --version
+      - name: Build website
+        working-directory: www
+        run: |
+          npm ci
+          npm run build
+      - name: Build fluxwright-cli
+        run: cargo build -p fluxwright-cli
+      - name: Install E2E dependencies
+        working-directory: tests/e2e
+        run: npm ci
+      - name: Run E2E suite
+        run: node tests/e2e/run.mjs
