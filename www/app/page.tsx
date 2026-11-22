@@ -2,7 +2,7 @@ import type { CSSProperties } from "react";
 import { CopyCommand } from "./_components/CopyCommand";
 import { FleetBoard } from "./_components/FleetBoard";
 import { SiteHeader } from "./_components/SiteHeader";
-import { GITHUB, Logo, NPM, SECTIONS } from "./_components/site";
+import { GITHUB, Logo, NPM, PYPI, RELEASES, SECTIONS } from "./_components/site";
 import { Tabs } from "./_components/Tabs";
 
 const FEATURES: { name: string; text: string; api: string }[] = [
@@ -17,13 +17,13 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "QueueFullMode::Wait",
   },
   {
-    name: "A memory ceiling",
-    text: "No new work starts while the fleet's real memory footprint is over your budget. Shared pages are not counted twice.",
+    name: "Container-aware memory ceiling",
+    text: "Auto-sizes to 1 browser per 4 CPUs and 75% of free RAM (reading cgroup limits in Docker). No new work starts above budget.",
     api: "memory_ceiling_mb",
   },
   {
     name: "Recycling",
-    text: "A browser restarts after a number of jobs, an age, or a memory threshold. It drains its running jobs first.",
+    text: "A browser drains running jobs without pausing the pool after a job count, age, or memory threshold, and shuts down when idle.",
     api: "recycle_after_jobs",
   },
   {
@@ -32,18 +32,33 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "JobOptions::retries",
   },
   {
-    name: "A Playwright-style API",
-    text: "getByRole, getByLabel, getByTestId, nth and filter, frameLocator for cross-origin iframes, page.route to fake or change requests, downloads, and clicks that wait until the element can take them.",
+    name: "Full Playwright-style API",
+    text: "Locators, cross-origin frameLocator, page.route, page.pdf(), HAR 1.2 record/replay, prewarmContexts, ResourcePreset, multi-tab contexts, APIRequestContext, and newCDPSession.",
     api: "page.getByRole()",
   },
   {
-    name: "Settings per job",
-    text: "Each job can have its own proxy, user agent, locale, timezone and location, and start from a saved login, on the same browser as jobs that use none.",
-    api: "newPage({ storageState })",
+    name: "Profiles, proxies & AIMD",
+    text: "Named persistent profiles, rotating proxy pools with sticky affinity and exponential cooldowns, per-host rate limits, and AIMD adaptive concurrency under memory pressure.",
+    api: "--profiles-dir",
   },
   {
-    name: "Built for agents",
-    text: "An MCP server lets Claude, Codex or Cursor drive the fleet on your machine.",
+    name: "Pooled CDP gateway",
+    text: "Connect existing Playwright, Puppeteer, or Chrome DevTools scripts straight to Fluxwright's pooled Chrome fleet with context isolation and /json/version discovery.",
+    api: "GET /cdp",
+  },
+  {
+    name: "Live screencast & HITL",
+    text: "Watch live JPEG streams in /dashboard, pause any session with pause_for_human, drive mouse, keyboard, and navigation remotely, and resume cleanly.",
+    api: "/dashboard",
+  },
+  {
+    name: "HTTP server & cluster mode",
+    text: "Bearer-authenticated job API, Prometheus /metrics, W3C traceparent spans, --journal persistence, Docker image, and pull-based fluxwright coordinate clusters with TLS.",
+    api: "fluxwright serve",
+  },
+  {
+    name: "Built for AI agents",
+    text: "21-tool MCP server for Claude, Codex, and Cursor, plus native @eN accessibility tree snapshots and clean HTML-to-Markdown extraction.",
     api: "fluxwright-mcp",
   },
 ];
@@ -90,6 +105,10 @@ await page.getByRole("textbox", { name: "Search" }).fill("chromium");
 const payment = page.frameLocator("iframe#payment");
 const card = payment.getByRole("textbox", { name: "Card number" });
 await card.fill("4242 4242 4242 4242");
+
+// AI-native accessibility tree (@eN refs) and clean Markdown.
+const snapshot = await page.ariaSnapshot();
+const markdown = await page.markdown();
 
 await page.close(); // the context is destroyed and the slot is free
 await browser.close();`;
@@ -139,6 +158,18 @@ const MCP_EXAMPLE = `{
   }
 }`;
 
+const GATEWAY_EXAMPLE = `// Start the pooled server with CDP gateway, profiles, and AIMD
+// $ fluxwright serve --allow-query-token --profiles-dir ./profiles --adaptive-concurrency
+
+// Connect existing Playwright scripts straight to the pooled fleet
+import { chromium } from "playwright";
+
+const browser = await chromium.connectOverCDP(
+  \`ws://127.0.0.1:7331/cdp?token=\${process.env.FLUXWRIGHT_SERVER_TOKEN}\`,
+);
+const page = await browser.newPage();
+await page.goto("https://example.com");`;
+
 function Code({ children, label }: { children: string; label: string }) {
   return (
     <pre className="code" aria-label={label}>
@@ -169,7 +200,8 @@ export default function Home() {
             <p className="lead">
               Fluxwright pools Chrome, gives every job a fresh isolated page, queues work when the
               fleet is full, restarts browsers before they bloat, and retries when one crashes. Use
-              it from Node, Python or Rust, or from an AI agent over MCP.
+              it from Node, Python, or Rust, over the HTTP server and pooled CDP gateway, or from
+              AI agents via MCP.
             </p>
             <CopyCommand command="npm install fluxwright" />
             <div className="actions">
@@ -181,7 +213,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.9.0, open source under Apache-2.0. Prebuilt for Windows, macOS and Linux, on npm and PyPI.
+              Version 0.9.0, open source under Apache-2.0. Prebuilt for Windows, macOS, and Linux (x64 &amp; ARM64) on npm, PyPI, and GitHub Releases.
             </p>
           </div>
           <FleetBoard />
@@ -237,8 +269,9 @@ export default function Home() {
                 handles the fleet. Node and Python load a native module, so there is no driver process in between.
               </p>
               <p className="note">
-                The MCP server exposes open, goto, click, fill, evaluate, screenshot and close.
-                Selectors accept CSS, <code>text=</code> and <code>role=</code>.
+                The 21-tool MCP server exposes navigation, <code>snapshot</code> (<code>@eN</code>{" "}
+                refs), <code>markdown</code>, forms, downloads, storage state, screenshots, and PDFs.
+                Or connect Playwright/Puppeteer scripts over the pooled <code>/cdp</code> WebSocket gateway.
               </p>
             </div>
             <Tabs
@@ -247,6 +280,7 @@ export default function Home() {
                 { title: "TypeScript", content: <Code label="TypeScript example">{TS_EXAMPLE}</Code> },
                 { title: "Python", content: <Code label="Python example">{PY_EXAMPLE}</Code> },
                 { title: "Rust", content: <Code label="Rust example">{RUST_EXAMPLE}</Code> },
+                { title: "Server / CDP", content: <Code label="Server and CDP gateway example">{GATEWAY_EXAMPLE}</Code> },
                 { title: "MCP", content: <Code label="Claude Desktop configuration">{MCP_EXAMPLE}</Code> },
               ]}
             />
@@ -259,8 +293,7 @@ export default function Home() {
               <h2 id="bench-title">Benchmarks</h2>
               <p>
                 Jobs per second, higher is better. Every tool ran on the same chrome-headless-shell
-                binary and loaded a small local page, with the same number of jobs in flight (up to
-                24).
+                binary and loaded a small local page with fresh isolated contexts per job.
               </p>
             </div>
             <table className="bench">
@@ -318,8 +351,8 @@ export default function Home() {
                     <>
                       <Code label="npm install">{`npm install fluxwright`}</Code>
                       <p className="note">
-                        Prebuilt for Windows x64, macOS on Apple silicon and Intel, and Linux x64
-                        (glibc). Node 18 or later.
+                        Prebuilt for Windows x64, macOS (Apple silicon &amp; Intel), and Linux (x64
+                        &amp; ARM64 glibc). Node 18 or later.
                       </p>
                     </>
                   ),
@@ -330,8 +363,8 @@ export default function Home() {
                     <>
                       <Code label="pip install">{`pip install fluxwright`}</Code>
                       <p className="note">
-                        Wheels for Windows x64, macOS on Apple silicon and Intel, and Linux x64
-                        (glibc 2.17 or later). Python 3.10 or later, with asyncio and blocking APIs.
+                        Wheels for Windows x64, macOS (Apple silicon &amp; Intel), and Linux (x64
+                        &amp; ARM64 glibc). Python 3.10 or later, with asyncio and blocking APIs.
                       </p>
                     </>
                   ),
@@ -353,9 +386,10 @@ tokio = { version = "1", features = ["full"] }`}</Code>
                     <>
                       <Code label="Install the MCP server">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-mcp`}</Code>
                       <p className="note">
-                        Add it to Claude Desktop, Codex or Cursor as shown in the code section. Use the
-                        full path to <code>fluxwright-mcp</code> if it is not on your PATH. The fleet
-                        runs on your machine, so serverless hosts cannot run it.
+                        Prebuilt binaries are also available on{" "}
+                        <a href={RELEASES}>GitHub Releases</a>. Add it to Claude Desktop, Codex, or
+                        Cursor as shown in the code section. The fleet runs on your machine or your
+                        own container, so serverless hosts cannot run it.
                       </p>
                     </>
                   ),
@@ -368,9 +402,29 @@ tokio = { version = "1", features = ["full"] }`}</Code>
 fluxwright install
 fluxwright doctor
 fluxwright start --max-browsers 4 --max-contexts 8
-fluxwright stats`}</Code>
+fluxwright serve --listen 127.0.0.1:7331`}</Code>
                       <p className="note">
-                        <code>fluxwright install</code> fetches managed Chromium binaries; the local daemon listens on a Unix socket or Windows named pipe.
+                        Prebuilt CLI archives are on <a href={RELEASES}>GitHub Releases</a>.{" "}
+                        <code>fluxwright install</code> fetches managed Chromium binaries; use{" "}
+                        <code>fluxwright serve</code> and <code>fluxwright coordinate</code> for
+                        HTTP and cluster mode.
+                      </p>
+                    </>
+                  ),
+                },
+                {
+                  title: "Docker",
+                  content: (
+                    <>
+                      <Code label="Run Fluxwright in Docker">{`docker build -t fluxwright .
+docker run --rm \\
+  -e FLUXWRIGHT_SERVER_TOKEN="$FLUXWRIGHT_SERVER_TOKEN" \\
+  -p 127.0.0.1:7331:7331 --shm-size=1g \\
+  --memory=4g --cpus=4 --cap-add=SYS_ADMIN \\
+  fluxwright`}</Code>
+                      <p className="note">
+                        Reads container cgroup limits automatically for browser count and RAM ceiling,
+                        and uses <code>tini</code> as PID 1 so Chromium subprocesses are always reaped.
                       </p>
                     </>
                   ),
@@ -402,6 +456,11 @@ fluxwright stats`}</Code>
                   <li>On Linux and macOS the engine talks to Chrome over a private pipe, not a debugging port.</li>
                   <li>Jobs never share cookies or storage.</li>
                   <li>Chrome exits when the engine exits, even after a crash.</li>
+                  <li>Bearer tokens are required on HTTP and CDP server endpoints even on loopback, with single-use WebSocket tickets for live dashboard streams.</li>
+                  <li>
+                    Saved profiles and job journals are written owner-only (<code>0600</code> on Unix),
+                    and cluster workers support isolated <code>FLUXWRIGHT_WORKER_TOKEN</code> and native TLS.
+                  </li>
                 </ul>
               </div>
             </div>
@@ -427,6 +486,12 @@ fluxwright stats`}</Code>
               </li>
               <li>
                 <a href={NPM}>npm</a>
+              </li>
+              <li>
+                <a href={PYPI}>PyPI</a>
+              </li>
+              <li>
+                <a href={RELEASES}>Releases</a>
               </li>
             </ul>
           </nav>
