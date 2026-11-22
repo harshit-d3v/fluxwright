@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 const SERVER_TOKEN: &str = "server_token_0123456789abcdef0123456789abcdef";
@@ -59,16 +61,34 @@ impl ManagedProcs {
     }
 
     fn spawn(&mut self, label: &str, args: &[&str]) {
+        self.spawn_inner(label, args, Some(SERVER_TOKEN), WORKER_TOKEN);
+    }
+
+    fn spawn_worker_only_token(&mut self, label: &str, args: &[&str]) {
+        self.spawn_inner(label, args, None, WORKER_TOKEN);
+    }
+
+    fn spawn_inner(
+        &mut self,
+        label: &str,
+        args: &[&str],
+        server_token: Option<&str>,
+        worker_token: &str,
+    ) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fluxwright"));
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("FLUXWRIGHT_SERVER_TOKEN", SERVER_TOKEN)
-            .env("FLUXWRIGHT_WORKER_TOKEN", WORKER_TOKEN)
+            .env("FLUXWRIGHT_WORKER_TOKEN", worker_token)
             .env("FLUXWRIGHT_NO_SANDBOX", "1")
             .env("FLUXWRIGHT_HEADLESS", "1")
             .kill_on_drop(true);
+        if let Some(tok) = server_token {
+            cmd.env("FLUXWRIGHT_SERVER_TOKEN", tok);
+        } else {
+            cmd.env_remove("FLUXWRIGHT_SERVER_TOKEN");
+        }
 
         let mut child = cmd
             .spawn()
@@ -273,7 +293,7 @@ async fn wait_for_job(addr: SocketAddr, job_id: &str, procs: &ManagedProcs) -> V
     .unwrap_or_else(|_| panic!("timed out waiting for job {job_id}\nlogs:\n{}", procs.dump_logs()))
 }
 
-async fn spawn_fixture_server() -> (String, AbortOnDrop) {
+async fn spawn_fixture_server() -> (String, Arc<AtomicUsize>, Arc<Notify>, AbortOnDrop) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fixture HTTP server");
@@ -284,12 +304,31 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
         "<h1>Cluster Worker OK</h1>",
         "</body></html>"
     );
+    let failover_hold_html = concat!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<title>Failover Hold</title></head><body>",
+        "<p>Waiting for failover...</p>",
+        "</body></html>"
+    );
+    let failover_ok_html = concat!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<title>Failover Recovered</title></head><body>",
+        "<h1 id=\"ready\">Recovered</h1>",
+        "</body></html>"
+    );
+
+    let failover_hits = Arc::new(AtomicUsize::new(0));
+    let failover_started = Arc::new(Notify::new());
+    let hits_clone = failover_hits.clone();
+    let started_clone = failover_started.clone();
 
     let task = tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
+            let hits = hits_clone.clone();
+            let started = started_clone.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 let mut filled = 0usize;
@@ -306,9 +345,26 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
                         }
                     }
                 }
+                let req_text = std::str::from_utf8(&buf[..filled]).unwrap_or("");
+                let path = req_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path == "/failover" {
+                    let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit == 1 {
+                        started.notify_one();
+                        failover_hold_html
+                    } else {
+                        failover_ok_html
+                    }
+                } else {
+                    html
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-                    html.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
                 let _ = stream.shutdown().await;
@@ -316,12 +372,20 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
         }
     });
 
-    (format!("http://{addr}/"), AbortOnDrop(task))
+    (
+        format!("http://{addr}"),
+        failover_hits,
+        failover_started,
+        AbortOnDrop(task),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_coordinator_and_workers_e2e() {
-    let (fixture_url, _fixture_guard) = spawn_fixture_server().await;
+    let (fixture_base, failover_hits, failover_started, _fixture_guard) =
+        spawn_fixture_server().await;
+    let fixture_url = format!("{fixture_base}/");
+    let failover_url = format!("{fixture_base}/failover");
     let tmp = TempDirGuard::new("fluxwright-cluster-e2e");
     let journal_path = tmp.0.join("journal.jsonl");
     let journal_str = journal_path.to_str().expect("UTF-8 temp path").to_string();
@@ -355,60 +419,24 @@ async fn cluster_coordinator_and_workers_e2e() {
     .await
     .unwrap_or_else(|_| panic!("coordinator did not become healthy\nlogs:\n{}", procs.dump_logs()));
 
-    // Spawn 2 workers joining the coordinator
-    procs.spawn(
-        "worker-a",
-        &[
-            "serve",
-            "--join",
-            &coord_url,
-            "--worker-id",
-            "worker-a",
-            "--max-browsers",
-            "1",
-            "--max-contexts",
-            "2",
-        ],
+    // Verify coordinator rejects pause_for_human immediately with 400 (no local browser / HITL).
+    let (pause_status, pause_body) = http_json(
+        coord_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": fixture_url },
+                { "action": "pause_for_human", "message": "not supported on coordinator" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(
+        pause_status, 400,
+        "coordinator must reject pause_for_human with 400, got {pause_status}: {pause_body}"
     );
-    procs.spawn(
-        "worker-b",
-        &[
-            "serve",
-            "--join",
-            &coord_url,
-            "--worker-id",
-            "worker-b",
-            "--max-browsers",
-            "1",
-            "--max-contexts",
-            "2",
-        ],
-    );
-
-    // Wait until /v1/workers lists both worker-a and worker-b online
-    let workers_snapshot = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let (status, body) =
-                http_json(coord_addr, "GET", "/v1/workers", Some(SERVER_TOKEN), None).await;
-            assert_eq!(status, 200, "{body}");
-            let workers = body["workers"].as_array();
-            let has_a = workers.is_some_and(|list| {
-                list.iter()
-                    .any(|w| w["worker"] == "worker-a" && w["status"] == "online")
-            });
-            let has_b = workers.is_some_and(|list| {
-                list.iter()
-                    .any(|w| w["worker"] == "worker-b" && w["status"] == "online")
-            });
-            if has_a && has_b {
-                return body;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("workers did not register\nlogs:\n{}", procs.dump_logs()));
-    assert_eq!(workers_snapshot["summary"]["online"], 2, "{workers_snapshot}");
 
     // Verify worker token is rejected with 401 on client job submission endpoint
     let (unauth_status, unauth_body) = http_json(
@@ -424,7 +452,44 @@ async fn cluster_coordinator_and_workers_e2e() {
         "expected worker token to get 401 on /v1/jobs, got {unauth_status}: {unauth_body}"
     );
 
-    // Submit real browser job #1 and verify it succeeds
+    // Spawn worker-a with ONLY FLUXWRIGHT_WORKER_TOKEN (no FLUXWRIGHT_SERVER_TOKEN!)
+    procs.spawn_worker_only_token(
+        "worker-a",
+        &[
+            "serve",
+            "--join",
+            &coord_url,
+            "--worker-id",
+            "worker-a",
+            "--max-browsers",
+            "1",
+            "--max-contexts",
+            "2",
+        ],
+    );
+
+    // Wait until /v1/workers lists worker-a online with true capacity max_jobs == 2
+    let workers_snapshot = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, body) =
+                http_json(coord_addr, "GET", "/v1/workers", Some(SERVER_TOKEN), None).await;
+            assert_eq!(status, 200, "{body}");
+            let has_a = body["workers"].as_array().is_some_and(|list| {
+                list.iter()
+                    .any(|w| w["worker"] == "worker-a" && w["status"] == "online")
+            });
+            if has_a {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("worker-a did not register\nlogs:\n{}", procs.dump_logs()));
+    assert_eq!(workers_snapshot["summary"]["online"], 1, "{workers_snapshot}");
+    assert_eq!(workers_snapshot["summary"]["capacity"], 2, "{workers_snapshot}");
+
+    // Submit real browser job #1 and verify it succeeds on worker-a
     let (sub1_status, sub1_body) = http_json(
         coord_addr,
         "POST",
@@ -446,47 +511,136 @@ async fn cluster_coordinator_and_workers_e2e() {
     assert_eq!(done1["results"][1], json!("Cluster E2E Page"));
     assert_eq!(done1["results"][2], json!("Cluster Worker OK"));
 
-    // Record worker-b's completed count before killing worker-a
-    let (_, before_kill) =
-        http_json(coord_addr, "GET", "/v1/workers", Some(SERVER_TOKEN), None).await;
-    let b_before = before_kill["workers"]
-        .as_array()
-        .and_then(|arr| arr.iter().find(|w| w["worker"] == "worker-b"))
-        .and_then(|w| w["succeeded_jobs"].as_u64())
-        .expect("worker-b entry before kill");
-
-    // Kill worker-a and submit job #2; worker-b must execute and complete it
-    procs.kill_and_wait("worker-a").await;
-
-    let (sub2_status, sub2_body) = http_json(
+    // Submit failover job (retries: 1) that holds on hit #1 until worker-a is SIGKILLed.
+    let (fail_sub_status, fail_sub_body) = http_json(
         coord_addr,
         "POST",
         "/v1/jobs",
         Some(SERVER_TOKEN),
         Some(&json!({
-            "timeout_ms": 60_000,
+            "retries": 1,
+            "timeout_ms": 90_000,
             "steps": [
-                { "action": "goto", "url": fixture_url },
-                { "action": "evaluate", "expression": "document.querySelector('h1').textContent" }
+                { "action": "goto", "url": failover_url },
+                { "action": "wait_for_selector", "selector": "#ready" },
+                { "action": "text_content", "selector": "#ready" },
+                { "action": "title" }
             ]
         })),
     )
     .await;
-    assert_eq!(sub2_status, 202, "submit job 2 failed: {sub2_body}");
-    let job2_id = sub2_body["id"].as_str().expect("job 2 id");
-    let done2 = wait_for_job(coord_addr, job2_id, &procs).await;
-    assert_eq!(done2["results"][1], json!("Cluster Worker OK"));
+    assert_eq!(fail_sub_status, 202, "submit failover job failed: {fail_sub_body}");
+    let failover_job_id = fail_sub_body["id"].as_str().expect("failover job id");
 
-    let (_, after_kill) =
+    // Wait until worker-a is actively executing hit #1 of /failover.
+    tokio::time::timeout(Duration::from_secs(30), failover_started.notified())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "worker-a did not start failover job\nlogs:\n{}",
+                procs.dump_logs()
+            )
+        });
+
+    // Wait >3 worker poll cycles (200ms each) while worker-a holds 1 of 2 slots, then verify
+    // GET /v1/workers still reports true capacity max_jobs == 2 (not overwritten to want=1).
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let (busy_status, busy_workers) =
         http_json(coord_addr, "GET", "/v1/workers", Some(SERVER_TOKEN), None).await;
-    let b_after = after_kill["workers"]
+    assert_eq!(busy_status, 200, "{busy_workers}");
+    let worker_a_busy = busy_workers["workers"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|w| w["worker"] == "worker-a"))
+        .unwrap_or_else(|| panic!("worker-a missing while busy: {busy_workers}"));
+    assert_eq!(
+        worker_a_busy["active_jobs"], 1,
+        "worker-a should have 1 active job while holding /failover: {busy_workers}"
+    );
+    assert_eq!(
+        worker_a_busy["max_jobs"], 2,
+        "worker-a max_jobs capacity must remain 2 while busy (not overwritten by want=1): {busy_workers}"
+    );
+    assert_eq!(
+        busy_workers["summary"]["capacity"], 2,
+        "cluster summary capacity must remain 2 while busy: {busy_workers}"
+    );
+
+    // SIGKILL worker-a mid-job (no graceful /release or /result).
+    procs.kill_and_wait("worker-a").await;
+
+    // Spawn worker-b (also with ONLY FLUXWRIGHT_WORKER_TOKEN) to pick up the requeued job
+    // once worker-a's lease expires.
+    procs.spawn_worker_only_token(
+        "worker-b",
+        &[
+            "serve",
+            "--join",
+            &coord_url,
+            "--worker-id",
+            "worker-b",
+            "--max-browsers",
+            "1",
+            "--max-contexts",
+            "2",
+        ],
+    );
+
+    // Wait for worker-b to register online.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, body) =
+                http_json(coord_addr, "GET", "/v1/workers", Some(SERVER_TOKEN), None).await;
+            assert_eq!(status, 200, "{body}");
+            let has_b = body["workers"].as_array().is_some_and(|list| {
+                list.iter()
+                    .any(|w| w["worker"] == "worker-b" && w["status"] == "online")
+            });
+            if has_b {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("worker-b did not register\nlogs:\n{}", procs.dump_logs()));
+
+    // Wait for coordinator lease expiry (30s default) -> requeue -> execution on worker-b.
+    let done_failover = wait_for_job(coord_addr, failover_job_id, &procs).await;
+    assert_eq!(done_failover["status"], json!("succeeded"), "{done_failover}");
+    assert_eq!(
+        done_failover["attempts"], 2,
+        "expected failover job to succeed on attempt 2 after lease expiry: {done_failover}"
+    );
+    assert_eq!(done_failover["results"][2], json!("Recovered"), "{done_failover}");
+    assert_eq!(
+        done_failover["results"][3],
+        json!("Failover Recovered"),
+        "{done_failover}"
+    );
+    assert_eq!(
+        failover_hits.load(Ordering::SeqCst),
+        2,
+        "expected /failover to be hit once by worker-a and once by worker-b"
+    );
+
+    let (_, after_failover) =
+        http_json(coord_addr, "GET", "/v1/workers", Some(SERVER_TOKEN), None).await;
+    let a_expired = after_failover["workers"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|w| w["worker"] == "worker-a"))
+        .and_then(|w| w["expired_leases"].as_u64())
+        .unwrap_or_else(|| panic!("worker-a missing after failover: {after_failover}"));
+    let b_succeeded = after_failover["workers"]
         .as_array()
         .and_then(|arr| arr.iter().find(|w| w["worker"] == "worker-b"))
         .and_then(|w| w["succeeded_jobs"].as_u64())
-        .expect("worker-b entry after kill");
+        .unwrap_or_else(|| panic!("worker-b missing after failover: {after_failover}"));
     assert_eq!(
-        b_after,
-        b_before + 1,
-        "expected job 2 to execute on worker-b after killing worker-a: {after_kill}"
+        a_expired, 1,
+        "expected worker-a to record 1 expired lease after mid-job SIGKILL: {after_failover}"
+    );
+    assert!(
+        b_succeeded >= 1,
+        "expected worker-b to complete the requeued failover job: {after_failover}"
     );
 }

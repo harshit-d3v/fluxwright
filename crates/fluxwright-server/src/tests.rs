@@ -1729,3 +1729,104 @@ async fn cluster_worker_token_isolates_worker_and_client_routes() {
 
     coord.shutdown(Duration::ZERO).await.unwrap();
 }
+
+#[tokio::test]
+async fn coordinator_rejects_pause_for_human_and_preserves_worker_capacity() {
+    let mut config = ServerConfig::new(TOKEN.into()).unwrap();
+    config.max_jobs = 16;
+    let coord = HttpServer::coordinator(config).unwrap();
+
+    // Coordinator must reject pause_for_human upfront with HTTP 400.
+    let bad = call(
+        &coord,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"pause_for_human","message":"wait"}]}"#,
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let bad_body = body(bad).await;
+    assert_eq!(bad_body["error"]["code"], "invalid_request");
+
+    // Submit 2 jobs and lease them with capacity=4, then poll again with want=2, capacity=4.
+    let _j1 = submit_priority(&coord, "normal", 0).await;
+    let _j2 = submit_priority(&coord, "normal", 0).await;
+
+    let l1 = call(
+        &coord,
+        "POST",
+        "/v1/workers/w-cap/lease",
+        r#"{"max_jobs":4,"capacity":4}"#,
+    )
+    .await;
+    assert_eq!(l1.status(), StatusCode::OK);
+    assert_eq!(body(l1).await["jobs"].as_array().unwrap().len(), 2);
+
+    // Subsequent poll with smaller `max_jobs` (free slots) must keep reported capacity=4.
+    let l2 = call(
+        &coord,
+        "POST",
+        "/v1/workers/w-cap/lease",
+        r#"{"max_jobs":2,"capacity":4}"#,
+    )
+    .await;
+    assert_eq!(l2.status(), StatusCode::OK);
+
+    // Legacy worker without `capacity` field also does not shrink its registered capacity.
+    let _ = call(
+        &coord,
+        "POST",
+        "/v1/workers/w-legacy/lease",
+        r#"{"max_jobs":3}"#,
+    )
+    .await;
+    let _ = call(
+        &coord,
+        "POST",
+        "/v1/workers/w-legacy/lease",
+        r#"{"max_jobs":1}"#,
+    )
+    .await;
+
+    let workers = body(call(&coord, "GET", "/v1/workers", Body::empty()).await).await;
+    let list = workers["workers"].as_array().unwrap();
+    let w_cap = list.iter().find(|w| w["worker"] == "w-cap").unwrap();
+    assert_eq!(w_cap["max_jobs"], 4);
+    assert_eq!(w_cap["active_jobs"], 2);
+    let w_legacy = list.iter().find(|w| w["worker"] == "w-legacy").unwrap();
+    assert_eq!(w_legacy["max_jobs"], 3);
+    assert_eq!(workers["summary"]["capacity"], 7);
+
+    coord.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[test]
+fn remaining_retries_accounts_for_prior_cluster_attempts() {
+    assert_eq!(remaining_retries(2, 0), 2);
+    assert_eq!(remaining_retries(2, 1), 2);
+    assert_eq!(remaining_retries(2, 2), 1);
+    assert_eq!(remaining_retries(2, 3), 0);
+    assert_eq!(remaining_retries(1, 2), 0);
+    assert_eq!(remaining_retries(0, 2), 0);
+}
+
+#[tokio::test]
+async fn stats_and_dashboard_snapshot_expose_memory_ceiling() {
+    let engine = BrowserEngine::builder()
+        .source(Arc::new(NeverStarts))
+        .memory_ceiling_mb(2048)
+        .build()
+        .await
+        .unwrap();
+    let srv = HttpServer::new(engine, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+
+    let stats_val = body(call(&srv, "GET", "/v1/stats", Body::empty()).await).await;
+    assert_eq!(stats_val["memory_ceiling_mb"], 2048);
+    assert_eq!(stats_val["memory_ceiling_bytes"], 2048u64 * 1024 * 1024);
+
+    let snap = srv.inner.dashboard_snapshot().await;
+    assert_eq!(snap["server"]["memory_ceiling_mb"], 2048);
+    assert_eq!(snap["server"]["memory_ceiling_bytes"], 2048u64 * 1024 * 1024);
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+}

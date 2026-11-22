@@ -2,7 +2,7 @@
 //! WebSocket ticket auth, and Human-in-the-Loop (HITL) mouse/keyboard forwarding.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,8 @@ use fluxwright::{netguard, Connection};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::cdp_gateway::percent_decode_str;
@@ -27,8 +28,12 @@ const MAX_TICKETS: usize = 256;
 const TICKET_TTL: Duration = Duration::from_secs(30);
 const MAX_WS_PAYLOAD_BYTES: usize = 16 * 1024;
 const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+const INPUT_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const STATIC_FALLBACK_DELAY: Duration = Duration::from_millis(300);
+const INPUT_QUEUE_CAPACITY: usize = 256;
+const MAX_INFLIGHT_ACKS: usize = 8;
+const MAX_INFLIGHT_NAVIGATES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -578,6 +583,9 @@ fn parse_client_command(raw: &str, any_url: bool) -> Result<ClientCommand, Strin
                 "button": button,
                 "modifiers": modifiers,
             });
+            if let Some(buttons) = val.get("buttons").and_then(Value::as_u64) {
+                params["buttons"] = json!(buttons & 31);
+            }
             if matches!(event, "mousePressed" | "mouseReleased") {
                 params["clickCount"] = json!(click_count);
             }
@@ -800,13 +808,81 @@ async fn run_live_stream(
         return;
     }
 
-    let any_url = std::env::var_os("FLUXWRIGHT_SERVER_ANY_URL").is_some();
+    enum InputOp {
+        Mouse(Value),
+        Key(Value),
+        Text(String),
+        Resume(u64),
+    }
+
+    let any_url = inner.allow_any_url();
     let mut shutdown_rx = inner.shutdown_tx.subscribe();
     let mut pause_rx = entry.pause_tx.as_ref().map(|tx| tx.subscribe());
     let mut got_frame = false;
     let fallback_sleep = tokio::time::sleep(STATIC_FALLBACK_DELAY);
     tokio::pin!(fallback_sleep);
     let mut target_detached = false;
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (input_tx, mut input_rx) = mpsc::channel::<InputOp>(INPUT_QUEUE_CAPACITY);
+    let pause_seq = Arc::new(AtomicU64::new(0));
+    let ack_permits = Arc::new(Semaphore::new(MAX_INFLIGHT_ACKS));
+    let nav_permits = Arc::new(Semaphore::new(MAX_INFLIGHT_NAVIGATES));
+    let mut bg_tasks = JoinSet::new();
+
+    // Run Input.* sequentially off the select! loop so slow/hung pages never stall
+    // pause/resume/pings/shutdown while preserving click -> text -> submit -> resume order.
+    let input_task = {
+        let conn = entry.conn.clone();
+        let obs_sid = obs_sid.clone();
+        let entry = entry.clone();
+        let out_tx = out_tx.clone();
+        let pause_seq = pause_seq.clone();
+        tokio::spawn(async move {
+            while let Some(op) = input_rx.recv().await {
+                match op {
+                    InputOp::Mouse(params) => {
+                        let _ = conn
+                            .call(
+                                "Input.dispatchMouseEvent",
+                                params,
+                                Some(&obs_sid),
+                                INPUT_CALL_TIMEOUT,
+                            )
+                            .await;
+                    }
+                    InputOp::Key(params) => {
+                        let _ = conn
+                            .call(
+                                "Input.dispatchKeyEvent",
+                                params,
+                                Some(&obs_sid),
+                                INPUT_CALL_TIMEOUT,
+                            )
+                            .await;
+                    }
+                    InputOp::Text(t) => {
+                        let _ = conn
+                            .call(
+                                "Input.insertText",
+                                json!({ "text": t }),
+                                Some(&obs_sid),
+                                INPUT_CALL_TIMEOUT,
+                            )
+                            .await;
+                    }
+                    InputOp::Resume(seq) => {
+                        if pause_seq.load(Ordering::SeqCst) == seq {
+                            if let Some(tx) = &entry.pause_tx {
+                                apply_pause_state(tx, &entry.pause_reason, false, None);
+                                let _ = out_tx.send(status_payload(&entry));
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
 
     loop {
         if *shutdown_rx.borrow() {
@@ -828,6 +904,12 @@ async fn run_live_stream(
                     break;
                 }
             }
+            Some(_) = bg_tasks.join_next(), if !bg_tasks.is_empty() => {}
+            Some(msg) = out_rx.recv() => {
+                if !send_json(&mut ws_tx, &msg).await {
+                    break;
+                }
+            }
             Ok(()) = async {
                 match pause_rx.as_mut() {
                     Some(rx) => rx.changed().await,
@@ -840,11 +922,15 @@ async fn run_live_stream(
             }
             () = &mut fallback_sleep, if !got_frame => {
                 got_frame = true;
-                if let Some(frame_msg) = capture_fallback_frame(&entry.conn, &obs_sid, query.quality).await {
-                    if !send_json(&mut ws_tx, &frame_msg).await {
-                        break;
+                let conn = entry.conn.clone();
+                let obs_sid = obs_sid.clone();
+                let out_tx = out_tx.clone();
+                let quality = query.quality;
+                bg_tasks.spawn(async move {
+                    if let Some(frame_msg) = capture_fallback_frame(&conn, &obs_sid, quality).await {
+                        let _ = out_tx.send(frame_msg);
                     }
-                }
+                });
             }
             ev = cdp_events.recv() => {
                 let Some(ev) = ev else {
@@ -891,12 +977,19 @@ async fn run_live_stream(
                             break;
                         }
                         if let Some(ack_id) = ev.params.get("sessionId").cloned() {
-                            let _ = entry.conn.call(
-                                "Page.screencastFrameAck",
-                                json!({ "sessionId": ack_id }),
-                                Some(&obs_sid),
-                                CLEANUP_TIMEOUT,
-                            ).await;
+                            if let Ok(permit) = ack_permits.clone().try_acquire_owned() {
+                                let conn = entry.conn.clone();
+                                let obs_sid = obs_sid.clone();
+                                bg_tasks.spawn(async move {
+                                    let _permit = permit;
+                                    let _ = conn.call(
+                                        "Page.screencastFrameAck",
+                                        json!({ "sessionId": ack_id }),
+                                        Some(&obs_sid),
+                                        CLEANUP_TIMEOUT,
+                                    ).await;
+                                });
+                            }
                         }
                     }
                     "Page.frameNavigated" if !ev.params["frame"]["parentId"].is_string() => {
@@ -915,21 +1008,32 @@ async fn run_live_stream(
                     Some(Ok(Message::Text(text))) => {
                         match parse_client_command(text.as_str(), any_url) {
                             Ok(ClientCommand::Mouse(params)) => {
-                                let _ = entry.conn.call("Input.dispatchMouseEvent", params, Some(&obs_sid), CDP_CALL_TIMEOUT).await;
+                                let _ = input_tx.try_send(InputOp::Mouse(params));
                             }
                             Ok(ClientCommand::Key(params)) => {
-                                let _ = entry.conn.call("Input.dispatchKeyEvent", params, Some(&obs_sid), CDP_CALL_TIMEOUT).await;
+                                let _ = input_tx.try_send(InputOp::Key(params));
                             }
                             Ok(ClientCommand::Text(t)) => {
-                                let _ = entry.conn.call("Input.insertText", json!({ "text": t }), Some(&obs_sid), CDP_CALL_TIMEOUT).await;
+                                let _ = input_tx.try_send(InputOp::Text(t));
                             }
                             Ok(ClientCommand::Navigate(url)) => {
-                                if let Err(err) = entry.conn.call("Page.navigate", json!({ "url": url }), Some(&obs_sid), CDP_CALL_TIMEOUT).await {
-                                    let _ = send_json(&mut ws_tx, &json!({ "type": "error", "message": err.to_string() })).await;
+                                if let Ok(permit) = nav_permits.clone().try_acquire_owned() {
+                                    let conn = entry.conn.clone();
+                                    let obs_sid = obs_sid.clone();
+                                    let out_tx = out_tx.clone();
+                                    bg_tasks.spawn(async move {
+                                        let _permit = permit;
+                                        if let Err(err) = conn.call("Page.navigate", json!({ "url": url }), Some(&obs_sid), CDP_CALL_TIMEOUT).await {
+                                            let _ = out_tx.send(json!({ "type": "error", "message": err.to_string() }));
+                                        }
+                                    });
+                                } else {
+                                    let _ = send_json(&mut ws_tx, &json!({ "type": "error", "message": "too many concurrent navigations" })).await;
                                 }
                             }
                             Ok(ClientCommand::Pause) => {
                                 if let Some(tx) = &entry.pause_tx {
+                                    pause_seq.fetch_add(1, Ordering::SeqCst);
                                     apply_pause_state(tx, &entry.pause_reason, true, None);
                                     if !send_json(&mut ws_tx, &status_payload(&entry)).await {
                                         break;
@@ -940,9 +1044,12 @@ async fn run_live_stream(
                             }
                             Ok(ClientCommand::Resume) => {
                                 if let Some(tx) = &entry.pause_tx {
-                                    apply_pause_state(tx, &entry.pause_reason, false, None);
-                                    if !send_json(&mut ws_tx, &status_payload(&entry)).await {
-                                        break;
+                                    let seq = pause_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if input_tx.try_send(InputOp::Resume(seq)).is_err() {
+                                        apply_pause_state(tx, &entry.pause_reason, false, None);
+                                        if !send_json(&mut ws_tx, &status_payload(&entry)).await {
+                                            break;
+                                        }
                                     }
                                 } else {
                                     let _ = send_json(&mut ws_tx, &json!({ "type": "error", "message": "CDP gateway sessions cannot be resumed" })).await;
@@ -969,6 +1076,9 @@ async fn run_live_stream(
             }
         }
     }
+
+    input_task.abort();
+    bg_tasks.abort_all();
 
     if !target_detached {
         let _ = entry
@@ -1077,8 +1187,12 @@ mod tests {
     #[test]
     fn client_command_validation_and_ssrf_guard() {
         assert!(matches!(
-            parse_client_command(r#"{"type":"mouse","event":"mousePressed","x":12,"y":34,"button":"left"}"#, false),
-            Ok(ClientCommand::Mouse(_))
+            parse_client_command(r#"{"type":"mouse","event":"mousePressed","x":12,"y":34,"button":"left","buttons":1}"#, false),
+            Ok(ClientCommand::Mouse(ref p)) if p["buttons"] == json!(1)
+        ));
+        assert!(matches!(
+            parse_client_command(r#"{"type":"mouse","event":"mouseMoved","x":50,"y":60,"button":"left","buttons":1}"#, false),
+            Ok(ClientCommand::Mouse(ref p)) if p["type"] == "mouseMoved" && p["buttons"] == json!(1)
         ));
         assert!(matches!(
             parse_client_command(r#"{"type":"key","event":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}"#, false),

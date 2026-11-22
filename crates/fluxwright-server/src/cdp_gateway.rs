@@ -6,6 +6,7 @@
 //! other's targets, cookies, storage, or browser lifecycle.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use axum::extract::{RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use fluxwright::{Connection, ContextLease, JobOptions, Priority, ResourcePreset};
+use fluxwright::{netguard, Connection, ContextLease, JobOptions, Priority, ResourcePreset};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex};
@@ -32,8 +33,15 @@ const SAFE_CREATE_CONTEXT_FIELDS: &[&str] = &[
     "disposeOnDetach",
     "proxyServer",
     "proxyBypassList",
-    "originsWithUniversalNetworkAccess",
 ];
+
+#[derive(Clone)]
+struct GatewayPolicy {
+    allow_any_url: bool,
+    enforce_server_proxy: bool,
+    resource_preset: Option<ResourcePreset>,
+    download_dir: PathBuf,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CdpQuery {
@@ -244,12 +252,17 @@ pub(crate) async fn ws_handler(
     }
 
     let mut opts = JobOptions::default().priority(query.priority);
-    if let Some(preset) = query.resource_preset {
-        opts = opts.resource_preset(preset);
-    }
     if let Some(timeout_ms) = query.timeout_ms {
         opts = opts.timeout(Duration::from_millis(timeout_ms));
     }
+
+    let enforce_server_proxy = engine.proxy_pool().is_some()
+        || engine
+            .config()
+            .launch
+            .extra_args
+            .iter()
+            .any(|a| a == "--proxy-server" || a.starts_with("--proxy-server="));
 
     let lease = engine.acquire_context_with(&opts).await.map_err(|e| match e {
         fluxwright::Error::ShuttingDown => ApiError::new(
@@ -271,14 +284,25 @@ pub(crate) async fn ws_handler(
     })?;
 
     lease.discard_warm_page().await;
-    if query.resource_preset.is_none() {
-        lease.mark_external_context(lease.context_id());
-    }
+    // Always mark gateway contexts external so CdpBrowser never double-attaches or installs
+    // internal dialog auto-dismissers; `resource_preset` is enforced inside the gateway via
+    // lightweight Fetch.enable across both primary and child contexts.
+    lease.mark_external_context(lease.context_id());
+
+    let policy = GatewayPolicy {
+        allow_any_url: inner.allow_any_url(),
+        enforce_server_proxy,
+        resource_preset: query.resource_preset,
+        download_dir: std::env::temp_dir().join(format!(
+            "fluxwright-cdp-dl-{}",
+            uuid::Uuid::new_v4().simple()
+        )),
+    };
 
     Ok(ws
         .max_frame_size(MAX_WS_PAYLOAD_BYTES)
         .max_message_size(MAX_WS_PAYLOAD_BYTES)
-        .on_upgrade(move |socket| run_gateway(socket, inner, lease, query.initial_page)))
+        .on_upgrade(move |socket| run_gateway(socket, inner, lease, query.initial_page, policy)))
 }
 
 struct ActiveCdpSessionGuard {
@@ -305,8 +329,17 @@ struct GatewayState {
     primary_context: String,
     allowed_contexts: HashSet<String>,
     extra_contexts: Vec<String>,
+    pending_extra_contexts: usize,
+    closing: bool,
     owned_targets: HashSet<String>,
+    owned_pages: Vec<String>,
+    owned_page_urls: HashMap<String, String>,
     owned_sessions: HashMap<String, String>,
+    owned_window_ids: HashSet<i64>,
+    blocker_sessions: HashMap<String, String>,
+    blocker_targets: HashSet<String>,
+    blocker_waiters: HashMap<String, watch::Receiver<bool>>,
+    download_dir_created: bool,
     auto_attached_targets: HashSet<String>,
     auto_attach_waiters: HashMap<String, watch::Receiver<bool>>,
     discover_targets: bool,
@@ -327,8 +360,17 @@ impl GatewayState {
             primary_context,
             allowed_contexts,
             extra_contexts: Vec::new(),
+            pending_extra_contexts: 0,
+            closing: false,
             owned_targets: HashSet::new(),
+            owned_pages: Vec::new(),
+            owned_page_urls: HashMap::new(),
             owned_sessions: HashMap::new(),
+            owned_window_ids: HashSet::new(),
+            blocker_sessions: HashMap::new(),
+            blocker_targets: HashSet::new(),
+            blocker_waiters: HashMap::new(),
+            download_dir_created: false,
             auto_attached_targets: HashSet::new(),
             auto_attach_waiters: HashMap::new(),
             discover_targets: false,
@@ -344,6 +386,7 @@ async fn run_gateway(
     inner: Arc<Inner>,
     lease: ContextLease,
     initial_page: bool,
+    policy: GatewayPolicy,
 ) {
     let _active_guard = ActiveCdpSessionGuard::enter(inner.clone());
     let conn = lease.cdp_connection();
@@ -388,18 +431,29 @@ async fn run_gateway(
             .await
         {
             if let Some(tid) = res["targetId"].as_str() {
-                let mut g = state.lock().await;
-                g.owned_targets.insert(tid.to_string());
-                *g.live_target.lock().unwrap() = Some(tid.to_string());
+                {
+                    let mut g = state.lock().await;
+                    g.owned_targets.insert(tid.to_string());
+                    if !g.owned_pages.iter().any(|p| p == tid) {
+                        g.owned_pages.push(tid.to_string());
+                    }
+                    g.owned_page_urls
+                        .insert(tid.to_string(), String::from("about:blank"));
+                    *g.live_target.lock().unwrap() = Some(tid.to_string());
+                }
+                if let Some(preset) = policy.resource_preset {
+                    ensure_preset_blocker(&conn, &state, &lease, tid, preset).await;
+                }
             }
         }
     }
 
-    let event_task = {
+    let mut event_task = {
         let state = state.clone();
         let conn = conn.clone();
         let lease = lease.clone();
         let out_tx = out_tx.clone();
+        let preset = policy.resource_preset;
         tokio::spawn(async move {
             while let Some(ev) = cdp_events.recv().await {
                 if ev.method == "Fluxwright.disconnected" {
@@ -407,23 +461,44 @@ async fn run_gateway(
                     break;
                 }
                 if let Some(sid) = ev.session_id.as_deref() {
-                    let forward = {
+                    let (is_blocker, forward, detach_child, blocker_child_tid) = {
                         let mut g = state.lock().await;
-                        if !g.owned_sessions.contains_key(sid) {
-                            false
+                        if g.blocker_sessions.contains_key(sid) {
+                            (true, false, None, None)
+                        } else if !g.owned_sessions.contains_key(sid) {
+                            (false, false, None, None)
                         } else {
+                            let mut detach_child = None;
+                            let mut blocker_child_tid = None;
                             if ev.method == "Target.attachedToTarget" {
                                 if let Some(child_sid) = ev.params["sessionId"].as_str() {
                                     let child_tid = ev.params["targetInfo"]["targetId"]
                                         .as_str()
                                         .unwrap_or_default()
                                         .to_string();
-                                    g.owned_sessions
-                                        .insert(child_sid.to_string(), child_tid.clone());
-                                    if !child_tid.is_empty() {
-                                        g.owned_targets.insert(child_tid);
+                                    let child_ty = ev.params["targetInfo"]["type"]
+                                        .as_str()
+                                        .unwrap_or("");
+                                    if g.closing {
+                                        detach_child = Some(child_sid.to_string());
+                                    } else {
+                                        g.owned_sessions
+                                            .insert(child_sid.to_string(), child_tid.clone());
+                                        if !child_tid.is_empty() {
+                                            g.owned_targets.insert(child_tid.clone());
+                                            if child_ty == "page"
+                                                && !g.owned_pages.iter().any(|p| p == &child_tid)
+                                            {
+                                                g.owned_pages.push(child_tid.clone());
+                                            }
+                                            if preset.is_some()
+                                                && matches!(child_ty, "page" | "iframe")
+                                            {
+                                                blocker_child_tid = Some(child_tid);
+                                            }
+                                        }
+                                        lease.mark_external_session(child_sid);
                                     }
-                                    lease.mark_external_session(child_sid);
                                 }
                             } else if ev.method == "Target.detachedFromTarget" {
                                 if let Some(child_sid) = ev.params["sessionId"].as_str() {
@@ -431,9 +506,53 @@ async fn run_gateway(
                                     lease.unmark_external_session(child_sid);
                                 }
                             }
-                            true
+                            (false, !g.closing, detach_child, blocker_child_tid)
                         }
                     };
+                    if is_blocker {
+                        if ev.method == "Fetch.requestPaused" {
+                            if let Some(req_id) = ev.params["requestId"].as_str().map(str::to_owned)
+                            {
+                                let conn = conn.clone();
+                                let sid = sid.to_string();
+                                tokio::spawn(async move {
+                                    let _ = conn
+                                        .call_raw(
+                                            "Fetch.failRequest",
+                                            json!({
+                                                "requestId": req_id,
+                                                "errorReason": "BlockedByClient",
+                                            }),
+                                            Some(&sid),
+                                            Duration::from_secs(5),
+                                        )
+                                        .await;
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(child_sid) = detach_child {
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            let _ = conn
+                                .call_raw(
+                                    "Target.detachFromTarget",
+                                    json!({ "sessionId": child_sid }),
+                                    None,
+                                    CLEANUP_TIMEOUT,
+                                )
+                                .await;
+                        });
+                    }
+                    if let (Some(child_tid), Some(p)) = (blocker_child_tid, preset) {
+                        let conn = conn.clone();
+                        let state = state.clone();
+                        let lease = lease.clone();
+                        tokio::spawn(async move {
+                            ensure_preset_blocker(&conn, &state, &lease, &child_tid, p).await;
+                        });
+                    }
                     if forward {
                         send_event(&out_tx, &ev.method, &ev.params, Some(sid));
                     }
@@ -447,23 +566,35 @@ async fn run_gateway(
                             continue;
                         };
                         let ctx_id = info["browserContextId"].as_str();
-                        let (owned, discover, attach_tx) = {
+                        let ty = info["type"].as_str().unwrap_or("");
+                        let (owned, discover, attach_tx, should_block) = {
                             let mut g = state.lock().await;
-                            let is_ours = ctx_id
-                                .is_some_and(|c| g.allowed_contexts.contains(c))
-                                || g.owned_targets.contains(tid);
+                            let is_ours = !g.closing
+                                && (ctx_id
+                                    .is_some_and(|c| g.allowed_contexts.contains(c))
+                                    || g.owned_targets.contains(tid));
                             if !is_ours {
-                                (false, false, None)
+                                (false, false, None, false)
                             } else {
                                 g.owned_targets.insert(tid.to_string());
-                                let ty = info["type"].as_str().unwrap_or("");
                                 if ty == "page" {
+                                    if !g.owned_pages.iter().any(|p| p == tid) {
+                                        g.owned_pages.push(tid.to_string());
+                                    }
+                                    if let Some(u) =
+                                        info["url"].as_str().filter(|s| !s.is_empty())
+                                    {
+                                        g.owned_page_urls
+                                            .insert(tid.to_string(), u.to_string());
+                                    }
                                     let mut slot = g.live_target.lock().unwrap();
                                     if slot.is_none() || ev.method == "Target.targetCreated" {
                                         *slot = Some(tid.to_string());
                                     }
                                     if slot.as_deref() == Some(tid) {
-                                        if let Some(u) = info["url"].as_str().filter(|s| !s.is_empty()) {
+                                        if let Some(u) =
+                                            info["url"].as_str().filter(|s| !s.is_empty())
+                                        {
                                             *g.live_url.lock().unwrap() = u.to_string();
                                         }
                                     }
@@ -479,11 +610,26 @@ async fn run_gateway(
                                 } else {
                                     None
                                 };
-                                (true, g.discover_targets, attach_tx)
+                                let should_block = ev.method == "Target.targetCreated"
+                                    && preset.is_some()
+                                    && matches!(ty, "page" | "iframe")
+                                    && !g.blocker_targets.contains(tid);
+                                (true, g.discover_targets, attach_tx, should_block)
                             }
                         };
                         if !owned {
                             continue;
+                        }
+                        if should_block {
+                            if let Some(p) = preset {
+                                let conn = conn.clone();
+                                let state = state.clone();
+                                let lease = lease.clone();
+                                let tid = tid.to_string();
+                                tokio::spawn(async move {
+                                    ensure_preset_blocker(&conn, &state, &lease, &tid, p).await;
+                                });
+                            }
                         }
                         if discover {
                             send_event(&out_tx, &ev.method, &ev.params, None);
@@ -503,6 +649,7 @@ async fn run_gateway(
                                     &out_tx,
                                     &tid,
                                     Some(info),
+                                    preset,
                                 )
                                 .await;
                                 state.lock().await.auto_attach_waiters.remove(&tid);
@@ -514,18 +661,38 @@ async fn run_gateway(
                         let Some(tid) = ev.params["targetId"].as_str() else {
                             continue;
                         };
-                        let (was_owned, discover) = {
+                        let (was_owned, discover, blocker_sids) = {
                             let mut g = state.lock().await;
                             let was_owned = g.owned_targets.remove(tid);
+                            g.owned_pages.retain(|p| p != tid);
+                            g.owned_page_urls.remove(tid);
                             g.auto_attached_targets.remove(tid);
                             g.auto_attach_waiters.remove(tid);
+                            g.blocker_targets.remove(tid);
+                            g.blocker_waiters.remove(tid);
+                            let mut bsids = Vec::new();
+                            g.blocker_sessions.retain(|bsid, t| {
+                                if t == tid {
+                                    bsids.push(bsid.clone());
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
                             let mut slot = g.live_target.lock().unwrap();
                             if slot.as_deref() == Some(tid) {
-                                *slot = None;
-                                g.live_url.lock().unwrap().clear();
+                                let fallback = g.owned_pages.last().cloned();
+                                *slot = fallback.clone();
+                                let next_url = fallback
+                                    .and_then(|id| g.owned_page_urls.get(&id).cloned())
+                                    .unwrap_or_default();
+                                *g.live_url.lock().unwrap() = next_url;
                             }
-                            (was_owned, g.discover_targets)
+                            (was_owned, g.discover_targets, bsids)
                         };
+                        for bsid in blocker_sids {
+                            lease.unmark_external_session(&bsid);
+                        }
                         if was_owned && discover {
                             send_event(&out_tx, &ev.method, &ev.params, None);
                         }
@@ -534,7 +701,15 @@ async fn run_gateway(
                         let Some(sid) = ev.params["sessionId"].as_str() else {
                             continue;
                         };
-                        let was_owned = state.lock().await.owned_sessions.remove(sid).is_some();
+                        let (was_blocker, was_owned) = {
+                            let mut g = state.lock().await;
+                            let b = g.blocker_sessions.remove(sid).is_some();
+                            let o = g.owned_sessions.remove(sid).is_some();
+                            (b, o)
+                        };
+                        if was_blocker {
+                            lease.unmark_external_session(sid);
+                        }
                         if was_owned {
                             lease.unmark_external_session(sid);
                             send_event(&out_tx, &ev.method, &ev.params, None);
@@ -561,6 +736,10 @@ async fn run_gateway(
                     break;
                 }
             }
+            _ = &mut event_task => {
+                let _ = out_tx.send(Message::Close(None));
+                break;
+            }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             msg = ws_rx.next() => {
                 match msg {
@@ -570,6 +749,7 @@ async fn run_gateway(
                             &conn,
                             &state,
                             &lease,
+                            &policy,
                             &out_tx,
                             &mut tasks,
                         ).await {
@@ -589,15 +769,20 @@ async fn run_gateway(
         }
     }
 
+    // Mark closing before aborting tasks so any in-flight createBrowserContext / attachToTarget
+    // RPCs self-dispose / self-detach on completion instead of leaking Chrome state.
+    state.lock().await.closing = true;
     event_task.abort();
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
 
-    let (sessions_to_detach, contexts_to_dispose) = {
+    let (sessions_to_detach, contexts_to_dispose, remove_download_dir) = {
         let mut g = state.lock().await;
-        let sessions: Vec<String> = g.owned_sessions.drain().map(|(s, _)| s).collect();
+        let mut sessions: Vec<String> = g.owned_sessions.drain().map(|(s, _)| s).collect();
+        sessions.extend(g.blocker_sessions.drain().map(|(s, _)| s));
         let contexts: Vec<String> = std::mem::take(&mut g.extra_contexts);
-        (sessions, contexts)
+        let remove_dir = g.download_dir_created;
+        (sessions, contexts, remove_dir)
     };
 
     for sid in sessions_to_detach {
@@ -625,6 +810,11 @@ async fn run_gateway(
     lease.unmark_external_context(&primary_context);
     let _ = lease.close().await;
 
+    if remove_download_dir {
+        let dir = policy.download_dir;
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
+    }
+
     drop(out_tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), writer_task).await;
 }
@@ -635,6 +825,7 @@ async fn handle_client_text(
     conn: &Arc<Connection>,
     state: &Arc<Mutex<GatewayState>>,
     lease: &Arc<ContextLease>,
+    policy: &GatewayPolicy,
     out_tx: &mpsc::UnboundedSender<Message>,
     tasks: &mut JoinSet<()>,
 ) -> bool {
@@ -647,7 +838,7 @@ async fn handle_client_text(
         send_error(out_tx, id.as_ref(), None, -32600, "missing CDP method");
         return false;
     };
-    let params = val.get("params").cloned().unwrap_or_else(|| json!({}));
+    let mut params = val.get("params").cloned().unwrap_or_else(|| json!({}));
     let session_id = val
         .get("sessionId")
         .and_then(Value::as_str)
@@ -664,12 +855,120 @@ async fn handle_client_text(
             );
             return false;
         }
+        match method.as_str() {
+            "DOM.setFileInputFiles" => {
+                send_error(
+                    out_tx,
+                    id.as_ref(),
+                    Some(&sid),
+                    -32000,
+                    "DOM.setFileInputFiles is blocked over /cdp to prevent host file reads",
+                );
+                return false;
+            }
+            "Page.navigate" => {
+                if !policy.allow_any_url {
+                    match params.get("url") {
+                        Some(Value::String(url)) => {
+                            if let Err(why) = netguard::url_allowed(url) {
+                                send_error(
+                                    out_tx,
+                                    id.as_ref(),
+                                    Some(&sid),
+                                    -32000,
+                                    &format!("navigation blocked: {why}"),
+                                );
+                                return false;
+                            }
+                        }
+                        Some(_) => {
+                            send_error(out_tx, id.as_ref(), Some(&sid), -32602, "invalid url");
+                            return false;
+                        }
+                        None => {}
+                    }
+                }
+            }
+            "Page.setDownloadBehavior" | "Browser.setDownloadBehavior" => {
+                if method == "Browser.setDownloadBehavior"
+                    && !scope_browser_context(&mut params, state, out_tx, id.as_ref(), Some(&sid))
+                        .await
+                {
+                    return false;
+                }
+                if let Err((code, msg)) = prepare_download_behavior(&mut params, state, policy).await
+                {
+                    send_error(out_tx, id.as_ref(), Some(&sid), code, msg);
+                    return false;
+                }
+            }
+            "Storage.getCookies"
+            | "Storage.setCookies"
+            | "Storage.clearCookies"
+            | "Browser.grantPermissions"
+            | "Browser.resetPermissions"
+            | "Browser.setPermission"
+            | "Browser.cancelDownload" => {
+                if !scope_browser_context(&mut params, state, out_tx, id.as_ref(), Some(&sid)).await
+                {
+                    return false;
+                }
+            }
+            "Browser.getWindowForTarget" => {
+                match parse_optional_target_id(&params) {
+                    Ok(Some(tid)) => {
+                        let tid = tid.to_owned();
+                        if !ensure_target_owned(conn, state, out_tx, id.as_ref(), Some(&sid), &tid)
+                            .await
+                        {
+                            return false;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(msg) => {
+                        send_error(out_tx, id.as_ref(), Some(&sid), -32602, msg);
+                        return false;
+                    }
+                }
+            }
+            "Browser.setWindowBounds" => {
+                let Some(wid) = params.get("windowId").and_then(Value::as_i64) else {
+                    send_error(
+                        out_tx,
+                        id.as_ref(),
+                        Some(&sid),
+                        -32602,
+                        "missing or invalid windowId",
+                    );
+                    return false;
+                };
+                if !state.lock().await.owned_window_ids.contains(&wid) {
+                    send_error(
+                        out_tx,
+                        id.as_ref(),
+                        Some(&sid),
+                        -32000,
+                        "windowId not owned by this CDP lease",
+                    );
+                    return false;
+                }
+            }
+            _ => {}
+        }
         let conn = conn.clone();
+        let state = state.clone();
         let out_tx = out_tx.clone();
         tasks.spawn(async move {
             let res = conn
                 .call_raw(&method, params, Some(&sid), CDP_CMD_TIMEOUT)
                 .await;
+            if method == "Browser.getWindowForTarget" {
+                if let Ok(Ok(ref val)) = res {
+                    if let Some(wid) = val["windowId"].as_i64() {
+                        state.lock().await.owned_window_ids.insert(wid);
+                    }
+                }
+            }
             relay_call_result(&out_tx, id.as_ref(), Some(&sid), res);
         });
         return false;
@@ -684,13 +983,25 @@ async fn handle_client_text(
     let conn = conn.clone();
     let state = state.clone();
     let lease = lease.clone();
+    let policy = policy.clone();
     let out_tx = out_tx.clone();
     tasks.spawn(async move {
-        handle_browser_command(&method, params, id.as_ref(), &conn, &state, &lease, &out_tx).await;
+        handle_browser_command(
+            &method,
+            params,
+            id.as_ref(),
+            &conn,
+            &state,
+            &lease,
+            &policy,
+            &out_tx,
+        )
+        .await;
     });
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_browser_command(
     method: &str,
     mut params: Value,
@@ -698,6 +1009,7 @@ async fn handle_browser_command(
     conn: &Arc<Connection>,
     state: &Arc<Mutex<GatewayState>>,
     lease: &Arc<ContextLease>,
+    policy: &GatewayPolicy,
     out_tx: &mpsc::UnboundedSender<Message>,
 ) {
     match method {
@@ -716,35 +1028,87 @@ async fn handle_browser_command(
             send_result(out_tx, id, None, json!({ "browserContextIds": ids }));
         }
         "Target.createBrowserContext" => {
-            let allowed = {
-                let g = state.lock().await;
-                g.extra_contexts.len() < MAX_EXTRA_CONTEXTS
-            };
-            if !allowed {
-                send_error(
-                    out_tx,
-                    id,
-                    None,
-                    -32000,
-                    "browser context limit reached for this CDP lease",
-                );
-                return;
-            }
-            let filtered = filter_create_context_params(&params);
-            match conn
-                .call_raw("Target.createBrowserContext", filtered, None, CDP_CMD_TIMEOUT)
-                .await
-            {
-                Ok(Ok(result)) => {
-                    if let Some(ctx_id) = result["browserContextId"].as_str() {
-                        lease.mark_external_context(ctx_id);
-                        let mut g = state.lock().await;
-                        g.allowed_contexts.insert(ctx_id.to_string());
-                        g.extra_contexts.push(ctx_id.to_string());
-                    }
-                    send_result(out_tx, id, None, result);
+            let filtered = match filter_create_context_params(&params, policy.enforce_server_proxy) {
+                Ok(v) => v,
+                Err(msg) => {
+                    send_error(out_tx, id, None, -32000, msg);
+                    return;
                 }
-                other => relay_call_result(out_tx, id, None, other),
+            };
+            {
+                let mut g = state.lock().await;
+                if g.closing {
+                    return;
+                }
+                if g.extra_contexts.len() + g.pending_extra_contexts >= MAX_EXTRA_CONTEXTS {
+                    send_error(
+                        out_tx,
+                        id,
+                        None,
+                        -32000,
+                        "browser context limit reached for this CDP lease",
+                    );
+                    return;
+                }
+                g.pending_extra_contexts += 1;
+            }
+            // Spawn so disconnect/cancellation of the caller task cannot abandon a newly created
+            // Chrome BrowserContext without disposing it.
+            let create_handle = tokio::spawn({
+                let conn = conn.clone();
+                let state = state.clone();
+                let lease = lease.clone();
+                async move {
+                    let res = conn
+                        .call_raw("Target.createBrowserContext", filtered, None, CDP_CMD_TIMEOUT)
+                        .await
+                        .map_err(|e| e.to_string());
+                    match res {
+                        Ok(Ok(result)) => {
+                            if let Some(ctx_id) = result["browserContextId"].as_str() {
+                                let should_dispose = {
+                                    let mut g = state.lock().await;
+                                    g.pending_extra_contexts =
+                                        g.pending_extra_contexts.saturating_sub(1);
+                                    if g.closing {
+                                        true
+                                    } else {
+                                        lease.mark_external_context(ctx_id);
+                                        g.allowed_contexts.insert(ctx_id.to_string());
+                                        g.extra_contexts.push(ctx_id.to_string());
+                                        false
+                                    }
+                                };
+                                if should_dispose {
+                                    let _ = conn
+                                        .call_raw(
+                                            "Target.disposeBrowserContext",
+                                            json!({ "browserContextId": ctx_id }),
+                                            None,
+                                            CLEANUP_TIMEOUT,
+                                        )
+                                        .await;
+                                    return Err("CDP gateway disconnected".to_string());
+                                }
+                            } else {
+                                let mut g = state.lock().await;
+                                g.pending_extra_contexts =
+                                    g.pending_extra_contexts.saturating_sub(1);
+                            }
+                            Ok(Ok(result))
+                        }
+                        other => {
+                            let mut g = state.lock().await;
+                            g.pending_extra_contexts =
+                                g.pending_extra_contexts.saturating_sub(1);
+                            other
+                        }
+                    }
+                }
+            });
+            match create_handle.await {
+                Ok(res) => relay_call_result(out_tx, id, None, res),
+                Err(e) => send_error(out_tx, id, None, -32000, &e.to_string()),
             }
         }
         "Target.disposeBrowserContext" => {
@@ -793,6 +1157,35 @@ async fn handle_browser_command(
                 send_error(out_tx, id, None, -32602, "params must be an object");
                 return;
             };
+            if !policy.allow_any_url {
+                if let Some(url_val) = obj.get("url") {
+                    match url_val.as_str() {
+                        Some(u) if u.is_empty() => {}
+                        Some(u) => {
+                            if let Err(why) = netguard::url_allowed(u) {
+                                send_error(
+                                    out_tx,
+                                    id,
+                                    None,
+                                    -32000,
+                                    &format!("navigation blocked: {why}"),
+                                );
+                                return;
+                            }
+                        }
+                        None => {
+                            send_error(out_tx, id, None, -32602, "invalid url");
+                            return;
+                        }
+                    }
+                }
+            }
+            let initial_url = obj
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("about:blank")
+                .to_string();
             {
                 let g = state.lock().await;
                 if let Some(ctx) = obj.get("browserContextId").and_then(Value::as_str) {
@@ -823,18 +1216,25 @@ async fn handle_browser_command(
                         WaitFor(watch::Receiver<bool>),
                         None,
                     }
-                    let post_attach = if let Some(tid) = result["targetId"].as_str() {
+                    let created_tid = result["targetId"].as_str().map(str::to_owned);
+                    let post_attach = if let Some(ref tid) = created_tid {
                         let mut g = state.lock().await;
-                        g.owned_targets.insert(tid.to_string());
+                        g.owned_targets.insert(tid.clone());
+                        if !g.owned_pages.iter().any(|p| p == tid) {
+                            g.owned_pages.push(tid.clone());
+                        }
+                        g.owned_page_urls
+                            .entry(tid.clone())
+                            .or_insert_with(|| initial_url.clone());
                         {
                             let mut slot = g.live_target.lock().unwrap();
                             if slot.is_none() {
-                                *slot = Some(tid.to_string());
+                                *slot = Some(tid.clone());
                             }
                         }
                         if g.auto_attach {
-                            if g.auto_attached_targets.insert(tid.to_string()) {
-                                PostCreateAttach::AttachNow(tid.to_string())
+                            if g.auto_attached_targets.insert(tid.clone()) {
+                                PostCreateAttach::AttachNow(tid.clone())
                             } else if let Some(rx) = g.auto_attach_waiters.get(tid).cloned() {
                                 PostCreateAttach::WaitFor(rx)
                             } else {
@@ -846,11 +1246,23 @@ async fn handle_browser_command(
                     } else {
                         PostCreateAttach::None
                     };
+                    if let (Some(ref tid), Some(preset)) = (&created_tid, policy.resource_preset) {
+                        ensure_preset_blocker(conn, state, lease, tid, preset).await;
+                    }
                     // Emit `Target.attachedToTarget` before the `Target.createTarget` result so
                     // clients like Playwright `connectOverCDP` already have the page session registered.
                     match post_attach {
                         PostCreateAttach::AttachNow(tid) => {
-                            let _ = attach_target(conn, state, lease, out_tx, &tid, None).await;
+                            let _ = attach_target(
+                                conn,
+                                state,
+                                lease,
+                                out_tx,
+                                &tid,
+                                None,
+                                policy.resource_preset,
+                            )
+                            .await;
                         }
                         PostCreateAttach::WaitFor(mut rx) => {
                             while !*rx.borrow() {
@@ -884,10 +1296,20 @@ async fn handle_browser_command(
                 send_error(out_tx, id, None, -32602, "missing targetId");
                 return;
             };
-            if !ensure_target_owned(conn, state, out_tx, id, &tid).await {
+            if !ensure_target_owned(conn, state, out_tx, id, None, &tid).await {
                 return;
             }
-            match attach_target(conn, state, lease, out_tx, &tid, None).await {
+            match attach_target(
+                conn,
+                state,
+                lease,
+                out_tx,
+                &tid,
+                None,
+                policy.resource_preset,
+            )
+            .await
+            {
                 Ok(sid) => send_result(out_tx, id, None, json!({ "sessionId": sid })),
                 Err(ErrPayload::Raw(err)) => send_cdp_err(out_tx, id, None, err),
                 Err(ErrPayload::Msg(msg)) => send_error(out_tx, id, None, -32000, &msg),
@@ -924,7 +1346,7 @@ async fn handle_browser_command(
                 send_error(out_tx, id, None, -32602, "missing targetId");
                 return;
             };
-            if !ensure_target_owned(conn, state, out_tx, id, &tid).await {
+            if !ensure_target_owned(conn, state, out_tx, id, None, &tid).await {
                 return;
             }
             let res = conn.call_raw(method, params, None, CDP_CMD_TIMEOUT).await;
@@ -939,7 +1361,7 @@ async fn handle_browser_command(
                 }
             };
             let forward_params = if let Some(tid) = tid.as_deref() {
-                if !ensure_target_owned(conn, state, out_tx, id, tid).await {
+                if !ensure_target_owned(conn, state, out_tx, id, None, tid).await {
                     return;
                 }
                 params
@@ -993,39 +1415,73 @@ async fn handle_browser_command(
                 }
             }
             for (tid, info) in to_attach {
-                let _ = attach_target(conn, state, lease, out_tx, &tid, Some(info)).await;
+                let _ = attach_target(
+                    conn,
+                    state,
+                    lease,
+                    out_tx,
+                    &tid,
+                    Some(info),
+                    policy.resource_preset,
+                )
+                .await;
             }
             send_result(out_tx, id, None, json!({}));
+        }
+        "Browser.setDownloadBehavior" => {
+            if !scope_browser_context(&mut params, state, out_tx, id, None).await {
+                return;
+            }
+            if let Err((code, msg)) = prepare_download_behavior(&mut params, state, policy).await {
+                send_error(out_tx, id, None, code, msg);
+                return;
+            }
+            let res = conn.call_raw(method, params, None, CDP_CMD_TIMEOUT).await;
+            relay_call_result(out_tx, id, None, res);
+        }
+        "Browser.getWindowForTarget" => {
+            let Some(tid) = params["targetId"].as_str().map(str::to_owned) else {
+                send_error(out_tx, id, None, -32602, "missing targetId");
+                return;
+            };
+            if !ensure_target_owned(conn, state, out_tx, id, None, &tid).await {
+                return;
+            }
+            let res = conn.call_raw(method, params, None, CDP_CMD_TIMEOUT).await;
+            if let Ok(Ok(ref val)) = res {
+                if let Some(wid) = val["windowId"].as_i64() {
+                    state.lock().await.owned_window_ids.insert(wid);
+                }
+            }
+            relay_call_result(out_tx, id, None, res);
+        }
+        "Browser.setWindowBounds" => {
+            let Some(wid) = params.get("windowId").and_then(Value::as_i64) else {
+                send_error(out_tx, id, None, -32602, "missing or invalid windowId");
+                return;
+            };
+            if !state.lock().await.owned_window_ids.contains(&wid) {
+                send_error(
+                    out_tx,
+                    id,
+                    None,
+                    -32000,
+                    "windowId not owned by this CDP lease",
+                );
+                return;
+            }
+            let res = conn.call_raw(method, params, None, CDP_CMD_TIMEOUT).await;
+            relay_call_result(out_tx, id, None, res);
         }
         "Storage.getCookies"
         | "Storage.setCookies"
         | "Storage.clearCookies"
         | "Browser.grantPermissions"
         | "Browser.resetPermissions"
-        | "Browser.setDownloadBehavior" => {
-            let Some(obj) = params.as_object_mut() else {
-                send_error(out_tx, id, None, -32602, "params must be an object");
+        | "Browser.setPermission"
+        | "Browser.cancelDownload" => {
+            if !scope_browser_context(&mut params, state, out_tx, id, None).await {
                 return;
-            };
-            {
-                let g = state.lock().await;
-                if let Some(ctx) = obj.get("browserContextId").and_then(Value::as_str) {
-                    if !g.allowed_contexts.contains(ctx) {
-                        send_error(
-                            out_tx,
-                            id,
-                            None,
-                            -32000,
-                            "browserContextId not owned by this CDP lease",
-                        );
-                        return;
-                    }
-                } else {
-                    obj.insert(
-                        "browserContextId".into(),
-                        Value::String(g.primary_context.clone()),
-                    );
-                }
             }
             let res = conn.call_raw(method, params, None, CDP_CMD_TIMEOUT).await;
             relay_call_result(out_tx, id, None, res);
@@ -1042,16 +1498,261 @@ async fn handle_browser_command(
     }
 }
 
-fn filter_create_context_params(params: &Value) -> Value {
+async fn scope_browser_context(
+    params: &mut Value,
+    state: &Arc<Mutex<GatewayState>>,
+    out_tx: &mpsc::UnboundedSender<Message>,
+    id: Option<&Value>,
+    session_id: Option<&str>,
+) -> bool {
+    let Some(obj) = params.as_object_mut() else {
+        send_error(out_tx, id, session_id, -32602, "params must be an object");
+        return false;
+    };
+    let g = state.lock().await;
+    match obj.get("browserContextId") {
+        Some(Value::String(ctx)) => {
+            if !g.allowed_contexts.contains(ctx.as_str()) {
+                send_error(
+                    out_tx,
+                    id,
+                    session_id,
+                    -32000,
+                    "browserContextId not owned by this CDP lease",
+                );
+                return false;
+            }
+        }
+        None | Some(Value::Null) => {
+            obj.remove("browserContextId");
+            if session_id.is_none() {
+                obj.insert(
+                    "browserContextId".into(),
+                    Value::String(g.primary_context.clone()),
+                );
+            }
+        }
+        Some(_) => {
+            send_error(out_tx, id, session_id, -32602, "invalid browserContextId");
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_download_behavior_params(params: &mut Value) -> Result<bool, (i64, &'static str)> {
+    let Some(obj) = params.as_object_mut() else {
+        return Err((-32602, "params must be an object"));
+    };
+    match obj.get("downloadPath") {
+        None | Some(Value::Null) => {
+            obj.remove("downloadPath");
+        }
+        Some(Value::String(s)) if s.is_empty() => {
+            obj.remove("downloadPath");
+        }
+        Some(Value::String(_)) => {
+            return Err((
+                -32000,
+                "custom downloadPath is not permitted on a pooled CDP connection",
+            ));
+        }
+        Some(_) => {
+            return Err((-32602, "invalid downloadPath"));
+        }
+    }
+    let allows_downloads = matches!(
+        obj.get("behavior").and_then(Value::as_str),
+        Some("allow" | "allowAndName")
+    );
+    Ok(allows_downloads)
+}
+
+async fn prepare_download_behavior(
+    params: &mut Value,
+    state: &Arc<Mutex<GatewayState>>,
+    policy: &GatewayPolicy,
+) -> Result<(), (i64, &'static str)> {
+    let allows_downloads = validate_download_behavior_params(params)?;
+    if allows_downloads {
+        let already_created = state.lock().await.download_dir_created;
+        if !already_created {
+            let dir = policy.download_dir.clone();
+            tokio::task::spawn_blocking(move || std::fs::create_dir_all(dir))
+                .await
+                .map_err(|_| (-32000, "failed to prepare ephemeral download directory"))?
+                .map_err(|_| (-32000, "failed to prepare ephemeral download directory"))?;
+            state.lock().await.download_dir_created = true;
+        }
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert(
+                "downloadPath".into(),
+                Value::String(policy.download_dir.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn preset_fetch_patterns(preset: ResourcePreset) -> Vec<Value> {
+    let types: &[&str] = match preset {
+        ResourcePreset::Scraping => &["Image", "Font", "Media"],
+        ResourcePreset::Minimal => &["Image", "Font", "Media", "Stylesheet"],
+        ResourcePreset::NoMedia => &["Image", "Media"],
+    };
+    types
+        .iter()
+        .map(|t| json!({ "urlPattern": "*", "resourceType": t, "requestStage": "Request" }))
+        .collect()
+}
+
+async fn ensure_preset_blocker(
+    conn: &Arc<Connection>,
+    state: &Arc<Mutex<GatewayState>>,
+    lease: &Arc<ContextLease>,
+    target_id: &str,
+    preset: ResourcePreset,
+) {
+    enum BlockerPlan {
+        Install(watch::Sender<bool>),
+        Wait(watch::Receiver<bool>),
+        Done,
+    }
+    let plan = {
+        let mut g = state.lock().await;
+        if g.closing {
+            BlockerPlan::Done
+        } else if g.blocker_targets.insert(target_id.to_string()) {
+            let (tx, rx) = watch::channel(false);
+            g.blocker_waiters.insert(target_id.to_string(), rx);
+            BlockerPlan::Install(tx)
+        } else if let Some(rx) = g.blocker_waiters.get(target_id).cloned() {
+            BlockerPlan::Wait(rx)
+        } else {
+            BlockerPlan::Done
+        }
+    };
+
+    match plan {
+        BlockerPlan::Done => {}
+        BlockerPlan::Wait(mut rx) => {
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        BlockerPlan::Install(tx) => {
+            // Spawn so disconnect/cancellation never leaks the internal Fetch blocker session.
+            let handle = tokio::spawn({
+                let conn = conn.clone();
+                let state = state.clone();
+                let lease = lease.clone();
+                let target_id = target_id.to_string();
+                async move {
+                    let attached = conn
+                        .call_raw(
+                            "Target.attachToTarget",
+                            json!({ "targetId": target_id, "flatten": true }),
+                            None,
+                            CDP_CMD_TIMEOUT,
+                        )
+                        .await;
+                    let blocker_sid = attached
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .and_then(|v| v["sessionId"].as_str().map(str::to_owned));
+                    let Some(bsid) = blocker_sid else {
+                        let mut g = state.lock().await;
+                        g.blocker_targets.remove(&target_id);
+                        g.blocker_waiters.remove(&target_id);
+                        let _ = tx.send(true);
+                        return;
+                    };
+                    let should_detach = {
+                        let mut g = state.lock().await;
+                        if g.closing {
+                            true
+                        } else {
+                            lease.mark_external_session(&bsid);
+                            g.blocker_sessions.insert(bsid.clone(), target_id.clone());
+                            false
+                        }
+                    };
+                    if should_detach {
+                        let _ = conn
+                            .call_raw(
+                                "Target.detachFromTarget",
+                                json!({ "sessionId": bsid }),
+                                None,
+                                CLEANUP_TIMEOUT,
+                            )
+                            .await;
+                        let mut g = state.lock().await;
+                        g.blocker_waiters.remove(&target_id);
+                        let _ = tx.send(true);
+                        return;
+                    }
+                    let enabled = conn
+                        .call_raw(
+                            "Fetch.enable",
+                            json!({
+                                "patterns": preset_fetch_patterns(preset),
+                                "handleAuthRequests": false,
+                            }),
+                            Some(&bsid),
+                            Duration::from_secs(5),
+                        )
+                        .await;
+                    if !matches!(enabled, Ok(Ok(_))) {
+                        {
+                            let mut g = state.lock().await;
+                            g.blocker_sessions.remove(&bsid);
+                            g.blocker_targets.remove(&target_id);
+                        }
+                        lease.unmark_external_session(&bsid);
+                        let _ = conn
+                            .call_raw(
+                                "Target.detachFromTarget",
+                                json!({ "sessionId": bsid }),
+                                None,
+                                CLEANUP_TIMEOUT,
+                            )
+                            .await;
+                    }
+                    state.lock().await.blocker_waiters.remove(&target_id);
+                    let _ = tx.send(true);
+                }
+            });
+            let _ = handle.await;
+        }
+    }
+}
+
+fn filter_create_context_params(
+    params: &Value,
+    enforce_server_proxy: bool,
+) -> Result<Value, &'static str> {
     let mut map = serde_json::Map::new();
     if let Some(obj) = params.as_object() {
+        if enforce_server_proxy
+            && (obj.get("proxyServer").is_some_and(|v| !v.is_null())
+                || obj.get("proxyBypassList").is_some_and(|v| !v.is_null()))
+        {
+            return Err(
+                "custom proxyServer/proxyBypassList is not permitted when server proxy is configured",
+            );
+        }
         for key in SAFE_CREATE_CONTEXT_FIELDS {
+            if enforce_server_proxy && matches!(*key, "proxyServer" | "proxyBypassList") {
+                continue;
+            }
             if let Some(val) = obj.get(*key) {
                 map.insert((*key).to_string(), val.clone());
             }
         }
     }
-    Value::Object(map)
+    Ok(Value::Object(map))
 }
 
 async fn filter_and_record_targets(
@@ -1070,6 +1771,14 @@ async fn filter_and_record_targets(
             || g.owned_targets.contains(tid);
         if owned {
             g.owned_targets.insert(tid.to_string());
+            if info["type"].as_str() == Some("page") {
+                if !g.owned_pages.iter().any(|p| p == tid) {
+                    g.owned_pages.push(tid.to_string());
+                }
+                if let Some(u) = info["url"].as_str().filter(|s| !s.is_empty()) {
+                    g.owned_page_urls.insert(tid.to_string(), u.to_string());
+                }
+            }
             out.push(info);
         }
     }
@@ -1089,6 +1798,7 @@ async fn ensure_target_owned(
     state: &Arc<Mutex<GatewayState>>,
     out_tx: &mpsc::UnboundedSender<Message>,
     id: Option<&Value>,
+    session_id: Option<&str>,
     target_id: &str,
 ) -> bool {
     match verify_target_owned(conn, state, target_id).await {
@@ -1097,14 +1807,14 @@ async fn ensure_target_owned(
             send_error(
                 out_tx,
                 id,
-                None,
+                session_id,
                 -32000,
                 "targetId not owned by this CDP lease",
             );
             false
         }
         Err(e) => {
-            send_error(out_tx, id, None, -32000, &e);
+            send_error(out_tx, id, session_id, -32000, &e);
             false
         }
     }
@@ -1134,6 +1844,11 @@ async fn verify_target_owned(
             let owned = ctx.is_some_and(|c| g.allowed_contexts.contains(c));
             if owned {
                 g.owned_targets.insert(target_id.to_string());
+                if val["targetInfo"]["type"].as_str() == Some("page")
+                    && !g.owned_pages.iter().any(|p| p == target_id)
+                {
+                    g.owned_pages.push(target_id.to_string());
+                }
             }
             Ok(owned)
         }
@@ -1153,29 +1868,72 @@ async fn attach_target(
     out_tx: &mpsc::UnboundedSender<Message>,
     target_id: &str,
     info_hint: Option<Value>,
+    resource_preset: Option<ResourcePreset>,
 ) -> Result<String, ErrPayload> {
-    let attached = conn
-        .call_raw(
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-            None,
-            CDP_CMD_TIMEOUT,
-        )
-        .await
-        .map_err(|e| ErrPayload::Msg(e.to_string()))?;
+    if state.lock().await.closing {
+        return Err(ErrPayload::Msg("CDP gateway disconnected".into()));
+    }
 
-    let result = match attached {
-        Ok(v) => v,
-        Err(err) => {
-            state.lock().await.auto_attached_targets.remove(target_id);
-            return Err(ErrPayload::Raw(err));
+    // Spawn the attach + record-or-detach step so caller cancellation cannot leak an attached
+    // Chrome session on disconnect.
+    let attach_handle = tokio::spawn({
+        let conn = conn.clone();
+        let state = state.clone();
+        let lease = lease.clone();
+        let target_id = target_id.to_string();
+        async move {
+            let attached = conn
+                .call_raw(
+                    "Target.attachToTarget",
+                    json!({ "targetId": target_id, "flatten": true }),
+                    None,
+                    CDP_CMD_TIMEOUT,
+                )
+                .await
+                .map_err(|e| ErrPayload::Msg(e.to_string()))?;
+
+            let result = match attached {
+                Ok(v) => v,
+                Err(err) => {
+                    state.lock().await.auto_attached_targets.remove(&target_id);
+                    return Err(ErrPayload::Raw(err));
+                }
+            };
+
+            let sid = result["sessionId"]
+                .as_str()
+                .ok_or_else(|| ErrPayload::Msg("attachToTarget: missing sessionId".into()))?
+                .to_string();
+
+            let should_detach = {
+                let mut g = state.lock().await;
+                if g.closing {
+                    true
+                } else {
+                    lease.mark_external_session(&sid);
+                    g.owned_targets.insert(target_id.clone());
+                    g.owned_sessions.insert(sid.clone(), target_id.clone());
+                    false
+                }
+            };
+            if should_detach {
+                let _ = conn
+                    .call_raw(
+                        "Target.detachFromTarget",
+                        json!({ "sessionId": sid }),
+                        None,
+                        CLEANUP_TIMEOUT,
+                    )
+                    .await;
+                return Err(ErrPayload::Msg("CDP gateway disconnected".into()));
+            }
+            Ok(sid)
         }
-    };
+    });
 
-    let sid = result["sessionId"]
-        .as_str()
-        .ok_or_else(|| ErrPayload::Msg("attachToTarget: missing sessionId".into()))?
-        .to_string();
+    let sid = attach_handle
+        .await
+        .map_err(|e| ErrPayload::Msg(e.to_string()))??;
 
     let info = match info_hint {
         Some(v) => v,
@@ -1193,11 +1951,17 @@ async fn attach_target(
             .unwrap_or_else(|| json!({ "targetId": target_id, "type": "page", "url": "" })),
     };
 
-    lease.mark_external_session(&sid);
-    {
+    let ty = info["type"].as_str().unwrap_or("");
+    if ty == "page" {
         let mut g = state.lock().await;
-        g.owned_targets.insert(target_id.to_string());
-        g.owned_sessions.insert(sid.clone(), target_id.to_string());
+        if !g.owned_pages.iter().any(|p| p == target_id) {
+            g.owned_pages.push(target_id.to_string());
+        }
+    }
+    if let Some(preset) = resource_preset {
+        if matches!(ty, "page" | "iframe" | "") {
+            ensure_preset_blocker(conn, state, lease, target_id, preset).await;
+        }
     }
 
     send_event(
@@ -1464,5 +2228,81 @@ mod tests {
             parse_optional_target_id(&json!({ "targetId": 123 })),
             Err("invalid targetId")
         );
+    }
+
+    #[test]
+    fn create_context_filter_strips_universal_access_and_enforces_server_proxy() {
+        let raw = json!({
+            "disposeOnDetach": true,
+            "originsWithUniversalNetworkAccess": ["https://evil.example"],
+            "proxyServer": "http://127.0.0.1:8888",
+            "proxyBypassList": "localhost",
+            "unknownField": 1
+        });
+
+        let allowed = filter_create_context_params(&raw, false).unwrap();
+        assert_eq!(allowed["disposeOnDetach"], json!(true));
+        assert_eq!(allowed["proxyServer"], json!("http://127.0.0.1:8888"));
+        assert_eq!(allowed["proxyBypassList"], json!("localhost"));
+        assert!(allowed.get("originsWithUniversalNetworkAccess").is_none());
+        assert!(allowed.get("unknownField").is_none());
+
+        assert!(filter_create_context_params(&raw, true).is_err());
+
+        let no_proxy = json!({
+            "disposeOnDetach": true,
+            "originsWithUniversalNetworkAccess": ["https://evil.example"]
+        });
+        let enforced_ok = filter_create_context_params(&no_proxy, true).unwrap();
+        assert_eq!(enforced_ok, json!({ "disposeOnDetach": true }));
+    }
+
+    #[test]
+    fn download_behavior_validator_blocks_caller_download_path() {
+        let mut custom = json!({ "behavior": "allow", "downloadPath": "/tmp/host-escape" });
+        assert_eq!(
+            validate_download_behavior_params(&mut custom),
+            Err((
+                -32000,
+                "custom downloadPath is not permitted on a pooled CDP connection"
+            ))
+        );
+
+        let mut bad_type = json!({ "behavior": "allow", "downloadPath": 42 });
+        assert_eq!(
+            validate_download_behavior_params(&mut bad_type),
+            Err((-32602, "invalid downloadPath"))
+        );
+
+        let mut deny = json!({ "behavior": "deny", "downloadPath": "" });
+        assert_eq!(validate_download_behavior_params(&mut deny), Ok(false));
+        assert!(deny.get("downloadPath").is_none());
+
+        let mut allow = json!({ "behavior": "allowAndName" });
+        assert_eq!(validate_download_behavior_params(&mut allow), Ok(true));
+    }
+
+    #[test]
+    fn preset_fetch_patterns_cover_expected_resource_types() {
+        let scraping = preset_fetch_patterns(ResourcePreset::Scraping);
+        let types: Vec<&str> = scraping
+            .iter()
+            .filter_map(|v| v["resourceType"].as_str())
+            .collect();
+        assert_eq!(types, vec!["Image", "Font", "Media"]);
+
+        let minimal = preset_fetch_patterns(ResourcePreset::Minimal);
+        let m_types: Vec<&str> = minimal
+            .iter()
+            .filter_map(|v| v["resourceType"].as_str())
+            .collect();
+        assert_eq!(m_types, vec!["Image", "Font", "Media", "Stylesheet"]);
+
+        let no_media = preset_fetch_patterns(ResourcePreset::NoMedia);
+        let nm_types: Vec<&str> = no_media
+            .iter()
+            .filter_map(|v| v["resourceType"].as_str())
+            .collect();
+        assert_eq!(nm_types, vec!["Image", "Media"]);
     }
 }
