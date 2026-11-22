@@ -28,8 +28,10 @@ pub struct ToHaveScreenshotOptions {
     pub max_diff_pixel_ratio: Option<f64>,
     /// Whether CSS animations are disabled during capture (default: [`Animations::Disabled`]).
     pub animations: Animations,
-    /// Create or overwrite the golden baseline file (also enabled by `FLUXWRIGHT_UPDATE_SNAPSHOTS=1`).
-    pub update: bool,
+    /// Create or overwrite the golden baseline file (`None` defers to
+    /// `FLUXWRIGHT_UPDATE_SNAPSHOTS`, `Some(true)` forces update, `Some(false)` disables update
+    /// even when the environment variable is set).
+    pub update: Option<bool>,
     /// Capture full scrollable page (page screenshots only).
     pub full_page: bool,
     /// Omit default white background (transparent PNG).
@@ -45,7 +47,7 @@ impl Default for ToHaveScreenshotOptions {
             max_diff_pixels: None,
             max_diff_pixel_ratio: None,
             animations: Animations::Disabled,
-            update: false,
+            update: None,
             full_page: false,
             omit_background: false,
             clip: None,
@@ -75,7 +77,7 @@ impl ToHaveScreenshotOptions {
     }
 
     pub fn update(mut self, update: bool) -> Self {
-        self.update = update;
+        self.update = Some(update);
         self
     }
 
@@ -177,37 +179,64 @@ pub(crate) const RESTORE_ANIMATIONS_LOCATOR_JS: &str = r#"(el) => {
     if (s) s.remove();
 }"#;
 
-pub fn should_update_snapshots(explicit_update: bool) -> bool {
-    if explicit_update {
-        return true;
+pub fn should_update_snapshots(explicit_update: Option<bool>) -> bool {
+    match explicit_update {
+        Some(v) => v,
+        None => std::env::var("FLUXWRIGHT_UPDATE_SNAPSHOTS")
+            .ok()
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "all"
+                )
+            }),
     }
-    std::env::var("FLUXWRIGHT_UPDATE_SNAPSHOTS")
-        .ok()
-        .is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "all"
-            )
-        })
 }
 
 /// Returns `(baseline_path, actual_path, diff_path)` where artifacts share `<stem>-actual.png` / `<stem>-diff.png`.
-pub fn artifact_paths(baseline: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let parent = baseline.parent();
-    let stem = baseline
+/// Rejects empty paths, missing filenames, and parent-directory (`..`) traversal components.
+pub fn artifact_paths(baseline: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let raw = baseline.to_string_lossy();
+    if raw.is_empty() {
+        return Err(Error::Other(
+            "to_have_screenshot: snapshot path must not be empty".into(),
+        ));
+    }
+    if raw.ends_with('/') || raw.ends_with('\\') {
+        return Err(Error::Other(format!(
+            "to_have_screenshot: snapshot path must include a filename: {}",
+            baseline.display()
+        )));
+    }
+    if baseline
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::Other(format!(
+            "to_have_screenshot: snapshot path must not contain '..': {}",
+            baseline.display()
+        )));
+    }
+    let Some(stem) = baseline
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or("screenshot");
+    else {
+        return Err(Error::Other(format!(
+            "to_have_screenshot: snapshot path must include a valid filename: {}",
+            baseline.display()
+        )));
+    };
+    let parent = baseline.parent();
     let join = |suffix: &str| match parent {
         Some(p) if !p.as_os_str().is_empty() => p.join(format!("{stem}{suffix}")),
         _ => PathBuf::from(format!("{stem}{suffix}")),
     };
-    (
+    Ok((
         baseline.to_path_buf(),
         join("-actual.png"),
         join("-diff.png"),
-    )
+    ))
 }
 
 /// Decodes any valid PNG into normalized 8-bit RGBA pixels.
@@ -287,27 +316,7 @@ fn blend_channel(c: u8, alpha: u8, bg: f64) -> f64 {
 }
 
 #[inline]
-fn yiq_delta_sq(p1: &[u8], p2: &[u8]) -> f64 {
-    if p1 == p2 {
-        return 0.0;
-    }
-    let (mut r1, mut g1, mut b1, a1) = (p1[0] as f64, p1[1] as f64, p1[2] as f64, p1[3]);
-    let (mut r2, mut g2, mut b2, a2) = (p2[0] as f64, p2[1] as f64, p2[2] as f64, p2[3]);
-    if a1 < 255 {
-        const BG: f64 = 192.0;
-        r1 = blend_channel(p1[0], a1, BG);
-        g1 = blend_channel(p1[1], a1, BG);
-        b1 = blend_channel(p1[2], a1, BG);
-    }
-    if a2 < 255 {
-        const BG: f64 = 192.0;
-        r2 = blend_channel(p2[0], a2, BG);
-        g2 = blend_channel(p2[1], a2, BG);
-        b2 = blend_channel(p2[2], a2, BG);
-    }
-    let dr = r1 - r2;
-    let dg = g1 - g2;
-    let db = b1 - b2;
+fn rgb_yiq_delta_sq(dr: f64, dg: f64, db: f64) -> f64 {
     if dr == 0.0 && dg == 0.0 && db == 0.0 {
         return 0.0;
     }
@@ -315,6 +324,34 @@ fn yiq_delta_sq(p1: &[u8], p2: &[u8]) -> f64 {
     let i = dr * 0.59597799 - dg * 0.27417610 - db * 0.32180189;
     let q = dr * 0.21147017 - dg * 0.52261711 + db * 0.31114694;
     0.5053 * y * y + 0.299 * i * i + 0.1957 * q * q
+}
+
+#[inline]
+fn yiq_delta_sq(p1: &[u8], p2: &[u8]) -> f64 {
+    if p1 == p2 {
+        return 0.0;
+    }
+    let (a1, a2) = (p1[3], p2[3]);
+    if a1 == 255 && a2 == 255 {
+        return rgb_yiq_delta_sq(
+            (p1[0] as f64) - (p2[0] as f64),
+            (p1[1] as f64) - (p2[1] as f64),
+            (p1[2] as f64) - (p2[2] as f64),
+        );
+    }
+    // Dual-background blending (black + white) guarantees alpha differences can never cancel
+    // against a single fixed backdrop (e.g. opaque #C0C0C0 vs fully transparent).
+    let on_black = rgb_yiq_delta_sq(
+        blend_channel(p1[0], a1, 0.0) - blend_channel(p2[0], a2, 0.0),
+        blend_channel(p1[1], a1, 0.0) - blend_channel(p2[1], a2, 0.0),
+        blend_channel(p1[2], a1, 0.0) - blend_channel(p2[2], a2, 0.0),
+    );
+    let on_white = rgb_yiq_delta_sq(
+        blend_channel(p1[0], a1, 255.0) - blend_channel(p2[0], a2, 255.0),
+        blend_channel(p1[1], a1, 255.0) - blend_channel(p2[1], a2, 255.0),
+        blend_channel(p1[2], a1, 255.0) - blend_channel(p2[2], a2, 255.0),
+    );
+    on_black.max(on_white)
 }
 
 /// Compares `expected_img` and `actual_img` pixel-by-pixel using YIQ perceptual distance.
@@ -448,9 +485,58 @@ mod tests {
 
     #[test]
     fn artifact_paths_use_stem() {
-        let (base, actual, diff) = artifact_paths(Path::new("shots/hero.banner.png"));
+        let (base, actual, diff) = artifact_paths(Path::new("shots/hero.banner.png")).unwrap();
         assert_eq!(base, Path::new("shots/hero.banner.png"));
         assert_eq!(actual, Path::new("shots/hero.banner-actual.png"));
         assert_eq!(diff, Path::new("shots/hero.banner-diff.png"));
+    }
+
+    #[test]
+    fn artifact_paths_rejects_empty_and_parent_dir_traversal() {
+        assert!(artifact_paths(Path::new("")).is_err());
+        assert!(artifact_paths(Path::new(".")).is_err());
+        assert!(artifact_paths(Path::new("..")).is_err());
+        assert!(artifact_paths(Path::new("../escape.png")).is_err());
+        assert!(artifact_paths(Path::new("shots/../../escape.png")).is_err());
+        assert!(artifact_paths(Path::new("shots/")).is_err());
+        assert!(artifact_paths(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn yiq_delta_sq_detects_opaque_gray_vs_transparent() {
+        let opaque_gray = [192, 192, 192, 255];
+        let transparent = [0, 0, 0, 0];
+        assert!(yiq_delta_sq(&opaque_gray, &transparent) > 0.0);
+
+        let img_gray = decode_png(&solid_png(2, 2, opaque_gray)).unwrap();
+        let img_clear = decode_png(&solid_png(2, 2, transparent)).unwrap();
+        let strict = compare_images(&img_gray, &img_clear, 0.0, false).unwrap();
+        assert_eq!(strict.diff_pixels, 4);
+        let default_thresh = compare_images(&img_gray, &img_clear, 0.2, false).unwrap();
+        assert_eq!(default_thresh.diff_pixels, 4);
+
+        // Two fully transparent pixels with different RGB channels remain visually identical.
+        assert_eq!(yiq_delta_sq(&[255, 0, 0, 0], &[0, 0, 255, 0]), 0.0);
+    }
+
+    #[test]
+    fn should_update_snapshots_explicit_false_overrides_env() {
+        let prev = std::env::var_os("FLUXWRIGHT_UPDATE_SNAPSHOTS");
+        std::env::set_var("FLUXWRIGHT_UPDATE_SNAPSHOTS", "1");
+        let explicit_false = should_update_snapshots(Some(false));
+        let explicit_true = should_update_snapshots(Some(true));
+        let env_enabled = should_update_snapshots(None);
+        std::env::remove_var("FLUXWRIGHT_UPDATE_SNAPSHOTS");
+        let env_disabled = should_update_snapshots(None);
+        let explicit_true_without_env = should_update_snapshots(Some(true));
+        match prev {
+            Some(v) => std::env::set_var("FLUXWRIGHT_UPDATE_SNAPSHOTS", v),
+            None => std::env::remove_var("FLUXWRIGHT_UPDATE_SNAPSHOTS"),
+        }
+        assert!(!explicit_false);
+        assert!(explicit_true);
+        assert!(env_enabled);
+        assert!(!env_disabled);
+        assert!(explicit_true_without_env);
     }
 }

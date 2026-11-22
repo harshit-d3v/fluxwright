@@ -227,11 +227,19 @@ async fn visual_regression_to_have_screenshot() {
         .await
         .unwrap();
 
-    // 3. FLUXWRIGHT_UPDATE_SNAPSHOTS=1 creates golden baseline too.
+    // 3. FLUXWRIGHT_UPDATE_SNAPSHOTS=1 creates golden baseline too, while update(false) overrides it.
+    let no_update_shot = tmp.path().join("snapshots").join("no-update.png");
     let prev_env = std::env::var_os("FLUXWRIGHT_UPDATE_SNAPSHOTS");
     std::env::set_var("FLUXWRIGHT_UPDATE_SNAPSHOTS", "1");
     let env_res = expect_locator(&page.locator("#box"))
         .to_have_screenshot(&env_shot)
+        .await;
+    let override_false_res = expect_locator(&page.locator("#box"))
+        .timeout(Duration::from_millis(250))
+        .to_have_screenshot_with(
+            &no_update_shot,
+            &ToHaveScreenshotOptions::default().update(false),
+        )
         .await;
     match prev_env {
         Some(v) => std::env::set_var("FLUXWRIGHT_UPDATE_SNAPSHOTS", v),
@@ -239,6 +247,22 @@ async fn visual_regression_to_have_screenshot() {
     }
     env_res.unwrap();
     assert!(env_shot.exists());
+    let override_err = override_false_res.unwrap_err();
+    assert!(
+        override_err.to_string().contains("baseline snapshot does not exist"),
+        "update(false) must override FLUXWRIGHT_UPDATE_SNAPSHOTS=1, got: {override_err}"
+    );
+    assert!(!no_update_shot.exists());
+
+    // 3b. Path traversal (`..`) in snapshot path is rejected cleanly.
+    let traversal_err = expect_locator(&page.locator("#box"))
+        .to_have_screenshot(Path::new("../escape.png"))
+        .await
+        .unwrap_err();
+    assert!(
+        traversal_err.to_string().contains(".."),
+        "expected path traversal rejection, got: {traversal_err}"
+    );
 
     // 4. Auto-retrying polling passes once delayed DOM change restores baseline appearance.
     page.evaluate(

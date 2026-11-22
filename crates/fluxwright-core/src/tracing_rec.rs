@@ -30,6 +30,7 @@ pub struct TracingStartOptions {
     pub title: Option<String>,
     pub screenshots: bool,
     pub snapshots: bool,
+    pub sources: bool,
 }
 
 /// Options for [`Tracing::start_chunk`].
@@ -105,12 +106,15 @@ struct TraceState {
     closed: bool,
     screenshots: bool,
     snapshots: bool,
+    sources: bool,
     name: Option<String>,
     title: Option<String>,
     origin_instant: Instant,
     origin_wall_ms: f64,
     next_call_seq: u64,
     next_page_seq: u64,
+    chunk_seq: u64,
+    session_gen: u64,
     page_ids: HashMap<String, String>,
     trace_lines: Vec<String>,
     network_lines: Vec<String>,
@@ -119,6 +123,7 @@ struct TraceState {
     in_flight_net: HashMap<(String, String), InFlightNet>,
     open_pages: Vec<TrackedPage>,
     watchers: HashMap<Uuid, PageWatchHandles>,
+    cleanup_tasks: HashMap<Uuid, Vec<JoinHandle<()>>>,
 }
 
 impl TraceState {
@@ -129,12 +134,15 @@ impl TraceState {
             closed: false,
             screenshots: false,
             snapshots: false,
+            sources: false,
             name: None,
             title: None,
             origin_instant: Instant::now(),
             origin_wall_ms: unix_now_ms(),
             next_call_seq: 0,
             next_page_seq: 0,
+            chunk_seq: 0,
+            session_gen: 0,
             page_ids: HashMap::new(),
             trace_lines: Vec::new(),
             network_lines: Vec::new(),
@@ -143,6 +151,7 @@ impl TraceState {
             in_flight_net: HashMap::new(),
             open_pages: Vec::new(),
             watchers: HashMap::new(),
+            cleanup_tasks: HashMap::new(),
         }
     }
 
@@ -173,6 +182,7 @@ impl TraceState {
             "options": {
                 "screenshots": self.screenshots,
                 "snapshots": self.snapshots,
+                "sources": self.sources,
             }
         });
         if let Some(ref title) = self.title {
@@ -192,6 +202,7 @@ impl TraceState {
         self.resources.clear();
         self.in_flight_net.clear();
         self.chunk_frames = 0;
+        self.chunk_seq = self.chunk_seq.wrapping_add(1);
         self.chunk_active = true;
         self.push_context_options();
         let open_ids: Vec<String> = self
@@ -216,14 +227,56 @@ impl TraceState {
         }
     }
 
-    fn flush_in_flight_network(&mut self) {
+    fn snapshot_network_ndjson(&self) -> String {
         let end_ms = self.mono_ms();
-        let pending = std::mem::take(&mut self.in_flight_net);
-        for (_, item) in pending {
-            if self.chunk_active {
-                self.network_lines
-                    .push(build_resource_snapshot(item, end_ms).to_string());
+        let mut lines = self.network_lines.clone();
+        if self.chunk_active {
+            for item in self.in_flight_net.values() {
+                lines.push(build_resource_snapshot(item, end_ms).to_string());
             }
+        }
+        let mut net_data = lines.join("\n");
+        if !net_data.is_empty() {
+            net_data.push('\n');
+        }
+        net_data
+    }
+}
+
+struct ActionTraceGuard<'a> {
+    tracing: &'a ContextTracing,
+    call_id: Option<String>,
+    chunk_seq: u64,
+}
+
+impl ActionTraceGuard<'_> {
+    fn finish(&mut self, error: Option<Value>) {
+        let Some(call_id) = self.call_id.take() else {
+            return;
+        };
+        let mut st = self.tracing.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.active && st.chunk_active && st.chunk_seq == self.chunk_seq {
+            let end_time = st.mono_ms();
+            let mut after = json!({
+                "type": "after",
+                "callId": call_id,
+                "endTime": end_time,
+            });
+            if let Some(err_val) = error {
+                after["error"] = err_val;
+            }
+            st.trace_lines.push(after.to_string());
+        }
+    }
+}
+
+impl Drop for ActionTraceGuard<'_> {
+    fn drop(&mut self) {
+        if self.call_id.is_some() {
+            self.finish(Some(json!({
+                "name": "CancelledError",
+                "message": "cancelled",
+            })));
         }
     }
 }
@@ -280,19 +333,85 @@ impl ContextTracing {
                         .to_string(),
                     );
                 }
-                Some((st.screenshots, page_id))
+                Some((st.screenshots, page_id, st.session_gen))
             } else {
                 None
             }
         };
-        if let Some((screenshots, page_id)) = should_watch {
-            self.attach_page_watchers(lease_id, page, log, page_id, screenshots)
+        if let Some((screenshots, page_id, session_gen)) = should_watch {
+            self.attach_page_watchers(lease_id, page, log, page_id, screenshots, session_gen)
+                .await;
+        }
+    }
+
+    pub(crate) async fn register_popup(
+        self: &Arc<Self>,
+        lease_id: Uuid,
+        page: CdpPage,
+        log: Arc<std::sync::Mutex<PageLog>>,
+        log_task: JoinHandle<()>,
+    ) {
+        let mut close_events = page.browser.subscribe_unbounded();
+        let target_id = page.target_id.0.clone();
+        let popup_for_close = page.clone();
+        let me_for_close = Arc::clone(self);
+
+        let should_watch = {
+            let mut st = self.state.lock().unwrap();
+            if st.closed {
+                log_task.abort();
+                return;
+            }
+            st.open_pages.push(TrackedPage {
+                lease_id,
+                page: page.clone(),
+                log: log.clone(),
+            });
+            let close_task = tokio::spawn(async move {
+                if !popup_for_close.is_closed() {
+                    while let Some(ev) = close_events.recv().await {
+                        if ev.method == "Target.targetDestroyed"
+                            && ev.params["targetId"].as_str() == Some(target_id.as_str())
+                        {
+                            break;
+                        }
+                        if popup_for_close.is_closed() {
+                            break;
+                        }
+                    }
+                }
+                me_for_close.unregister_page(lease_id);
+            });
+            st.cleanup_tasks.insert(lease_id, vec![log_task, close_task]);
+            if st.active {
+                let page_id = st.ensure_page_id(&page.target_id.0);
+                if st.chunk_active {
+                    let t = st.mono_ms();
+                    st.trace_lines.push(
+                        json!({
+                            "type": "event",
+                            "time": t,
+                            "class": "BrowserContext",
+                            "method": "page",
+                            "params": { "pageId": page_id },
+                            "pageId": page_id,
+                        })
+                        .to_string(),
+                    );
+                }
+                Some((st.screenshots, page_id, st.session_gen))
+            } else {
+                None
+            }
+        };
+        if let Some((screenshots, page_id, session_gen)) = should_watch {
+            self.attach_page_watchers(lease_id, page, log, page_id, screenshots, session_gen)
                 .await;
         }
     }
 
     pub(crate) fn unregister_page(&self, lease_id: Uuid) {
-        let (removed, watch) = {
+        let (removed, watch, cleanup) = {
             let mut st = self.state.lock().unwrap();
             let pos = st.open_pages.iter().position(|p| p.lease_id == lease_id);
             let removed = pos.map(|i| st.open_pages.remove(i));
@@ -314,9 +433,15 @@ impl ContextTracing {
                 }
             }
             let watch = st.watchers.remove(&lease_id);
-            (removed, watch)
+            let cleanup = st.cleanup_tasks.remove(&lease_id);
+            (removed, watch, cleanup)
         };
         drop(removed);
+        if let Some(tasks) = cleanup {
+            for h in tasks {
+                h.abort();
+            }
+        }
         if let Some(handles) = watch {
             for h in handles.tasks {
                 h.abort();
@@ -336,7 +461,7 @@ impl ContextTracing {
 
     pub(crate) fn shutdown(&self) {
         self.active_flag.store(false, Ordering::Release);
-        let watches = {
+        let (watches, cleanups) = {
             let mut st = self.state.lock().unwrap();
             st.closed = true;
             st.active = false;
@@ -346,8 +471,16 @@ impl ContextTracing {
             st.network_lines.clear();
             st.resources.clear();
             st.in_flight_net.clear();
-            std::mem::take(&mut st.watchers)
+            (
+                std::mem::take(&mut st.watchers),
+                std::mem::take(&mut st.cleanup_tasks),
+            )
         };
+        for (_, tasks) in cleanups {
+            for h in tasks {
+                h.abort();
+            }
+        }
         for (_, handles) in watches {
             for h in handles.tasks {
                 h.abort();
@@ -377,11 +510,12 @@ impl ContextTracing {
     where
         F: std::future::Future<Output = Result<T>>,
     {
-        let call_id = if self.is_active() {
+        let (call_id, chunk_seq) = if self.is_active() {
             let mut st = self.state.lock().unwrap();
             if st.active && st.chunk_active {
                 st.next_call_seq += 1;
                 let seq = st.next_call_seq;
+                let chunk_seq = st.chunk_seq;
                 let call_id = format!("call@{seq}");
                 let page_id = st.ensure_page_id(target_id);
                 let start_time = st.mono_ms();
@@ -399,38 +533,36 @@ impl ContextTracing {
                     })
                     .to_string(),
                 );
-                Some(call_id)
+                (Some(call_id), chunk_seq)
             } else {
-                None
+                (None, 0)
             }
         } else {
-            None
+            (None, 0)
+        };
+
+        let mut guard = ActionTraceGuard {
+            tracing: self,
+            call_id,
+            chunk_seq,
         };
 
         let result = fut.await;
 
-        if let Some(call_id) = call_id {
-            let mut st = self.state.lock().unwrap();
-            if st.active && st.chunk_active {
-                let end_time = st.mono_ms();
-                let mut after = json!({
-                    "type": "after",
-                    "callId": call_id,
-                    "endTime": end_time,
-                });
-                if let Err(ref err) = result {
-                    after["error"] = json!({ "message": err.to_string() });
-                }
-                st.trace_lines.push(after.to_string());
-            }
-        }
+        let err_val = result.as_ref().err().map(|err| {
+            json!({
+                "name": "Error",
+                "message": err.to_string(),
+            })
+        });
+        guard.finish(err_val);
 
         result
     }
 
     async fn start(self: &Arc<Self>, options: TracingStartOptions) -> Result<()> {
         let _guard = self.op_lock.lock().await;
-        let existing_pages = {
+        let (existing_pages, session_gen) = {
             let mut st = self.state.lock().unwrap();
             if st.closed {
                 return Err(Error::Other("browser context is closed".into()));
@@ -439,11 +571,14 @@ impl ContextTracing {
                 return Err(Error::Other("Tracing has been already started".into()));
             }
             st.active = true;
+            st.session_gen = st.session_gen.wrapping_add(1);
             st.screenshots = options.screenshots;
             st.snapshots = options.snapshots;
+            st.sources = options.sources;
             st.origin_instant = Instant::now();
             st.origin_wall_ms = unix_now_ms();
             st.reset_chunk(options.name, options.title);
+            let session_gen = st.session_gen;
             let pages: Vec<(Uuid, CdpPage, Arc<std::sync::Mutex<PageLog>>, String)> = st
                 .open_pages
                 .iter()
@@ -452,19 +587,27 @@ impl ContextTracing {
                     (tp.lease_id, tp.page.clone(), tp.log.clone(), pid)
                 })
                 .collect();
-            pages
+            let resolved = pages
                 .into_iter()
                 .map(|(lid, page, log, tid)| {
                     let page_id = st.ensure_page_id(&tid);
                     (lid, page, log, page_id)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (resolved, session_gen)
         };
         self.active_flag.store(true, Ordering::Release);
 
         for (lease_id, page, log, page_id) in existing_pages {
-            self.attach_page_watchers(lease_id, page, log, page_id, options.screenshots)
-                .await;
+            self.attach_page_watchers(
+                lease_id,
+                page,
+                log,
+                page_id,
+                options.screenshots,
+                session_gen,
+            )
+            .await;
         }
         Ok(())
     }
@@ -517,6 +660,7 @@ impl ContextTracing {
             return Ok(());
         }
         if path.is_some() && !chunk_active {
+            self.teardown_recording().await;
             return Err(Error::Other(
                 "No active trace chunk; call start_chunk before stop(Some(path))".into(),
             ));
@@ -570,34 +714,29 @@ impl ContextTracing {
 
         tokio::time::sleep(FLUSH_SETTLE_DELAY).await;
 
-        let bundle = {
-            let mut st = self.state.lock().unwrap();
-            st.flush_in_flight_network();
-            st.chunk_active = false;
-            if path.is_some() {
+        if let Some(dest) = path {
+            let zip_bytes = {
+                let st = self.state.lock().unwrap();
                 let mut trace_data = st.trace_lines.join("\n");
                 if !trace_data.is_empty() {
                     trace_data.push('\n');
                 }
-                let mut net_data = st.network_lines.join("\n");
-                if !net_data.is_empty() {
-                    net_data.push('\n');
-                }
-                let resources = std::mem::take(&mut st.resources);
-                Some((trace_data, net_data, resources))
-            } else {
-                st.resources.clear();
-                None
-            }
-        };
-
-        if let (Some(dest), Some((trace_data, net_data, resources))) = (path, bundle) {
-            let zip_bytes = build_trace_zip(&trace_data, &net_data, &resources)?;
+                let net_data = st.snapshot_network_ndjson();
+                build_trace_zip(&trace_data, &net_data, &st.resources)?
+            };
             let dest_owned = dest.to_path_buf();
             tokio::task::spawn_blocking(move || write_zip_file(&dest_owned, &zip_bytes))
                 .await
                 .map_err(|e| Error::Other(format!("tracing write join error: {e}")))??;
         }
+
+        let mut st = self.state.lock().unwrap();
+        st.chunk_active = false;
+        st.trace_lines.clear();
+        st.network_lines.clear();
+        st.resources.clear();
+        st.in_flight_net.clear();
+        st.chunk_frames = 0;
         Ok(())
     }
 
@@ -672,6 +811,7 @@ impl ContextTracing {
         log: Arc<std::sync::Mutex<PageLog>>,
         page_id: String,
         screenshots: bool,
+        session_gen: u64,
     ) {
         let (mut log_rx, mut net_rx) = {
             let mut guard = log.lock().unwrap();
@@ -781,7 +921,7 @@ impl ContextTracing {
                             .remove(&key)
                             .unwrap_or_else(|| new_inflight_from_req(&pid_net, &req, now_ms));
                         st.network_lines
-                            .push(build_resource_snapshot(item, now_ms).to_string());
+                            .push(build_resource_snapshot(&item, now_ms).to_string());
                     }
                     NetEvent::Failed(req, reason) => {
                         let key = (pid_net.clone(), req.id.clone());
@@ -791,7 +931,7 @@ impl ContextTracing {
                             .unwrap_or_else(|| new_inflight_from_req(&pid_net, &req, now_ms));
                         item.failed_text = Some(reason);
                         st.network_lines
-                            .push(build_resource_snapshot(item, now_ms).to_string());
+                            .push(build_resource_snapshot(&item, now_ms).to_string());
                     }
                 }
             }
@@ -862,9 +1002,11 @@ impl ContextTracing {
         };
 
         let mut old_watch = None;
+        let mut rejected_session = None;
         {
             let mut st = self.state.lock().unwrap();
-            if st.active && !st.closed {
+            let page_still_open = st.open_pages.iter().any(|p| p.lease_id == lease_id);
+            if st.active && !st.closed && st.session_gen == session_gen && page_still_open {
                 old_watch = st
                     .watchers
                     .insert(lease_id, PageWatchHandles { tasks, cdp_session });
@@ -872,21 +1014,23 @@ impl ContextTracing {
                 for t in tasks {
                     t.abort();
                 }
-                if let Some(session) = cdp_session {
-                    tokio::spawn(async move {
-                        let _ = session
-                            .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
-                            .await;
-                        let _ = session.detach(Duration::from_secs(2)).await;
-                    });
-                }
+                rejected_session = cdp_session;
             }
+        }
+        if let Some(session) = rejected_session {
+            let _ = session
+                .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
+                .await;
+            let _ = session.detach(Duration::from_secs(2)).await;
         }
         if let Some(old) = old_watch {
             for t in old.tasks {
                 t.abort();
             }
             if let Some(s) = old.cdp_session {
+                let _ = s
+                    .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
+                    .await;
                 let _ = s.detach(Duration::from_secs(2)).await;
             }
         }
@@ -943,7 +1087,7 @@ fn new_inflight_from_req(pageref: &str, req: &NetRequest, now_ms: f64) -> InFlig
     }
 }
 
-fn build_resource_snapshot(item: InFlightNet, end_mono_ms: f64) -> Value {
+fn build_resource_snapshot(item: &InFlightNet, end_mono_ms: f64) -> Value {
     let total_ms = (end_mono_ms - item.start_mono_ms).max(0.0);
     let wait_ms = item
         .response_mono_ms
@@ -997,7 +1141,7 @@ fn build_resource_snapshot(item: InFlightNet, end_mono_ms: f64) -> Value {
         "cache": {},
         "timings": { "send": 0.0, "wait": wait_ms, "receive": receive_ms },
     });
-    if let Some(err_text) = item.failed_text {
+    if let Some(ref err_text) = item.failed_text {
         snapshot["response"]["_failureText"] = json!(err_text);
     }
     json!({
@@ -1384,5 +1528,172 @@ mod tests {
         assert_eq!(&eocd[0..4], b"PK\x05\x06");
         assert_eq!(u16::from_le_bytes([eocd[8], eocd[9]]), 3);
         assert_eq!(u16::from_le_bytes([eocd[10], eocd[11]]), 3);
+    }
+
+    fn parsed_trace_events(tracer: &ContextTracing) -> Vec<Value> {
+        let st = tracer.state.lock().unwrap();
+        st.trace_lines
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn trace_action_cross_chunk_isolation_skips_orphaned_after() {
+        let tracer = ContextTracing::new();
+        tracer
+            .start(TracingStartOptions {
+                sources: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let action_handle = tokio::spawn({
+            let tracer = Arc::clone(&tracer);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            async move {
+                tracer
+                    .trace_action("t1", "Page", "click", "page.click", json!({}), async {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok::<_, Error>(())
+                    })
+                    .await
+            }
+        });
+
+        started.notified().await;
+        // Verify sources: true recorded in context-options of chunk 1.
+        let ev1 = parsed_trace_events(&tracer);
+        assert!(ev1.iter().any(|e| {
+            e["type"] == "context-options" && e["options"]["sources"] == json!(true)
+        }));
+        let call_id = ev1
+            .iter()
+            .find(|e| e["type"] == "before")
+            .unwrap()["callId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Cross chunk boundary while action is still in flight.
+        tracer.stop_chunk(None).await.unwrap();
+        tracer
+            .start_chunk(TracingChunkOptions::default())
+            .await
+            .unwrap();
+
+        release.notify_one();
+        action_handle.await.unwrap().unwrap();
+
+        // Chunk 2 must NOT contain an orphaned `after` for chunk 1's `callId`.
+        let ev2 = parsed_trace_events(&tracer);
+        assert!(
+            !ev2.iter()
+                .any(|e| e["type"] == "after" && e["callId"] == call_id),
+            "orphaned after leaked into chunk 2: {ev2:?}"
+        );
+        tracer.stop(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trace_action_cancelled_future_and_errors_emit_named_after() {
+        let tracer = ContextTracing::new();
+        assert!(!TracingStartOptions::default().sources);
+        tracer.start(TracingStartOptions::default()).await.unwrap();
+
+        // Cancelled future via timeout must emit `after` with CancelledError.
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(20),
+            tracer.trace_action(
+                "t1",
+                "Locator",
+                "click",
+                "locator.click",
+                json!({ "selector": "#slow" }),
+                async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok::<_, Error>(())
+                },
+            ),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        // Normal error must include `name: "Error"` and `message`.
+        let err_res = tracer
+            .trace_action(
+                "t1",
+                "Locator",
+                "fill",
+                "locator.fill",
+                json!({ "selector": "#bad" }),
+                async { Err::<(), _>(Error::Other("boom".into())) },
+            )
+            .await;
+        assert!(err_res.is_err());
+
+        let events = parsed_trace_events(&tracer);
+        let cancelled_before = events
+            .iter()
+            .find(|e| e["type"] == "before" && e["apiName"] == "locator.click")
+            .expect("cancelled before");
+        let cancelled_after = events
+            .iter()
+            .find(|e| e["type"] == "after" && e["callId"] == cancelled_before["callId"])
+            .expect("cancelled after");
+        assert_eq!(cancelled_after["error"]["name"], "CancelledError");
+        assert_eq!(cancelled_after["error"]["message"], "cancelled");
+
+        let failed_before = events
+            .iter()
+            .find(|e| e["type"] == "before" && e["apiName"] == "locator.fill")
+            .expect("failed before");
+        let failed_after = events
+            .iter()
+            .find(|e| e["type"] == "after" && e["callId"] == failed_before["callId"])
+            .expect("failed after");
+        assert_eq!(failed_after["error"]["name"], "Error");
+        assert_eq!(failed_after["error"]["message"], "boom");
+
+        tracer.stop(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_with_path_after_stop_chunk_tears_down_and_write_error_preserves_chunk() {
+        let dir = std::env::temp_dir().join(format!("fw-trace-unit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker_file = dir.join("not-a-dir");
+        std::fs::write(&blocker_file, b"x").unwrap();
+        let bad_zip = blocker_file.join("trace.zip");
+        let good_zip = dir.join("ok.zip");
+
+        let tracer = ContextTracing::new();
+        tracer.start(TracingStartOptions::default()).await.unwrap();
+        tracer
+            .trace_action("t1", "Page", "goto", "page.goto", json!({}), async {
+                Ok::<_, Error>(())
+            })
+            .await
+            .unwrap();
+
+        // Failing stop_chunk write must preserve the active chunk for retry.
+        assert!(tracer.stop_chunk(Some(&bad_zip)).await.is_err());
+        assert!(tracer.state.lock().unwrap().chunk_active);
+        tracer.stop_chunk(Some(&good_zip)).await.unwrap();
+        assert!(good_zip.exists());
+
+        // Calling stop(Some(path)) after stop_chunk must return Err AND tear down tracing.
+        assert!(tracer.stop(Some(&good_zip)).await.is_err());
+        assert!(!tracer.is_active());
+        // Because teardown ran, starting a fresh trace succeeds immediately.
+        tracer.start(TracingStartOptions::default()).await.unwrap();
+        tracer.stop(None).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -206,3 +206,84 @@ async fn page_expect_title_url_and_diagnostics() {
     drop(page);
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_page_locator_expect_fast_fails_and_relative_url_resolution() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            "/sub/page",
+            get(|| async { Html("<title>Sub</title><div id='ok'>ready</div>") }),
+        )
+        .route("/done", get(|| async { Html("<title>Done</title>") }));
+    let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = engine().await;
+    let base = format!("http://127.0.0.1:{port}/sub/page?old=1");
+    let mut opts = JobOptions::default();
+    opts.base_url = Some(base);
+    let ctx = eng.acquire_context_with(&opts).await.unwrap();
+    assert!(!ctx.is_closed());
+
+    let page = ctx.new_page().await.unwrap();
+    page.goto(&format!("http://127.0.0.1:{port}/sub/page?tab=2"))
+        .await
+        .unwrap();
+    expect_page(&page).to_have_url("?tab=2").await.unwrap();
+
+    page.evaluate("history.pushState({}, '', '/sub/page?old=1#sec')")
+        .await
+        .unwrap();
+    expect_page(&page).to_have_url("#sec").await.unwrap();
+
+    page.evaluate("history.pushState({}, '', '/done')")
+        .await
+        .unwrap();
+    expect_page(&page).to_have_url("../done").await.unwrap();
+
+    // Closing the context closes the page; LocatorExpect must fast-fail rather than wait 10s.
+    ctx.close().await.unwrap();
+    assert!(ctx.is_closed());
+    assert!(page.is_closed());
+
+    let started = Instant::now();
+    let vis_err = expect_locator(&page.locator("#ok"))
+        .timeout(Duration::from_secs(10))
+        .to_be_visible()
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "to_be_visible waited too long on closed page: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        vis_err.to_string().contains("page is closed"),
+        "unexpected error: {vis_err}"
+    );
+
+    let count_err = expect_locator(&page.locator("#ok"))
+        .timeout(Duration::from_secs(10))
+        .to_have_count(1)
+        .await
+        .unwrap_err();
+    assert!(
+        count_err.to_string().contains("page is closed"),
+        "unexpected error: {count_err}"
+    );
+
+    let text_err = expect_locator(&page.locator("#ok"))
+        .timeout(Duration::from_secs(10))
+        .to_have_text("ready")
+        .await
+        .unwrap_err();
+    assert!(
+        text_err.to_string().contains("page is closed"),
+        "unexpected error: {text_err}"
+    );
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv.abort();
+}

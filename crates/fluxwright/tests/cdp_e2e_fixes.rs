@@ -383,6 +383,7 @@ async fn popup_page_log_and_trace_isolation() {
             title: Some("Popup Isolation".into()),
             screenshots: false,
             snapshots: false,
+            ..Default::default()
         })
         .await
         .unwrap();
