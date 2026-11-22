@@ -19,6 +19,70 @@
     }
     return false;
   };
+  // Collects `root`, its open shadowRoot, and open shadowRoots of descendants in tree order.
+  const collectRoots = (root) => {
+    const roots = [];
+    const seen = new Set();
+    const visit = (r) => {
+      if (!r || typeof r.querySelectorAll !== 'function' || seen.has(r)) return;
+      seen.add(r);
+      roots.push(r);
+      if (r.shadowRoot) visit(r.shadowRoot);
+      for (const el of r.querySelectorAll('*')) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(root);
+    return roots;
+  };
+  const composedChildNodes = (el) => {
+    if (el.shadowRoot) return [...el.shadowRoot.childNodes];
+    if (el.tagName === 'SLOT' && typeof el.assignedNodes === 'function') {
+      const assigned = el.assignedNodes({ flatten: true });
+      return assigned.length ? assigned : [...el.childNodes];
+    }
+    return [...el.childNodes];
+  };
+  const composedPath = (node) => {
+    const path = [];
+    for (let cur = node; cur; cur = cur.assignedSlot || cur.parentNode || cur.host) {
+      path.push(cur);
+    }
+    return path.reverse();
+  };
+  // Compares nodes across shadow boundaries and slots via their LCA in the composed tree.
+  const compareComposedOrder = (a, b) => {
+    if (a === b) return 0;
+    const pa = composedPath(a);
+    const pb = composedPath(b);
+    let i = 0;
+    while (i < pa.length && i < pb.length && pa[i] === pb[i]) i++;
+    if (i === 0) {
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    }
+    if (i === pa.length) return -1;
+    if (i === pb.length) return 1;
+    const lca = pa[i - 1];
+    const ca = pa[i];
+    const cb = pb[i];
+    if (ca === lca.shadowRoot) return -1;
+    if (cb === lca.shadowRoot) return 1;
+    if (lca.tagName === 'SLOT' && typeof lca.assignedNodes === 'function') {
+      const assigned = lca.assignedNodes();
+      const ia = assigned.indexOf(ca);
+      const ib = assigned.indexOf(cb);
+      if (ia !== -1 && ib !== -1) return ia - ib;
+      if (ia !== -1) return -1;
+      if (ib !== -1) return 1;
+    }
+    const pos = ca.compareDocumentPosition(cb);
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  };
 
   // Splits on >> outside quotes, so text="a >> b" stays one part.
   const split = (s) => {
@@ -96,19 +160,34 @@
   // Name from content (AccName 2F, compact): descendant text, alt text, aria-label and input
   // button values, skipping hidden descendants. <button><img alt="Save"></button> is "Save".
   const contentName = (node, includeHidden) => {
+    if (!node) return '';
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
-    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+    if (node.nodeType !== Node.ELEMENT_NODE || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(node.tagName)) return '';
     const st = getComputedStyle(node);
     if (!includeHidden && (node.getAttribute('aria-hidden') === 'true' || st.display === 'none' || st.visibility === 'hidden')) return '';
     const label = norm(node.getAttribute('aria-label'));
     if (label) return label;
     if (node.tagName === 'IMG' || (node.tagName === 'INPUT' && node.type === 'image')) return node.getAttribute('alt') || '';
     if (node.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(node.type)) return node.value;
-    return [...node.childNodes].map((c) => contentName(c, includeHidden)).join(' ');
+    return composedChildNodes(node).map((c) => contentName(c, includeHidden)).join(' ');
   };
   const labelledBy = (el) => {
     const ids = el.getAttribute('aria-labelledby');
-    return ids ? norm(ids.split(/\s+/).map((id) => document.getElementById(id)?.textContent).join(' ')) : '';
+    if (!ids) return '';
+    const root = el.getRootNode();
+    const lookup = (id) =>
+      (root && typeof root.getElementById === 'function' && root.getElementById(id)) ||
+      document.getElementById(id);
+    return norm(
+      ids
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((id) => {
+          const target = lookup(id);
+          return target ? contentName(target, true) || target.textContent : '';
+        })
+        .join(' '),
+    );
   };
   // A compact accessible-name computation: aria-labelledby, aria-label, <label>, value of
   // input buttons, alt, then content for roles named by content, placeholder, title.
@@ -117,7 +196,7 @@
     if (byIds) return byIds;
     const label = norm(el.getAttribute('aria-label'));
     if (label) return label;
-    if (el.labels && el.labels.length) return norm([...el.labels].map((l) => l.textContent).join(' '));
+    if (el.labels && el.labels.length) return norm([...el.labels].map((l) => shownText(l)).join(' '));
     if (el.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(el.type)) {
       return norm(el.value) || { submit: 'Submit', reset: 'Reset' }[el.type] || '';
     }
@@ -126,16 +205,22 @@
       if (alt) return alt;
     }
     if (nameFromContent.test(roleOf(el) || '')) {
-      const t = norm([...el.childNodes].map((c) => contentName(c, includeHidden)).join(' '));
+      const t = norm(composedChildNodes(el).map((c) => contentName(c, includeHidden)).join(' '));
       if (t) return t;
     }
     return norm(el.getAttribute('placeholder')) || norm(el.getAttribute('title'));
+  };
+  const isAriaHidden = (el) => {
+    for (let cur = el; cur; cur = cur.assignedSlot || cur.parentNode || cur.host) {
+      if (cur.nodeType === 1 && cur.getAttribute('aria-hidden') === 'true') return true;
+    }
+    return false;
   };
   // Hidden elements are not in the accessibility tree, so getByRole never matches them.
   const rendered = (el) =>
     el.getClientRects().length > 0 &&
     getComputedStyle(el).visibility !== 'hidden' &&
-    !el.closest('[aria-hidden="true"]');
+    !isAriaHidden(el);
 
   // Input buttons show their value, not text content.
   const buttons = 'input[type=button],input[type=submit],input[type=reset]';
@@ -144,20 +229,153 @@
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
     if (node.nodeType !== Node.ELEMENT_NODE || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(node.tagName)) return '';
     if (node.matches(buttons)) return ' ' + node.value + ' ';
-    return [...node.childNodes].map(shownText).join('');
+    return composedChildNodes(node).map(shownText).join('');
   };
 
-  // Each engine returns its matches inside `root` in document order; only the first when `first`.
+  const queryAllDeep = (root, selector) => {
+    const roots = collectRoots(root);
+    if (roots.length === 1) return [...roots[0].querySelectorAll(selector)];
+    return inOrder(roots.flatMap((r) => [...r.querySelectorAll(selector)]));
+  };
+  // Splits a CSS selector list on top-level commas, and each branch on top-level combinators
+  // (' ', '>', '+', '~') outside quotes, escapes, brackets and parentheses.
+  const parseCssSelector = (sel) => {
+    const branches = [];
+    let steps = [];
+    let cur = '';
+    let pendingComb = null;
+    let quote = null;
+    let paren = 0;
+    let bracket = 0;
+    let branchStart = 0;
+    const flushPart = (nextComb) => {
+      if (cur) {
+        steps.push({ comb: pendingComb, sel: cur });
+        cur = '';
+        pendingComb = nextComb;
+      } else if (nextComb && nextComb !== ' ' && pendingComb === ' ') {
+        pendingComb = nextComb;
+      }
+    };
+    const flushBranch = (end) => {
+      flushPart(null);
+      if (steps.length) branches.push({ raw: sel.slice(branchStart, end).trim(), steps });
+      steps = [];
+      pendingComb = null;
+      branchStart = end + 1;
+    };
+    for (let i = 0; i < sel.length; i++) {
+      const c = sel[i];
+      if (quote) {
+        cur += c;
+        if (c === '\\') cur += sel[++i] ?? '';
+        else if (c === quote) quote = null;
+      } else if (c === '\\') {
+        cur += c + (sel[++i] ?? '');
+      } else if (c === '"' || c === "'") {
+        quote = c;
+        cur += c;
+      } else if (c === '(') {
+        paren++;
+        cur += c;
+      } else if (c === ')') {
+        if (paren > 0) paren--;
+        cur += c;
+      } else if (c === '[') {
+        bracket++;
+        cur += c;
+      } else if (c === ']') {
+        if (bracket > 0) bracket--;
+        cur += c;
+      } else if (paren === 0 && bracket === 0) {
+        if (c === ',') {
+          flushBranch(i);
+        } else if (c === '>' || c === '+' || c === '~') {
+          flushPart(c);
+        } else if (/\s/.test(c)) {
+          if (cur) flushPart(' ');
+        } else {
+          cur += c;
+        }
+      } else {
+        cur += c;
+      }
+    }
+    flushBranch(sel.length);
+    return branches;
+  };
+
+  // Each engine returns its matches inside `root` in composed document order; only the first when `first`.
   const pick = (els, keep, first) => (first ? [els.find(keep)].filter(Boolean) : els.filter(keep));
   const engines = {
-    css: (body, root, first) =>
+    'css:light': (body, root, first) =>
       first ? [root.querySelector(body)].filter(Boolean) : [...root.querySelectorAll(body)],
+    css: (body, root, first) => {
+      const roots = collectRoots(root);
+      if (roots.length === 1) {
+        return first ? [root.querySelector(body)].filter(Boolean) : [...root.querySelectorAll(body)];
+      }
+      root.querySelectorAll(body); // validate CSS syntax before stepping
+      const out = [];
+      for (const { raw, steps } of parseCssSelector(body)) {
+        for (const r of roots) out.push(...r.querySelectorAll(raw));
+        if (steps.length > 1) {
+          let cur = steps[0].sel === ':scope'
+            ? (root === document ? [document.documentElement].filter(Boolean) : [root])
+            : roots.flatMap((r) => [...r.querySelectorAll(steps[0].sel)]);
+          for (let i = 1; i < steps.length && cur.length; i++) {
+            const { comb, sel } = steps[i];
+            const next = [];
+            const seen = new Set();
+            const add = (el) => {
+              if (!seen.has(el)) {
+                seen.add(el);
+                next.push(el);
+              }
+            };
+            for (const el of cur) {
+              if (comb === ' ') {
+                for (const r of collectRoots(el)) {
+                  for (const m of r.querySelectorAll(sel)) add(m);
+                }
+              } else if (comb === '>') {
+                for (const c of el.children) if (c.matches(sel)) add(c);
+                if (el.shadowRoot) {
+                  for (const c of el.shadowRoot.children) if (c.matches(sel)) add(c);
+                }
+              } else if (comb === '+') {
+                const sib = el.nextElementSibling;
+                if (sib && sib.matches(sel) && (root === document || ownsNode(root, sib))) add(sib);
+              } else if (comb === '~') {
+                for (let sib = el.nextElementSibling; sib; sib = sib.nextElementSibling) {
+                  if (sib.matches(sel) && (root === document || ownsNode(root, sib))) add(sib);
+                }
+              }
+            }
+            cur = next;
+          }
+          out.push(...cur);
+        }
+      }
+      const sorted = inOrder(out);
+      return first ? sorted.slice(0, 1) : sorted;
+    },
     // The deepest element whose text matches wins, like Playwright.
     text: (body, root, first) => {
       const m = matcher(body);
       const skip = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD)$/;
-      // Input buttons are matched in the same walk, so the first match in DOM order wins.
+      // Input buttons are matched in the same walk, so the first match in composed order wins.
       const out = [];
+      const start = root === document ? document.body : root;
+      if (!start) return out;
+      const roots = collectRoots(start);
+      const hasShadowSubtree = (el) => {
+        if (el.shadowRoot || el.tagName === 'SLOT' || el.querySelector('slot')) return true;
+        for (const r of roots) {
+          if (r.host && el.contains(r.host)) return true;
+        }
+        return false;
+      };
       // True when el or something inside it matched.
       const walk = (el) => {
         if (el.matches(buttons)) {
@@ -165,23 +383,19 @@
           out.push(el);
           return true;
         }
-        // textContent includes <script> text: fine to rule a subtree out, never to match. Matched
-        // on it, a Next.js page's __NEXT_DATA__ made <body> the element, so a wait for text not
-        // shown yet returned at once and the click landed mid-page.
-        const t = norm(el.textContent);
-        if (m.prune && !m.has(t) && !el.querySelector(buttons)) return false; // nothing below can match
+        // textContent includes <script> text: fine to rule a subtree out when no shadow/slot is below.
+        if (m.prune && !hasShadowSubtree(el) && !m.has(norm(el.textContent)) && !el.querySelector(buttons)) return false;
         let below = false;
-        for (const c of el.children) {
-          if (skip.test(c.tagName)) continue;
+        for (const c of composedChildNodes(el)) {
+          if (c.nodeType !== Node.ELEMENT_NODE || skip.test(c.tagName)) continue;
           if (walk(c)) below = true;
           if (below && first) return true;
         }
-        if (below || !m.is(norm(shownText(el)))) return below;
+        if (below || el.tagName === 'SLOT' || !m.is(norm(shownText(el)))) return below;
         out.push(el);
         return true;
       };
-      const start = root === document ? document.body : root;
-      if (start) walk(start);
+      walk(start);
       return out;
     },
     role: (body, root, first) => {
@@ -236,7 +450,7 @@
           ? nameRe.test(n)
           : name === null || (exact ? n === name : n.toLowerCase().includes(name.toLowerCase()));
       return pick(
-        [...root.querySelectorAll('*')],
+        queryAllDeep(root, '*'),
         (el) => roleOf(el) === want && (includeHidden || rendered(el)) && checks.every((fn) => fn(el)) && nameOk(nameOf(el, includeHidden)),
         first,
       );
@@ -265,29 +479,29 @@
       const labels = (el) => [
         labelledBy(el),
         norm(el.getAttribute('aria-label')),
-        ...[...(el.labels || [])].map((l) => norm(l.textContent)),
+        ...[...(el.labels || [])].map((l) => norm(shownText(l))),
       ];
-      return pick([...root.querySelectorAll('*')], (el) => labels(el).some((t) => t && m.is(t)), first);
+      return pick(queryAllDeep(root, '*'), (el) => labels(el).some((t) => t && m.is(t)), first);
     },
     placeholder: (body, root, first) => {
       const m = matcher(body);
-      return pick([...root.querySelectorAll('[placeholder]')], (el) => m.is(norm(el.getAttribute('placeholder'))), first);
+      return pick(queryAllDeep(root, '[placeholder]'), (el) => m.is(norm(el.getAttribute('placeholder'))), first);
     },
     alt: (body, root, first) => {
       const m = matcher(body);
       return pick(
-        [...root.querySelectorAll('img[alt],area[alt],input[type=image][alt]')],
+        queryAllDeep(root, 'img[alt],area[alt],input[type=image][alt]'),
         (el) => m.is(norm(el.getAttribute('alt'))),
         first,
       );
     },
     title: (body, root, first) => {
       const m = matcher(body);
-      return pick([...root.querySelectorAll('[title]')], (el) => m.is(norm(el.getAttribute('title'))), first);
+      return pick(queryAllDeep(root, '[title]'), (el) => m.is(norm(el.getAttribute('title'))), first);
     },
     testid: (body, root, first) => {
       const id = body.startsWith('"') ? JSON.parse(body) : body;
-      return pick([...root.querySelectorAll('[data-testid]')], (el) => el.getAttribute('data-testid') === id, first);
+      return pick(queryAllDeep(root, '[data-testid]'), (el) => el.getAttribute('data-testid') === id, first);
     },
     ref: (_body, root) =>
       refEl && refEl.nodeType === 1 && refEl.isConnected && (root === document || ownsNode(root, refEl))
@@ -305,7 +519,8 @@
   }
   function isDisabledEl(el) {
     if (el.matches(':disabled')) return true;
-    for (let cur = el; cur && cur.nodeType === 1; cur = cur.parentElement) {
+    for (let cur = el; cur; cur = cur.assignedSlot || cur.parentNode || cur.host) {
+      if (cur.nodeType !== 1) continue;
       const v = cur.getAttribute('aria-disabled');
       if (v !== null) return v.toLowerCase() === 'true';
     }
@@ -359,14 +574,13 @@
   const strictViolation = (s, list) =>
     `strict mode violation: ${s} resolved to ${list.length} elements:\n` +
     list.slice(0, 10).map((e, i) => `    ${i + 1}) ${describeEl(e)}`).join('\n');
-  const inOrder = (els) =>
-    [...new Set(els)].sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+  const inOrder = (els) => [...new Set(els)].sort(compareComposedOrder);
   // Throws SyntaxError on a malformed selector (caught below).
   const findAll = (selStr, docRoot, limitOne) => {
     const parts = split(selStr);
     let found = null; // null until the first part searched docRoot
     parts.forEach((part, i) => {
-      const m = /^(css|xpath|text|role|label|placeholder|alt|title|testid|ref|nth|has-text|has-not-text|has|has-not|and|or)=([\s\S]*)$/.exec(part);
+      const m = /^(css:light|css|xpath|text|role|label|placeholder|alt|title|testid|ref|nth|has-text|has-not-text|has|has-not|and|or)=([\s\S]*)$/.exec(part);
       const [engine, body] = m
         ? [m[1], m[2]]
         : /^@e\d+$/.test(part)
@@ -539,7 +753,7 @@
     }
     if (!opts.force) {
       if (!visible(el)) return { ok: false, reason: 'hidden' };
-      if (el.matches(':disabled') || el.closest('[aria-disabled="true"]')) {
+      if (isDisabledEl(el)) {
         return { ok: false, reason: 'disabled' };
       }
     }
@@ -605,7 +819,7 @@
     const opts = mode === 'click' ? { requireEnabled: true } : arg || {};
     if (!opts.force) {
       if (!visible(el)) return { ok: false, reason: 'hidden' };
-      if (opts.requireEnabled && (el.matches(':disabled') || el.closest('[aria-disabled="true"]'))) {
+      if (opts.requireEnabled && isDisabledEl(el)) {
         return { ok: false, reason: 'disabled' };
       }
     }
@@ -617,8 +831,16 @@
     if (!opts.force) {
       let hit = document.elementFromPoint(x, y);
       while (hit && hit !== el && hit.shadowRoot) {
-        const inner = hit.shadowRoot.elementFromPoint(x, y);
-        if (!inner || inner === hit) break;
+        let inner = hit.shadowRoot.elementFromPoint(x, y);
+        // Chromium retargets slotted text nodes back to an outer host in elementFromPoint;
+        // elementsFromPoint exposes the shadow element wrapping the <slot>.
+        if ((!inner || inner === hit || !ownsNode(hit, inner)) && typeof hit.shadowRoot.elementsFromPoint === 'function') {
+          const stack = hit.shadowRoot.elementsFromPoint(x, y);
+          const hostIdx = stack.indexOf(hit);
+          const above = hostIdx >= 0 ? stack.slice(0, hostIdx) : stack;
+          inner = above.find((e) => e !== hit && ownsNode(hit, e)) || null;
+        }
+        if (!inner || inner === hit || !ownsNode(hit, inner)) break;
         hit = inner;
       }
       if (!hit) return { ok: false, reason: 'centre is outside the viewport' };
