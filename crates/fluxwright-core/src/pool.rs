@@ -15,11 +15,14 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::adaptive::{AdaptiveConfig, AdaptiveController};
 use crate::config::{EngineConfig, JobOptions, Priority, QueueFullMode};
 use crate::error::{Error, Result};
 use crate::hosts::{HostLimits, HostSlot};
 use crate::metrics::{Counters, MetricsSnapshot};
 use crate::process::{current_process_rss_bytes, process_tree_memory_map};
+use crate::profiles::{validate_profile_name, ProfileStore};
+use crate::proxies::{ProxyLease, ProxyPool};
 use crate::source::BrowserSource;
 
 #[derive(Clone)]
@@ -30,6 +33,8 @@ pub struct Engine {
 struct Inner {
     config: EngineConfig,
     source: Arc<dyn BrowserSource>,
+    profiles: Option<Arc<ProfileStore>>,
+    adaptive: Option<AdaptiveController>,
     state: Mutex<State>,
     admit: Notify,
     /// When the fleet's memory was last walked (never: `None`), and each browser root's footprint.
@@ -109,13 +114,22 @@ struct ContextGuard {
     http_defaults: std::sync::Mutex<HttpContextDefaults>,
     har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
     har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    proxy_lease: std::sync::Mutex<Option<ProxyLease>>,
+    profile_target: std::sync::Mutex<Option<(Arc<ProfileStore>, String)>>,
     runtime: tokio::runtime::Handle,
+    failed: AtomicBool,
     disposed: AtomicBool,
 }
 
 impl ContextGuard {
     fn is_disposed(&self) -> bool {
         self.disposed.load(Ordering::SeqCst)
+    }
+
+    fn release_proxy(&self, completed: bool) {
+        if let Some(lease) = self.proxy_lease.lock().unwrap().take() {
+            lease.report_outcome(completed);
+        }
     }
 
     async fn invalidate_warm_page(&self) {
@@ -130,6 +144,7 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
@@ -147,6 +162,7 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
@@ -169,6 +185,8 @@ impl Drop for ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let completed = !self.failed.load(Ordering::SeqCst);
+        self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
@@ -182,7 +200,7 @@ impl Drop for ContextGuard {
                 let _ = rec.finish().await;
             }
             let _ = browser.dispose_context(&ctx).await;
-            engine.release_slot(&browser, true).await;
+            engine.release_slot(&browser, completed).await;
         });
     }
 }
@@ -354,10 +372,24 @@ fn route_newest<T: Send + 'static>(
 
 impl Engine {
     pub fn new(config: EngineConfig, source: Arc<dyn BrowserSource>) -> Self {
+        let profiles = config
+            .profiles_dir
+            .as_ref()
+            .map(|d| Arc::new(ProfileStore::new(d)));
+        let hard_max = config
+            .max_browsers
+            .saturating_mul(config.max_contexts_per_browser)
+            .max(1);
+        let adaptive = config
+            .adaptive_concurrency
+            .clone()
+            .map(|cfg| AdaptiveController::new(cfg, hard_max));
         let inner = Arc::new(Inner {
             hosts: HostLimits::new(config.max_concurrency_per_host, config.min_delay_per_host),
             config,
             source,
+            profiles,
+            adaptive,
             state: Mutex::new(State {
                 browsers: Vec::new(),
                 queue: VecDeque::new(),
@@ -444,14 +476,62 @@ impl Engine {
         self.acquire_context_with(&JobOptions::default()).await
     }
 
+    /// Named profile store when `EngineConfig::profiles_dir` is configured.
+    pub fn profiles(&self) -> Option<&ProfileStore> {
+        self.inner.profiles.as_deref()
+    }
+
+    /// Configured outbound proxy pool, if any.
+    pub fn proxy_pool(&self) -> Option<&ProxyPool> {
+        self.inner.config.proxy_pool.as_ref()
+    }
+
     /// Acquires an isolated browser context configured with `opts`; open tabs via [`ContextLease::new_page`].
     pub async fn acquire_context_with(&self, opts: &JobOptions) -> Result<ContextLease> {
+        let loaded_profile_state = if let Some(ref profile_name) = opts.profile {
+            validate_profile_name(profile_name)?;
+            let Some(store) = self.inner.profiles.as_ref() else {
+                return Err(Error::Other("profiles_dir is not configured".into()));
+            };
+            if opts.storage_state.is_none() {
+                let store = Arc::clone(store);
+                let name = profile_name.clone();
+                tokio::task::spawn_blocking(move || store.load(&name))
+                    .await
+                    .map_err(|e| Error::Other(e.to_string()))??
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (effective_proxy, proxy_lease) = match (&opts.proxy, &self.inner.config.proxy_pool) {
+            (Some(p), _) => (Some(p.clone()), None),
+            (None, Some(pool)) => {
+                let lease = pool.acquire(opts.proxy_session.as_deref());
+                let proxy = lease.proxy().clone();
+                (Some(proxy), Some(lease))
+            }
+            (None, None) => (None, None),
+        };
+
         let timeout_budget = opts.timeout.unwrap_or(self.inner.config.acquire_timeout);
-        let ctx = self
-            .acquire_context_guard(opts.priority, opts.proxy.clone(), timeout_budget)
+        let guard = self
+            .acquire_context_guard(opts.priority, effective_proxy.clone(), timeout_budget)
             .await?;
-        let guard = ctx;
-        if opts.storage_state.is_some()
+        *guard.proxy_lease.lock().unwrap() = proxy_lease;
+        if let (Some(profile_name), Some(store)) = (&opts.profile, &self.inner.profiles) {
+            if opts.persist_profile {
+                *guard.profile_target.lock().unwrap() =
+                    Some((Arc::clone(store), profile_name.clone()));
+            }
+        }
+        let effective_storage_state = opts
+            .storage_state
+            .as_ref()
+            .or(loaded_profile_state.as_ref());
+        if effective_storage_state.is_some()
             || opts.record_har.is_some()
             || opts.emulation.javascript_enabled == Some(false)
             || opts.emulation.bypass_csp
@@ -463,7 +543,7 @@ impl Engine {
             extra_http_headers: opts.emulation.extra_http_headers.clone(),
             user_agent: opts.emulation.user_agent.clone(),
             http_credentials: opts.http_credentials.clone(),
-            proxy: opts.proxy.clone(),
+            proxy: effective_proxy,
         };
         let setup_res = async {
             apply_context_blocking(&guard, opts).await?;
@@ -478,7 +558,7 @@ impl Engine {
                 .browser
                 .context_grant_permissions(&guard.context, &opts.permissions, timeout)
                 .await?;
-            if let Some(state) = &opts.storage_state {
+            if let Some(state) = effective_storage_state {
                 guard
                     .browser
                     .context_set_storage_state(&guard.context, state, timeout)
@@ -662,6 +742,16 @@ impl Engine {
             .await
             .unwrap_or(0);
         let leases = contexts;
+        let hard_max = self
+            .inner
+            .config
+            .max_browsers
+            .saturating_mul(self.inner.config.max_contexts_per_browser);
+        let effective_concurrency_limit = self
+            .inner
+            .adaptive
+            .as_ref()
+            .map_or(hard_max, |a| a.limit());
         MetricsSnapshot {
             browsers,
             contexts,
@@ -676,6 +766,7 @@ impl Engine {
             engine_rss_bytes: engine_rss,
             browser_tree_rss_bytes: tree,
             memory_per_job_bytes_estimate: if leases == 0 { 0 } else { tree / leases as u64 },
+            effective_concurrency_limit,
         }
     }
 
@@ -846,8 +937,15 @@ impl Inner {
         }
         // Over the memory ceiling no new browser starts; one already running still takes work.
         let ceiling = self.config.memory_ceiling_mb * 1024 * 1024;
+        let tree = if ceiling > 0 || self.adaptive.is_some() {
+            self.browser_tree_rss().await
+        } else {
+            0
+        };
+        if let Some(ref adaptive) = self.adaptive {
+            adaptive.observe_rss(tree, ceiling);
+        }
         let over_ceiling = ceiling > 0 && {
-            let tree = self.browser_tree_rss().await;
             if tree > ceiling {
                 debug!(tree, ceiling, "rss ceiling hit: no new launches");
             }
@@ -864,6 +962,13 @@ impl Inner {
                 return Ok(false);
             }
             drop_abandoned(&mut st.queue);
+            if let Some(ref adaptive) = self.adaptive {
+                let in_flight: usize =
+                    st.browsers.iter().map(|s| s.active).sum::<usize>() + st.launching;
+                if in_flight >= adaptive.limit() {
+                    return Ok(false);
+                }
+            }
             let idx = st.next_reusable_browser(self.config.max_contexts_per_browser);
             if idx.is_none() && (over_ceiling || !st.can_launch_for_queue(&self.config)) {
                 return Ok(false);
@@ -1174,24 +1279,34 @@ impl Inner {
             http_defaults: std::sync::Mutex::new(HttpContextDefaults::default()),
             har_recorders: Default::default(),
             har_route_tasks: Default::default(),
+            proxy_lease: Default::default(),
+            profile_target: Default::default(),
             runtime: tokio::runtime::Handle::current(),
+            failed: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
         }))
     }
 
     async fn release_slot(self: &Arc<Self>, browser: &CdpBrowser, completed: bool) {
-        let mut st = self.state.lock().await;
-        if let Some(s) = st.browsers.iter_mut().find(|s| s.browser.id == browser.id) {
-            s.active = s.active.saturating_sub(1);
-            s.last_used = Instant::now();
-            if completed {
-                s.jobs_served += 1;
+        let has_queue_demand = {
+            let mut st = self.state.lock().await;
+            if let Some(s) = st.browsers.iter_mut().find(|s| s.browser.id == browser.id) {
+                s.active = s.active.saturating_sub(1);
+                s.last_used = Instant::now();
+                if completed {
+                    s.jobs_served += 1;
+                }
+                if s.crashed || browser.connection_dead() {
+                    s.crashed = true;
+                }
             }
-            if s.crashed || browser.connection_dead() {
-                s.crashed = true;
-            }
+            !st.queue.is_empty()
+        };
+        if let Some(ref adaptive) = self.adaptive {
+            let ceiling = self.config.memory_ceiling_mb * 1024 * 1024;
+            let tree: u64 = self.rss_cache.lock().await.1.values().copied().sum();
+            adaptive.on_outcome(completed, has_queue_demand, tree, ceiling);
         }
-        drop(st);
         self.admit.notify_waiters();
     }
 
@@ -2891,9 +3006,37 @@ impl PageLease {
         }
     }
 
-    pub async fn close(mut self) -> Result<()> {
-        self.release(true).await;
+    /// Persists current `storageState` to the job's named profile once, if configured.
+    pub async fn save_profile(&self) -> Result<()> {
+        let Some((store, name)) = self.context.profile_target.lock().unwrap().take() else {
+            return Ok(());
+        };
+        if self.is_closed() {
+            return Ok(());
+        }
+        let state = self.storage_state().await?;
+        tokio::task::spawn_blocking(move || store.save(&name, &state))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))??;
         Ok(())
+    }
+
+    pub async fn close(mut self) -> Result<()> {
+        let save_res = self.save_profile().await;
+        self.release(save_res.is_ok()).await;
+        save_res
+    }
+
+    /// Releases the page and reports `completed = false` without saving any profile.
+    pub async fn discard(mut self) {
+        self.mark_failed();
+        self.release(false).await;
+    }
+
+    /// Marks the context lease as failed so drop-based cleanup records proxy and adaptive backoff.
+    pub fn mark_failed(&self) {
+        self.context.profile_target.lock().unwrap().take();
+        self.context.failed.store(true, Ordering::SeqCst);
     }
 
     async fn release(&mut self, completed: bool) {
@@ -2940,9 +3083,10 @@ impl Drop for PageLease {
             return;
         }
         self.released = true;
+        let completed = !self.context.failed.load(Ordering::SeqCst);
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
         if self.owns_context && recorders.is_empty() {
-            self.context.dispose_in_background(true);
+            self.context.dispose_in_background(completed);
         } else {
             let owns = self.owns_context;
             let ctx = Arc::clone(&self.context);
@@ -2963,7 +3107,7 @@ impl Drop for PageLease {
                     let _ = rec.finish().await;
                 }
                 if owns {
-                    ctx.dispose(true).await;
+                    ctx.dispose(completed).await;
                 } else if !ctx.is_disposed() {
                     for f in ctx_flushers {
                         f.flush_session(Some(sid.clone())).await;
@@ -3614,6 +3758,21 @@ impl EngineBuilder {
     /// Pre-warmed blank context + `about:blank` page slots kept ready per running browser.
     pub fn prewarm_contexts(mut self, n: usize) -> Self {
         self.config.prewarm_contexts = n;
+        self
+    }
+    /// Directory used to persist named browser profiles (`JobOptions::profile`).
+    pub fn profiles_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.config.profiles_dir = Some(dir.into());
+        self
+    }
+    /// Outbound proxy pool used when `JobOptions::proxy` is unset.
+    pub fn proxy_pool(mut self, pool: ProxyPool) -> Self {
+        self.config.proxy_pool = Some(pool);
+        self
+    }
+    /// Enables AIMD adaptive concurrency limiting driven by memory pressure and outcomes.
+    pub fn adaptive_concurrency(mut self, cfg: AdaptiveConfig) -> Self {
+        self.config.adaptive_concurrency = Some(cfg);
         self
     }
     pub fn source(mut self, source: Arc<dyn BrowserSource>) -> Self {

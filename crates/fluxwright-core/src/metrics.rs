@@ -16,6 +16,8 @@ pub struct MetricsSnapshot {
     pub browser_tree_rss_bytes: u64,
     /// Browser process-tree RSS divided by active leases. An estimate.
     pub memory_per_job_bytes_estimate: u64,
+    /// Active admission limit (equals configured max capacity unless adaptive concurrency is on).
+    pub effective_concurrency_limit: usize,
 }
 
 #[derive(Debug, Clone, Default)]

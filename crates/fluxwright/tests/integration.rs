@@ -3028,9 +3028,11 @@ async fn api_request_cookies_and_indexeddb() {
 #[test]
 fn public_reexports_compile() {
     use fluxwright::{
-        find_channel, managed_browsers_dir, AriaRef, AriaSnapshot, Har, HarContentPolicy, HarLog,
-        HarMode, HarNotFound, HarRouteOptions, HarRouter, IgnoreDefaultArgs, MarkdownOptions,
-        RecordHarOptions, ResourcePreset, SnapshotOptions, WebSocketEvent, Worker, WorkerEvent,
+        find_channel, managed_browsers_dir, parse_proxy_url, validate_profile_name, AdaptiveConfig,
+        AriaRef, AriaSnapshot, Har, HarContentPolicy, HarLog, HarMode, HarNotFound,
+        HarRouteOptions, HarRouter, IgnoreDefaultArgs, MarkdownOptions, ProfileInfo, ProfileStore,
+        ProxyLease, ProxyPool, ProxyRotation, ProxyStatus, RecordHarOptions, ResourcePreset,
+        SnapshotOptions, WebSocketEvent, Worker, WorkerEvent,
     };
     let _ = std::any::type_name::<AriaRef>();
     let _ = std::any::type_name::<AriaSnapshot>();
@@ -3038,6 +3040,15 @@ fn public_reexports_compile() {
     let _ = std::any::type_name::<SnapshotOptions>();
     let _ = std::any::type_name::<IgnoreDefaultArgs>();
     let _ = std::any::type_name::<ResourcePreset>();
+    let _ = std::any::type_name::<AdaptiveConfig>();
+    let _ = std::any::type_name::<ProfileInfo>();
+    let _ = std::any::type_name::<ProfileStore>();
+    let _ = std::any::type_name::<ProxyLease>();
+    let _ = std::any::type_name::<ProxyPool>();
+    let _ = std::any::type_name::<ProxyRotation>();
+    let _ = std::any::type_name::<ProxyStatus>();
+    assert!(validate_profile_name("ok_1").is_ok());
+    assert!(parse_proxy_url("http://127.0.0.1:8080").is_ok());
     let _ = managed_browsers_dir as fn() -> Option<std::path::PathBuf>;
     assert!(find_channel("bogus-channel").is_err());
     let _ = std::any::type_name::<WebSocketEvent>();
@@ -3153,6 +3164,64 @@ async fn aria_snapshot_refs_and_markdown_extraction() {
     );
 
     drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn persistent_profile_reuses_cookies_and_localstorage_across_jobs() {
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async { axum::response::Html("<!doctype html><h1>Profile</h1>") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let srv_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let profiles_dir = std::env::temp_dir()
+        .join(format!("fluxwright-int-prof-{}-{stamp}", std::process::id()));
+
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .profiles_dir(&profiles_dir)
+        .build()
+        .await
+        .unwrap();
+
+    // Job 1: set cookie + localStorage and persist on close().
+    let p1 = eng.acquire_job(&JobOptions::default().profile("acct_1")).await.unwrap();
+    p1.goto(&format!("{base}/")).await.unwrap();
+    p1.evaluate("document.cookie = 'fw_sid=token123; Path=/'; localStorage.setItem('fw_theme', 'dark');")
+        .await
+        .unwrap();
+    p1.close().await.unwrap();
+
+    // Job 2: loads saved state, sees cookie + localStorage, mutates with persist_profile(false).
+    let p2 = eng
+        .acquire_job(&JobOptions::default().profile("acct_1").persist_profile(false))
+        .await
+        .unwrap();
+    p2.goto(&format!("{base}/")).await.unwrap();
+    let cookie = p2.evaluate("document.cookie").await.unwrap();
+    assert!(cookie.as_str().unwrap().contains("fw_sid=token123"), "{cookie}");
+    assert_eq!(p2.evaluate("localStorage.getItem('fw_theme')").await.unwrap(), "dark");
+    p2.evaluate("localStorage.setItem('fw_theme', 'light')").await.unwrap();
+    p2.close().await.unwrap();
+
+    // Job 3: persist_profile(false) must not overwrite prior state.
+    let p3 = eng.acquire_job(&JobOptions::default().profile("acct_1")).await.unwrap();
+    p3.goto(&format!("{base}/")).await.unwrap();
+    assert_eq!(p3.evaluate("localStorage.getItem('fw_theme')").await.unwrap(), "dark");
+    p3.close().await.unwrap();
+
+    let _ = std::fs::remove_dir_all(&profiles_dir);
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
     srv_task.abort();
 }

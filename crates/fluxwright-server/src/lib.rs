@@ -28,7 +28,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use fluxwright::BrowserEngine;
+use fluxwright::{validate_profile_name, BrowserEngine};
 use serde_json::{json, Value};
 use tokio::task::AbortHandle;
 use tracing::Instrument;
@@ -421,6 +421,9 @@ impl HttpServer {
             protected = protected
                 .route("/cdp", get(cdp_gateway::ws_handler))
                 .route("/json/version", get(cdp_gateway::json_version))
+                .route("/v1/profiles", get(list_profiles))
+                .route("/v1/profiles/{name}", delete(delete_profile))
+                .route("/v1/proxies", get(list_proxies))
                 .route("/v1/live", get(live::list_sessions))
                 .route("/v1/live/{id}/ticket", post(live::create_ticket))
                 .route("/v1/jobs/{id}/pause", post(live::pause_job))
@@ -985,6 +988,15 @@ pub(crate) async fn execute_job(
                         }
                     }
 
+                    if run_error.is_none() {
+                        if let Err(err) = page.save_profile().await {
+                            run_error = Some(err);
+                        }
+                    }
+                    if run_error.is_some() {
+                        page.mark_failed();
+                    }
+
                     // Drop schedules context disposal even if the enclosing deadline/cancellation fires.
                     // Do not await close() here: cancellation halfway through an async close would depend
                     // on that close's cancellation safety.
@@ -1284,6 +1296,85 @@ async fn stats(State(inner): State<Arc<Inner>>) -> Json<fluxwright::MetricsSnaps
         Some(engine) => Json(engine.metrics().await),
         None => Json(Default::default()),
     }
+}
+
+async fn list_profiles(State(inner): State<Arc<Inner>>) -> Result<Json<Value>, ApiError> {
+    let engine = inner
+        .engine
+        .as_ref()
+        .filter(|e| e.profiles().is_some())
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "profiles_not_configured",
+                "named profiles directory is not configured",
+            )
+        })?;
+    let profiles = tokio::task::spawn_blocking(move || {
+        engine
+            .profiles()
+            .expect("profiles store checked")
+            .list()
+    })
+    .await
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "profile_error", e.to_string()))?
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "profile_error", e.to_string()))?;
+    Ok(Json(json!({ "profiles": profiles })))
+}
+
+async fn delete_profile(
+    State(inner): State<Arc<Inner>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    validate_profile_name(&name).map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_profile_name",
+            e.to_string(),
+        )
+    })?;
+    let engine = inner
+        .engine
+        .as_ref()
+        .filter(|e| e.profiles().is_some())
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "profiles_not_configured",
+                "named profiles directory is not configured",
+            )
+        })?;
+    let target = name.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        engine
+            .profiles()
+            .expect("profiles store checked")
+            .delete(&target)
+    })
+    .await
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "profile_error", e.to_string()))?
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "profile_error", e.to_string()))?;
+    if !removed {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "profile_not_found",
+            format!("profile '{name}' not found"),
+        ));
+    }
+    Ok(Json(json!({ "deleted": true, "name": name })))
+}
+
+async fn list_proxies(State(inner): State<Arc<Inner>>) -> Result<Json<Value>, ApiError> {
+    let Some(pool) = inner.engine.as_ref().and_then(|e| e.proxy_pool()) else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "proxies_not_configured",
+            "outbound proxy pool is not configured",
+        ));
+    };
+    Ok(Json(json!({ "proxies": pool.stats() })))
 }
 
 async fn metrics_endpoint(State(inner): State<Arc<Inner>>) -> Response {
