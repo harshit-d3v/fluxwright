@@ -5,6 +5,87 @@ const fs = require('node:fs/promises')
 const { dirname } = require('node:path')
 const { performance } = require('node:perf_hooks')
 
+const SNAPSHOT_TIMEOUT_MS = 500
+
+const SNAPSHOT_JS = `(() => {
+  try {
+    const t0 = performance.now();
+    const doc = document;
+    const root = doc && doc.documentElement;
+    if (!root) return null;
+    const MAX_NODES = 4000;
+    const MAX_TEXT = 16384;
+    let nodeCount = 0;
+    let textRemaining = MAX_TEXT;
+    const ser = (n) => {
+      if (!n || nodeCount >= MAX_NODES) return null;
+      const nt = n.nodeType;
+      if (nt === 3) {
+        const v = n.nodeValue;
+        if (!v || textRemaining <= 0) return null;
+        nodeCount++;
+        if (v.length > textRemaining) {
+          const s = v.slice(0, textRemaining);
+          textRemaining = 0;
+          return s;
+        }
+        textRemaining -= v.length;
+        return v;
+      }
+      if (nt !== 1) return null;
+      nodeCount++;
+      const tag = n.tagName || '';
+      const upper = tag.toUpperCase();
+      if (upper === 'SCRIPT') return ['SCRIPT', {}];
+      const attrs = {};
+      const rawAttrs = n.attributes;
+      if (rawAttrs) {
+        for (let i = 0; i < rawAttrs.length; i++) {
+          const a = rawAttrs[i];
+          if (a.name === '__proto__') continue;
+          attrs[a.name] = a.value;
+        }
+      }
+      if (upper === 'INPUT') {
+        const t = (n.type || '').toLowerCase();
+        if (t === 'checkbox' || t === 'radio') {
+          attrs.__playwright_checked__ = Boolean(n.checked);
+        } else if (t !== 'file') {
+          attrs.__playwright_value__ = n.value != null ? String(n.value) : '';
+        }
+      } else if (upper === 'TEXTAREA' || upper === 'SELECT') {
+        attrs.__playwright_value__ = n.value != null ? String(n.value) : '';
+      } else if (upper === 'OPTION') {
+        attrs.__playwright_selected__ = Boolean(n.selected);
+      }
+      const out = [tag, attrs];
+      const ch = n.childNodes;
+      if (ch) {
+        for (let i = 0; i < ch.length; i++) {
+          if (nodeCount >= MAX_NODES) break;
+          const s = ser(ch[i]);
+          if (s !== null) out.push(s);
+        }
+      }
+      return out;
+    };
+    const html = ser(root);
+    if (!html) return null;
+    return {
+      frameUrl: String(doc.URL || (doc.location && doc.location.href) || ''),
+      doctype: doc.doctype ? String(doc.doctype.name || '') : '',
+      html,
+      viewport: {
+        width: Number(window.innerWidth) || 0,
+        height: Number(window.innerHeight) || 0
+      },
+      collectionTime: Math.max(0, performance.now() - t0)
+    };
+  } catch (_) {
+    return null;
+  }
+})()`
+
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256)
   for (let i = 0; i < 256; i++) {
@@ -532,6 +613,8 @@ class Tracing {
     const watcher = {
       pageId,
       cdp: null,
+      cdpReady: null,
+      screencastStarted: false,
       cleanup: () => {
         page.off('console', onConsole)
         page.off('pageerror', onPageError)
@@ -543,61 +626,73 @@ class Tracing {
     }
     this.#watchers.set(page, watcher)
 
-    if (this.#screenshots && !page.isClosed()) {
+    if ((this.#screenshots || this.#snapshots) && !page.isClosed()) {
       const gen = this.#sessionGen
-      let cdp = null
-      let onFrame = null
-      try {
-        cdp = await ctx.newCDPSession(page)
-        if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
-          await cdp.detach().catch(() => {})
-          return
-        }
-        onFrame = (ev) => {
-          if (ev?.sessionId != null) {
-            cdp.send('Page.screencastFrameAck', { sessionId: ev.sessionId }).catch(() => {})
+      const attachCdp = (async () => {
+        let cdp = null
+        let onFrame = null
+        let screencastStarted = false
+        try {
+          cdp = await ctx.newCDPSession(page)
+          if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
+            await cdp.detach().catch(() => {})
+            return
           }
-          const t = selfRef.deref()
-          if (!t || !ev?.data) return
-          const buf = Buffer.from(ev.data, 'base64')
-          const meta = ev.metadata || {}
-          t.#recordJpegFrame(
-            pageId,
-            buf,
-            meta.deviceWidth,
-            meta.deviceHeight,
-            typeof meta.timestamp === 'number' ? meta.timestamp * 1000 : Date.now(),
-          )
+          if (this.#screenshots) {
+            onFrame = (ev) => {
+              if (ev?.sessionId != null) {
+                cdp.send('Page.screencastFrameAck', { sessionId: ev.sessionId }).catch(() => {})
+              }
+              const t = selfRef.deref()
+              if (!t || !ev?.data) return
+              const buf = Buffer.from(ev.data, 'base64')
+              const meta = ev.metadata || {}
+              t.#recordJpegFrame(
+                pageId,
+                buf,
+                meta.deviceWidth,
+                meta.deviceHeight,
+                typeof meta.timestamp === 'number' ? meta.timestamp * 1000 : Date.now(),
+              )
+            }
+            cdp.on('Page.screencastFrame', onFrame)
+            await cdp.send('Page.enable').catch(() => {})
+            if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
+              cdp.off('Page.screencastFrame', onFrame)
+              await cdp.detach().catch(() => {})
+              return
+            }
+            await cdp.send('Page.startScreencast', {
+              format: 'jpeg',
+              quality: 80,
+              maxWidth: 1280,
+              maxHeight: 720,
+              everyNthFrame: 1,
+            })
+            screencastStarted = true
+            if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
+              cdp.off('Page.screencastFrame', onFrame)
+              await cdp.send('Page.stopScreencast').catch(() => {})
+              await cdp.detach().catch(() => {})
+              return
+            }
+            watcher.cleanupCdp = () => cdp.off('Page.screencastFrame', onFrame)
+          }
+          watcher.cdp = cdp
+          watcher.screencastStarted = screencastStarted
+        } catch {
+          // Page or context closed concurrently while attaching CDP session.
+          if (cdp) {
+            if (onFrame) cdp.off('Page.screencastFrame', onFrame)
+            if (screencastStarted) await cdp.send('Page.stopScreencast').catch(() => {})
+            await cdp.detach().catch(() => {})
+          }
+        } finally {
+          watcher.cdpReady = null
         }
-        cdp.on('Page.screencastFrame', onFrame)
-        await cdp.send('Page.enable').catch(() => {})
-        if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
-          cdp.off('Page.screencastFrame', onFrame)
-          await cdp.detach().catch(() => {})
-          return
-        }
-        await cdp.send('Page.startScreencast', {
-          format: 'jpeg',
-          quality: 80,
-          maxWidth: 1280,
-          maxHeight: 720,
-          everyNthFrame: 1,
-        })
-        if (!this.#active || this.#sessionGen !== gen || page.isClosed() || this.#watchers.get(page) !== watcher) {
-          cdp.off('Page.screencastFrame', onFrame)
-          await cdp.send('Page.stopScreencast').catch(() => {})
-          await cdp.detach().catch(() => {})
-          return
-        }
-        watcher.cdp = cdp
-        watcher.cleanupCdp = () => cdp.off('Page.screencastFrame', onFrame)
-      } catch {
-        // Page or context closed concurrently while attaching screencast.
-        if (cdp) {
-          if (onFrame) cdp.off('Page.screencastFrame', onFrame)
-          await cdp.detach().catch(() => {})
-        }
-      }
+      })()
+      watcher.cdpReady = attachCdp
+      await attachCdp
     }
   }
 
@@ -608,8 +703,78 @@ class Tracing {
     watcher.cleanup()
     watcher.cleanupCdp?.()
     if (watcher.cdp) {
-      await watcher.cdp.send('Page.stopScreencast').catch(() => {})
+      if (watcher.screencastStarted) {
+        await watcher.cdp.send('Page.stopScreencast').catch(() => {})
+      }
       await watcher.cdp.detach().catch(() => {})
+    }
+  }
+
+  async #captureSnapshot(page, pageId, callId, phase, chunkSeq, sessionGen) {
+    if (!this.#active || !this.#chunkActive || !this.#snapshots) return null
+    if (this.#chunkSeq !== chunkSeq || this.#sessionGen !== sessionGen) return null
+    if (!page || page.isClosed?.()) return null
+    let watcher = this.#watchers.get(page)
+    if (!watcher?.cdp && watcher?.cdpReady) {
+      let readyTimer = null
+      try {
+        await Promise.race([
+          watcher.cdpReady.catch(() => {}),
+          new Promise((resolve) => {
+            readyTimer = setTimeout(resolve, SNAPSHOT_TIMEOUT_MS)
+          }),
+        ])
+      } finally {
+        if (readyTimer !== null) clearTimeout(readyTimer)
+      }
+      watcher = this.#watchers.get(page)
+    }
+    const cdp = watcher?.cdp
+    if (!cdp) return null
+    if (!this.#active || !this.#chunkActive || this.#chunkSeq !== chunkSeq || this.#sessionGen !== sessionGen) {
+      return null
+    }
+    let timer = null
+    try {
+      const evalPromise = cdp.send('Runtime.evaluate', {
+        expression: SNAPSHOT_JS,
+        returnByValue: true,
+      })
+      evalPromise.catch(() => {})
+      const timeoutPromise = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), SNAPSHOT_TIMEOUT_MS)
+      })
+      const res = await Promise.race([evalPromise, timeoutPromise])
+      if (!res || res.exceptionDetails) return null
+      const val = res?.result?.value
+      if (!val || typeof val !== 'object' || !Array.isArray(val.html)) return null
+      if (!this.#active || !this.#chunkActive || this.#chunkSeq !== chunkSeq || this.#sessionGen !== sessionGen) {
+        return null
+      }
+      return {
+        callId,
+        snapshotName: `${phase}@${callId}`,
+        pageId,
+        frameId: 'main',
+        frameUrl: typeof val.frameUrl === 'string' ? val.frameUrl : '',
+        doctype: typeof val.doctype === 'string' ? val.doctype : '',
+        html: val.html,
+        viewport:
+          val.viewport && typeof val.viewport === 'object'
+            ? {
+                width: Number(val.viewport.width) || 0,
+                height: Number(val.viewport.height) || 0,
+              }
+            : { width: 0, height: 0 },
+        timestamp: this.#monoMs(),
+        collectionTime: typeof val.collectionTime === 'number' && val.collectionTime >= 0 ? val.collectionTime : 0,
+        resourceOverrides: [],
+        isMainFrame: true,
+      }
+    } catch {
+      return null
+    } finally {
+      if (timer !== null) clearTimeout(timer)
     }
   }
 
@@ -677,22 +842,37 @@ class Tracing {
   async _runAction(page, className, methodName, apiName, params, fn) {
     if (!this.#active || !this.#chunkActive || this.#suppressActions) return fn()
     const chunkSeq = this.#chunkSeq
+    const sessionGen = this.#sessionGen
     const callId = `call@${++this.#nextCallSeq}`
     const pageId = this.#ensurePageId(page)
+
+    let beforeSnapshotName
+    if (this.#snapshots) {
+      const snap = await this.#captureSnapshot(page, pageId, callId, 'before', chunkSeq, sessionGen)
+      if (!this.#active || !this.#chunkActive || this.#chunkSeq !== chunkSeq || this.#sessionGen !== sessionGen) {
+        return fn()
+      }
+      if (snap) {
+        beforeSnapshotName = snap.snapshotName
+        this.#traceLines.push(JSON.stringify({ type: 'frame-snapshot', snapshot: snap }))
+      }
+    }
+
     const startTime = this.#monoMs()
-    this.#traceLines.push(
-      JSON.stringify({
-        type: 'before',
-        callId,
-        startTime,
-        class: className,
-        method: methodName,
-        apiName,
-        params: params ?? {},
-        pageId,
-        stepId: callId,
-      }),
-    )
+    const beforeEv = {
+      type: 'before',
+      callId,
+      startTime,
+      class: className,
+      method: methodName,
+      apiName,
+      params: params ?? {},
+      pageId,
+      stepId: callId,
+    }
+    if (beforeSnapshotName !== undefined) beforeEv.beforeSnapshot = beforeSnapshotName
+    this.#traceLines.push(JSON.stringify(beforeEv))
+
     let errorInfo
     try {
       return await fn()
@@ -703,12 +883,27 @@ class Tracing {
           : { name: 'Error', message: String(err), stack: '' }
       throw err
     } finally {
-      if (this.#active && this.#chunkActive && this.#chunkSeq === chunkSeq) {
+      let afterSnapshotName
+      if (
+        this.#snapshots &&
+        this.#active &&
+        this.#chunkActive &&
+        this.#chunkSeq === chunkSeq &&
+        this.#sessionGen === sessionGen
+      ) {
+        const snap = await this.#captureSnapshot(page, pageId, callId, 'after', chunkSeq, sessionGen)
+        if (snap && this.#active && this.#chunkActive && this.#chunkSeq === chunkSeq && this.#sessionGen === sessionGen) {
+          afterSnapshotName = snap.snapshotName
+          this.#traceLines.push(JSON.stringify({ type: 'frame-snapshot', snapshot: snap }))
+        }
+      }
+      if (this.#active && this.#chunkActive && this.#chunkSeq === chunkSeq && this.#sessionGen === sessionGen) {
         const after = {
           type: 'after',
           callId,
           endTime: this.#monoMs(),
         }
+        if (afterSnapshotName !== undefined) after.afterSnapshot = afterSnapshotName
         if (errorInfo !== undefined) after.error = errorInfo
         this.#traceLines.push(JSON.stringify(after))
       }

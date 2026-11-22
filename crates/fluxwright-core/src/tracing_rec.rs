@@ -1,8 +1,9 @@
 //! Playwright Trace Viewer-compatible `.zip` context tracing (`context.tracing()`).
 //!
-//! Captures action `before`/`after` events, CDP `Page.startScreencast` JPEG frames, console
-//! messages, page errors, and network activity, bundling them into a standard Store-mode ZIP
-//! archive containing `trace.trace`, `trace.network`, and `resources/<sha1>.jpeg`.
+//! Captures action `before`/`after` events, bounded DOM `frame-snapshot` events, CDP
+//! `Page.startScreencast` JPEG frames, console messages, page errors, and network activity,
+//! bundling them into a standard Store-mode ZIP archive containing `trace.trace`,
+//! `trace.network`, and `resources/<sha1>.jpeg`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -19,9 +20,89 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 
 const CDP_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(500);
 const SCREENCAST_WAIT_MAX: Duration = Duration::from_millis(250);
 const SCREENCAST_POLL_STEP: Duration = Duration::from_millis(20);
 const FLUSH_SETTLE_DELAY: Duration = Duration::from_millis(20);
+
+const SNAPSHOT_JS: &str = r#"(() => {
+  try {
+    const t0 = performance.now();
+    const doc = document;
+    const root = doc && doc.documentElement;
+    if (!root) return null;
+    const MAX_NODES = 4000;
+    const MAX_TEXT = 16384;
+    let nodeCount = 0;
+    let textRemaining = MAX_TEXT;
+    const ser = (n) => {
+      if (!n || nodeCount >= MAX_NODES) return null;
+      const nt = n.nodeType;
+      if (nt === 3) {
+        const v = n.nodeValue;
+        if (!v || textRemaining <= 0) return null;
+        nodeCount++;
+        if (v.length > textRemaining) {
+          const s = v.slice(0, textRemaining);
+          textRemaining = 0;
+          return s;
+        }
+        textRemaining -= v.length;
+        return v;
+      }
+      if (nt !== 1) return null;
+      nodeCount++;
+      const tag = n.tagName || '';
+      const upper = tag.toUpperCase();
+      if (upper === 'SCRIPT') return ['SCRIPT', {}];
+      const attrs = {};
+      const rawAttrs = n.attributes;
+      if (rawAttrs) {
+        for (let i = 0; i < rawAttrs.length; i++) {
+          const a = rawAttrs[i];
+          if (a.name === '__proto__') continue;
+          attrs[a.name] = a.value;
+        }
+      }
+      if (upper === 'INPUT') {
+        const t = (n.type || '').toLowerCase();
+        if (t === 'checkbox' || t === 'radio') {
+          attrs.__playwright_checked__ = Boolean(n.checked);
+        } else if (t !== 'file') {
+          attrs.__playwright_value__ = n.value != null ? String(n.value) : '';
+        }
+      } else if (upper === 'TEXTAREA' || upper === 'SELECT') {
+        attrs.__playwright_value__ = n.value != null ? String(n.value) : '';
+      } else if (upper === 'OPTION') {
+        attrs.__playwright_selected__ = Boolean(n.selected);
+      }
+      const out = [tag, attrs];
+      const ch = n.childNodes;
+      if (ch) {
+        for (let i = 0; i < ch.length; i++) {
+          if (nodeCount >= MAX_NODES) break;
+          const s = ser(ch[i]);
+          if (s !== null) out.push(s);
+        }
+      }
+      return out;
+    };
+    const html = ser(root);
+    if (!html) return null;
+    return {
+      frameUrl: String(doc.URL || (doc.location && doc.location.href) || ''),
+      doctype: doc.doctype ? String(doc.doctype.name || '') : '',
+      html,
+      viewport: {
+        width: Number(window.innerWidth) || 0,
+        height: Number(window.innerHeight) || 0
+      },
+      collectionTime: Math.max(0, performance.now() - t0)
+    };
+  } catch (_) {
+    return null;
+  }
+})()"#;
 
 /// Options for [`Tracing::start`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,6 +163,7 @@ pub(crate) struct TrackedPage {
 struct PageWatchHandles {
     tasks: Vec<JoinHandle<()>>,
     cdp_session: Option<CdpSession>,
+    screencast_started: bool,
 }
 
 struct InFlightNet {
@@ -227,6 +309,15 @@ impl TraceState {
         }
     }
 
+    fn cdp_session_for_target(&self, target_id: &str) -> Option<CdpSession> {
+        self.open_pages
+            .iter()
+            .rev()
+            .find(|tp| tp.page.target_id.0 == target_id && !tp.page.is_closed())
+            .and_then(|tp| self.watchers.get(&tp.lease_id))
+            .and_then(|w| w.cdp_session.clone())
+    }
+
     fn snapshot_network_ndjson(&self) -> String {
         let end_ms = self.mono_ms();
         let mut lines = self.network_lines.clone();
@@ -247,21 +338,40 @@ struct ActionTraceGuard<'a> {
     tracing: &'a ContextTracing,
     call_id: Option<String>,
     chunk_seq: u64,
+    session_gen: u64,
+    completed_error: Option<Option<Value>>,
 }
 
 impl ActionTraceGuard<'_> {
-    fn finish(&mut self, error: Option<Value>) {
+    fn set_completed(&mut self, error: Option<Value>) {
+        self.completed_error = Some(error);
+    }
+
+    fn finish(&mut self, page_id: &str, after_raw: Option<Value>) {
         let Some(call_id) = self.call_id.take() else {
             return;
         };
+        let error = self.completed_error.take().flatten();
         let mut st = self.tracing.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.active && st.chunk_active && st.chunk_seq == self.chunk_seq {
+        if st.active
+            && st.chunk_active
+            && st.chunk_seq == self.chunk_seq
+            && st.session_gen == self.session_gen
+        {
+            let after_snap_name = if st.snapshots {
+                after_raw.map(|raw| push_frame_snapshot(&mut st, page_id, &call_id, "after", raw))
+            } else {
+                None
+            };
             let end_time = st.mono_ms();
             let mut after = json!({
                 "type": "after",
                 "callId": call_id,
                 "endTime": end_time,
             });
+            if let Some(ref snap_name) = after_snap_name {
+                after["afterSnapshot"] = json!(snap_name);
+            }
             if let Some(err_val) = error {
                 after["error"] = err_val;
             }
@@ -272,11 +382,32 @@ impl ActionTraceGuard<'_> {
 
 impl Drop for ActionTraceGuard<'_> {
     fn drop(&mut self) {
-        if self.call_id.is_some() {
-            self.finish(Some(json!({
+        let Some(call_id) = self.call_id.take() else {
+            return;
+        };
+        let error = match self.completed_error.take() {
+            Some(err) => err,
+            None => Some(json!({
                 "name": "CancelledError",
                 "message": "cancelled",
-            })));
+            })),
+        };
+        let mut st = self.tracing.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.active
+            && st.chunk_active
+            && st.chunk_seq == self.chunk_seq
+            && st.session_gen == self.session_gen
+        {
+            let end_time = st.mono_ms();
+            let mut after = json!({
+                "type": "after",
+                "callId": call_id,
+                "endTime": end_time,
+            });
+            if let Some(err_val) = error {
+                after["error"] = err_val;
+            }
+            st.trace_lines.push(after.to_string());
         }
     }
 }
@@ -333,14 +464,22 @@ impl ContextTracing {
                         .to_string(),
                     );
                 }
-                Some((st.screenshots, page_id, st.session_gen))
+                Some((st.screenshots, st.snapshots, page_id, st.session_gen))
             } else {
                 None
             }
         };
-        if let Some((screenshots, page_id, session_gen)) = should_watch {
-            self.attach_page_watchers(lease_id, page, log, page_id, screenshots, session_gen)
-                .await;
+        if let Some((screenshots, snapshots, page_id, session_gen)) = should_watch {
+            self.attach_page_watchers(
+                lease_id,
+                page,
+                log,
+                page_id,
+                screenshots,
+                snapshots,
+                session_gen,
+            )
+            .await;
         }
     }
 
@@ -399,14 +538,22 @@ impl ContextTracing {
                         .to_string(),
                     );
                 }
-                Some((st.screenshots, page_id, st.session_gen))
+                Some((st.screenshots, st.snapshots, page_id, st.session_gen))
             } else {
                 None
             }
         };
-        if let Some((screenshots, page_id, session_gen)) = should_watch {
-            self.attach_page_watchers(lease_id, page, log, page_id, screenshots, session_gen)
-                .await;
+        if let Some((screenshots, snapshots, page_id, session_gen)) = should_watch {
+            self.attach_page_watchers(
+                lease_id,
+                page,
+                log,
+                page_id,
+                screenshots,
+                snapshots,
+                session_gen,
+            )
+            .await;
         }
     }
 
@@ -443,19 +590,7 @@ impl ContextTracing {
             }
         }
         if let Some(handles) = watch {
-            for h in handles.tasks {
-                h.abort();
-            }
-            if let Some(session) = handles.cdp_session {
-                if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                    rt.spawn(async move {
-                        let _ = session
-                            .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
-                            .await;
-                        let _ = session.detach(Duration::from_secs(2)).await;
-                    });
-                }
-            }
+            abort_watch_handles(handles);
         }
     }
 
@@ -482,19 +617,7 @@ impl ContextTracing {
             }
         }
         for (_, handles) in watches {
-            for h in handles.tasks {
-                h.abort();
-            }
-            if let Some(session) = handles.cdp_session {
-                if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                    rt.spawn(async move {
-                        let _ = session
-                            .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
-                            .await;
-                        let _ = session.detach(Duration::from_secs(2)).await;
-                    });
-                }
-            }
+            abort_watch_handles(handles);
         }
     }
 
@@ -511,44 +634,133 @@ impl ContextTracing {
         F: std::future::Future<Output = Result<T>>,
         P: FnOnce() -> Value,
     {
-        let (call_id, chunk_seq) = if self.is_active() {
+        struct Prepared {
+            call_id: String,
+            page_id: String,
+            chunk_seq: u64,
+            session_gen: u64,
+            snapshots_enabled: bool,
+            cdp_session: Option<CdpSession>,
+            params_val: Option<Value>,
+        }
+
+        let prep = if self.is_active() {
             let mut st = self.state.lock().unwrap();
             if st.active && st.chunk_active {
                 let params_val = params();
                 st.next_call_seq += 1;
                 let seq = st.next_call_seq;
                 let chunk_seq = st.chunk_seq;
+                let session_gen = st.session_gen;
                 let call_id = format!("call@{seq}");
                 let page_id = st.ensure_page_id(target_id);
-                let start_time = st.mono_ms();
-                st.trace_lines.push(
-                    json!({
-                        "type": "before",
-                        "callId": call_id,
-                        "startTime": start_time,
-                        "class": class_name,
-                        "method": method_name,
-                        "apiName": api_name,
-                        "params": params_val,
-                        "pageId": page_id,
-                        "stepId": call_id,
+                if !st.snapshots {
+                    let start_time = st.mono_ms();
+                    st.trace_lines.push(
+                        json!({
+                            "type": "before",
+                            "callId": call_id,
+                            "startTime": start_time,
+                            "class": class_name,
+                            "method": method_name,
+                            "apiName": api_name,
+                            "params": params_val,
+                            "pageId": page_id,
+                            "stepId": call_id,
+                        })
+                        .to_string(),
+                    );
+                    Some(Prepared {
+                        call_id,
+                        page_id,
+                        chunk_seq,
+                        session_gen,
+                        snapshots_enabled: false,
+                        cdp_session: None,
+                        params_val: None,
                     })
-                    .to_string(),
-                );
-                (Some(call_id), chunk_seq)
+                } else {
+                    let cdp_session = st.cdp_session_for_target(target_id);
+                    Some(Prepared {
+                        call_id,
+                        page_id,
+                        chunk_seq,
+                        session_gen,
+                        snapshots_enabled: true,
+                        cdp_session,
+                        params_val: Some(params_val),
+                    })
+                }
             } else {
                 drop(params);
-                (None, 0)
+                None
             }
         } else {
             drop(params);
-            (None, 0)
+            None
+        };
+
+        let (call_id, page_id, chunk_seq, session_gen, snapshots_enabled) = match prep {
+            Some(p) if p.snapshots_enabled => {
+                let before_raw = match p.cdp_session.as_ref() {
+                    Some(sess) => eval_dom_snapshot(sess).await,
+                    None => None,
+                };
+                let armed = {
+                    let mut st = self.state.lock().unwrap();
+                    if st.active
+                        && st.chunk_active
+                        && st.chunk_seq == p.chunk_seq
+                        && st.session_gen == p.session_gen
+                    {
+                        let before_snap_name = before_raw.map(|raw| {
+                            push_frame_snapshot(&mut st, &p.page_id, &p.call_id, "before", raw)
+                        });
+                        let start_time = st.mono_ms();
+                        let mut before = json!({
+                            "type": "before",
+                            "callId": p.call_id,
+                            "startTime": start_time,
+                            "class": class_name,
+                            "method": method_name,
+                            "apiName": api_name,
+                            "params": p.params_val.unwrap_or_else(|| json!({})),
+                            "pageId": p.page_id,
+                            "stepId": p.call_id,
+                        });
+                        if let Some(ref snap_name) = before_snap_name {
+                            before["beforeSnapshot"] = json!(snap_name);
+                        }
+                        st.trace_lines.push(before.to_string());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                (
+                    if armed { Some(p.call_id) } else { None },
+                    p.page_id,
+                    p.chunk_seq,
+                    p.session_gen,
+                    true,
+                )
+            }
+            Some(p) => (
+                Some(p.call_id),
+                p.page_id,
+                p.chunk_seq,
+                p.session_gen,
+                false,
+            ),
+            None => (None, String::new(), 0, 0, false),
         };
 
         let mut guard = ActionTraceGuard {
             tracing: self,
             call_id,
             chunk_seq,
+            session_gen,
+            completed_error: None,
         };
 
         let result = fut.await;
@@ -559,7 +771,31 @@ impl ContextTracing {
                 "message": err.to_string(),
             })
         });
-        guard.finish(err_val);
+        guard.set_completed(err_val);
+
+        let after_raw = if guard.call_id.is_some() && snapshots_enabled {
+            let after_sess = {
+                let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.active
+                    && st.chunk_active
+                    && st.chunk_seq == chunk_seq
+                    && st.session_gen == session_gen
+                    && st.snapshots
+                {
+                    st.cdp_session_for_target(target_id)
+                } else {
+                    None
+                }
+            };
+            match after_sess {
+                Some(sess) => eval_dom_snapshot(&sess).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        guard.finish(&page_id, after_raw);
 
         result
     }
@@ -609,6 +845,7 @@ impl ContextTracing {
                 log,
                 page_id,
                 options.screenshots,
+                options.snapshots,
                 session_gen,
             )
             .await;
@@ -761,10 +998,7 @@ impl ContextTracing {
                 h.abort();
             }
             if let Some(session) = handles.cdp_session {
-                let _ = session
-                    .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
-                    .await;
-                let _ = session.detach(Duration::from_secs(2)).await;
+                detach_cdp_session(session, handles.screencast_started).await;
             }
         }
     }
@@ -808,6 +1042,7 @@ impl ContextTracing {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn attach_page_watchers(
         self: &Arc<Self>,
         lease_id: Uuid,
@@ -815,6 +1050,7 @@ impl ContextTracing {
         log: Arc<std::sync::Mutex<PageLog>>,
         page_id: String,
         screenshots: bool,
+        snapshots: bool,
         session_gen: u64,
     ) {
         let (mut log_rx, mut net_rx) = {
@@ -941,68 +1177,74 @@ impl ContextTracing {
             }
         }));
 
-        let cdp_session = if screenshots && !page.is_closed() {
+        let (cdp_session, screencast_started) = if (screenshots || snapshots) && !page.is_closed() {
             match page.new_cdp_session(CDP_TIMEOUT).await {
                 Ok(session) => {
-                    let mut cdp_rx = session.subscribe_events();
-                    let _ = session.send("Page.enable", json!({}), CDP_TIMEOUT).await;
-                    let start_res = session
-                        .send(
-                            "Page.startScreencast",
-                            json!({
-                                "format": "jpeg",
-                                "quality": 80,
-                                "maxWidth": 1280,
-                                "maxHeight": 720,
-                                "everyNthFrame": 1,
-                            }),
-                            CDP_TIMEOUT,
-                        )
-                        .await;
-                    if start_res.is_ok() {
-                        let me_sc = Arc::clone(self);
-                        let sess_sc = session.clone();
-                        let pid_sc = page_id.clone();
-                        tasks.push(tokio::spawn(async move {
-                            while let Some(ev) = cdp_rx.recv().await {
-                                if ev.method != "Page.screencastFrame" {
-                                    continue;
+                    if screenshots {
+                        let mut cdp_rx = session.subscribe_events();
+                        let _ = session.send("Page.enable", json!({}), CDP_TIMEOUT).await;
+                        let start_res = session
+                            .send(
+                                "Page.startScreencast",
+                                json!({
+                                    "format": "jpeg",
+                                    "quality": 80,
+                                    "maxWidth": 1280,
+                                    "maxHeight": 720,
+                                    "everyNthFrame": 1,
+                                }),
+                                CDP_TIMEOUT,
+                            )
+                            .await;
+                        if start_res.is_ok() {
+                            let me_sc = Arc::clone(self);
+                            let sess_sc = session.clone();
+                            let pid_sc = page_id.clone();
+                            tasks.push(tokio::spawn(async move {
+                                while let Some(ev) = cdp_rx.recv().await {
+                                    if ev.method != "Page.screencastFrame" {
+                                        continue;
+                                    }
+                                    if let Some(ack_id) = ev.params.get("sessionId").cloned() {
+                                        let ack_sess = sess_sc.clone();
+                                        tokio::spawn(async move {
+                                            let _ = ack_sess
+                                                .send(
+                                                    "Page.screencastFrameAck",
+                                                    json!({ "sessionId": ack_id }),
+                                                    Duration::from_secs(2),
+                                                )
+                                                .await;
+                                        });
+                                    }
+                                    let Some(b64) = ev.params["data"].as_str() else {
+                                        continue;
+                                    };
+                                    let Some(bytes) = decode_base64(b64) else {
+                                        continue;
+                                    };
+                                    let meta = &ev.params["metadata"];
+                                    let w = meta["deviceWidth"].as_f64();
+                                    let h = meta["deviceHeight"].as_f64();
+                                    let wall = meta["timestamp"].as_f64().map(|s| s * 1000.0);
+                                    me_sc.record_jpeg_frame(&pid_sc, bytes, w, h, wall);
                                 }
-                                if let Some(ack_id) = ev.params.get("sessionId").cloned() {
-                                    let ack_sess = sess_sc.clone();
-                                    tokio::spawn(async move {
-                                        let _ = ack_sess
-                                            .send(
-                                                "Page.screencastFrameAck",
-                                                json!({ "sessionId": ack_id }),
-                                                Duration::from_secs(2),
-                                            )
-                                            .await;
-                                    });
-                                }
-                                let Some(b64) = ev.params["data"].as_str() else {
-                                    continue;
-                                };
-                                let Some(bytes) = decode_base64(b64) else {
-                                    continue;
-                                };
-                                let meta = &ev.params["metadata"];
-                                let w = meta["deviceWidth"].as_f64();
-                                let h = meta["deviceHeight"].as_f64();
-                                let wall = meta["timestamp"].as_f64().map(|s| s * 1000.0);
-                                me_sc.record_jpeg_frame(&pid_sc, bytes, w, h, wall);
-                            }
-                        }));
-                        Some(session)
+                            }));
+                            (Some(session), true)
+                        } else if snapshots && !session.is_detached() {
+                            (Some(session), false)
+                        } else {
+                            let _ = session.detach(Duration::from_secs(2)).await;
+                            (None, false)
+                        }
                     } else {
-                        let _ = session.detach(Duration::from_secs(2)).await;
-                        None
+                        (Some(session), false)
                     }
                 }
-                Err(_) => None,
+                Err(_) => (None, false),
             }
         } else {
-            None
+            (None, false)
         };
 
         let mut old_watch = None;
@@ -1011,9 +1253,14 @@ impl ContextTracing {
             let mut st = self.state.lock().unwrap();
             let page_still_open = st.open_pages.iter().any(|p| p.lease_id == lease_id);
             if st.active && !st.closed && st.session_gen == session_gen && page_still_open {
-                old_watch = st
-                    .watchers
-                    .insert(lease_id, PageWatchHandles { tasks, cdp_session });
+                old_watch = st.watchers.insert(
+                    lease_id,
+                    PageWatchHandles {
+                        tasks,
+                        cdp_session,
+                        screencast_started,
+                    },
+                );
             } else {
                 for t in tasks {
                     t.abort();
@@ -1022,23 +1269,112 @@ impl ContextTracing {
             }
         }
         if let Some(session) = rejected_session {
-            let _ = session
-                .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
-                .await;
-            let _ = session.detach(Duration::from_secs(2)).await;
+            detach_cdp_session(session, screencast_started).await;
         }
         if let Some(old) = old_watch {
             for t in old.tasks {
                 t.abort();
             }
             if let Some(s) = old.cdp_session {
-                let _ = s
-                    .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
-                    .await;
-                let _ = s.detach(Duration::from_secs(2)).await;
+                detach_cdp_session(s, old.screencast_started).await;
             }
         }
     }
+}
+
+async fn detach_cdp_session(session: CdpSession, stop_screencast: bool) {
+    if stop_screencast {
+        let _ = session
+            .send("Page.stopScreencast", json!({}), Duration::from_secs(2))
+            .await;
+    }
+    let _ = session.detach(Duration::from_secs(2)).await;
+}
+
+fn abort_watch_handles(handles: PageWatchHandles) {
+    for h in handles.tasks {
+        h.abort();
+    }
+    if let Some(session) = handles.cdp_session {
+        let stop_sc = handles.screencast_started;
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(detach_cdp_session(session, stop_sc));
+        }
+    }
+}
+
+async fn eval_dom_snapshot(session: &CdpSession) -> Option<Value> {
+    if session.is_detached() {
+        return None;
+    }
+    let resp = session
+        .send(
+            "Runtime.evaluate",
+            json!({
+                "expression": SNAPSHOT_JS,
+                "returnByValue": true,
+            }),
+            SNAPSHOT_TIMEOUT,
+        )
+        .await
+        .ok()?;
+    if resp
+        .get("exceptionDetails")
+        .is_some_and(|v| !v.is_null())
+    {
+        return None;
+    }
+    let val = resp.get("result")?.get("value")?;
+    if !val.is_object() || val.get("html").is_none_or(|h| !h.is_array()) {
+        return None;
+    }
+    Some(val.clone())
+}
+
+fn push_frame_snapshot(
+    st: &mut TraceState,
+    page_id: &str,
+    call_id: &str,
+    phase: &str,
+    raw: Value,
+) -> String {
+    let snapshot_name = format!("{phase}@{call_id}");
+    let timestamp = st.mono_ms();
+    let frame_url = raw.get("frameUrl").and_then(Value::as_str).unwrap_or("");
+    let doctype = raw.get("doctype").and_then(Value::as_str).unwrap_or("");
+    let html = raw.get("html").cloned().unwrap_or_else(|| json!([]));
+    let viewport = raw
+        .get("viewport")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({ "width": 0, "height": 0 }));
+    let collection_time = raw
+        .get("collectionTime")
+        .and_then(Value::as_f64)
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(0.0);
+
+    st.trace_lines.push(
+        json!({
+            "type": "frame-snapshot",
+            "snapshot": {
+                "callId": call_id,
+                "snapshotName": snapshot_name,
+                "pageId": page_id,
+                "frameId": "main",
+                "frameUrl": frame_url,
+                "doctype": doctype,
+                "html": html,
+                "viewport": viewport,
+                "timestamp": timestamp,
+                "collectionTime": collection_time,
+                "resourceOverrides": [],
+                "isMainFrame": true,
+            }
+        })
+        .to_string(),
+    );
+    snapshot_name
 }
 
 async fn capture_fallback_jpeg(session: Option<&CdpSession>, page: &CdpPage) -> Option<Vec<u8>> {
@@ -1699,5 +2035,81 @@ mod tests {
         tracer.stop(None).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn trace_action_snapshots_cancelled_future_and_v6_snapshot_schema() {
+        let tracer = ContextTracing::new();
+        tracer
+            .start(TracingStartOptions {
+                snapshots: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(20),
+            tracer.trace_action(
+                "t1",
+                "Locator",
+                "click",
+                "locator.click",
+                || json!({ "selector": "#slow" }),
+                async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok::<_, Error>(())
+                },
+            ),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        {
+            let mut st = tracer.state.lock().unwrap();
+            let name = push_frame_snapshot(
+                &mut st,
+                "page@1",
+                "call@1",
+                "before",
+                json!({
+                    "frameUrl": "https://example.test/",
+                    "doctype": "html",
+                    "html": ["HTML", {}, ["BODY", {}, ["DIV", {}, "hi"]]],
+                    "viewport": { "width": 1280, "height": 720 },
+                    "collectionTime": 1.25
+                }),
+            );
+            assert_eq!(name, "before@call@1");
+        }
+
+        let events = parsed_trace_events(&tracer);
+        let cancelled_after = events
+            .iter()
+            .find(|e| e["type"] == "after")
+            .expect("cancelled after");
+        assert_eq!(cancelled_after["error"]["name"], "CancelledError");
+        assert!(cancelled_after.get("afterSnapshot").is_none());
+
+        let snap_ev = events
+            .iter()
+            .find(|e| e["type"] == "frame-snapshot")
+            .expect("frame-snapshot event");
+        let s = &snap_ev["snapshot"];
+        assert_eq!(s["callId"], "call@1");
+        assert_eq!(s["snapshotName"], "before@call@1");
+        assert_eq!(s["pageId"], "page@1");
+        assert_eq!(s["frameId"], "main");
+        assert_eq!(s["frameUrl"], "https://example.test/");
+        assert_eq!(s["doctype"], "html");
+        assert_eq!(s["html"][0], "HTML");
+        assert_eq!(s["viewport"]["width"], 1280);
+        assert_eq!(s["viewport"]["height"], 720);
+        assert!(s["timestamp"].as_f64().is_some());
+        assert_eq!(s["collectionTime"], 1.25);
+        assert_eq!(s["resourceOverrides"], json!([]));
+        assert_eq!(s["isMainFrame"], true);
+
+        tracer.stop(None).await.unwrap();
     }
 }
