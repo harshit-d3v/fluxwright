@@ -24,6 +24,7 @@ use crate::process::{current_process_rss_bytes, process_tree_memory_map};
 use crate::profiles::{validate_profile_name, ProfileStore};
 use crate::proxies::{ProxyLease, ProxyPool};
 use crate::source::BrowserSource;
+use crate::tracing_rec::{ContextTracing, Tracing};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -117,6 +118,7 @@ struct ContextGuard {
     har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     proxy_lease: std::sync::Mutex<Option<ProxyLease>>,
     profile_target: std::sync::Mutex<Option<(Arc<ProfileStore>, String)>>,
+    tracing: Arc<ContextTracing>,
     runtime: tokio::runtime::Handle,
     failed: AtomicBool,
     disposed: AtomicBool,
@@ -144,6 +146,7 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.tracing.shutdown();
         let dir = self.download_dir.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
         self.release_proxy(completed);
@@ -163,6 +166,7 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.tracing.shutdown();
         let _ = std::fs::remove_dir_all(&self.download_dir);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
@@ -186,6 +190,7 @@ impl Drop for ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.tracing.shutdown();
         let _ = std::fs::remove_dir_all(&self.download_dir);
         let completed = !self.failed.load(Ordering::SeqCst);
         self.release_proxy(completed);
@@ -1303,6 +1308,7 @@ impl Inner {
             har_route_tasks: Default::default(),
             proxy_lease: Default::default(),
             profile_target: Default::default(),
+            tracing: ContextTracing::new(),
             runtime: tokio::runtime::Handle::current(),
             failed: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
@@ -1513,7 +1519,12 @@ fn build_page_lease(
     default_timeouts: (Option<Duration>, Option<Duration>),
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PageLease> + Send>> {
     Box::pin(async move {
+        let lease_id = Uuid::new_v4();
         let (log, downloads, log_task) = page.collect_logs(&context.download_dir);
+        context
+            .tracing
+            .register_page(lease_id, page.clone(), log.clone())
+            .await;
         let dialog_listeners = Listeners::default();
         route_newest(page.dialogs().await, dialog_listeners.clone());
         let file_chooser_listeners = Listeners::default();
@@ -1562,7 +1573,7 @@ fn build_page_lease(
             context,
             owns_context,
             page,
-            lease_id: Uuid::new_v4(),
+            lease_id,
             released: false,
             runtime: tokio::runtime::Handle::current(),
             log,
@@ -1921,6 +1932,10 @@ impl ContextLease {
         Ok(())
     }
 
+    pub fn tracing(&self) -> Tracing {
+        Tracing::new(Arc::clone(&self.guard.tracing))
+    }
+
     pub async fn close(&self) -> Result<()> {
         self.guard.dispose(true).await;
         Ok(())
@@ -1932,6 +1947,34 @@ impl ContextLease {
 }
 
 impl PageLease {
+    async fn traced<F, P, T>(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        api_name: &str,
+        params: P,
+        fut: F,
+    ) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+        P: FnOnce() -> serde_json::Value,
+    {
+        if !self.context.tracing.is_active() {
+            return fut.await;
+        }
+        self.context
+            .tracing
+            .trace_action(
+                &self.page.target_id.0,
+                class_name,
+                method_name,
+                api_name,
+                params(),
+                fut,
+            )
+            .await
+    }
+
     /// For click, fill, waits, screenshots and the like: the call's own timeout, else this
     /// page's default, else the engine's.
     fn action_timeout(&self) -> Duration {
@@ -2070,17 +2113,35 @@ impl PageLease {
         let base = self.base_url.lock().unwrap().clone();
         let url = resolve_url(base.as_deref(), url);
         self.engine.hosts.enter(&url, &self.host_slot).await;
-        self.page
-            .frame_goto(frame_id, &url, wait_until, self.navigation_timeout())
-            .await?;
-        Ok(())
+        self.traced(
+            "Frame",
+            "goto",
+            "frame.goto",
+            || serde_json::json!({ "frameId": frame_id, "url": url }),
+            async {
+                self.page
+                    .frame_goto(frame_id, &url, wait_until, self.navigation_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn frame_evaluate(&self, frame_id: &str, expression: &str) -> Result<serde_json::Value> {
-        Ok(self
-            .page
-            .frame_evaluate(frame_id, expression, self.action_timeout())
-            .await?)
+        self.traced(
+            "Frame",
+            "evaluate",
+            "frame.evaluate",
+            || serde_json::json!({ "frameId": frame_id }),
+            async {
+                Ok(self
+                    .page
+                    .frame_evaluate(frame_id, expression, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub fn frame_locator_by_id(&self, frame_id: &str) -> FrameLocator<'_> {
@@ -2138,10 +2199,19 @@ impl PageLease {
         let base = self.base_url.lock().unwrap().clone();
         let url = resolve_url(base.as_deref(), url);
         self.engine.hosts.enter(&url, &self.host_slot).await;
-        self.page
-            .goto(&url, wait_until, self.navigation_timeout())
-            .await?;
-        Ok(())
+        self.traced(
+            "Page",
+            "goto",
+            "page.goto",
+            || serde_json::json!({ "url": url }),
+            async {
+                self.page
+                    .goto(&url, wait_until, self.navigation_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub fn url(&self) -> String {
@@ -2161,8 +2231,17 @@ impl PageLease {
     }
 
     pub async fn reload_with(&self, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
-        self.page.reload(wait_until, self.navigation_timeout()).await?;
-        Ok(())
+        self.traced(
+            "Page",
+            "reload",
+            "page.reload",
+            || serde_json::json!({}),
+            async {
+                self.page.reload(wait_until, self.navigation_timeout()).await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn go_back(&self) -> Result<bool> {
@@ -2170,7 +2249,19 @@ impl PageLease {
     }
 
     pub async fn go_back_with(&self, wait_until: fluxwright_cdp::WaitUntil) -> Result<bool> {
-        Ok(self.page.go_back(wait_until, self.navigation_timeout()).await?)
+        self.traced(
+            "Page",
+            "goBack",
+            "page.goBack",
+            || serde_json::json!({}),
+            async {
+                Ok(self
+                    .page
+                    .go_back(wait_until, self.navigation_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn go_forward(&self) -> Result<bool> {
@@ -2178,7 +2269,19 @@ impl PageLease {
     }
 
     pub async fn go_forward_with(&self, wait_until: fluxwright_cdp::WaitUntil) -> Result<bool> {
-        Ok(self.page.go_forward(wait_until, self.navigation_timeout()).await?)
+        self.traced(
+            "Page",
+            "goForward",
+            "page.goForward",
+            || serde_json::json!({}),
+            async {
+                Ok(self
+                    .page
+                    .go_forward(wait_until, self.navigation_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn set_content(&self, html: &str) -> Result<()> {
@@ -2186,17 +2289,35 @@ impl PageLease {
     }
 
     pub async fn set_content_with(&self, html: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
-        self.page
-            .set_content(html, wait_until, self.navigation_timeout())
-            .await?;
-        Ok(())
+        self.traced(
+            "Page",
+            "setContent",
+            "page.setContent",
+            || serde_json::json!({ "length": html.len() }),
+            async {
+                self.page
+                    .set_content(html, wait_until, self.navigation_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn wait_for_load_state(&self, state: fluxwright_cdp::WaitUntil) -> Result<()> {
-        self.page
-            .wait_for_load_state(state, self.navigation_timeout())
-            .await?;
-        Ok(())
+        self.traced(
+            "Page",
+            "waitForLoadState",
+            "page.waitForLoadState",
+            || serde_json::json!({}),
+            async {
+                self.page
+                    .wait_for_load_state(state, self.navigation_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn wait_for_url(&self, pattern: &str, wait_until: fluxwright_cdp::WaitUntil) -> Result<()> {
@@ -2245,10 +2366,19 @@ impl PageLease {
         expression: &str,
         polling: fluxwright_cdp::WaitPolling,
     ) -> Result<serde_json::Value> {
-        Ok(self
-            .page
-            .wait_for_function(expression, polling, self.action_timeout())
-            .await?)
+        self.traced(
+            "Page",
+            "waitForFunction",
+            "page.waitForFunction",
+            || serde_json::json!({ "expression": expression }),
+            async {
+                Ok(self
+                    .page
+                    .wait_for_function(expression, polling, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn title(&self) -> Result<String> {
@@ -2281,10 +2411,19 @@ impl PageLease {
     }
 
     pub async fn evaluate(&self, expression: &str) -> Result<serde_json::Value> {
-        Ok(self
-            .page
-            .evaluate(expression, self.action_timeout())
-            .await?)
+        self.traced(
+            "Page",
+            "evaluate",
+            "page.evaluate",
+            || serde_json::json!({ "expression": expression }),
+            async {
+                Ok(self
+                    .page
+                    .evaluate(expression, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
@@ -2299,10 +2438,19 @@ impl PageLease {
 
     /// PNG or JPEG, of the viewport, the whole page or a clip.
     pub async fn screenshot_with(&self, options: &ScreenshotOptions) -> Result<Vec<u8>> {
-        Ok(self
-            .page
-            .screenshot(options, self.action_timeout())
-            .await?)
+        self.traced(
+            "Page",
+            "screenshot",
+            "page.screenshot",
+            || serde_json::json!({ "fullPage": options.full_page }),
+            async {
+                Ok(self
+                    .page
+                    .screenshot(options, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     /// The page printed to PDF (headless Chrome only).
@@ -2313,26 +2461,52 @@ impl PageLease {
     /// `pdf`, failing without reading on once the PDF is over `max_bytes`: for a caller that
     /// must bound what one job can make it hold.
     pub async fn pdf_within(&self, options: &PdfOptions, max_bytes: usize) -> Result<Vec<u8>> {
-        Ok(self
-            .page
-            .pdf(options, max_bytes, self.action_timeout())
-            .await?)
+        self.traced(
+            "Page",
+            "pdf",
+            "page.pdf",
+            || serde_json::json!({}),
+            async {
+                Ok(self
+                    .page
+                    .pdf(options, max_bytes, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     /// CSS-pixel viewport for this lease's page. Leases are fresh contexts, so it never leaks.
     pub async fn set_viewport_size(&self, width: u32, height: u32) -> Result<()> {
-        Ok(self
-            .page
-            .set_viewport(width, height, self.action_timeout())
-            .await?)
+        self.traced(
+            "Page",
+            "setViewportSize",
+            "page.setViewportSize",
+            || serde_json::json!({ "width": width, "height": height }),
+            async {
+                Ok(self
+                    .page
+                    .set_viewport(width, height, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     /// Selectors: CSS, `text=`, `role=` (see [`Selector`]), or a [`Selector`] with frames.
     pub async fn click(&self, selector: impl Into<Selector>) -> Result<()> {
-        self.page
-            .click(&selector.into(), self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "click",
+            "page.click",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page.click(&sel, self.action_timeout()).await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn click_with(
@@ -2340,10 +2514,20 @@ impl PageLease {
         selector: impl Into<Selector>,
         options: &fluxwright_cdp::ClickOptions,
     ) -> Result<()> {
-        self.page
-            .click_with(&selector.into(), options, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "click",
+            "page.click",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .click_with(&sel, options, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn dblclick(
@@ -2351,10 +2535,20 @@ impl PageLease {
         selector: impl Into<Selector>,
         options: &fluxwright_cdp::ClickOptions,
     ) -> Result<()> {
-        self.page
-            .dblclick(&selector.into(), options, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "dblclick",
+            "page.dblclick",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .dblclick(&sel, options, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn hover(
@@ -2362,27 +2556,67 @@ impl PageLease {
         selector: impl Into<Selector>,
         options: &fluxwright_cdp::HoverOptions,
     ) -> Result<()> {
-        self.page
-            .hover(&selector.into(), options, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "hover",
+            "page.hover",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .hover(&sel, options, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn focus(&self, selector: impl Into<Selector>) -> Result<()> {
-        self.page.focus(&selector.into(), self.action_timeout()).await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "focus",
+            "page.focus",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page.focus(&sel, self.action_timeout()).await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn blur(&self, selector: impl Into<Selector>) -> Result<()> {
-        self.page.blur(&selector.into(), self.action_timeout()).await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "blur",
+            "page.blur",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page.blur(&sel, self.action_timeout()).await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn scroll_into_view_if_needed(&self, selector: impl Into<Selector>) -> Result<()> {
-        self.page
-            .scroll_into_view_if_needed(&selector.into(), self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "scrollIntoViewIfNeeded",
+            "page.scrollIntoViewIfNeeded",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .scroll_into_view_if_needed(&sel, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn drag_and_drop(
@@ -2391,24 +2625,53 @@ impl PageLease {
         target: impl Into<Selector>,
         force: bool,
     ) -> Result<()> {
-        self.page
-            .drag_and_drop(&source.into(), &target.into(), force, self.action_timeout())
-            .await?;
-        Ok(())
+        let src = source.into();
+        let dst = target.into();
+        self.traced(
+            "Page",
+            "dragAndDrop",
+            "page.dragAndDrop",
+            || serde_json::json!({ "source": src.query, "target": dst.query }),
+            async {
+                self.page
+                    .drag_and_drop(&src, &dst, force, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn fill(&self, selector: impl Into<Selector>, value: &str) -> Result<()> {
-        self.page
-            .fill(&selector.into(), value, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "fill",
+            "page.fill",
+            || serde_json::json!({ "selector": sel.query, "value": value }),
+            async {
+                self.page.fill(&sel, value, self.action_timeout()).await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn clear(&self, selector: impl Into<Selector>, force: bool) -> Result<()> {
-        self.page
-            .fill_with(&selector.into(), "", force, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "clear",
+            "page.clear",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .fill_with(&sel, "", force, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn press(
@@ -2417,10 +2680,20 @@ impl PageLease {
         key: &str,
         delay: Option<Duration>,
     ) -> Result<()> {
-        self.page
-            .press(&selector.into(), key, delay, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "press",
+            "page.press",
+            || serde_json::json!({ "selector": sel.query, "key": key }),
+            async {
+                self.page
+                    .press(&sel, key, delay, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn press_sequentially(
@@ -2429,10 +2702,43 @@ impl PageLease {
         text: &str,
         delay: Option<Duration>,
     ) -> Result<()> {
-        self.page
-            .press_sequentially(&selector.into(), text, delay, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "pressSequentially",
+            "page.pressSequentially",
+            || serde_json::json!({ "selector": sel.query, "text": text }),
+            async {
+                self.page
+                    .press_sequentially(&sel, text, delay, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn set_checked_as(
+        &self,
+        method: &str,
+        api: &str,
+        selector: Selector,
+        checked: bool,
+        options: &fluxwright_cdp::CheckOptions,
+    ) -> Result<()> {
+        self.traced(
+            "Page",
+            method,
+            api,
+            || serde_json::json!({ "selector": selector.query, "checked": checked }),
+            async {
+                self.page
+                    .set_checked(&selector, checked, options, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn set_checked(
@@ -2441,10 +2747,8 @@ impl PageLease {
         checked: bool,
         options: &fluxwright_cdp::CheckOptions,
     ) -> Result<()> {
-        self.page
-            .set_checked(&selector.into(), checked, options, self.action_timeout())
-            .await?;
-        Ok(())
+        self.set_checked_as("setChecked", "page.setChecked", selector.into(), checked, options)
+            .await
     }
 
     pub async fn check(
@@ -2452,7 +2756,8 @@ impl PageLease {
         selector: impl Into<Selector>,
         options: &fluxwright_cdp::CheckOptions,
     ) -> Result<()> {
-        self.set_checked(selector, true, options).await
+        self.set_checked_as("check", "page.check", selector.into(), true, options)
+            .await
     }
 
     pub async fn uncheck(
@@ -2460,7 +2765,8 @@ impl PageLease {
         selector: impl Into<Selector>,
         options: &fluxwright_cdp::CheckOptions,
     ) -> Result<()> {
-        self.set_checked(selector, false, options).await
+        self.set_checked_as("uncheck", "page.uncheck", selector.into(), false, options)
+            .await
     }
 
     pub async fn select_option(
@@ -2469,10 +2775,20 @@ impl PageLease {
         items: &[fluxwright_cdp::SelectEntry],
         force: bool,
     ) -> Result<Vec<String>> {
-        Ok(self
-            .page
-            .select_option(&selector.into(), items, force, self.action_timeout())
-            .await?)
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "selectOption",
+            "page.selectOption",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                Ok(self
+                    .page
+                    .select_option(&sel, items, force, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn set_input_files(
@@ -2480,10 +2796,20 @@ impl PageLease {
         selector: impl Into<Selector>,
         files: &fluxwright_cdp::FileInput,
     ) -> Result<()> {
-        self.page
-            .set_input_files(&selector.into(), files, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "setInputFiles",
+            "page.setInputFiles",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .set_input_files(&sel, files, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn tap(
@@ -2491,14 +2817,31 @@ impl PageLease {
         selector: impl Into<Selector>,
         options: &fluxwright_cdp::HoverOptions,
     ) -> Result<()> {
-        self.page
-            .tap(&selector.into(), options, self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "tap",
+            "page.tap",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .tap(&sel, options, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn mouse_move(&self, x: f64, y: f64, steps: u32) -> Result<()> {
-        Ok(self.page.mouse_move(x, y, steps, self.action_timeout()).await?)
+        self.traced(
+            "Mouse",
+            "move",
+            "mouse.move",
+            || serde_json::json!({ "x": x, "y": y }),
+            async { Ok(self.page.mouse_move(x, y, steps, self.action_timeout()).await?) },
+        )
+        .await
     }
 
     pub async fn mouse_down(
@@ -2506,10 +2849,19 @@ impl PageLease {
         button: fluxwright_cdp::MouseButton,
         click_count: u32,
     ) -> Result<()> {
-        Ok(self
-            .page
-            .mouse_down(button, click_count, self.action_timeout())
-            .await?)
+        self.traced(
+            "Mouse",
+            "down",
+            "mouse.down",
+            || serde_json::json!({}),
+            async {
+                Ok(self
+                    .page
+                    .mouse_down(button, click_count, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn mouse_up(
@@ -2517,10 +2869,19 @@ impl PageLease {
         button: fluxwright_cdp::MouseButton,
         click_count: u32,
     ) -> Result<()> {
-        Ok(self
-            .page
-            .mouse_up(button, click_count, self.action_timeout())
-            .await?)
+        self.traced(
+            "Mouse",
+            "up",
+            "mouse.up",
+            || serde_json::json!({}),
+            async {
+                Ok(self
+                    .page
+                    .mouse_up(button, click_count, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn mouse_click(
@@ -2531,10 +2892,19 @@ impl PageLease {
         click_count: u32,
         delay: Option<Duration>,
     ) -> Result<()> {
-        Ok(self
-            .page
-            .mouse_click(x, y, button, click_count, delay, self.action_timeout())
-            .await?)
+        self.traced(
+            "Mouse",
+            "click",
+            "mouse.click",
+            || serde_json::json!({ "x": x, "y": y }),
+            async {
+                Ok(self
+                    .page
+                    .mouse_click(x, y, button, click_count, delay, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn mouse_dblclick(
@@ -2544,60 +2914,138 @@ impl PageLease {
         button: fluxwright_cdp::MouseButton,
         delay: Option<Duration>,
     ) -> Result<()> {
-        Ok(self
-            .page
-            .mouse_dblclick(x, y, button, delay, self.action_timeout())
-            .await?)
+        self.traced(
+            "Mouse",
+            "dblclick",
+            "mouse.dblclick",
+            || serde_json::json!({ "x": x, "y": y }),
+            async {
+                Ok(self
+                    .page
+                    .mouse_dblclick(x, y, button, delay, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn mouse_wheel(&self, delta_x: f64, delta_y: f64) -> Result<()> {
-        Ok(self
-            .page
-            .mouse_wheel(delta_x, delta_y, self.action_timeout())
-            .await?)
+        self.traced(
+            "Mouse",
+            "wheel",
+            "mouse.wheel",
+            || serde_json::json!({ "deltaX": delta_x, "deltaY": delta_y }),
+            async {
+                Ok(self
+                    .page
+                    .mouse_wheel(delta_x, delta_y, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn keyboard_down(&self, key: &str) -> Result<()> {
-        Ok(self.page.keyboard_down(key, self.action_timeout()).await?)
+        self.traced(
+            "Keyboard",
+            "down",
+            "keyboard.down",
+            || serde_json::json!({ "key": key }),
+            async { Ok(self.page.keyboard_down(key, self.action_timeout()).await?) },
+        )
+        .await
     }
 
     pub async fn keyboard_up(&self, key: &str) -> Result<()> {
-        Ok(self.page.keyboard_up(key, self.action_timeout()).await?)
+        self.traced(
+            "Keyboard",
+            "up",
+            "keyboard.up",
+            || serde_json::json!({ "key": key }),
+            async { Ok(self.page.keyboard_up(key, self.action_timeout()).await?) },
+        )
+        .await
     }
 
     pub async fn keyboard_press(&self, key: &str, delay: Option<Duration>) -> Result<()> {
-        Ok(self
-            .page
-            .keyboard_press(key, delay, self.action_timeout())
-            .await?)
+        self.traced(
+            "Keyboard",
+            "press",
+            "keyboard.press",
+            || serde_json::json!({ "key": key }),
+            async {
+                Ok(self
+                    .page
+                    .keyboard_press(key, delay, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn keyboard_type(&self, text: &str, delay: Option<Duration>) -> Result<()> {
-        Ok(self
-            .page
-            .keyboard_type(text, delay, self.action_timeout())
-            .await?)
+        self.traced(
+            "Keyboard",
+            "type",
+            "keyboard.type",
+            || serde_json::json!({ "text": text }),
+            async {
+                Ok(self
+                    .page
+                    .keyboard_type(text, delay, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn keyboard_insert_text(&self, text: &str) -> Result<()> {
-        Ok(self
-            .page
-            .keyboard_insert_text(text, self.action_timeout())
-            .await?)
+        self.traced(
+            "Keyboard",
+            "insertText",
+            "keyboard.insertText",
+            || serde_json::json!({ "text": text }),
+            async {
+                Ok(self
+                    .page
+                    .keyboard_insert_text(text, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn touchscreen_tap(&self, x: f64, y: f64) -> Result<()> {
-        Ok(self
-            .page
-            .touchscreen_tap(x, y, self.action_timeout())
-            .await?)
+        self.traced(
+            "Touchscreen",
+            "tap",
+            "touchscreen.tap",
+            || serde_json::json!({ "x": x, "y": y }),
+            async {
+                Ok(self
+                    .page
+                    .touchscreen_tap(x, y, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub async fn wait_for_selector(&self, selector: impl Into<Selector>) -> Result<()> {
-        self.page
-            .wait_for_selector(&selector.into(), self.action_timeout())
-            .await?;
-        Ok(())
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "waitForSelector",
+            "page.waitForSelector",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                self.page
+                    .wait_for_selector(&sel, self.action_timeout())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Waits for the selector to be attached, detached, visible or hidden.
@@ -2606,10 +3054,20 @@ impl PageLease {
         selector: impl Into<Selector>,
         state: fluxwright_cdp::WaitState,
     ) -> Result<()> {
-        Ok(self
-            .page
-            .wait_for_selector_state(&selector.into(), state, self.action_timeout())
-            .await?)
+        let sel = selector.into();
+        self.traced(
+            "Page",
+            "waitForSelector",
+            "page.waitForSelector",
+            || serde_json::json!({ "selector": sel.query }),
+            async {
+                Ok(self
+                    .page
+                    .wait_for_selector_state(&sel, state, self.action_timeout())
+                    .await?)
+            },
+        )
+        .await
     }
 
     /// `textContent` of the first match, once it exists.
@@ -3053,6 +3511,7 @@ impl PageLease {
             return;
         }
         self.released = true;
+        self.context.tracing.unregister_page(self.lease_id);
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
         for rec in recorders {
             let _ = rec.finish().await;
@@ -3087,6 +3546,7 @@ impl Drop for PageLease {
             return;
         }
         self.released = true;
+        self.context.tracing.unregister_page(self.lease_id);
         let completed = !self.context.failed.load(Ordering::SeqCst);
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
         if self.owns_context && recorders.is_empty() {

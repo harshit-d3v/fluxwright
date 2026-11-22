@@ -10,7 +10,7 @@ pub use fluxwright_core::{
     Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, Frame, FrameLocator, JobOptions,
     LocalChromium, Locator, LocatorExpect, MetricsSnapshot, PageExpect, PageLease, Priority,
     ProfileInfo, ProfileStore, ProxyLease, ProxyPool, ProxyRotation, ProxyStatus, QueueFullMode,
-    RemoteCdp, ResourcePreset, Result,
+    RemoteCdp, ResourcePreset, Result, Tracing, TracingChunkOptions, TracingStartOptions,
 };
 
 pub use fluxwright_cdp::{

@@ -390,9 +390,40 @@ export interface BrowserContext {
   ): Promise<void>
   clearCookies(options?: { name?: string | RegExp; domain?: string | RegExp; path?: string | RegExp }): Promise<void>
   readonly request: APIRequestContext
+  readonly tracing: Tracing
   newCDPSession(page: Page | Frame): Promise<CDPSession>
   /** Closes this context and all of its pages and popups. */
   close(): Promise<void>
+}
+
+export interface TracingStartOptions {
+  /** Trace archive logical context name. */
+  name?: string
+  /** Display title shown in Playwright Trace Viewer. */
+  title?: string
+  /** Whether to capture screenshots / screencast frames during tracing. */
+  screenshots?: boolean
+  /** Whether to record DOM snapshot metadata. */
+  snapshots?: boolean
+}
+
+export interface TracingChunkOptions {
+  /** Logical chunk identifier. */
+  name?: string
+  /** Display title shown for this trace chunk. */
+  title?: string
+}
+
+export interface TracingStopOptions {
+  /** Destination path to write the Playwright trace `.zip` bundle. */
+  path?: string
+}
+
+export interface Tracing {
+  start(options?: TracingStartOptions): Promise<void>
+  startChunk(options?: TracingChunkOptions): Promise<void>
+  stopChunk(options?: TracingStopOptions): Promise<void>
+  stop(options?: TracingStopOptions): Promise<void>
 }
 
 export interface CDPSession {
