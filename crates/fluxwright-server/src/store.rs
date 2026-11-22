@@ -88,15 +88,6 @@ pub(crate) struct SqliteStore {
 }
 
 impl SqliteStore {
-    #[cfg(test)]
-    pub(crate) fn open(
-        path: &Path,
-        result_ttl: Duration,
-        max_finished: usize,
-    ) -> Result<(Self, LoadedJobs), ConfigError> {
-        Self::open_at(path, result_ttl, max_finished, crate::now_ms())
-    }
-
     pub(crate) fn open_at(
         path: &Path,
         result_ttl: Duration,

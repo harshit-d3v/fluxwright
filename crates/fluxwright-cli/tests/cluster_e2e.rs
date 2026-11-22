@@ -1023,6 +1023,19 @@ async fn cluster_coordinator_max_per_host_limits_concurrent_host_a_and_runs_host
                         }
                     }
                 }
+                let req_text = std::str::from_utf8(&buf[..filled]).unwrap_or("");
+                let path = req_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                if path != "/slow" {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
                 let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
                 let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_c.fetch_max(cur, Ordering::SeqCst);
@@ -1078,6 +1091,19 @@ async fn cluster_coordinator_max_per_host_limits_concurrent_host_a_and_runs_host
                                 }
                             }
                         }
+                    }
+                    let req_text = std::str::from_utf8(&buf[..filled]).unwrap_or("");
+                    let path = req_text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if path != "/fast" {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = stream.shutdown().await;
+                        return;
                     }
                     hits.fetch_add(1, Ordering::SeqCst);
                     let body = "<!doctype html><title>Host B OK</title><h1>Host B</h1>";
