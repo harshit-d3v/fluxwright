@@ -72,29 +72,143 @@ fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn resolve_url(base: Option<&str>, url: &str) -> String {
-    let Some(base) = base.filter(|_| !url.split(['/', '?', '#']).next().unwrap_or("").contains(':')) else {
+fn has_uri_scheme(s: &str) -> bool {
+    let head = s.split(['/', '?', '#']).next().unwrap_or("");
+    let Some((scheme, _)) = head.split_once(':') else {
+        return false;
+    };
+    let mut bytes = scheme.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut output: Vec<&str> = Vec::new();
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input[3..];
+            output.pop();
+        } else if input == "/.." {
+            input = "/";
+            output.pop();
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let search_start = usize::from(input.starts_with('/'));
+            match input[search_start..].find('/') {
+                Some(idx) => {
+                    let split = search_start + idx;
+                    output.push(&input[..split]);
+                    input = &input[split..];
+                }
+                None => {
+                    output.push(input);
+                    input = "";
+                }
+            }
+        }
+    }
+    output.concat()
+}
+
+pub(crate) fn resolve_url(base: Option<&str>, url: &str) -> String {
+    let Some(base) = base.filter(|_| !has_uri_scheme(url)) else {
         return url.to_string();
     };
-    if url.starts_with("//") {
-        if let Some((scheme, _)) = base.split_once("://") {
-            return format!("{scheme}:{url}");
-        }
-    }
-    if url.starts_with('/') {
-        if let Some((scheme, rest)) = base.split_once("://") {
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-            return format!("{scheme}://{authority}{url}");
-        }
-    }
-    let dir = match base.find("://").map(|i| i + 3) {
-        Some(after_scheme) => match base[after_scheme..].rfind('/') {
-            Some(slash) => &base[..=after_scheme + slash],
-            None => return format!("{base}/{}", url.trim_start_matches("./")),
-        },
-        None => base,
+    let (base_no_frag, _) = base.split_once('#').unwrap_or((base, ""));
+    let (base_no_query, base_query) = match base_no_frag.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base_no_frag, None),
     };
-    format!("{dir}{}", url.trim_start_matches("./"))
+    let Some((base_scheme, base_rest)) = base_no_query.split_once("://") else {
+        return url.to_string();
+    };
+    let (base_authority, base_path) = match base_rest.find('/') {
+        Some(i) => (Some(&base_rest[..i]), &base_rest[i..]),
+        None => (Some(base_rest), ""),
+    };
+
+    let (ref_no_frag, ref_frag) = match url.split_once('#') {
+        Some((a, b)) => (a, Some(b)),
+        None => (url, None),
+    };
+    let (ref_no_query, ref_query) = match ref_no_frag.split_once('?') {
+        Some((a, b)) => (a, Some(b)),
+        None => (ref_no_frag, None),
+    };
+
+    let (t_authority, t_path, t_query) = if let Some(after_slashes) = ref_no_query.strip_prefix("//")
+    {
+        let (auth, path) = match after_slashes.find('/') {
+            Some(i) => (&after_slashes[..i], &after_slashes[i..]),
+            None => (after_slashes, ""),
+        };
+        (Some(auth), remove_dot_segments(path), ref_query)
+    } else if ref_no_query.is_empty() {
+        (
+            base_authority,
+            remove_dot_segments(base_path),
+            ref_query.or(base_query),
+        )
+    } else if ref_no_query.starts_with('/') {
+        (base_authority, remove_dot_segments(ref_no_query), ref_query)
+    } else {
+        let merged = if base_authority.is_some() && base_path.is_empty() {
+            format!("/{ref_no_query}")
+        } else if let Some(slash) = base_path.rfind('/') {
+            format!("{}{ref_no_query}", &base_path[..=slash])
+        } else {
+            ref_no_query.to_string()
+        };
+        (base_authority, remove_dot_segments(&merged), ref_query)
+    };
+
+    let mut out = String::new();
+    out.push_str(base_scheme);
+    out.push_str("://");
+    if let Some(auth) = t_authority {
+        out.push_str(auth);
+    }
+    if t_path.is_empty()
+        && t_authority.is_some()
+        && matches!(
+            base_scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "ws" | "wss"
+        )
+    {
+        out.push('/');
+    } else {
+        out.push_str(&t_path);
+    }
+    if let Some(q) = t_query {
+        out.push('?');
+        out.push_str(q);
+    }
+    if let Some(f) = ref_frag {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+fn is_fatal_message(msg: &str) -> bool {
+    msg.contains("page is closed")
+        || msg.contains("page closed")
+        || msg.contains("devtools websocket:")
+        || msg.contains("engine is shut down")
+        || msg.contains("browser context is closed")
 }
 
 fn is_fatal_error(err: &Error) -> bool {
@@ -103,7 +217,12 @@ fn is_fatal_error(err: &Error) -> bool {
     }
     match err {
         Error::ShuttingDown => true,
-        Error::Other(msg) => msg.contains("page is closed") || msg.contains("page closed"),
+        Error::Other(msg) => is_fatal_message(msg),
+        Error::Cdp(fluxwright_cdp::Error::Other(msg)) => is_fatal_message(msg),
+        Error::Cdp(fluxwright_cdp::Error::Command { message, .. }) => {
+            message.contains("Target closed")
+                || message.contains("Session with given id not found")
+        }
         Error::Cdp(fluxwright_cdp::Error::NotActionable { reason, .. }) => {
             reason.starts_with("invalid selector:")
         }
@@ -135,6 +254,9 @@ fn format_expect_error(
 }
 
 async fn ensure_attached(locator: &Locator<'_>, limit: Duration) -> Result<Option<Probe>> {
+    if locator.lease().is_closed() {
+        return Err(Error::Other("page is closed".into()));
+    }
     match with_timeout(Some(limit), locator.count()).await {
         Ok(0) => Ok(Some(Probe::NotAttached)),
         Ok(_) => Ok(None),
@@ -227,6 +349,9 @@ impl<'a> LocatorExpect<'a> {
             self.timeout,
             self.poll_interval,
             |limit| async move {
+                if locator.lease().is_closed() {
+                    return Err(Error::Other("page is closed".into()));
+                }
                 if require_attached {
                     if let Some(early) = ensure_attached(locator, limit).await? {
                         return Ok(early);
@@ -294,6 +419,9 @@ impl<'a> LocatorExpect<'a> {
             self.timeout,
             self.poll_interval,
             |limit| async move {
+                if locator.lease().is_closed() {
+                    return Err(Error::Other("page is closed".into()));
+                }
                 match with_timeout(Some(limit), locator.count()).await {
                     Ok(0) => Ok(Probe::Value {
                         matched: false,
@@ -564,6 +692,9 @@ impl<'a> LocatorExpect<'a> {
             self.timeout,
             self.poll_interval,
             |limit| async move {
+                if locator.lease().is_closed() {
+                    return Err(Error::Other("page is closed".into()));
+                }
                 match with_timeout(Some(limit), locator.count()).await {
                     Ok(actual) => Ok(Probe::Value {
                         matched: actual == expected,
@@ -590,7 +721,7 @@ impl<'a> LocatorExpect<'a> {
         options: &ToHaveScreenshotOptions,
     ) -> Result<()> {
         let target = self.target_label();
-        run_to_have_screenshot(
+        Box::pin(run_to_have_screenshot(
             &target,
             path.as_ref(),
             options,
@@ -599,7 +730,7 @@ impl<'a> LocatorExpect<'a> {
             self.poll_interval,
             self.locator.lease(),
             Some(self.locator),
-        )
+        ))
         .await
     }
 }
@@ -700,7 +831,7 @@ impl<'a> PageExpect<'a> {
         path: impl AsRef<Path>,
         options: &ToHaveScreenshotOptions,
     ) -> Result<()> {
-        run_to_have_screenshot(
+        Box::pin(run_to_have_screenshot(
             "expect(page)",
             path.as_ref(),
             options,
@@ -709,7 +840,7 @@ impl<'a> PageExpect<'a> {
             self.poll_interval,
             self.page,
             None,
-        )
+        ))
         .await
     }
 }
@@ -821,7 +952,7 @@ async fn run_to_have_screenshot(
     }
 
     let disable_animations = options.animations == Animations::Disabled;
-    let res = run_to_have_screenshot_inner(
+    let res = Box::pin(run_to_have_screenshot_inner(
         target,
         path,
         options,
@@ -830,9 +961,9 @@ async fn run_to_have_screenshot(
         page,
         locator,
         disable_animations,
-    )
+    ))
     .await;
-    clear_animation_guard(page, locator, disable_animations).await;
+    Box::pin(clear_animation_guard(page, locator, disable_animations)).await;
     res
 }
 
@@ -847,7 +978,10 @@ async fn run_to_have_screenshot_inner(
     locator: Option<&Locator<'_>>,
     disable_animations: bool,
 ) -> Result<()> {
-    let (baseline_path, actual_path, diff_path) = artifact_paths(path);
+    let (baseline_path, actual_path, diff_path) = artifact_paths(path)?;
+    if page.is_closed() {
+        return Err(Error::Other("page is closed".into()));
+    }
     let shot_limit = |remaining: Duration| -> Duration {
         remaining.clamp(Duration::from_millis(100), Duration::from_secs(2))
     };
@@ -858,9 +992,9 @@ async fn run_to_have_screenshot_inner(
         let mut last_err: Option<String>;
         let mut attempts = 0usize;
         loop {
-            apply_animation_guard(page, locator, disable_animations).await;
+            Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
             let remaining = timeout.saturating_sub(start.elapsed());
-            match capture_png_shot(page, locator, options, shot_limit(remaining)).await {
+            match Box::pin(capture_png_shot(page, locator, options, shot_limit(remaining))).await {
                 Ok(bytes) => {
                     attempts += 1;
                     let img = decode_png(&bytes)?;
@@ -895,7 +1029,7 @@ async fn run_to_have_screenshot_inner(
                 if attempts == 1 {
                     // Single shot exhausted a tight timeout; capture one confirmation shot.
                     let confirm_limit = Duration::from_secs(1);
-                    if let Ok(bytes) = capture_png_shot(page, locator, options, confirm_limit).await {
+                    if let Ok(bytes) = Box::pin(capture_png_shot(page, locator, options, confirm_limit)).await {
                         let img = decode_png(&bytes)?;
                         if let Some(ref prev) = prev_img {
                             let diff = compare_images(prev, &img, options.threshold, false)?;
@@ -930,8 +1064,8 @@ async fn run_to_have_screenshot_inner(
     let baseline_bytes = match baseline_read {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            apply_animation_guard(page, locator, disable_animations).await;
-            if let Ok(actual) = capture_png_shot(page, locator, options, Duration::from_secs(2)).await {
+            Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
+            if let Ok(actual) = Box::pin(capture_png_shot(page, locator, options, Duration::from_secs(2))).await {
                 let _ = write_file_mkdir(actual_path.clone(), actual).await;
             }
             return Err(Error::Other(format!(
@@ -954,9 +1088,9 @@ async fn run_to_have_screenshot_inner(
     let mut last_err: Option<String>;
 
     loop {
-        apply_animation_guard(page, locator, disable_animations).await;
+        Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
         let remaining = timeout.saturating_sub(start.elapsed());
-        match capture_png_shot(page, locator, options, shot_limit(remaining)).await {
+        match Box::pin(capture_png_shot(page, locator, options, shot_limit(remaining))).await {
             Ok(bytes) => {
                 let actual_img = decode_png(&bytes)?;
                 let diff = compare_images(&baseline_img, &actual_img, options.threshold, false)?;
@@ -1039,6 +1173,87 @@ mod tests {
             "https://other.test/x"
         );
         assert_eq!(resolve_url(None, "/done"), "/done");
+        // Query-only & fragment-only references
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/app/view?old=1#top"), "?tab=2"),
+            "http://127.0.0.1:8080/app/view?tab=2"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080"), "?tab=2"),
+            "http://127.0.0.1:8080/?tab=2"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/app/view?a=1#old"), "#sec"),
+            "http://127.0.0.1:8080/app/view?a=1#sec"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080"), "#sec"),
+            "http://127.0.0.1:8080/#sec"
+        );
+        // Protocol-relative references (including dot segments)
+        assert_eq!(
+            resolve_url(Some("https://127.0.0.1:8080/sub/page"), "//other.test/x"),
+            "https://other.test/x"
+        );
+        assert_eq!(
+            resolve_url(Some("https://127.0.0.1:8080/sub/page"), "//other.test/a/../b"),
+            "https://other.test/b"
+        );
+        // Dot-segment normalization and base URLs containing `?` / `/` in query strings
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/a/b/c"), "../b"),
+            "http://127.0.0.1:8080/a/b"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/a/b/c?next=/x/y/z"), "../d"),
+            "http://127.0.0.1:8080/a/d"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/a/b/c?next=/x/y/z"), "sibling"),
+            "http://127.0.0.1:8080/a/b/sibling"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/a/b"), "../../../../root"),
+            "http://127.0.0.1:8080/root"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/a/b/c"), "."),
+            "http://127.0.0.1:8080/a/b/"
+        );
+        assert_eq!(
+            resolve_url(Some("http://127.0.0.1:8080/a/b/c"), ".."),
+            "http://127.0.0.1:8080/a/"
+        );
+    }
+
+    #[test]
+    fn is_fatal_error_catches_cdp_closed_and_command_errors() {
+        assert!(is_fatal_error(&Error::Cdp(fluxwright_cdp::Error::Other(
+            "page is closed".into()
+        ))));
+        assert!(is_fatal_error(&Error::Cdp(fluxwright_cdp::Error::Other(
+            "devtools websocket: connection reset".into()
+        ))));
+        assert!(is_fatal_error(&Error::Cdp(fluxwright_cdp::Error::Other(
+            "engine is shut down".into()
+        ))));
+        assert!(is_fatal_error(&Error::Cdp(fluxwright_cdp::Error::Other(
+            "browser context is closed".into()
+        ))));
+        assert!(is_fatal_error(&Error::Cdp(fluxwright_cdp::Error::Command {
+            method: "Runtime.evaluate".into(),
+            message: "Target closed".into(),
+        })));
+        assert!(is_fatal_error(&Error::Cdp(fluxwright_cdp::Error::Command {
+            method: "DOM.getDocument".into(),
+            message: "Session with given id not found".into(),
+        })));
+        assert!(!is_fatal_error(&Error::Cdp(fluxwright_cdp::Error::timeout(
+            "probe", 50
+        ))));
+        assert!(!is_fatal_error(&Error::Cdp(
+            fluxwright_cdp::Error::JavaScript("transient".into())
+        )));
     }
 
     #[test]

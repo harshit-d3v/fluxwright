@@ -180,6 +180,7 @@ async fn tracing_start_stop_zip_bundle() {
             title: Some("Rust Trace Title".into()),
             screenshots: true,
             snapshots: true,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -189,6 +190,12 @@ async fn tracing_start_stop_zip_bundle() {
     page.goto(&format!("{base}/app")).await.unwrap();
     page.locator("#name").fill("Fluxwright").await.unwrap();
     page.locator("#go").click().await.unwrap();
+    let _shot = page.locator("#out").screenshot().await.unwrap();
+    let _eval = page
+        .locator("#out")
+        .evaluate("(el) => el.textContent", None)
+        .await
+        .unwrap();
     page.evaluate(
         r#"(() => {
             console.log('trace-console-msg', 42);
@@ -224,16 +231,44 @@ async fn tracing_start_stop_zip_bundle() {
         "missing goto before: {trace_events:?}"
     );
     assert!(
-        trace_events
-            .iter()
-            .any(|e| e["type"] == "before" && e["method"] == "fill"),
-        "missing fill before: {trace_events:?}"
+        trace_events.iter().any(|e| {
+            e["type"] == "before"
+                && e["class"] == "Locator"
+                && e["method"] == "fill"
+                && e["apiName"] == "locator.fill"
+                && e["params"]["selector"] == "#name"
+        }),
+        "missing locator.fill before: {trace_events:?}"
     );
     assert!(
-        trace_events
-            .iter()
-            .any(|e| e["type"] == "before" && e["method"] == "click"),
-        "missing click before: {trace_events:?}"
+        trace_events.iter().any(|e| {
+            e["type"] == "before"
+                && e["class"] == "Locator"
+                && e["method"] == "click"
+                && e["apiName"] == "locator.click"
+                && e["params"]["selector"] == "#go"
+        }),
+        "missing locator.click before: {trace_events:?}"
+    );
+    assert!(
+        trace_events.iter().any(|e| {
+            e["type"] == "before"
+                && e["class"] == "Locator"
+                && e["method"] == "screenshot"
+                && e["apiName"] == "locator.screenshot"
+                && e["params"]["selector"] == "#out"
+        }),
+        "missing locator.screenshot before: {trace_events:?}"
+    );
+    assert!(
+        trace_events.iter().any(|e| {
+            e["type"] == "before"
+                && e["class"] == "Locator"
+                && e["method"] == "evaluate"
+                && e["apiName"] == "locator.evaluate"
+                && e["params"]["selector"] == "#out"
+        }),
+        "missing locator.evaluate before: {trace_events:?}"
     );
     assert!(trace_events.iter().any(|e| e["type"] == "after"));
     assert!(
@@ -337,6 +372,7 @@ async fn tracing_chunks_and_validation() {
             title: Some("Chunk 1".into()),
             screenshots: true,
             snapshots: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -409,5 +445,225 @@ async fn tracing_chunks_and_validation() {
     drop(page);
     ctx.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tracing_unsubscribed_popup_cancellation_and_chunk_isolation() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let popup_hit = Arc::new(Notify::new());
+    let slow_entered = Arc::new(Notify::new());
+    let slow_release = Arc::new(Notify::new());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            "/opener",
+            get(|| async {
+                Html(
+                    r#"<!doctype html>
+                    <html><body>
+                      <button id="open" onclick="window.open('/popup', '_blank')">Open</button>
+                    </body></html>"#,
+                )
+            }),
+        )
+        .route(
+            "/popup",
+            get(|| async {
+                Html(
+                    r#"<!doctype html>
+                    <html><body style="margin:0;background:#16a34a;width:400px;height:300px">
+                      <h1>Popup Page</h1>
+                      <script>
+                        setTimeout(() => {
+                          console.log('popup-unsub-log');
+                          fetch('/popup-ping');
+                        }, 150);
+                      </script>
+                    </body></html>"#,
+                )
+            }),
+        )
+        .route(
+            "/popup-ping",
+            get({
+                let popup_hit = Arc::clone(&popup_hit);
+                move || {
+                    let popup_hit = Arc::clone(&popup_hit);
+                    async move {
+                        popup_hit.notify_one();
+                        Json(json!({ "popup": true }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/slow",
+            get({
+                let slow_entered = Arc::clone(&slow_entered);
+                let slow_release = Arc::clone(&slow_release);
+                move || {
+                    let slow_entered = Arc::clone(&slow_entered);
+                    let slow_release = Arc::clone(&slow_release);
+                    async move {
+                        slow_entered.notify_one();
+                        slow_release.notified().await;
+                        "done"
+                    }
+                }
+            }),
+        );
+    let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let tmp = std::env::temp_dir().join(format!("fw-rust-trace-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let popup_zip = tmp.join("popup.zip");
+    let c1_zip = tmp.join("iso-c1.zip");
+    let c2_zip = tmp.join("iso-c2.zip");
+
+    let eng = engine().await;
+    let ctx = eng.acquire_context().await.unwrap();
+    let tracing = ctx.tracing();
+
+    // 1. Unsubscribed popup tracing (NO subscribe_popups() listener attached).
+    tracing
+        .start(TracingStartOptions {
+            name: Some("unsub-popup".into()),
+            title: Some("Unsubscribed Popup".into()),
+            screenshots: true,
+            snapshots: false,
+            sources: true,
+        })
+        .await
+        .unwrap();
+
+    let page = ctx.new_page().await.unwrap();
+    page.goto(&format!("{base}/opener")).await.unwrap();
+    page.locator("#open").click().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), popup_hit.notified())
+        .await
+        .expect("popup fetched /popup-ping");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // 2. Cancelled future emits `after` with CancelledError instead of leaving an unclosed `before`.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(80),
+        page.locator("#does-not-exist").click(),
+    )
+    .await;
+    assert!(cancelled.is_err(), "expected timeout cancelling locator.click");
+
+    tracing.stop(Some(&popup_zip)).await.unwrap();
+
+    let popup_files = parse_zip_store(&std::fs::read(&popup_zip).unwrap());
+    let popup_events = parse_ndjson(&popup_files["trace.trace"]);
+    let page_event_ids: HashSet<&str> = popup_events
+        .iter()
+        .filter(|e| e["type"] == "event" && e["class"] == "BrowserContext" && e["method"] == "page")
+        .filter_map(|e| e["pageId"].as_str())
+        .collect();
+    assert!(
+        page_event_ids.len() >= 2,
+        "expected BrowserContext.page for opener and unsubscribed popup, got: {page_event_ids:?}"
+    );
+    assert!(
+        popup_events.iter().any(|e| {
+            e["type"] == "console"
+                && e["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("popup-unsub-log"))
+        }),
+        "missing popup console event: {popup_events:?}"
+    );
+    let popup_net = parse_ndjson(&popup_files["trace.network"]);
+    assert!(
+        popup_net.iter().any(|e| {
+            e["type"] == "resource-snapshot"
+                && e["snapshot"]["request"]["url"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("/popup-ping"))
+        }),
+        "missing /popup-ping network entry: {popup_net:?}"
+    );
+    assert!(
+        popup_events.iter().any(|e| e["type"] == "screencast-frame"),
+        "expected screencast-frame in popup trace"
+    );
+    let cancelled_before = popup_events
+        .iter()
+        .find(|e| {
+            e["type"] == "before"
+                && e["class"] == "Locator"
+                && e["apiName"] == "locator.click"
+                && e["params"]["selector"] == "#does-not-exist"
+        })
+        .expect("missing cancelled locator.click before");
+    let cancelled_after = popup_events
+        .iter()
+        .find(|e| e["type"] == "after" && e["callId"] == cancelled_before["callId"])
+        .expect("cancelled future must still emit after");
+    assert_eq!(cancelled_after["error"]["name"], "CancelledError");
+    assert_eq!(cancelled_after["error"]["message"], "cancelled");
+
+    // 3. Cross-chunk isolation & stop(Some(path)) after stop_chunk still tearing down tracing.
+    tracing
+        .start(TracingStartOptions {
+            name: Some("iso".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let (eval_res, chunk_res) = tokio::join!(
+        page.evaluate("fetch('/slow').then(r => r.text())"),
+        async {
+            tokio::time::timeout(Duration::from_secs(10), slow_entered.notified())
+                .await
+                .expect("slow request entered");
+            tracing.stop_chunk(Some(&c1_zip)).await?;
+            tracing
+                .start_chunk(TracingChunkOptions {
+                    name: Some("iso-2".into()),
+                    title: Some("Iso 2".into()),
+                })
+                .await?;
+            slow_release.notify_one();
+            Ok::<_, fluxwright::Error>(())
+        }
+    );
+    eval_res.unwrap();
+    chunk_res.unwrap();
+
+    tracing.stop_chunk(Some(&c2_zip)).await.unwrap();
+
+    // Calling stop(Some(path)) after stop_chunk returns Err AND tears down tracing cleanly.
+    assert!(tracing.stop(Some(&c2_zip)).await.is_err());
+    // Re-starting tracing succeeds immediately (not stuck active).
+    tracing.start(TracingStartOptions::default()).await.unwrap();
+    tracing.stop(None).await.unwrap();
+
+    let ev1 = parse_ndjson(&parse_zip_store(&std::fs::read(&c1_zip).unwrap())["trace.trace"]);
+    let ev2 = parse_ndjson(&parse_zip_store(&std::fs::read(&c2_zip).unwrap())["trace.trace"]);
+    let slow_before = ev1
+        .iter()
+        .find(|e| e["type"] == "before" && e["method"] == "evaluate")
+        .expect("slow evaluate before in chunk 1");
+    assert!(
+        !ev2.iter()
+            .any(|e| e["type"] == "after" && e["callId"] == slow_before["callId"]),
+        "chunk 1 evaluate must not inject orphaned after into chunk 2: {ev2:?}"
+    );
+
+    drop(page);
+    ctx.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -1,11 +1,11 @@
 //! Per-page video recording via CDP `Page.startScreencast`, muxing into WebM (`ffmpeg`)
 //! or falling back cleanly to a pure-Rust MJPEG-in-AVI (`RIFF....AVI `) container.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 
 const CDP_TIMEOUT: Duration = Duration::from_secs(5);
 const SCREENCAP_SETTLE_DELAY: Duration = Duration::from_millis(25);
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Valid 2x2 black baseline JPEG used only when a page closes before any frame can be captured.
 const FALLBACK_JPEG: &[u8] = &[
@@ -380,6 +381,43 @@ pub fn jpeg_dimensions(jpeg: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+fn resolve_avi_dims(first_dims: Option<(u32, u32)>, size: Option<(u32, u32)>) -> (u32, u32) {
+    first_dims.or(size).unwrap_or((800, 600))
+}
+
+fn has_webm_magic(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).is_ok() && magic == [0x1a, 0x45, 0xdf, 0xa3]
+}
+
+fn wait_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn mux_frames(
     dir: &Path,
     id: Uuid,
@@ -399,7 +437,8 @@ fn mux_frames(
     let first_dims = frames
         .first()
         .and_then(|f| jpeg_dimensions(&f.jpeg).or_else(|| f.width.zip(f.height)));
-    let (width, height) = size.or(first_dims).unwrap_or((800, 600));
+    let (width, height) = resolve_avi_dims(first_dims, size);
+    let frames = Arc::new(frames);
 
     let webm_path = dir.join(format!("{id}.webm"));
     if try_mux_webm(&webm_path, &frames, fps, size, first_dims) {
@@ -423,7 +462,7 @@ fn mux_frames(
 
 fn try_mux_webm(
     out_path: &Path,
-    frames: &[RecordedFrame],
+    frames: &Arc<Vec<RecordedFrame>>,
     fps: u32,
     size: Option<(u32, u32)>,
     first_dims: Option<(u32, u32)>,
@@ -464,24 +503,28 @@ fn try_mux_webm(
     let Ok(mut child) = cmd.spawn() else {
         return false;
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        for frame in frames {
-            if stdin.write_all(&frame.jpeg).is_err() {
-                break;
+    let writer = child.stdin.take().map(|mut stdin| {
+        let frames_for_writer = Arc::clone(frames);
+        std::thread::spawn(move || {
+            for frame in frames_for_writer.iter() {
+                if stdin.write_all(&frame.jpeg).is_err() {
+                    break;
+                }
             }
-        }
-        let _ = stdin.flush();
+            let _ = stdin.flush();
+        })
+    });
+    let status = wait_child_with_timeout(&mut child, FFMPEG_TIMEOUT);
+    if let Some(handle) = writer {
+        let _ = handle.join();
     }
-    let Ok(status) = child.wait() else {
+    let Some(status) = status else {
         return false;
     };
     if !status.success() {
         return false;
     }
-    let Ok(head) = std::fs::read(out_path) else {
-        return false;
-    };
-    head.len() >= 4 && head[..4] == [0x1a, 0x45, 0xdf, 0xa3]
+    has_webm_magic(out_path)
 }
 
 /// Encodes raw JPEG frames into a valid RIFF MJPEG-in-AVI (`RIFF....AVI `) container.
@@ -632,5 +675,28 @@ mod tests {
         assert!(RecordVideoOptions::new("").validate().is_err());
         assert!(RecordVideoOptions::new("videos").size(0, 480).validate().is_err());
         assert!(RecordVideoOptions::new("videos").size(640, 480).validate().is_ok());
+    }
+
+    #[test]
+    fn avi_dims_prefer_first_frame_and_webm_magic_reads_four_bytes() {
+        assert_eq!(resolve_avi_dims(Some((320, 180)), Some((640, 480))), (320, 180));
+        assert_eq!(resolve_avi_dims(None, Some((640, 480))), (640, 480));
+        assert_eq!(resolve_avi_dims(None, None), (800, 600));
+
+        let dir = std::env::temp_dir().join(format!("fw-webm-magic-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let valid = dir.join("ok.webm");
+        let short = dir.join("short.webm");
+        let wrong = dir.join("wrong.webm");
+        std::fs::write(&valid, [0x1a, 0x45, 0xdf, 0xa3, 0x00, 0x01]).unwrap();
+        std::fs::write(&short, [0x1a, 0x45, 0xdf]).unwrap();
+        std::fs::write(&wrong, b"RIFF0000AVI ").unwrap();
+
+        assert!(has_webm_magic(&valid));
+        assert!(!has_webm_magic(&short));
+        assert!(!has_webm_magic(&wrong));
+        assert!(!has_webm_magic(&dir.join("missing.webm")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
