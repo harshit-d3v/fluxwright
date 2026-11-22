@@ -81,7 +81,8 @@ class Handler(BaseHTTPRequestHandler):
             status = 404
             body = b"missing"
         elif self.path.startswith("/report"):
-            headers = {"Content-Disposition": f'attachment; filename="{self.path[1:]}.csv"'}
+            report_name = re.sub(r"[^A-Za-z0-9._-]", "_", self.path[1:])
+            headers = {"Content-Disposition": f'attachment; filename="{report_name}.csv"'}
             body = b"a,b\n1,2\n"
         elif self.path == "/hdr":
             headers = {"Content-Type": "text/plain"}
@@ -130,7 +131,9 @@ class Handler(BaseHTTPRequestHandler):
             body = f"<title>{self.headers.get('user-agent')}|{self.headers.get('accept-language')}</title>".encode()
         self.send_response(status)
         for name, value in headers.items():
-            self.send_header(name, value)
+            safe_name = name.replace("\r", "").replace("\n", "")
+            safe_value = value.replace("\r", "").replace("\n", "")
+            self.send_header(safe_name, safe_value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
