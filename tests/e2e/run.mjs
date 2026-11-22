@@ -95,6 +95,7 @@ function startFixtureServer() {
   <main>
     <h1>Fluxwright E2E Fixture</h1>
     <p id="status">Ready</p>
+    <a id="dl-link" href="/download-test" download="escape.txt">Download</a>
   </main>
 </body>
 </html>`;
@@ -143,6 +144,7 @@ function startFixtureServer() {
 </html>`;
 
   let assetHits = 0;
+  let downloadHits = 0;
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
@@ -180,6 +182,18 @@ function startFixtureServer() {
       res.end(ONE_BY_ONE_PNG);
       return;
     }
+    if (url.pathname === '/download-test') {
+      downloadHits += 1;
+      const body = 'blocked-host-write';
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="escape.txt"',
+        'Content-Length': Buffer.byteLength(body),
+        'Cache-Control': 'no-store',
+      });
+      res.end(body);
+      return;
+    }
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('not found');
   });
@@ -193,6 +207,10 @@ function startFixtureServer() {
         getAssetHits: () => assetHits,
         resetAssetHits: () => {
           assetHits = 0;
+        },
+        getDownloadHits: () => downloadHits,
+        resetDownloadHits: () => {
+          downloadHits = 0;
         },
         close: () => new Promise((res) => server.close(() => res())),
       });
@@ -513,6 +531,7 @@ async function runCdpGatewayE2E(baseUrl, port, token, fixture) {
   // Test raw CDP security boundaries and cross-tenant isolation.
   const rawA = await openRawCdp(`ws://127.0.0.1:${port}/cdp?initial_page=true&token=${token}`);
   const rawB = await openRawCdp(`ws://127.0.0.1:${port}/cdp?token=${token}`);
+  const forbiddenDlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fluxwright-e2e-forbidden-dl-'));
   try {
     const targetsResp = await rawA.send('Target.getTargets');
     const targetId = targetsResp.result?.targetInfos?.[0]?.targetId;
@@ -522,25 +541,57 @@ async function runCdpGatewayE2E(baseUrl, port, token, fixture) {
     const sessionId = attachResp.result?.sessionId;
     assert.ok(sessionId, `Expected sessionId from attachToTarget: ${JSON.stringify(attachResp)}`);
 
-    const dlBrowser = await rawA.send('Browser.setDownloadBehavior', {
+    const dlBadType = await rawA.send('Browser.setDownloadBehavior', {
       behavior: 'allow',
-      downloadPath: '/tmp/evil-download-path',
+      downloadPath: 42,
     });
     assert.equal(
-      dlBrowser.error?.code,
-      -32000,
-      `Browser.setDownloadBehavior with custom downloadPath must be rejected: ${JSON.stringify(dlBrowser)}`,
+      dlBadType.error?.code,
+      -32602,
+      `Browser.setDownloadBehavior with non-string downloadPath must return -32602: ${JSON.stringify(dlBadType)}`,
     );
+
+    // Caller-supplied downloadPath is clamped to the lease's ephemeral dir (never written to host path).
+    const dlBrowser = await rawA.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: forbiddenDlDir,
+    });
+    assert.equal(dlBrowser.error, undefined, `Browser.setDownloadBehavior clamped call failed: ${JSON.stringify(dlBrowser)}`);
 
     const dlPage = await rawA.send(
       'Page.setDownloadBehavior',
-      { behavior: 'allow', downloadPath: '/tmp/evil-download-path' },
+      { behavior: 'allow', downloadPath: forbiddenDlDir },
       sessionId,
     );
-    assert.equal(
-      dlPage.error?.code,
-      -32000,
-      `Page.setDownloadBehavior with custom downloadPath must be rejected: ${JSON.stringify(dlPage)}`,
+    assert.equal(dlPage.error, undefined, `Page.setDownloadBehavior clamped call failed: ${JSON.stringify(dlPage)}`);
+
+    fixture.resetDownloadHits();
+    await rawA.send('Page.navigate', { url: `${fixtureUrl}/` }, sessionId);
+    const navDeadline = Date.now() + 10_000;
+    while (Date.now() < navDeadline) {
+      const ready = await rawA.send(
+        'Runtime.evaluate',
+        { expression: "document.readyState === 'complete' && !!document.getElementById('dl-link')", returnByValue: true },
+        sessionId,
+      );
+      if (ready.result?.result?.value === true) break;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    await rawA.send(
+      'Runtime.evaluate',
+      { expression: "document.getElementById('dl-link').click()", userGesture: true },
+      sessionId,
+    );
+    const dlDeadline = Date.now() + 10_000;
+    while (Date.now() < dlDeadline && fixture.getDownloadHits() === 0) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.ok(fixture.getDownloadHits() >= 1, 'Expected download fixture endpoint to be hit');
+    await new Promise((r) => setTimeout(r, 250));
+    assert.deepEqual(
+      fs.readdirSync(forbiddenDlDir),
+      [],
+      'Caller-supplied downloadPath must never receive downloaded files',
     );
 
     const fileInput = await rawA.send(
@@ -580,6 +631,7 @@ async function runCdpGatewayE2E(baseUrl, port, token, fixture) {
     );
   } finally {
     await Promise.allSettled([rawA.close(), rawB.close()]);
+    fs.rmSync(forbiddenDlDir, { recursive: true, force: true });
   }
 
   // Ensure server stats reflect clean lease teardown

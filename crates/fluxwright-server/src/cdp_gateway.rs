@@ -1540,22 +1540,19 @@ async fn scope_browser_context(
     true
 }
 
+/// Validates and sanitizes `Browser.setDownloadBehavior` / `Page.setDownloadBehavior` params.
+///
+/// Caller-supplied `downloadPath` values are NEVER forwarded to Chrome (Playwright's
+/// `connectOverCDP` routinely passes a local temp `downloadPath` during handshake, so stripping
+/// and clamping to the lease's isolated ephemeral temp dir keeps Playwright working while
+/// strictly preventing arbitrary host filesystem writes).
 fn validate_download_behavior_params(params: &mut Value) -> Result<bool, (i64, &'static str)> {
     let Some(obj) = params.as_object_mut() else {
         return Err((-32602, "params must be an object"));
     };
     match obj.get("downloadPath") {
-        None | Some(Value::Null) => {
+        None | Some(Value::Null) | Some(Value::String(_)) => {
             obj.remove("downloadPath");
-        }
-        Some(Value::String(s)) if s.is_empty() => {
-            obj.remove("downloadPath");
-        }
-        Some(Value::String(_)) => {
-            return Err((
-                -32000,
-                "custom downloadPath is not permitted on a pooled CDP connection",
-            ));
         }
         Some(_) => {
             return Err((-32602, "invalid downloadPath"));
@@ -2257,29 +2254,48 @@ mod tests {
         assert_eq!(enforced_ok, json!({ "disposeOnDetach": true }));
     }
 
-    #[test]
-    fn download_behavior_validator_blocks_caller_download_path() {
-        let mut custom = json!({ "behavior": "allow", "downloadPath": "/tmp/host-escape" });
-        assert_eq!(
-            validate_download_behavior_params(&mut custom),
-            Err((
-                -32000,
-                "custom downloadPath is not permitted on a pooled CDP connection"
-            ))
-        );
-
+    #[tokio::test]
+    async fn download_behavior_strips_and_clamps_caller_download_path() {
         let mut bad_type = json!({ "behavior": "allow", "downloadPath": 42 });
         assert_eq!(
             validate_download_behavior_params(&mut bad_type),
             Err((-32602, "invalid downloadPath"))
         );
 
-        let mut deny = json!({ "behavior": "deny", "downloadPath": "" });
+        let mut deny = json!({ "behavior": "deny", "downloadPath": "/tmp/host-escape" });
         assert_eq!(validate_download_behavior_params(&mut deny), Ok(false));
         assert!(deny.get("downloadPath").is_none());
 
-        let mut allow = json!({ "behavior": "allowAndName" });
+        let mut allow = json!({ "behavior": "allowAndName", "downloadPath": "/tmp/host-escape" });
         assert_eq!(validate_download_behavior_params(&mut allow), Ok(true));
+        assert!(allow.get("downloadPath").is_none());
+
+        // prepare_download_behavior clamps allowed downloads strictly to the lease's ephemeral dir.
+        let ephemeral = std::env::temp_dir().join(format!(
+            "fluxwright-cdp-dl-unit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let policy = GatewayPolicy {
+            allow_any_url: false,
+            enforce_server_proxy: false,
+            resource_preset: None,
+            download_dir: ephemeral.clone(),
+        };
+        let state = Arc::new(Mutex::new(GatewayState::new(
+            "ctx-1".into(),
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(String::new())),
+        )));
+        let mut clamped = json!({ "behavior": "allow", "downloadPath": "/etc/cron.d" });
+        prepare_download_behavior(&mut clamped, &state, &policy)
+            .await
+            .unwrap();
+        assert_eq!(
+            clamped["downloadPath"],
+            Value::String(ephemeral.to_string_lossy().into_owned())
+        );
+        assert!(state.lock().await.download_dir_created);
+        let _ = std::fs::remove_dir_all(&ephemeral);
     }
 
     #[test]

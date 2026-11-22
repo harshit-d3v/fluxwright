@@ -1536,12 +1536,14 @@ async fn cdp_gateway_security_presets_dialogs_and_window_bounds() {
 
     let img_hits = Arc::new(AtomicUsize::new(0));
     let img_hits_route = img_hits.clone();
+    let dl_hits = Arc::new(AtomicUsize::new(0));
+    let dl_hits_route = dl_hits.clone();
     let app = axum::Router::new()
         .route(
             "/",
             axum::routing::get(|| async {
                 axum::response::Html(
-                    "<!doctype html><title>PresetTest</title><img id='pic' src='/pic.png'>",
+                    "<!doctype html><title>PresetTest</title><img id='pic' src='/pic.png'><a id='dl' href='/download-test' download='escape.txt'>dl</a>",
                 )
             }),
         )
@@ -1550,6 +1552,27 @@ async fn cdp_gateway_security_presets_dialogs_and_window_bounds() {
             axum::routing::get(move || {
                 img_hits_route.fetch_add(1, Ordering::SeqCst);
                 async { ([(axum::http::header::CONTENT_TYPE, "image/png")], vec![0u8; 4]) }
+            }),
+        )
+        .route(
+            "/download-test",
+            axum::routing::get(move || {
+                dl_hits_route.fetch_add(1, Ordering::SeqCst);
+                async {
+                    (
+                        [
+                            (
+                                axum::http::header::CONTENT_TYPE,
+                                "application/octet-stream",
+                            ),
+                            (
+                                axum::http::header::CONTENT_DISPOSITION,
+                                "attachment; filename=\"escape.txt\"",
+                            ),
+                        ],
+                        "blocked-host-write",
+                    )
+                }
             }),
         );
     let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1597,7 +1620,7 @@ async fn cdp_gateway_security_presets_dialogs_and_window_bounds() {
     .to_string();
     cdp_rpc(&mut ws, 3, "Page.enable", json!({}), Some(&sid1)).await;
 
-    // 2. Security rejections: DOM.setFileInputFiles, downloadPath, file:///, cloud metadata.
+    // 2. Security boundary checks: DOM.setFileInputFiles, downloadPath clamping/validation, file:///, cloud metadata.
     let file_err = cdp_rpc(
         &mut ws,
         4,
@@ -1608,25 +1631,43 @@ async fn cdp_gateway_security_presets_dialogs_and_window_bounds() {
     .await;
     assert_eq!(file_err["error"]["code"], -32000, "{file_err}");
 
-    let dl_browser_err = cdp_rpc(
+    let dl_bad_type = cdp_rpc(
         &mut ws,
         5,
         "Browser.setDownloadBehavior",
-        json!({ "behavior": "allow", "downloadPath": "/tmp/evil" }),
+        json!({ "behavior": "allow", "downloadPath": 42 }),
         None,
     )
     .await;
-    assert_eq!(dl_browser_err["error"]["code"], -32000, "{dl_browser_err}");
+    assert_eq!(dl_bad_type["error"]["code"], -32602, "{dl_bad_type}");
 
-    let dl_page_err = cdp_rpc(
+    let forbidden_dl_dir = std::env::temp_dir().join(format!(
+        "fluxwright-http-forbidden-dl-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&forbidden_dl_dir).unwrap();
+    let forbidden_dl_str = forbidden_dl_dir.to_string_lossy().into_owned();
+
+    // Caller-supplied downloadPath is clamped to the lease's ephemeral dir (Playwright connectOverCDP compatible).
+    let dl_browser_ok = cdp_rpc(
         &mut ws,
         6,
+        "Browser.setDownloadBehavior",
+        json!({ "behavior": "allow", "downloadPath": forbidden_dl_str }),
+        None,
+    )
+    .await;
+    assert!(dl_browser_ok.get("error").is_none(), "{dl_browser_ok}");
+
+    let dl_page_ok = cdp_rpc(
+        &mut ws,
+        61,
         "Page.setDownloadBehavior",
-        json!({ "behavior": "allow", "downloadPath": "/tmp/evil" }),
+        json!({ "behavior": "allow", "downloadPath": forbidden_dl_str }),
         Some(&sid1),
     )
     .await;
-    assert_eq!(dl_page_err["error"]["code"], -32000, "{dl_page_err}");
+    assert!(dl_page_ok.get("error").is_none(), "{dl_page_ok}");
 
     let nav_file_err = cdp_rpc(
         &mut ws,
@@ -1721,6 +1762,33 @@ async fn cdp_gateway_security_presets_dialogs_and_window_bounds() {
     .await
     .expect("primary page loaded");
     assert_eq!(img_hits.load(Ordering::SeqCst), 0, "scraping preset must block image on primary context");
+
+    // 4b. Trigger a real download and verify ZERO files land in caller-supplied forbidden_dl_dir.
+    let _ = cdp_rpc(
+        &mut ws,
+        450,
+        "Runtime.evaluate",
+        json!({ "expression": "document.getElementById('dl').click()", "userGesture": true }),
+        Some(&sid1),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while dl_hits.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("download endpoint hit");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let leaked_files: Vec<_> = std::fs::read_dir(&forbidden_dl_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        leaked_files.is_empty(),
+        "caller-supplied downloadPath must never be written to: {leaked_files:?}"
+    );
+    let _ = std::fs::remove_dir_all(&forbidden_dl_dir);
 
     // 5. Verify confirm() dialog is NOT auto-dismissed by CdpBrowser and can be accepted by client.
     let eval_msg = json!({
