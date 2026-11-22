@@ -4,6 +4,20 @@
   "description": "Run hundreds of headless Chrome jobs on one machine: pooling, queueing, recycling and crash recovery, with a Playwright-style API.",
   "main": "addon.js",
   "types": "addon.d.ts",
+  "exports": {
+    ".": {
+      "types": "./addon.d.ts",
+      "default": "./addon.js"
+    },
+    "./test": {
+      "types": "./test_runner.d.ts",
+      "default": "./test_runner.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "fluxwright-test": "./cli_test.js"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/harshit-d3v/fluxwright.git",
@@ -33,19 +47,23 @@
   "files": [
     "addon.js",
     "addon.d.ts",
+    "cli_test.js",
     "expect.js",
+    "html_report.js",
     "tracing.js",
     "video.js",
     "visual.js",
     "index.js",
     "index.d.ts",
+    "test_runner.js",
+    "test_runner.d.ts",
     "MISSING.md",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "napi build --platform --release",
-    "test": "node --expose-gc test/smoke.mjs && node test/expect.mjs && node test/tracing.mjs && node test/video_visual.mjs",
+    "test": "node --expose-gc test/smoke.mjs && node test/expect.mjs && node test/tracing.mjs && node test/video_visual.mjs && node test/runner.mjs",
     "test:types": "tsc -p test",
     "build:debug": "napi build --platform",
     "artifacts": "napi artifacts",
