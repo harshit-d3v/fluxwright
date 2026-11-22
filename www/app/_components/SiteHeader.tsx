@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { GITHUB, Logo, NPM, SECTIONS } from "./site";
+import { GITHUB, Logo, NPM, PYPI, SECTIONS } from "./site";
 
 function GitHubMark() {
   return (
@@ -42,6 +42,9 @@ export function SiteHeader() {
         <div className="header-actions">
           <a className="header-link" href={NPM}>
             npm
+          </a>
+          <a className="header-link" href={PYPI}>
+            PyPI
           </a>
           <a className="header-link" href={GITHUB}>
             <GitHubMark />

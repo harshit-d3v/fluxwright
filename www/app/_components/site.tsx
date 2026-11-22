@@ -10,6 +10,8 @@ export const SECTIONS = [
 
 export const GITHUB = "https://github.com/harshit-d3v/fluxwright";
 export const NPM = "https://www.npmjs.com/package/fluxwright";
+export const PYPI = "https://pypi.org/project/fluxwright/";
+export const RELEASES = "https://github.com/harshit-d3v/fluxwright/releases";
 
 export function Logo() {
   return (
