@@ -38,7 +38,6 @@ struct Inner {
     state: Mutex<State>,
     admit: Notify,
     queue_space: Notify,
-    last_maintenance: Mutex<Option<Instant>>,
     /// When the fleet's memory was last walked (never: `None`), and each browser root's footprint.
     rss_cache: Mutex<(Option<Instant>, HashMap<u32, u64>)>,
     rss_refreshing: AtomicBool,
@@ -164,10 +163,7 @@ impl ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let dir = self.download_dir.clone();
-        self.runtime.spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(dir);
-        });
+        let _ = std::fs::remove_dir_all(&self.download_dir);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
@@ -190,10 +186,7 @@ impl Drop for ContextGuard {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let dir = self.download_dir.clone();
-        self.runtime.spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(dir);
-        });
+        let _ = std::fs::remove_dir_all(&self.download_dir);
         let completed = !self.failed.load(Ordering::SeqCst);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
@@ -408,7 +401,6 @@ impl Engine {
             }),
             admit: Notify::new(),
             queue_space: Notify::new(),
-            last_maintenance: Mutex::new(None),
             rss_cache: Mutex::new((None, HashMap::new())),
             rss_refreshing: AtomicBool::new(false),
             grants: Arc::new(tokio::sync::Semaphore::new(hard_max.clamp(24, 128))),
@@ -933,18 +925,8 @@ impl State {
 
 impl Inner {
     async fn dispatch(self: Arc<Self>) -> Result<bool> {
-        let run_maintenance = {
-            let mut last = self.last_maintenance.lock().await;
-            let due = last.is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
-            if due {
-                *last = Some(Instant::now());
-            }
-            due
-        };
-        if run_maintenance {
-            self.reap().await;
-            self.recycle().await;
-        }
+        self.reap().await;
+        self.recycle().await;
         let can_dispatch_now = {
             let mut st = self.state.lock().await;
             if st.shutting_down {
@@ -954,11 +936,6 @@ impl Inner {
             st.can_dispatch(&self.config)
         };
         if !can_dispatch_now {
-            if !run_maintenance {
-                *self.last_maintenance.lock().await = Some(Instant::now());
-                self.reap().await;
-                self.recycle().await;
-            }
             self.maybe_prewarm().await;
             return Ok(false);
         }
