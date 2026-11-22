@@ -34,7 +34,9 @@ FIXTURE_HTML = b"""<!doctype html>
 <ul id="items"><li>One</li></ul>
 <div class="dup">First</div><div class="dup">Second</div>
 <div id="swap-host"><span id="swap">NotAnInput</span></div>
-<script>
+"""
+
+SCHEDULE_MUTATIONS_JS = """() => {
   setTimeout(() => {
     document.title = 'Updated   Title';
     history.pushState({}, '', '/done');
@@ -62,9 +64,8 @@ FIXTURE_HTML = b"""<!doctype html>
     inp.id = 'swap';
     inp.value = 'swapped';
     document.getElementById('swap-host').replaceChildren(inp);
-  }, 150);
-</script>
-"""
+  }, 120);
+}"""
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -124,6 +125,8 @@ async def _run_async_expect(base: str) -> None:
             await async_expect(page.locator("#edt")).not_to_be_editable()
             await async_expect(page.locator("#late")).not_to_be_attached()
             await page_assert.not_to_have_url("/done")
+
+            await page.evaluate(SCHEDULE_MUTATIONS_JS)
 
             # Delayed page title & URL.
             await page_assert.to_have_title("Updated Title")
@@ -221,6 +224,8 @@ def test_sync_expect(base):
             sync_expect(page.locator("#edt")).not_to_be_editable()
             sync_expect(page.locator("#late")).not_to_be_attached()
             page_assert.not_to_have_url("/done")
+
+            page.evaluate(SCHEDULE_MUTATIONS_JS)
 
             page_assert.to_have_title("Updated Title")
             page_assert.to_have_title(re.compile(r"Updated\s+Title"))

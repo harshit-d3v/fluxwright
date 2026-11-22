@@ -34,9 +34,16 @@ async fn locator_expect_delayed_dom_and_not() {
     .await
     .unwrap();
 
+    // Initially hidden / disabled / unchecked / readonly assertions pass immediately.
+    expect_locator(&page.locator("#vis")).to_be_hidden().await.unwrap();
+    expect_locator(&page.locator("#btn")).to_be_disabled().await.unwrap();
+    expect_locator(&page.locator("#chk")).not().to_be_checked().await.unwrap();
+    expect_locator(&page.locator("#edt")).not().to_be_editable().await.unwrap();
+    expect_locator(&page.locator("#late")).not().to_be_attached().await.unwrap();
+
     // Schedule delayed async DOM mutations so polling is genuinely exercised.
     page.evaluate(
-        r#"() => {
+        r#"(() => {
             setTimeout(() => {
                 document.getElementById('vis').style.display = 'block';
                 document.getElementById('hide').style.display = 'none';
@@ -59,18 +66,11 @@ async fn locator_expect_delayed_dom_and_not() {
                 document.body.appendChild(late);
                 const dups = document.querySelectorAll('.dup');
                 if (dups.length > 1) dups[1].remove();
-            }, 150);
-        }"#,
+            }, 120);
+        })()"#,
     )
     .await
     .unwrap();
-
-    // Initially hidden / disabled / unchecked / readonly assertions pass immediately.
-    expect_locator(&page.locator("#vis")).to_be_hidden().await.unwrap();
-    expect_locator(&page.locator("#btn")).to_be_disabled().await.unwrap();
-    expect_locator(&page.locator("#chk")).not().to_be_checked().await.unwrap();
-    expect_locator(&page.locator("#edt")).not().to_be_editable().await.unwrap();
-    expect_locator(&page.locator("#late")).not().to_be_attached().await.unwrap();
 
     // Wait for delayed DOM mutations via auto-retrying expect.
     expect_locator(&page.locator("#vis")).to_be_visible().await.unwrap();
@@ -124,7 +124,7 @@ async fn locator_expect_delayed_dom_and_not() {
     expect_locator(&page.locator("#vis")).not().not().to_be_visible().await.unwrap();
 
     // Toggle disabled back on after delay to verify positive `to_be_disabled` polling.
-    page.evaluate("() => setTimeout(() => { document.getElementById('btn').disabled = true; }, 100)")
+    page.evaluate("setTimeout(() => { document.getElementById('btn').disabled = true; }, 100)")
         .await
         .unwrap();
     expect_locator(&page.locator("#btn")).to_be_disabled().await.unwrap();
@@ -141,10 +141,7 @@ async fn page_expect_title_url_and_diagnostics() {
         .route(
             "/start",
             get(|| async {
-                Html(
-                    "<title>Start Page</title><p id='msg'>Working</p>\
-                     <script>setTimeout(() => { document.title = 'Done Page'; history.pushState({}, '', '/done'); }, 150);</script>",
-                )
+                Html("<title>Start Page</title><p id='msg'>Working</p>")
             }),
         )
         .route("/done", get(|| async { Html("<title>Done Page</title><p id='msg'>Done</p>") }));
@@ -159,6 +156,10 @@ async fn page_expect_title_url_and_diagnostics() {
     page.goto("/start").await.unwrap();
 
     expect_page(&page).not().to_have_url("/done").await.unwrap();
+    page.evaluate("setTimeout(() => { document.title = 'Done Page'; history.pushState({}, '', '/done'); }, 120)")
+        .await
+        .unwrap();
+
     expect_page(&page).to_have_title("Done Page").await.unwrap();
     expect_page(&page).to_have_url("/done").await.unwrap();
     expect_page(&page).to_have_url(format!("{base}/done")).await.unwrap();

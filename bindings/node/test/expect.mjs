@@ -22,36 +22,6 @@ const server = http.createServer((req, res) => {
     <ul id="items"><li>One</li></ul>
     <div class="dup">First</div><div class="dup">Second</div>
     <div id="swap-host"><span id="swap">NotAnInput</span></div>
-    <script>
-      setTimeout(() => {
-        document.title = 'Updated   Title'
-        history.pushState({}, '', '/done')
-        document.getElementById('vis').style.display = 'block'
-        document.getElementById('hide').style.display = 'none'
-        const btn = document.getElementById('btn')
-        btn.disabled = false
-        btn.setAttribute('data-status', 'ready-42')
-        document.getElementById('chk').checked = true
-        const edt = document.getElementById('edt')
-        edt.readOnly = false
-        edt.value = 'after'
-        document.getElementById('txt').textContent = '  Loaded\\n  42   items  '
-        document.getElementById('cls').className = 'pill active primary'
-        const li = document.createElement('li')
-        li.textContent = 'Two'
-        document.getElementById('items').appendChild(li)
-        const late = document.createElement('div')
-        late.id = 'late'
-        late.style.display = 'none'
-        document.body.appendChild(late)
-        const dups = document.querySelectorAll('.dup')
-        if (dups.length > 1) dups[1].remove()
-        const inp = document.createElement('input')
-        inp.id = 'swap'
-        inp.value = 'swapped'
-        document.getElementById('swap-host').replaceChildren(inp)
-      }, 150)
-    </script>
   `)
 })
 server.listen(0, '127.0.0.1')
@@ -79,6 +49,38 @@ try {
   await expect(page.locator('#edt')).not.toBeEditable()
   await expect(page.locator('#late')).not.toBeAttached()
   await expect(page).not.toHaveURL('/done')
+
+  // Schedule delayed async DOM mutations after immediate checks.
+  await page.evaluate(() => {
+    setTimeout(() => {
+      document.title = 'Updated   Title'
+      history.pushState({}, '', '/done')
+      document.getElementById('vis').style.display = 'block'
+      document.getElementById('hide').style.display = 'none'
+      const btn = document.getElementById('btn')
+      btn.disabled = false
+      btn.setAttribute('data-status', 'ready-42')
+      document.getElementById('chk').checked = true
+      const edt = document.getElementById('edt')
+      edt.readOnly = false
+      edt.value = 'after'
+      document.getElementById('txt').textContent = '  Loaded\n  42   items  '
+      document.getElementById('cls').className = 'pill active primary'
+      const li = document.createElement('li')
+      li.textContent = 'Two'
+      document.getElementById('items').appendChild(li)
+      const late = document.createElement('div')
+      late.id = 'late'
+      late.style.display = 'none'
+      document.body.appendChild(late)
+      const dups = document.querySelectorAll('.dup')
+      if (dups.length > 1) dups[1].remove()
+      const inp = document.createElement('input')
+      inp.id = 'swap'
+      inp.value = 'swapped'
+      document.getElementById('swap-host').replaceChildren(inp)
+    }, 120)
+  })
 
   // Delayed async assertions.
   await expect(page).toHaveTitle('Updated Title')
