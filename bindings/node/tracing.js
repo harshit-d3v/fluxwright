@@ -718,7 +718,7 @@ class Tracing {
     }
   }
 
-  start(options) {
+  async start(options) {
     const opts = validateTraceOptions('tracing.start', options, {
       name: 'string',
       title: 'string',
@@ -741,7 +741,7 @@ class Tracing {
     })
   }
 
-  startChunk(options) {
+  async startChunk(options) {
     const opts = validateTraceOptions('tracing.startChunk', options, {
       name: 'string',
       title: 'string',
@@ -754,7 +754,7 @@ class Tracing {
     })
   }
 
-  stopChunk(options) {
+  async stopChunk(options) {
     const opts = validateTraceOptions('tracing.stopChunk', options, {
       path: 'nonempty-string',
     })
@@ -765,7 +765,7 @@ class Tracing {
     })
   }
 
-  stop(options) {
+  async stop(options) {
     const opts = validateTraceOptions('tracing.stop', options, {
       path: 'nonempty-string',
     })
