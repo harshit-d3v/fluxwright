@@ -282,7 +282,7 @@ impl FrameTree {
         );
     }
 
-    pub(crate) fn detach(&mut self, id: &str) {
+    pub(crate) fn detach(&mut self, id: &str) -> Vec<String> {
         let mut dead = HashSet::from([id.to_string()]);
         loop {
             let mut added = false;
@@ -302,6 +302,7 @@ impl FrameTree {
             self.frames.remove(fid);
         }
         self.order.retain(|fid| !dead.contains(fid));
+        dead.into_iter().collect()
     }
 
     pub(crate) fn set_default_context(&mut self, frame_id: &str, session_id: &str, ctx_id: i64) {
@@ -320,12 +321,15 @@ impl FrameTree {
         }
     }
 
-    pub(crate) fn clear_session_contexts(&mut self, session_id: &str) {
+    pub(crate) fn clear_session_contexts(&mut self, session_id: &str) -> Vec<String> {
+        let mut cleared = Vec::new();
         for entry in self.frames.values_mut() {
             if entry.session_id == session_id {
                 entry.default_context_id = None;
+                cleared.push(entry.id.clone());
             }
         }
+        cleared
     }
 }
 
@@ -354,6 +358,7 @@ pub(crate) struct TargetState {
     owner_page: Option<String>,
     frames: Arc<std::sync::Mutex<FrameTree>>,
     workers: Arc<std::sync::Mutex<WorkerRegistry>>,
+    worlds: Arc<std::sync::Mutex<HashMap<String, i64>>>,
     closed: Arc<AtomicBool>,
     waiting: Vec<tokio::sync::oneshot::Sender<Result<String>>>,
 }
@@ -369,6 +374,7 @@ impl TargetState {
         owner_page: Option<String>,
         frames: Option<Arc<std::sync::Mutex<FrameTree>>>,
         workers: Option<Arc<std::sync::Mutex<WorkerRegistry>>>,
+        worlds: Option<Arc<std::sync::Mutex<HashMap<String, i64>>>>,
     ) -> Self {
         let initial = if url.is_empty() { "about:blank".into() } else { url.clone() };
         let frames = frames.unwrap_or_else(|| {
@@ -379,6 +385,7 @@ impl TargetState {
             }))
         });
         let workers = workers.unwrap_or_default();
+        let worlds = worlds.unwrap_or_default();
         Self {
             session_id: None,
             active_session_id: None,
@@ -391,6 +398,7 @@ impl TargetState {
             owner_page,
             frames,
             workers,
+            worlds,
             closed: Arc::new(AtomicBool::new(false)),
             waiting: Vec::new(),
         }
@@ -724,37 +732,37 @@ impl CdpBrowser {
                 }
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
 
-                let (owner_page, effective_opener, effective_ctx, url_tx, net, frames, workers, closed) = {
+                let (owner_page, effective_opener, effective_ctx, url_tx, net, frames, workers, worlds, closed) = {
                     let mut targets = self.targets.lock().await;
-                    let (detected_owner, owner_frames, owner_workers, parent_ctx, fallback_parent) = if ty == "page" {
-                        (Some(target_id.clone()), None, None, None, None)
+                    let (detected_owner, owner_frames, owner_workers, owner_worlds, parent_ctx, fallback_parent) = if ty == "page" {
+                        (Some(target_id.clone()), None, None, None, None, None)
                     } else if ty == "iframe" {
                         let parent_by_sid = ev.session_id.as_deref().and_then(|psid| {
                             targets.iter().find_map(|(pid, pt)| {
                                 (pt.active_session_id.as_deref() == Some(psid)
                                     || pt.session_id.as_deref() == Some(psid))
-                                .then(|| (pt.owner_page.clone(), pt.frames.clone(), pt.workers.clone(), pt.browser_context_id.clone(), opener_frame.clone().or_else(|| Some(pid.clone()))))
+                                .then(|| (pt.owner_page.clone(), pt.frames.clone(), pt.workers.clone(), pt.worlds.clone(), pt.browser_context_id.clone(), opener_frame.clone().or_else(|| Some(pid.clone()))))
                             })
                         });
-                        if let Some((owner, fr, wk, pctx, par)) = parent_by_sid {
-                            (owner, Some(fr), Some(wk), pctx, par)
+                        if let Some((owner, fr, wk, wd, pctx, par)) = parent_by_sid {
+                            (owner, Some(fr), Some(wk), Some(wd), pctx, par)
                         } else {
                             let by_frame_tree = targets.iter().find_map(|(tid, pt)| {
                                 (pt.r#type == "page"
                                     && pt.browser_context_id == ctx
                                     && pt.frames.lock().unwrap().get(&target_id).is_some())
-                                .then(|| (Some(tid.clone()), pt.frames.clone(), pt.workers.clone(), pt.browser_context_id.clone(), opener_frame.clone()))
+                                .then(|| (Some(tid.clone()), pt.frames.clone(), pt.workers.clone(), pt.worlds.clone(), pt.browser_context_id.clone(), opener_frame.clone()))
                             });
-                            if let Some((owner, fr, wk, pctx, par)) = by_frame_tree {
-                                (owner, Some(fr), Some(wk), pctx, par)
+                            if let Some((owner, fr, wk, wd, pctx, par)) = by_frame_tree {
+                                (owner, Some(fr), Some(wk), Some(wd), pctx, par)
                             } else {
                                 targets
                                     .iter()
                                     .find_map(|(tid, pt)| {
                                         (pt.r#type == "page" && pt.browser_context_id == ctx)
-                                            .then(|| (Some(tid.clone()), Some(pt.frames.clone()), Some(pt.workers.clone()), pt.browser_context_id.clone(), opener_frame.clone().or_else(|| Some(tid.clone()))))
+                                            .then(|| (Some(tid.clone()), Some(pt.frames.clone()), Some(pt.workers.clone()), Some(pt.worlds.clone()), pt.browser_context_id.clone(), opener_frame.clone().or_else(|| Some(tid.clone()))))
                                     })
-                                    .unwrap_or((None, None, None, None, opener_frame.clone()))
+                                    .unwrap_or((None, None, None, None, None, opener_frame.clone()))
                             }
                         }
                     } else if ty == "worker" {
@@ -769,15 +777,16 @@ impl CdpBrowser {
                                             pt.owner_page.clone(),
                                             Some(pt.frames.clone()),
                                             Some(pt.workers.clone()),
+                                            Some(pt.worlds.clone()),
                                             pt.browser_context_id.clone(),
                                             None,
                                         )
                                     })
                                 })
                             })
-                            .unwrap_or((None, None, None, None, None))
+                            .unwrap_or((None, None, None, None, None, None))
                     } else {
-                        (None, None, None, None, None)
+                        (None, None, None, None, None, None)
                     };
 
                     let effective_ctx = ctx.clone().or(parent_ctx);
@@ -791,6 +800,7 @@ impl CdpBrowser {
                             detected_owner.clone(),
                             owner_frames.clone(),
                             owner_workers.clone(),
+                            owner_worlds.clone(),
                         )
                     });
                     state.r#type = ty.clone();
@@ -806,6 +816,9 @@ impl CdpBrowser {
                     }
                     if let Some(wk) = owner_workers {
                         state.workers = wk;
+                    }
+                    if let Some(wd) = owner_worlds {
+                        state.worlds = wd;
                     }
                     if ty == "page" {
                         state.frames.lock().unwrap().set_root_session(&target_id, session_id.clone(), &url);
@@ -837,6 +850,7 @@ impl CdpBrowser {
                         state.net.clone(),
                         state.frames.clone(),
                         state.workers.clone(),
+                        state.worlds.clone(),
                         state.closed.clone(),
                     )
                 };
@@ -944,6 +958,13 @@ impl CdpBrowser {
                 }
                 // The session is published (and waiters woken) only once prepared, so a
                 // page never reaches a caller with its domains still being enabled.
+                // Subscribe before resuming a popup so its initial console/network events
+                // are buffered until `collect_logs` takes ownership of the stream.
+                let early_log_events = if ty == "page" && effective_opener.is_some() {
+                    Some(self.conn.subscribe_unbounded())
+                } else {
+                    None
+                };
                 let me = self.clone();
                 tokio::spawn(async move {
                     match prepare_session(&me.conn, &session_id, &ty, waiting, setup, page_setup).await {
@@ -978,7 +999,7 @@ impl CdpBrowser {
                                             opener_id: Some(TargetId(opener)),
                                             session_id: SessionId(session_id),
                                             targets: me.targets.clone(),
-                                            worlds: Default::default(),
+                                            worlds,
                                             setups: me.setups.clone(),
                                             page_setups: me.page_setups.clone(),
                                             frames,
@@ -989,6 +1010,9 @@ impl CdpBrowser {
                                             url: url_tx,
                                             net,
                                             ax_refs: Default::default(),
+                                            early_log_events: Arc::new(std::sync::Mutex::new(
+                                                early_log_events,
+                                            )),
                                         };
                                         let _ = tx.send(page);
                                     }
@@ -1043,6 +1067,7 @@ impl CdpBrowser {
                         owner,
                         None,
                         None,
+                        None,
                     )
                 });
             }
@@ -1072,7 +1097,10 @@ impl CdpBrowser {
                         self.targets.lock().await.remove(&tid);
                         workers.lock().unwrap().remove_by_session(sid);
                     }
-                    let frames_to_clear: Vec<Arc<std::sync::Mutex<FrameTree>>> = {
+                    let frames_to_clear: Vec<(
+                        Arc<std::sync::Mutex<FrameTree>>,
+                        Arc<std::sync::Mutex<HashMap<String, i64>>>,
+                    )> = {
                         let mut targets = self.targets.lock().await;
                         let mut list = Vec::new();
                         for t in targets.values_mut() {
@@ -1081,13 +1109,17 @@ impl CdpBrowser {
                             {
                                 t.session_id = None;
                                 t.active_session_id = None;
-                                list.push(t.frames.clone());
+                                list.push((t.frames.clone(), t.worlds.clone()));
                             }
                         }
                         list
                     };
-                    for fr in frames_to_clear {
-                        fr.lock().unwrap().clear_session_contexts(sid);
+                    for (fr, worlds) in frames_to_clear {
+                        let cleared = fr.lock().unwrap().clear_session_contexts(sid);
+                        let mut w = worlds.lock().unwrap();
+                        for fid in cleared {
+                            w.remove(&fid);
+                        }
                     }
                 }
             }
@@ -1309,7 +1341,7 @@ impl CdpBrowser {
                     ev.params["frameId"].as_str(),
                     ev.params["parentFrameId"].as_str(),
                 ) {
-                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                    if let Some((_, frames, _)) = self.session_frame_tree(sid).await {
                         frames.lock().unwrap().attach(
                             frame_id.to_owned(),
                             parent_id.to_owned(),
@@ -1330,7 +1362,7 @@ impl CdpBrowser {
                     } else {
                         None
                     };
-                    if let Some((main_id, frames)) = info {
+                    if let Some((main_id, frames, worlds)) = info {
                         frames.lock().unwrap().navigate(
                             frame_id.to_owned(),
                             parent_id.clone(),
@@ -1339,6 +1371,12 @@ impl CdpBrowser {
                             sid,
                             &main_id,
                         );
+                        let mut w = worlds.lock().unwrap();
+                        if frame_id == main_id {
+                            w.clear();
+                        } else {
+                            w.remove(frame_id);
+                        }
                     }
                     if parent_id.is_none() {
                         let mut targets = self.targets.lock().await;
@@ -1370,7 +1408,7 @@ impl CdpBrowser {
                 ) {
                     if !url.is_empty() {
                         if let Some(sid) = ev.session_id.as_deref() {
-                            if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                            if let Some((_, frames, _)) = self.session_frame_tree(sid).await {
                                 frames.lock().unwrap().update_url(frame_id, url.to_string());
                             }
                         }
@@ -1394,8 +1432,12 @@ impl CdpBrowser {
                     ev.session_id.as_deref(),
                     ev.params["frameId"].as_str(),
                 ) {
-                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
-                        frames.lock().unwrap().detach(frame_id);
+                    if let Some((_, frames, worlds)) = self.session_frame_tree(sid).await {
+                        let dead = frames.lock().unwrap().detach(frame_id);
+                        let mut w = worlds.lock().unwrap();
+                        for fid in dead {
+                            w.remove(&fid);
+                        }
                     }
                 }
             }
@@ -1407,7 +1449,7 @@ impl CdpBrowser {
                         aux["frameId"].as_str(),
                         ev.params["context"]["id"].as_i64(),
                     ) {
-                        if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                        if let Some((_, frames, _)) = self.session_frame_tree(sid).await {
                             frames.lock().unwrap().set_default_context(frame_id, sid, ctx_id);
                         }
                     }
@@ -1418,15 +1460,24 @@ impl CdpBrowser {
                     ev.session_id.as_deref(),
                     ev.params["executionContextId"].as_i64(),
                 ) {
-                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
+                    if let Some((_, frames, worlds)) = self.session_frame_tree(sid).await {
                         frames.lock().unwrap().remove_context(ctx_id);
+                        worlds.lock().unwrap().retain(|_, id| *id != ctx_id);
                     }
                 }
             }
             "Runtime.executionContextsCleared" => {
                 if let Some(sid) = ev.session_id.as_deref() {
-                    if let Some((_, frames)) = self.session_frame_tree(sid).await {
-                        frames.lock().unwrap().clear_session_contexts(sid);
+                    if let Some((main_id, frames, worlds)) = self.session_frame_tree(sid).await {
+                        let cleared = frames.lock().unwrap().clear_session_contexts(sid);
+                        let mut w = worlds.lock().unwrap();
+                        if cleared.iter().any(|fid| fid == &main_id) {
+                            w.clear();
+                        } else {
+                            for fid in cleared {
+                                w.remove(&fid);
+                            }
+                        }
                     }
                 }
             }
@@ -1623,7 +1674,7 @@ impl CdpBrowser {
 
         // Auto-attach prepares the session before announcing it; see on_event.
         let session_id = self.wait_for_session(&target_id, timeout).await?;
-        let (url, net, frames, workers, closed, opener_id) = {
+        let (url, net, frames, workers, worlds, closed, opener_id) = {
             let mut targets = self.targets.lock().await;
             match targets.get_mut(&target_id) {
                 Some(t) => {
@@ -1633,6 +1684,7 @@ impl CdpBrowser {
                         t.net.clone(),
                         t.frames.clone(),
                         t.workers.clone(),
+                        t.worlds.clone(),
                         t.closed.clone(),
                         t.opener_id.clone().map(TargetId),
                     )
@@ -1645,6 +1697,7 @@ impl CdpBrowser {
                         session_id.clone(),
                         "about:blank".into(),
                     ))),
+                    Default::default(),
                     Default::default(),
                     Default::default(),
                     None,
@@ -1662,7 +1715,7 @@ impl CdpBrowser {
             opener_id,
             session_id: SessionId(session_id),
             targets: self.targets.clone(),
-            worlds: Default::default(),
+            worlds,
             setups: self.setups.clone(),
             page_setups: self.page_setups.clone(),
             frames,
@@ -1673,6 +1726,7 @@ impl CdpBrowser {
             url,
             net,
             ax_refs: Default::default(),
+            early_log_events: Default::default(),
         })
     }
 
@@ -1688,7 +1742,7 @@ impl CdpBrowser {
             targets
                 .entry(target_id.to_string())
                 .or_insert_with(|| {
-                    TargetState::new(target_id, "page".into(), String::new(), None, None, Some(target_id.to_string()), None, None)
+                    TargetState::new(target_id, "page".into(), String::new(), None, None, Some(target_id.to_string()), None, None, None)
                 })
                 .waiting
                 .push(tx);
@@ -1715,13 +1769,21 @@ impl CdpBrowser {
             .unwrap_or((None, None, None))
     }
 
-    async fn session_frame_tree(&self, sid: &str) -> Option<(String, Arc<std::sync::Mutex<FrameTree>>)> {
+    #[allow(clippy::type_complexity)]
+    async fn session_frame_tree(
+        &self,
+        sid: &str,
+    ) -> Option<(
+        String,
+        Arc<std::sync::Mutex<FrameTree>>,
+        Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    )> {
         let targets = self.targets.lock().await;
         let t = targets.values().find(|t| {
             t.active_session_id.as_deref() == Some(sid) || t.session_id.as_deref() == Some(sid)
         })?;
         let main_id = t.owner_page.clone()?;
-        Some((main_id, t.frames.clone()))
+        Some((main_id, t.frames.clone(), t.worlds.clone()))
     }
 
     async fn context_of_session(&self, sid: &str) -> Option<String> {

@@ -413,6 +413,7 @@ mod tests {
             url: Arc::new(tokio::sync::watch::Sender::new("about:blank".into())),
             net: Default::default(),
             ax_refs: Default::default(),
+            early_log_events: Default::default(),
         };
 
         let err = page

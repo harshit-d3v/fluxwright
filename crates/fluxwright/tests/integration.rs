@@ -428,19 +428,36 @@ async fn console_messages_and_page_errors() {
 
     let eng = engine(1, 1).await;
     let page = eng.acquire().await.unwrap();
+    let mut popups = page.subscribe_popups();
     page.goto(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+    let popup = tokio::time::timeout(Duration::from_secs(10), popups.recv())
+        .await
+        .expect("popup within 10s")
+        .expect("popup channel open");
     // Events arrive on their own schedule; give them a moment.
     for _ in 0..100 {
-        if page.console_messages().len() >= 4 && !page.page_errors().is_empty() {
+        if page.console_messages().len() >= 3
+            && !page.page_errors().is_empty()
+            && !popup.console_messages().is_empty()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let console: Vec<(String, String)> = page.console_messages().into_iter().map(|m| (m.kind, m.text)).collect();
-    let wanted = [("log", "hello 3 null"), ("error", "bad"), ("warning", "from the iframe"), ("info", "from the popup")];
+    let wanted = [("log", "hello 3 null"), ("error", "bad"), ("warning", "from the iframe")];
     for want in wanted {
         assert!(console.contains(&(want.0.into(), want.1.into())), "{want:?} not in {console:?}");
     }
+    assert!(
+        !console.contains(&("info".into(), "from the popup".into())),
+        "popup console leaked into opener: {console:?}"
+    );
+    let popup_console: Vec<(String, String)> = popup.console_messages().into_iter().map(|m| (m.kind, m.text)).collect();
+    assert!(
+        popup_console.contains(&("info".into(), "from the popup".into())),
+        "popup console missing from popup PageLog: {popup_console:?}"
+    );
     let errors = page.page_errors();
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(errors[0].name, "TypeError");
