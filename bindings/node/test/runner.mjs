@@ -120,7 +120,7 @@ assert.deepEqual([..._internals.requestedFixtures(async () => {})], [])
   assert.ok(!/^LPT9$/i.test(_internals.sanitizePathSegment('LPT9')))
 }
 
-// Regression: compileGrepMatcher compiles real RegExp and throws clean error on invalid regex.
+// Regression: compileGrepMatcher compiles real RegExp (ReDoS-safe linear NFA) and throws clean error on invalid regex.
 {
   const r1 = compileGrepMatcher('item-\\d+')
   assert.equal(r1.test('item-42'), true)
@@ -130,7 +130,23 @@ assert.deepEqual([..._internals.requestedFixtures(async () => {})], [])
   assert.equal(r2.test('gamma-xyz'), false)
   const r3 = compileGrepMatcher('/CASE/i')
   assert.equal(r3.test('mixed case here'), true)
+  const r4 = compileGrepMatcher('^foo(?:bar|baz){1,2}$')
+  assert.equal(r4.test('foobarbaz'), true)
+  assert.equal(r4.test('foobarbazqux'), false)
+  const r5 = compileGrepMatcher('\\bword\\b')
+  assert.equal(r5.test('a word here'), true)
+  assert.equal(r5.test('awordhere'), false)
+  const r6 = compileGrepMatcher('/^line2/m')
+  assert.equal(r6.test('line1\nline2'), true)
+  // ReDoS-safe linear-time guarantee: catastrophic backtracking pattern completes instantaneously.
+  const redos = compileGrepMatcher('(a+)+b')
+  const t0 = Date.now()
+  assert.equal(redos.test(`${'a'.repeat(500)}c`), false)
+  assert.ok(Date.now() - t0 < 500, 'grep matcher must execute in linear time without ReDoS')
   assert.throws(() => compileGrepMatcher('[unclosed'), /Invalid --grep regex/)
+  assert.throws(() => compileGrepMatcher('(unclosed'), /Invalid --grep regex/)
+  assert.throws(() => compileGrepMatcher('*bad'), /Invalid --grep regex/)
+  assert.throws(() => compileGrepMatcher('a{3,1}'), /Invalid --grep regex/)
 }
 
 const tmpBase = await mkdtemp(join(__dirname, '.tmp-runner-'))

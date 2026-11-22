@@ -52,6 +52,61 @@ Options:
 `)
 }
 
+const MAX_NFA_STATES = 10_000
+const MAX_QUANTIFIER_REPEAT = 1000
+
+function isWordChar(ch) {
+  if (!ch) return false
+  const c = ch.charCodeAt(0)
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95
+}
+
+function isDigitChar(ch) {
+  const c = ch.charCodeAt(0)
+  return c >= 48 && c <= 57
+}
+
+function isSpaceChar(ch) {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v' || ch === '\u00a0' || ch === '\ufeff'
+}
+
+function isLineBreak(ch) {
+  return ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029'
+}
+
+function parseHexEscape(source, pos, digits) {
+  if (pos + digits > source.length) return null
+  const slice = source.slice(pos, pos + digits)
+  for (let i = 0; i < slice.length; i++) {
+    const c = slice.charCodeAt(i)
+    const isHex = (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+    if (!isHex) return null
+  }
+  return { char: String.fromCharCode(parseInt(slice, 16)), nextPos: pos + digits }
+}
+
+function charPredForEscape(esc, ignoreCase) {
+  if (esc === 'd') return isDigitChar
+  if (esc === 'D') return (ch) => !isDigitChar(ch)
+  if (esc === 'w') return isWordChar
+  if (esc === 'W') return (ch) => !isWordChar(ch)
+  if (esc === 's') return isSpaceChar
+  if (esc === 'S') return (ch) => !isSpaceChar(ch)
+  const map = { n: '\n', r: '\r', t: '\t', f: '\f', v: '\v', '0': '\0' }
+  const lit = Object.hasOwn(map, esc) ? map[esc] : esc
+  if (ignoreCase) {
+    const lower = lit.toLowerCase()
+    return (ch) => ch.toLowerCase() === lower
+  }
+  return (ch) => ch === lit
+}
+
+/**
+ * Linear-time Thompson NFA regex compiler (RE2-style, ReDoS-proof).
+ * Supports real regex syntax (/pattern/flags, character classes, shorthand escapes,
+ * grouping, alternation, quantifiers, and anchors) without calling `new RegExp`
+ * on untrusted CLI arguments.
+ */
 function compileGrepMatcher(pattern, flag = '--grep') {
   const raw = String(pattern)
   let source = raw
@@ -61,15 +116,446 @@ function compileGrepMatcher(pattern, flag = '--grep') {
     if (lastSlash > 0) {
       const candidateFlags = raw.slice(lastSlash + 1)
       if (/^[dgimsuvy]*$/.test(candidateFlags)) {
+        const seen = new Set()
+        for (const f of candidateFlags) {
+          if (seen.has(f)) {
+            throw new Error(`Invalid ${flag} regex "${raw}": duplicate flag "${f}"`)
+          }
+          seen.add(f)
+        }
+        if (seen.has('u') && seen.has('v')) {
+          throw new Error(`Invalid ${flag} regex "${raw}": incompatible flags "u" and "v"`)
+        }
         source = raw.slice(1, lastSlash)
         flags = candidateFlags.replace(/g/g, '')
       }
     }
   }
-  try {
-    return new RegExp(source, flags)
-  } catch (err) {
-    throw new Error(`Invalid ${flag} regex "${raw}": ${err.message}`)
+
+  const ignoreCase = flags.includes('i')
+  const multiline = flags.includes('m')
+  const dotAll = flags.includes('s')
+  const sticky = flags.includes('y')
+
+  const fail = (msg) => {
+    throw new Error(`Invalid ${flag} regex "${raw}": ${msg}`)
+  }
+
+  let pos = 0
+
+  function readEscapeChar() {
+    if (pos >= source.length) fail('Trailing backslash')
+    const ch = source[pos++]
+    if (ch === 'x') {
+      const hex = parseHexEscape(source, pos, 2)
+      if (hex) {
+        pos = hex.nextPos
+        return { kind: 'char', value: hex.char }
+      }
+      return { kind: 'char', value: 'x' }
+    }
+    if (ch === 'u') {
+      if (source[pos] === '{') {
+        const end = source.indexOf('}', pos + 1)
+        if (end !== -1) {
+          const hexStr = source.slice(pos + 1, end)
+          if (/^[0-9a-fA-F]+$/.test(hexStr)) {
+            const cp = parseInt(hexStr, 16)
+            if (cp > 0x10ffff) fail('Unicode code point out of range')
+            pos = end + 1
+            return { kind: 'char', value: String.fromCodePoint(cp) }
+          }
+        }
+      }
+      const hex = parseHexEscape(source, pos, 4)
+      if (hex) {
+        pos = hex.nextPos
+        return { kind: 'char', value: hex.char }
+      }
+      return { kind: 'char', value: 'u' }
+    }
+    if (ch === 'd' || ch === 'D' || ch === 'w' || ch === 'W' || ch === 's' || ch === 'S') {
+      return { kind: 'class', pred: charPredForEscape(ch, ignoreCase) }
+    }
+    const map = { n: '\n', r: '\r', t: '\t', f: '\f', v: '\v', '0': '\0' }
+    return { kind: 'char', value: Object.hasOwn(map, ch) ? map[ch] : ch }
+  }
+
+  function parseCharClass() {
+    pos += 1 // consume '['
+    let negated = false
+    if (pos < source.length && source[pos] === '^') {
+      negated = true
+      pos += 1
+    }
+    const preds = []
+    while (pos < source.length) {
+      if (source[pos] === ']') {
+        pos += 1
+        const combined = (ch) => {
+          const matched = preds.some((p) => p(ch))
+          return negated ? !matched : matched
+        }
+        return { type: 'match', pred: combined }
+      }
+      let item
+      if (source[pos] === '\\') {
+        pos += 1
+        item = readEscapeChar()
+      } else {
+        item = { kind: 'char', value: source[pos++] }
+      }
+
+      if (
+        item.kind === 'char' &&
+        pos + 1 < source.length &&
+        source[pos] === '-' &&
+        source[pos + 1] !== ']'
+      ) {
+        pos += 1 // consume '-'
+        let endItem
+        if (source[pos] === '\\') {
+          pos += 1
+          endItem = readEscapeChar()
+        } else {
+          endItem = { kind: 'char', value: source[pos++] }
+        }
+        if (endItem.kind !== 'char') fail('Invalid character class range')
+        const startCode = item.value.charCodeAt(0)
+        const endCode = endItem.value.charCodeAt(0)
+        if (endCode < startCode) fail('Range out of order in character class')
+        if (ignoreCase) {
+          preds.push((ch) => {
+            const c = ch.charCodeAt(0)
+            if (c >= startCode && c <= endCode) return true
+            const lc = ch.toLowerCase().charCodeAt(0)
+            const uc = ch.toUpperCase().charCodeAt(0)
+            return (lc >= startCode && lc <= endCode) || (uc >= startCode && uc <= endCode)
+          })
+        } else {
+          preds.push((ch) => {
+            const c = ch.charCodeAt(0)
+            return c >= startCode && c <= endCode
+          })
+        }
+      } else if (item.kind === 'class') {
+        preds.push(item.pred)
+      } else {
+        const val = item.value
+        if (ignoreCase) {
+          const lower = val.toLowerCase()
+          preds.push((ch) => ch.toLowerCase() === lower)
+        } else {
+          preds.push((ch) => ch === val)
+        }
+      }
+    }
+    fail('Unterminated character class')
+  }
+
+  function tryParseBraceQuantifier() {
+    const saved = pos
+    if (source[pos] !== '{') return null
+    pos += 1
+    const startMin = pos
+    while (pos < source.length && isDigitChar(source[pos])) pos += 1
+    if (pos === startMin) {
+      pos = saved
+      return null
+    }
+    const min = parseInt(source.slice(startMin, pos), 10)
+    let max = min
+    if (pos < source.length && source[pos] === ',') {
+      pos += 1
+      const startMax = pos
+      while (pos < source.length && isDigitChar(source[pos])) pos += 1
+      max = pos === startMax ? Infinity : parseInt(source.slice(startMax, pos), 10)
+    }
+    if (pos >= source.length || source[pos] !== '}') {
+      pos = saved
+      return null
+    }
+    pos += 1
+    if (max < min) fail('Numbers out of order in {} quantifier')
+    if (min > MAX_QUANTIFIER_REPEAT || (Number.isFinite(max) && max > MAX_QUANTIFIER_REPEAT)) {
+      fail('Quantifier repetition count too large')
+    }
+    if (pos < source.length && source[pos] === '?') pos += 1
+    return { min, max }
+  }
+
+  function parseAtom() {
+    const ch = source[pos]
+    if (ch === '(') {
+      pos += 1
+      if (source[pos] === '?') {
+        pos += 1
+        if (source[pos] === ':') {
+          pos += 1
+        } else if (source[pos] === '<') {
+          const closeAngle = source.indexOf('>', pos + 1)
+          if (closeAngle === -1) fail('Invalid group')
+          pos = closeAngle + 1
+        } else {
+          fail('Unsupported group syntax')
+        }
+      }
+      const inner = parseAlternation()
+      if (pos >= source.length || source[pos] !== ')') fail('Unterminated group')
+      pos += 1
+      return inner
+    }
+    if (ch === '[') return parseCharClass()
+    if (ch === '.') {
+      pos += 1
+      return { type: 'match', pred: dotAll ? () => true : (c) => !isLineBreak(c) }
+    }
+    if (ch === '^') {
+      pos += 1
+      return {
+        type: 'assert',
+        pred: (text, idx) => idx === 0 || (multiline && idx > 0 && isLineBreak(text[idx - 1])),
+      }
+    }
+    if (ch === '$') {
+      pos += 1
+      return {
+        type: 'assert',
+        pred: (text, idx) => idx === text.length || (multiline && idx < text.length && isLineBreak(text[idx])),
+      }
+    }
+    if (ch === '\\') {
+      pos += 1
+      if (pos >= source.length) fail('Trailing backslash')
+      if (source[pos] === 'b') {
+        pos += 1
+        return {
+          type: 'assert',
+          pred: (text, idx) => {
+            const before = idx > 0 && isWordChar(text[idx - 1])
+            const after = idx < text.length && isWordChar(text[idx])
+            return before !== after
+          },
+        }
+      }
+      if (source[pos] === 'B') {
+        pos += 1
+        return {
+          type: 'assert',
+          pred: (text, idx) => {
+            const before = idx > 0 && isWordChar(text[idx - 1])
+            const after = idx < text.length && isWordChar(text[idx])
+            return before === after
+          },
+        }
+      }
+      const esc = readEscapeChar()
+      if (esc.kind === 'class') return { type: 'match', pred: esc.pred }
+      const val = esc.value
+      if (ignoreCase) {
+        const lower = val.toLowerCase()
+        return { type: 'match', pred: (c) => c.toLowerCase() === lower }
+      }
+      return { type: 'match', pred: (c) => c === val }
+    }
+    if (ch === '*' || ch === '+' || ch === '?') {
+      fail('Nothing to repeat')
+    }
+    pos += 1
+    if (ignoreCase) {
+      const lower = ch.toLowerCase()
+      return { type: 'match', pred: (c) => c.toLowerCase() === lower }
+    }
+    return { type: 'match', pred: (c) => c === ch }
+  }
+
+  function parseSequence() {
+    const items = []
+    while (pos < source.length && source[pos] !== '|' && source[pos] !== ')') {
+      const atom = parseAtom()
+      let quant = null
+      if (pos < source.length) {
+        const qch = source[pos]
+        if (qch === '*') {
+          pos += 1
+          if (pos < source.length && source[pos] === '?') pos += 1
+          quant = { min: 0, max: Infinity }
+        } else if (qch === '+') {
+          pos += 1
+          if (pos < source.length && source[pos] === '?') pos += 1
+          quant = { min: 1, max: Infinity }
+        } else if (qch === '?') {
+          pos += 1
+          if (pos < source.length && source[pos] === '?') pos += 1
+          quant = { min: 0, max: 1 }
+        } else if (qch === '{') {
+          quant = tryParseBraceQuantifier()
+        }
+      }
+      if (quant) {
+        if (atom.type === 'assert') fail('Nothing to repeat')
+        items.push({ type: 'repeat', node: atom, min: quant.min, max: quant.max })
+      } else {
+        items.push(atom)
+      }
+    }
+    return items.length === 1 ? items[0] : { type: 'seq', items }
+  }
+
+  function parseAlternation() {
+    const branches = [parseSequence()]
+    while (pos < source.length && source[pos] === '|') {
+      pos += 1
+      branches.push(parseSequence())
+    }
+    return branches.length === 1 ? branches[0] : { type: 'alt', branches }
+  }
+
+  const ast = parseAlternation()
+  if (pos < source.length) {
+    fail(`Unexpected "${source[pos]}"`)
+  }
+
+  // Compile AST to Thompson NFA.
+  const states = []
+  function addNfaState(st) {
+    if (states.length >= MAX_NFA_STATES) fail('Pattern too complex')
+    states.push(st)
+    return states.length - 1
+  }
+
+  function patch(outs, target) {
+    for (const setter of outs) setter(target)
+  }
+
+  function compileNode(node) {
+    if (node.type === 'match') {
+      const st = { kind: 'match', pred: node.pred, out: -1 }
+      const id = addNfaState(st)
+      return { start: id, outs: [(t) => { st.out = t }] }
+    }
+    if (node.type === 'assert') {
+      const st = { kind: 'assert', pred: node.pred, out: -1 }
+      const id = addNfaState(st)
+      return { start: id, outs: [(t) => { st.out = t }] }
+    }
+    if (node.type === 'seq') {
+      if (node.items.length === 0) {
+        const st = { kind: 'eps', out: -1 }
+        const id = addNfaState(st)
+        return { start: id, outs: [(t) => { st.out = t }] }
+      }
+      let cur = compileNode(node.items[0])
+      for (let i = 1; i < node.items.length; i++) {
+        const next = compileNode(node.items[i])
+        patch(cur.outs, next.start)
+        cur = { start: cur.start, outs: next.outs }
+      }
+      return cur
+    }
+    if (node.type === 'alt') {
+      let cur = compileNode(node.branches[0])
+      for (let i = 1; i < node.branches.length; i++) {
+        const right = compileNode(node.branches[i])
+        const sp = { kind: 'split', out1: cur.start, out2: right.start }
+        const id = addNfaState(sp)
+        cur = { start: id, outs: [...cur.outs, ...right.outs] }
+      }
+      return cur
+    }
+    if (node.type === 'repeat') {
+      const seqParts = []
+      for (let i = 0; i < node.min; i++) {
+        seqParts.push(compileNode(node.node))
+      }
+      if (node.max === Infinity) {
+        const body = compileNode(node.node)
+        const sp = { kind: 'split', out1: body.start, out2: -1 }
+        const id = addNfaState(sp)
+        patch(body.outs, id)
+        seqParts.push({ start: id, outs: [(t) => { sp.out2 = t }] })
+      } else {
+        for (let i = node.min; i < node.max; i++) {
+          const body = compileNode(node.node)
+          const sp = { kind: 'split', out1: body.start, out2: -1 }
+          const id = addNfaState(sp)
+          seqParts.push({ start: id, outs: [...body.outs, (t) => { sp.out2 = t }] })
+        }
+      }
+      if (seqParts.length === 0) {
+        const st = { kind: 'eps', out: -1 }
+        const id = addNfaState(st)
+        return { start: id, outs: [(t) => { st.out = t }] }
+      }
+      let cur = seqParts[0]
+      for (let i = 1; i < seqParts.length; i++) {
+        patch(cur.outs, seqParts[i].start)
+        cur = { start: cur.start, outs: seqParts[i].outs }
+      }
+      return cur
+    }
+    fail('Invalid AST node')
+  }
+
+  const frag = compileNode(ast)
+  const acceptId = addNfaState({ kind: 'accept' })
+  patch(frag.outs, acceptId)
+  const startId = frag.start
+
+  const visited = new Int32Array(states.length)
+  let stamp = 0
+
+  function expand(initialIds, text, idx) {
+    stamp += 1
+    if (stamp > 0x70000000) {
+      visited.fill(0)
+      stamp = 1
+    }
+    const active = []
+    const stack = [...initialIds]
+    let accepted = false
+    while (stack.length > 0) {
+      const id = stack.pop()
+      if (id < 0 || visited[id] === stamp) continue
+      visited[id] = stamp
+      const st = states[id]
+      if (st.kind === 'accept') {
+        accepted = true
+      } else if (st.kind === 'eps') {
+        stack.push(st.out)
+      } else if (st.kind === 'split') {
+        stack.push(st.out2, st.out1)
+      } else if (st.kind === 'assert') {
+        if (st.pred(text, idx)) stack.push(st.out)
+      } else if (st.kind === 'match') {
+        active.push(id)
+      }
+    }
+    return { active, accepted }
+  }
+
+  return {
+    source,
+    flags,
+    lastIndex: 0,
+    test(input) {
+      const text = String(input)
+      const startPos = sticky ? Math.max(0, Math.min(this.lastIndex | 0, text.length)) : 0
+      let step = expand([startId], text, startPos)
+      if (step.accepted) return true
+      for (let i = startPos; i < text.length; i++) {
+        const ch = text[i]
+        const nextSeeds = sticky ? [] : [startId]
+        for (let k = 0; k < step.active.length; k++) {
+          const st = states[step.active[k]]
+          if (st.pred(ch)) nextSeeds.push(st.out)
+        }
+        if (nextSeeds.length === 0) return false
+        step = expand(nextSeeds, text, i + 1)
+        if (step.accepted) return true
+      }
+      return false
+    },
   }
 }
 
