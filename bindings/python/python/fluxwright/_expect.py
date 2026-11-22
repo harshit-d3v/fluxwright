@@ -6,12 +6,27 @@ import asyncio
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
+from os import PathLike
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 from urllib.parse import urljoin, urlparse
 
 from . import _native
 from ._errors import Error
+from ._types import FloatRect
+from ._visual import (
+    DISABLE_ANIMATIONS_LOCATOR_JS,
+    DISABLE_ANIMATIONS_PAGE_JS,
+    RESTORE_ANIMATIONS_LOCATOR_JS,
+    RESTORE_ANIMATIONS_PAGE_JS,
+    RgbaImage,
+    artifact_paths,
+    compare_images,
+    decode_png,
+    should_update_snapshots,
+)
 
 if TYPE_CHECKING:
     from .async_api import Page as AsyncPage
@@ -560,6 +575,53 @@ class LocatorAssertions:
     async def not_to_have_count(self, count: int, timeout: float | None = None) -> None:
         await self._count_check(count, matcher="not_to_have_count", negated=True, timeout=timeout)
 
+    async def to_have_screenshot(
+        self,
+        name: str | PathLike[str] | Sequence[str],
+        *,
+        threshold: float | None = None,
+        max_diff_pixels: int | None = None,
+        max_diff_pixel_ratio: float | None = None,
+        animations: Literal["disabled", "allow"] | None = None,
+        timeout: float | None = None,
+        omit_background: bool | None = None,
+        update: bool | None = None,
+    ) -> None:
+        opts = _validate_screenshot_options(
+            f"{self._target()}.to_have_screenshot",
+            threshold=threshold,
+            max_diff_pixels=max_diff_pixels,
+            max_diff_pixel_ratio=max_diff_pixel_ratio,
+            animations=animations,
+            timeout=timeout,
+            default_timeout=self._default_timeout,
+            omit_background=omit_background,
+            full_page=None,
+            clip=None,
+            update=update,
+        )
+
+        async def _disable(limit_ms: float) -> None:
+            with suppress(Exception):
+                await self._locator.evaluate(DISABLE_ANIMATIONS_LOCATOR_JS, None, timeout=min(limit_ms, 500.0))
+
+        async def _restore() -> None:
+            with suppress(Exception):
+                await self._locator.evaluate(RESTORE_ANIMATIONS_LOCATOR_JS, None, timeout=250.0)
+
+        await _run_to_have_screenshot(
+            target_label=self._target(),
+            name=name,
+            opts=opts,
+            is_closed=lambda: False,
+            disable_animations=_disable,
+            restore_animations=_restore,
+            capture_shot=lambda limit_ms: self._locator.screenshot(
+                omit_background=opts["omit_background"],
+                timeout=limit_ms,
+            ),
+        )
+
 
 class PageAssertions:
     """Auto-retrying assertions for an async ``Page``."""
@@ -633,6 +695,267 @@ class PageAssertions:
 
     async def not_to_have_url(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
         await self._url_check(expected, matcher="not_to_have_url", negated=True, timeout=timeout)
+
+    async def to_have_screenshot(
+        self,
+        name: str | PathLike[str] | Sequence[str],
+        *,
+        threshold: float | None = None,
+        max_diff_pixels: int | None = None,
+        max_diff_pixel_ratio: float | None = None,
+        animations: Literal["disabled", "allow"] | None = None,
+        timeout: float | None = None,
+        full_page: bool | None = None,
+        omit_background: bool | None = None,
+        clip: FloatRect | None = None,
+        update: bool | None = None,
+    ) -> None:
+        opts = _validate_screenshot_options(
+            "expect(page).to_have_screenshot",
+            threshold=threshold,
+            max_diff_pixels=max_diff_pixels,
+            max_diff_pixel_ratio=max_diff_pixel_ratio,
+            animations=animations,
+            timeout=timeout,
+            default_timeout=self._default_timeout,
+            omit_background=omit_background,
+            full_page=full_page,
+            clip=clip,
+            update=update,
+        )
+
+        async def _disable(_limit_ms: float) -> None:
+            with suppress(Exception):
+                await self._page.evaluate(DISABLE_ANIMATIONS_PAGE_JS)
+
+        async def _restore() -> None:
+            with suppress(Exception):
+                await self._page.evaluate(RESTORE_ANIMATIONS_PAGE_JS)
+
+        await _run_to_have_screenshot(
+            target_label="expect(page)",
+            name=name,
+            opts=opts,
+            is_closed=self._page.is_closed,
+            disable_animations=_disable,
+            restore_animations=_restore,
+            capture_shot=lambda limit_ms: self._page.screenshot(
+                full_page=opts["full_page"],
+                clip=opts["clip"],
+                omit_background=opts["omit_background"],
+                timeout=limit_ms,
+            ),
+        )
+
+
+def _validate_screenshot_options(
+    method: str,
+    *,
+    threshold: float | None,
+    max_diff_pixels: int | None,
+    max_diff_pixel_ratio: float | None,
+    animations: str | None,
+    timeout: float | None,
+    default_timeout: float,
+    omit_background: bool | None,
+    full_page: bool | None,
+    clip: FloatRect | None,
+    update: bool | None,
+) -> dict[str, Any]:
+    timeout_ms = _validate_timeout(timeout, default_timeout)
+    thresh = 0.2 if threshold is None else float(threshold)
+    if isinstance(threshold, bool) or math.isnan(thresh) or math.isinf(thresh) or not (0.0 <= thresh <= 1.0):
+        raise ValueError(f"{method}: threshold must be a finite float in [0.0, 1.0]")
+    if max_diff_pixels is not None and (
+        isinstance(max_diff_pixels, bool) or not isinstance(max_diff_pixels, int) or max_diff_pixels < 0
+    ):
+        raise ValueError(f"{method}: max_diff_pixels must be a non-negative int")
+    if max_diff_pixel_ratio is not None:
+        if (
+            isinstance(max_diff_pixel_ratio, bool)
+            or not isinstance(max_diff_pixel_ratio, (int, float))
+            or math.isnan(max_diff_pixel_ratio)
+            or math.isinf(max_diff_pixel_ratio)
+            or not (0.0 <= max_diff_pixel_ratio <= 1.0)
+        ):
+            raise ValueError(f"{method}: max_diff_pixel_ratio must be a finite float in [0.0, 1.0]")
+    anim = "disabled" if animations is None else animations
+    if anim not in ("disabled", "allow"):
+        raise ValueError(f"{method}: animations must be 'disabled' or 'allow', not {animations!r}")
+    return {
+        "timeout_ms": timeout_ms,
+        "threshold": thresh,
+        "max_diff_pixels": max_diff_pixels,
+        "max_diff_pixel_ratio": float(max_diff_pixel_ratio) if max_diff_pixel_ratio is not None else None,
+        "animations": anim,
+        "omit_background": bool(omit_background) if omit_background is not None else False,
+        "full_page": bool(full_page) if full_page is not None else False,
+        "clip": clip,
+        "update": bool(update) if update is not None else False,
+    }
+
+
+def _shot_limit(remaining_ms: float | None) -> float:
+    if remaining_ms is None:
+        return 2000.0
+    return max(100.0, min(remaining_ms, 2000.0))
+
+
+async def _write_artifact(path: Path, data: bytes) -> None:
+    def _write() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    await asyncio.to_thread(_write)
+
+
+async def _run_to_have_screenshot(
+    *,
+    target_label: str,
+    name: str | PathLike[str] | Sequence[str],
+    opts: dict[str, Any],
+    is_closed: Callable[[], bool],
+    disable_animations: Callable[[float], Awaitable[None]],
+    restore_animations: Callable[[], Awaitable[None]],
+    capture_shot: Callable[[float], Awaitable[bytes]],
+) -> None:
+    baseline_path, actual_path, diff_path = artifact_paths(name)
+    timeout_ms: float = opts["timeout_ms"]
+    disable_anim: bool = opts["animations"] == "disabled"
+    unlimited = timeout_ms == 0.0
+
+    try:
+        if should_update_snapshots(opts["update"]):
+            deadline = None if unlimited else time.monotonic() + (timeout_ms / 1000.0)
+            prev_img: RgbaImage | None = None
+            last_err: str | None = None
+            attempts = 0
+            while True:
+                if is_closed():
+                    raise Error("page is closed")
+                rem_ms = None if deadline is None else max(0.0, (deadline - time.monotonic()) * 1000.0)
+                limit = _shot_limit(rem_ms)
+                if disable_anim:
+                    await disable_animations(limit)
+                try:
+                    raw = await capture_shot(limit)
+                    attempts += 1
+                    img = decode_png(raw)
+                    if prev_img is not None:
+                        diff = compare_images(prev_img, img, threshold=opts["threshold"], render_diff=False)
+                        if diff.is_within_tolerance(
+                            max_diff_pixels=opts["max_diff_pixels"],
+                            max_diff_pixel_ratio=opts["max_diff_pixel_ratio"],
+                        ):
+                            await _write_artifact(baseline_path, raw)
+                            return
+                    elif unlimited:
+                        await _write_artifact(baseline_path, raw)
+                        return
+                    prev_img = img
+                    last_err = None
+                except Exception as exc:
+                    if _is_fatal_error(exc):
+                        raise
+                    last_err = str(exc)
+
+                if deadline is not None:
+                    rem_s = deadline - time.monotonic()
+                    if rem_s <= 0:
+                        if attempts == 1 and prev_img is not None:
+                            with suppress(Exception):
+                                raw = await capture_shot(1000.0)
+                                img = decode_png(raw)
+                                diff = compare_images(prev_img, img, threshold=opts["threshold"], render_diff=False)
+                                if diff.is_within_tolerance(
+                                    max_diff_pixels=opts["max_diff_pixels"],
+                                    max_diff_pixel_ratio=opts["max_diff_pixel_ratio"],
+                                ):
+                                    await _write_artifact(baseline_path, raw)
+                                    return
+                        if attempts >= 2:
+                            raise AssertionError(
+                                f"{target_label}.to_have_screenshot: Timed out {timeout_ms:g}ms "
+                                f"waiting for screenshot to stabilize for update at {baseline_path}"
+                            )
+                        raise AssertionError(
+                            f"{target_label}.to_have_screenshot: Failed to capture snapshot "
+                            f"({last_err or 'did not stabilize'})"
+                        )
+                    await asyncio.sleep(min(POLL_INTERVAL_S, rem_s))
+                else:
+                    await asyncio.sleep(POLL_INTERVAL_S)
+
+        try:
+            baseline_bytes = await asyncio.to_thread(baseline_path.read_bytes)
+        except FileNotFoundError:
+            if disable_anim:
+                await disable_animations(500.0)
+            with suppress(Exception):
+                actual_raw = await capture_shot(2000.0)
+                await _write_artifact(actual_path, actual_raw)
+            raise AssertionError(
+                f"{target_label}.to_have_screenshot: Baseline snapshot does not exist at {baseline_path}.\n"
+                f"Run with FLUXWRIGHT_UPDATE_SNAPSHOTS=1 or update=True to create it. Actual saved to {actual_path}"
+            ) from None
+
+        baseline_img = decode_png(baseline_bytes)
+        deadline = None if unlimited else time.monotonic() + (timeout_ms / 1000.0)
+        last_mismatch: tuple[bytes, RgbaImage] | None = None
+        last_err = None
+
+        while True:
+            if is_closed():
+                raise Error("page is closed")
+            rem_ms = None if deadline is None else max(0.0, (deadline - time.monotonic()) * 1000.0)
+            limit = _shot_limit(rem_ms)
+            if disable_anim:
+                await disable_animations(limit)
+            try:
+                raw = await capture_shot(limit)
+                actual_img = decode_png(raw)
+                diff = compare_images(baseline_img, actual_img, threshold=opts["threshold"], render_diff=False)
+                if diff.is_within_tolerance(
+                    max_diff_pixels=opts["max_diff_pixels"],
+                    max_diff_pixel_ratio=opts["max_diff_pixel_ratio"],
+                ):
+                    return
+                last_mismatch = (raw, actual_img)
+                last_err = None
+            except Exception as exc:
+                if _is_fatal_error(exc):
+                    raise
+                last_err = str(exc)
+
+            if deadline is not None:
+                rem_s = deadline - time.monotonic()
+                if rem_s <= 0:
+                    break
+                await asyncio.sleep(min(POLL_INTERVAL_S, rem_s))
+            else:
+                await asyncio.sleep(POLL_INTERVAL_S)
+
+        if last_mismatch is not None:
+            actual_raw, actual_img = last_mismatch
+            final_diff = compare_images(baseline_img, actual_img, threshold=opts["threshold"], render_diff=True)
+            await _write_artifact(actual_path, actual_raw)
+            if final_diff.diff_png is not None:
+                await _write_artifact(diff_path, final_diff.diff_png)
+            raise AssertionError(
+                f"{target_label}.to_have_screenshot: Screenshot mismatch ({final_diff.diff_pixels} of "
+                f"{final_diff.total_pixels} pixels differ, ratio {final_diff.diff_ratio:.6f}; "
+                f"expected {final_diff.expected_size[0]}x{final_diff.expected_size[1]}, "
+                f"actual {final_diff.actual_size[0]}x{final_diff.actual_size[1]}).\n"
+                f"Baseline: {baseline_path}\nActual:   {actual_path}\nDiff:     {diff_path}"
+            )
+
+        raise AssertionError(
+            f"{target_label}.to_have_screenshot: Timed out {timeout_ms:g}ms waiting for screenshot "
+            f"({last_err or 'unknown error'})"
+        )
+    finally:
+        if disable_anim and not is_closed():
+            await restore_animations()
 
 
 class _AsyncExpect:
@@ -753,6 +1076,30 @@ class SyncLocatorAssertions:
     def not_to_have_count(self, count: int, timeout: float | None = None) -> None:
         self._run(self._impl.not_to_have_count, count, timeout=timeout)
 
+    def to_have_screenshot(
+        self,
+        name: str | PathLike[str] | Sequence[str],
+        *,
+        threshold: float | None = None,
+        max_diff_pixels: int | None = None,
+        max_diff_pixel_ratio: float | None = None,
+        animations: Literal["disabled", "allow"] | None = None,
+        timeout: float | None = None,
+        omit_background: bool | None = None,
+        update: bool | None = None,
+    ) -> None:
+        self._run(
+            self._impl.to_have_screenshot,
+            name,
+            threshold=threshold,
+            max_diff_pixels=max_diff_pixels,
+            max_diff_pixel_ratio=max_diff_pixel_ratio,
+            animations=animations,
+            timeout=timeout,
+            omit_background=omit_background,
+            update=update,
+        )
+
 
 class SyncPageAssertions:
     """Auto-retrying assertions for a sync ``Page``."""
@@ -776,6 +1123,34 @@ class SyncPageAssertions:
 
     def not_to_have_url(self, expected: str | re.Pattern[str], timeout: float | None = None) -> None:
         self._run(self._impl.not_to_have_url, expected, timeout=timeout)
+
+    def to_have_screenshot(
+        self,
+        name: str | PathLike[str] | Sequence[str],
+        *,
+        threshold: float | None = None,
+        max_diff_pixels: int | None = None,
+        max_diff_pixel_ratio: float | None = None,
+        animations: Literal["disabled", "allow"] | None = None,
+        timeout: float | None = None,
+        full_page: bool | None = None,
+        omit_background: bool | None = None,
+        clip: FloatRect | None = None,
+        update: bool | None = None,
+    ) -> None:
+        self._run(
+            self._impl.to_have_screenshot,
+            name,
+            threshold=threshold,
+            max_diff_pixels=max_diff_pixels,
+            max_diff_pixel_ratio=max_diff_pixel_ratio,
+            animations=animations,
+            timeout=timeout,
+            full_page=full_page,
+            omit_background=omit_background,
+            clip=clip,
+            update=update,
+        )
 
 
 class SyncExpect:

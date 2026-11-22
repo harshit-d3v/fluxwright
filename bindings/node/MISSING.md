@@ -14,11 +14,11 @@ napi would silently ignore an option the binding does not implement, so it throw
 - Pointer/input options beyond the implemented subset (`noWaitAfter`, `sourcePosition` / `targetPosition` on `dragTo` / `dragAndDrop`)
 - Screenshots: `mask`, `maskColor`, `animations`, `caret`, `scale`, `style`, and WebP (see `docs/DECISIONS.md`)
 - `page.pdf()` works only in headless mode (headed browsers reject with an error)
-- `newPage` / `newContext` options the README does not list (`recordVideo`, ...), and `launch` options other than the supported ones (`args`; for `proxy`, give `newPage` one)
+- `newPage` / `newContext` options the README does not list, and `launch` options other than the supported ones (`args`; for `proxy`, give `newPage` one)
 - `page.route(url, handler, { times })`, `route.fallback(overrides)`, `page.close({ runBeforeUnload })`
 
 ## Out of scope
 
 - Firefox and WebKit
 - Playwright Test: the runner, fixtures and `expect`
-- Tracing, the trace viewer, codegen and video recording
+- Tracing, the trace viewer and codegen

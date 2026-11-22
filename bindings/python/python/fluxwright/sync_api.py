@@ -84,6 +84,7 @@ __all__ = [
     "TimeoutError",
     "Touchscreen",
     "Tracing",
+    "Video",
     "ViewportSize",
     "WebSocket",
     "Worker",
@@ -802,6 +803,25 @@ class CDPSession:
             raise
 
 
+class Video:
+    """Handle to a page's recorded video (``page.video``)."""
+
+    def __init__(self, impl: _a.Video) -> None:
+        self._impl = impl
+
+    def path(self) -> Path:
+        """Waits for recording to finish (on page/context close) and returns the video path."""
+        return _run(self._impl.path)
+
+    def save_as(self, path: str | PathLike[str]) -> None:
+        """Copies the recorded video to ``path``, creating missing parent directories."""
+        _run(self._impl.save_as, path)
+
+    def delete(self) -> None:
+        """Deletes the recorded video file if it exists."""
+        _run(self._impl.delete)
+
+
 class _SyncChildEmitter:
     """Shared listener bridging for sync ``WebSocket`` and ``Worker``."""
 
@@ -1383,6 +1403,12 @@ class Page(_Finders):
 
     def _owner_page_ref(self) -> weakref.ref[Page] | None:
         return weakref.ref(self)
+
+    @property
+    def video(self) -> Video | None:
+        """Recorded video handle when ``record_video_dir`` was configured, else ``None``."""
+        v = self._impl.video
+        return Video(v) if v is not None else None
 
     def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None) -> None:
         """Navigates; ``wait_until`` is ``load`` (the default), ``domcontentloaded``,
@@ -2169,6 +2195,8 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        record_video_dir: str | PathLike[str] | None = None,
+        record_video_size: ViewportSize | None = None,
         resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
         block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
         block_url_patterns: Sequence[str] | None = None,
@@ -2202,6 +2230,8 @@ class Browser:
                 record_har_content=record_har_content,
                 record_har_mode=record_har_mode,
                 record_har_url_filter=record_har_url_filter,
+                record_video_dir=record_video_dir,
+                record_video_size=record_video_size,
                 resource_preset=resource_preset,
                 block_resources=block_resources,
                 block_url_patterns=block_url_patterns,
@@ -2235,6 +2265,8 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        record_video_dir: str | PathLike[str] | None = None,
+        record_video_size: ViewportSize | None = None,
         resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
         block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
         block_url_patterns: Sequence[str] | None = None,
@@ -2266,6 +2298,8 @@ class Browser:
             record_har_content=record_har_content,
             record_har_mode=record_har_mode,
             record_har_url_filter=record_har_url_filter,
+            record_video_dir=record_video_dir,
+            record_video_size=record_video_size,
             resource_preset=resource_preset,
             block_resources=block_resources,
             block_url_patterns=block_url_patterns,

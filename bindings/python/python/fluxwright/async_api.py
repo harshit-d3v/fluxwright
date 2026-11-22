@@ -45,6 +45,7 @@ from ._errors import Error, TimeoutError
 from ._expect import LocatorAssertions, PageAssertions, expect
 from ._native import ConsoleMessage, Download, FrameLocator, Locator
 from ._tracing import AsyncTracing as Tracing
+from ._video import Video, VideoRecorder, normalize_record_video
 from ._types import (
     FilePayload,
     FloatRect,
@@ -95,6 +96,7 @@ __all__ = [
     "TimeoutError",
     "Touchscreen",
     "Tracing",
+    "Video",
     "ViewportSize",
     "WebSocket",
     "Worker",
@@ -1432,7 +1434,43 @@ class Page(_native.Page):
         self._context_ref: weakref.ref[BrowserContext] | None = None
         self._request: APIRequestContext | None = None
         self._frame_cache: weakref.WeakValueDictionary[str, Frame] = weakref.WeakValueDictionary()
+        self._video: Video | None = None
+        self._video_recorder: VideoRecorder | None = None
+        self._video_browser_ref: weakref.ref[Browser] | None = None
         _pages_by_target[self._target_id()] = self
+
+    @property
+    def video(self) -> Video | None:
+        """Recorded video handle when ``record_video_dir`` was configured, else ``None``."""
+        return self._video
+
+    async def _start_video(
+        self,
+        video_dir: Path,
+        video_size: tuple[int, int] | None,
+        browser: Browser | None = None,
+    ) -> None:
+        if self._video_recorder is not None or self.is_closed():
+            return
+        session = CDPSession(await self._new_cdp_session(None))
+        rec = await VideoRecorder.start(session, video_dir, video_size)
+        self._video_recorder = rec
+        self._video = Video(rec)
+        if browser is not None:
+            self._video_browser_ref = weakref.ref(browser)
+            browser._video_recorders.add(rec)
+
+    async def _stop_video(self) -> None:
+        rec = self._video_recorder
+        if rec is None:
+            return
+        self._video_recorder = None
+        try:
+            await rec.stop()
+        finally:
+            browser = self._video_browser_ref() if self._video_browser_ref is not None else None
+            if browser is not None:
+                browser._video_recorders.discard(rec)
 
     @property
     def request(self) -> APIRequestContext:
@@ -1864,6 +1902,7 @@ class Page(_native.Page):
 
     async def close(self) -> None:
         """Closes the page and rejects any pending ``expect_*`` waiters."""
+        await self._stop_video()
         for future in list(self._expects):
             if not future.done():
                 future.set_exception(Error("page closed"))
@@ -2402,6 +2441,7 @@ class Browser:
     def __init__(self, engine: _native.Engine) -> None:
         self._engine = engine
         self._closed = False
+        self._video_recorders: set[VideoRecorder] = set()
 
     async def new_page(
         self,
@@ -2430,6 +2470,8 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        record_video_dir: str | PathLike[str] | None = None,
+        record_video_size: ViewportSize | None = None,
         resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
         block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
         block_url_patterns: Sequence[str] | None = None,
@@ -2439,6 +2481,7 @@ class Browser:
         (``Asia/Tokyo``), ``color_scheme`` ``light``, ``dark`` or ``no-preference``;
         ``geolocation`` also needs ``permissions=["geolocation"]``; ``storage_state`` is what
         ``page.storage_state()`` returned, or the JSON file it saved."""
+        record_video = normalize_record_video(record_video_dir, record_video_size)
         native_url_filter, pending_filter = _split_har_url_filter(record_har_path, record_har_url_filter)
         lease = await self._engine.new_page(
             proxy=proxy,
@@ -2472,6 +2515,8 @@ class Browser:
         page = Page(lease)
         if pending_filter is not None:
             page._pending_har_filters.append(pending_filter)
+        if record_video is not None:
+            await page._start_video(*record_video, browser=self)
         return page
 
     async def new_context(
@@ -2501,11 +2546,14 @@ class Browser:
         record_har_content: Literal["embed", "omit"] | None = None,
         record_har_mode: Literal["full", "minimal"] | None = None,
         record_har_url_filter: str | re.Pattern[str] | None = None,
+        record_video_dir: str | PathLike[str] | None = None,
+        record_video_size: ViewportSize | None = None,
         resource_preset: Literal["scraping", "minimal", "no-media"] | None = None,
         block_resources: Sequence[Literal["image", "font", "media", "stylesheet", "script"]] | None = None,
         block_url_patterns: Sequence[str] | None = None,
     ) -> BrowserContext:
         """A browser context with ``new_page``'s options, as Playwright's ``new_context``; see ``BrowserContext``."""
+        record_video = normalize_record_video(record_video_dir, record_video_size)
         native_url_filter, pending_filter = _split_har_url_filter(record_har_path, record_har_url_filter)
         native_ctx = await self._engine.new_context(
             proxy=proxy,
@@ -2536,7 +2584,7 @@ class Browser:
             block_resources=list(block_resources) if block_resources is not None else None,
             block_url_patterns=list(block_url_patterns) if block_url_patterns is not None else None,
         )
-        ctx = BrowserContext(self, native_ctx)
+        ctx = BrowserContext(self, native_ctx, record_video=record_video)
         if pending_filter is not None:
             ctx._pending_har_filters.append(pending_filter)
         return ctx
@@ -2545,6 +2593,10 @@ class Browser:
         """Shuts the engine down, and with it every page and Chrome process it started."""
         if not self._closed:
             self._closed = True
+            if self._video_recorders:
+                recs = list(self._video_recorders)
+                self._video_recorders.clear()
+                await asyncio.gather(*(r.stop() for r in recs), return_exceptions=True)
             await self._engine.close()
 
     async def __aenter__(self) -> Browser:
@@ -2559,7 +2611,13 @@ class BrowserContext:
     storage, init scripts, exposed functions and routes.
     """
 
-    def __init__(self, browser: Browser, ctx: _native.Context) -> None:
+    def __init__(
+        self,
+        browser: Browser,
+        ctx: _native.Context,
+        *,
+        record_video: tuple[Path, tuple[int, int] | None] | None = None,
+    ) -> None:
         self._browser = browser
         self._ctx = ctx
         self._closed = False
@@ -2573,6 +2631,7 @@ class BrowserContext:
         self._pending_har_filters: list[tuple[Path, re.Pattern[str]]] = []
         self._request: APIRequestContext | None = None
         self._tracing: Tracing | None = None
+        self._record_video = record_video
 
     @property
     def request(self) -> APIRequestContext:
@@ -2621,6 +2680,8 @@ class BrowserContext:
         tracer = self._active_tracer()
         if tracer is not None:
             _keep(self._tasks, asyncio.ensure_future(tracer._on_page_created(popup)))
+        if self._record_video is not None:
+            _keep(self._tasks, asyncio.ensure_future(popup._start_video(*self._record_video, browser=self._browser)))
 
     def _remove_page(self, page: Page) -> None:
         with suppress(ValueError):
@@ -2638,6 +2699,8 @@ class BrowserContext:
         tracer = self._active_tracer()
         if tracer is not None:
             await tracer._on_page_created(page)
+        if self._record_video is not None:
+            await page._start_video(*self._record_video, browser=self._browser)
         return page
 
     async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:

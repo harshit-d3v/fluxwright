@@ -5,12 +5,14 @@
 
 pub use fluxwright_core::netguard;
 pub use fluxwright_core::{
-    expect_locator, expect_page, parse_proxy_url, validate_profile_name, with_timeout,
-    AdaptiveConfig, ApiRequestContext, BrowserInfo, BrowserSource, ContextLease, Downloads,
+    compare_images, decode_png, encode_mjpeg_avi, encode_png, expect_locator, expect_page,
+    parse_proxy_url, validate_profile_name, with_timeout, AdaptiveConfig, Animations,
+    ApiRequestContext, BrowserInfo, BrowserSource, ContextLease, Downloads,
     Engine as BrowserEngine, EngineBuilder, EngineConfig, Error, Frame, FrameLocator, JobOptions,
     LocalChromium, Locator, LocatorExpect, MetricsSnapshot, PageExpect, PageLease, Priority,
     ProfileInfo, ProfileStore, ProxyLease, ProxyPool, ProxyRotation, ProxyStatus, QueueFullMode,
-    RemoteCdp, ResourcePreset, Result, Tracing, TracingChunkOptions, TracingStartOptions,
+    RecordVideoOptions, RemoteCdp, ResourcePreset, Result, RgbaImage, ToHaveScreenshotOptions,
+    Tracing, TracingChunkOptions, TracingStartOptions, Video, VideoRecorder, VisualDiff,
 };
 
 pub use fluxwright_cdp::{

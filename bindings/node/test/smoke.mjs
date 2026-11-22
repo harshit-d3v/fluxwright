@@ -200,7 +200,6 @@ try {
   await assert.rejects(page.pdf({ format: 'A9' }), /unknown format/)
   await assert.rejects(page.pdf({ landscpe: true }), TypeError)
   await assert.rejects(page.pdf({ margin: { bogus: 10 } }), TypeError)
-  await assert.rejects(browser.newPage({ recordVideo: { dir: '.' } }), TypeError)
   await assert.rejects(
     browser.newPage({ httpCredentials: { username: 'u', password: 'p', send: 'always' } }),
     TypeError,
