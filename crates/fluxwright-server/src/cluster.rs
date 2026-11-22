@@ -91,6 +91,8 @@ pub struct WorkersSummary {
 pub(crate) struct LeaseRequest {
     #[serde(default = "default_lease_max")]
     pub(crate) max_jobs: usize,
+    #[serde(default)]
+    pub(crate) capacity: Option<usize>,
 }
 
 fn default_lease_max() -> usize {
@@ -170,7 +172,8 @@ fn touch_worker<'a>(
     registry: &'a mut crate::Registry,
     worker: &str,
     now: u64,
-    max_jobs: Option<usize>,
+    capacity: Option<usize>,
+    fallback_max_jobs: Option<usize>,
 ) -> &'a mut WorkerRecord {
     if !registry.workers.contains_key(worker) && registry.workers.len() >= MAX_WORKERS {
         let evict = registry
@@ -191,7 +194,7 @@ fn touch_worker<'a>(
         .workers
         .entry(worker.to_string())
         .or_insert_with(|| WorkerRecord {
-            max_jobs: max_jobs.unwrap_or(1),
+            max_jobs: capacity.or(fallback_max_jobs).unwrap_or(1),
             registered_at: now,
             last_seen_at: now,
             draining: false,
@@ -200,8 +203,8 @@ fn touch_worker<'a>(
             expired_leases: 0,
         });
     rec.last_seen_at = now;
-    if let Some(m) = max_jobs {
-        rec.max_jobs = m;
+    if let Some(cap) = capacity {
+        rec.max_jobs = cap;
     }
     rec
 }
@@ -331,7 +334,9 @@ pub(crate) async fn lease(
         }
 
         let limit = req.max_jobs.min(MAX_LEASE_BATCH);
-        let draining = touch_worker(registry, &worker, now, Some(limit)).draining;
+        let reported_capacity = req.capacity.map(|c| c.clamp(1, MAX_LEASE_BATCH));
+        let fallback_max = (limit > 0).then_some(limit);
+        let draining = touch_worker(registry, &worker, now, reported_capacity, fallback_max).draining;
         if draining {
             return Ok(Vec::new());
         }
@@ -394,7 +399,7 @@ pub(crate) async fn heartbeat(
 
     let lease_ms = inner.lease_ms();
     let cancelled = inner.with_registry(|registry, now| {
-        touch_worker(registry, &worker, now, None);
+        touch_worker(registry, &worker, now, None, None);
         let mut cancelled = Vec::new();
         for item in req.jobs {
             if let Some(record) = registry.find_mut(item.id) {
@@ -427,7 +432,7 @@ pub(crate) async fn release(
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
 
     let released = inner.with_registry(|registry, now| {
-        touch_worker(registry, &worker, now, None);
+        touch_worker(registry, &worker, now, None, None);
         let mut released = Vec::new();
         for id in req.jobs {
             if let Some(record) = registry.find_mut(id) {
@@ -480,7 +485,7 @@ pub(crate) async fn result(
     }
 
     let (job, finished) = inner.with_registry(|registry, now| -> Result<(Job, bool), ApiError> {
-        touch_worker(registry, &req.worker, now, None);
+        touch_worker(registry, &req.worker, now, None, None);
         let record = registry.find_mut(id).ok_or_else(not_found)?;
         if record.job.status == JobStatus::Cancelled {
             return Ok((record.job.clone(), false));
@@ -1008,7 +1013,7 @@ async fn worker_loop(
 
         if !draining && can_lease && active_len < max_jobs && pending_results.len() < max_jobs * 2 {
             let want = (max_jobs - active_len).min(MAX_LEASE_BATCH);
-            match post_lease(&endpoint, &token, &worker_id, want).await {
+            match post_lease(&endpoint, &token, &worker_id, want, max_jobs).await {
                 Ok(leased) if !leased.is_empty() => {
                     backoff = poll_interval.max(Duration::from_millis(50));
                     let got = leased.len();
@@ -1243,12 +1248,13 @@ async fn post_lease(
     token: &str,
     worker: &str,
     max_jobs: usize,
+    capacity: usize,
 ) -> Result<Vec<LeasedJob>, String> {
     let (status, body) = post_json_raw(
         ep,
         token,
         &format!("/v1/workers/{worker}/lease"),
-        &serde_json::json!({ "max_jobs": max_jobs }),
+        &serde_json::json!({ "max_jobs": max_jobs, "capacity": capacity }),
     )
     .await?;
     if status != 200 {

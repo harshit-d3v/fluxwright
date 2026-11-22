@@ -64,6 +64,9 @@ pub struct ServerConfig {
     /// Allow `?token=<token>` authentication on `/cdp` and `/json/version` for CDP clients that
     /// cannot send custom WebSocket headers. Disabled by default.
     pub allow_query_token: bool,
+    /// Disable the server-side SSRF URL guard (same effect as `FLUXWRIGHT_SERVER_ANY_URL=1`).
+    /// Disabled by default.
+    pub allow_any_url: bool,
 }
 
 const DEFAULT_LEASE_TIMEOUT_MS: u64 = 30_000;
@@ -96,6 +99,7 @@ impl ServerConfig {
             max_jobs: 128,
             journal: None,
             allow_query_token: false,
+            allow_any_url: false,
         })
     }
 
@@ -119,6 +123,7 @@ pub(crate) struct Inner {
     worker_token: Option<Vec<u8>>,
     max_jobs: usize,
     allow_query_token: bool,
+    allow_any_url: bool,
     lease_ms: AtomicU64,
     lease_notify: tokio::sync::Notify,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -168,6 +173,10 @@ impl Registry {
 }
 
 impl Inner {
+    pub(crate) fn allow_any_url(&self) -> bool {
+        self.allow_any_url || std::env::var_os("FLUXWRIGHT_SERVER_ANY_URL").is_some()
+    }
+
     pub(crate) fn lease_ms(&self) -> u64 {
         self.lease_ms.load(Ordering::Relaxed)
     }
@@ -228,6 +237,12 @@ impl Inner {
             Some(engine) => engine.metrics().await,
             None => Default::default(),
         };
+        let memory_ceiling_mb = self
+            .engine
+            .as_ref()
+            .map(|e| e.config().memory_ceiling_mb)
+            .unwrap_or(0);
+        let memory_ceiling_bytes = memory_ceiling_mb.saturating_mul(1024 * 1024);
         let lease_ms = self.lease_ms();
         let mode = if self.engine.is_some() {
             "standalone"
@@ -276,6 +291,8 @@ impl Inner {
                     "failed_jobs": reg.failed_jobs,
                     "cancelled_jobs": reg.cancelled_jobs,
                     "max_jobs": self.max_jobs,
+                    "memory_ceiling_mb": memory_ceiling_mb,
+                    "memory_ceiling_bytes": memory_ceiling_bytes,
                     "active_cdp_sessions": self.active_cdp_sessions.load(Ordering::Relaxed),
                     "total_cdp_sessions": self.total_cdp_sessions.load(Ordering::Relaxed),
                 },
@@ -345,6 +362,7 @@ impl HttpServer {
             worker_token: config.worker_token.map(String::into_bytes),
             max_jobs: config.max_jobs,
             allow_query_token: config.allow_query_token,
+            allow_any_url: config.allow_any_url,
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
             lease_notify: tokio::sync::Notify::new(),
             shutdown_tx,
@@ -605,6 +623,18 @@ async fn submit(
     request
         .validate()
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
+    if inner.engine.is_none()
+        && request
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::PauseForHuman { .. }))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "pause_for_human is not supported in coordinator mode",
+        ));
+    }
 
     let traceparent = headers.get("traceparent").and_then(|v| v.to_str().ok());
     let trace_ctx = JobTraceContext::from_headers(traceparent);
@@ -769,6 +799,10 @@ pub(crate) struct ExecutionProgress {
     pub(crate) failure_evidence: Option<FailureEvidence>,
 }
 
+pub(crate) fn remaining_retries(requested: u32, initial_attempts: u32) -> u32 {
+    requested.saturating_sub(initial_attempts.saturating_sub(1))
+}
+
 pub(crate) async fn execute_job(
     engine: BrowserEngine,
     request: JobRequest,
@@ -784,7 +818,8 @@ pub(crate) async fn execute_job(
         JobPriority::Normal => "normal",
         JobPriority::High => "high",
     };
-    let options = request.options();
+    let mut options = request.options();
+    options.retries = remaining_retries(request.retries, initial_attempts);
     let steps = Arc::new(request.steps);
     let attempt_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -839,8 +874,13 @@ pub(crate) async fn execute_job(
 
                     // SSRF guard: a job must not reach link-local hosts (cloud metadata)
                     // through a goto, redirect or subresource. FLUXWRIGHT_SERVER_ANY_URL=1
-                    // turns it off for trusted workloads.
-                    if std::env::var_os("FLUXWRIGHT_SERVER_ANY_URL").is_none() {
+                    // (or ServerConfig::allow_any_url) turns it off for trusted workloads.
+                    let any_url = inner
+                        .as_ref()
+                        .and_then(|w| w.upgrade())
+                        .is_some_and(|inn| inn.allow_any_url())
+                        || std::env::var_os("FLUXWRIGHT_SERVER_ANY_URL").is_some();
+                    if !any_url {
                         fluxwright::netguard::guard_requests(&page).await?;
                     }
 
@@ -913,14 +953,19 @@ pub(crate) async fn execute_job(
                             }
                         }
 
-                        let outcome = if let Step::PauseForHuman { message, timeout_ms } = step {
-                            if let Some(lg) = &live_guard {
-                                lg.set_pause_reason(Some(
-                                    message
-                                        .clone()
-                                        .unwrap_or_else(|| "Paused for human action".into()),
-                                ));
-                            }
+                        let outcome = if let (
+                            Step::PauseForHuman {
+                                message,
+                                timeout_ms,
+                            },
+                            Some(lg),
+                        ) = (step, live_guard.as_ref())
+                        {
+                            lg.set_pause_reason(Some(
+                                message
+                                    .clone()
+                                    .unwrap_or_else(|| "Paused for human action".into()),
+                            ));
                             let _ = pause_tx.send(true);
                             let pause_budget = timeout_ms
                                 .map(Duration::from_millis)
@@ -931,16 +976,14 @@ pub(crate) async fn execute_job(
                                 &mut net_rx,
                                 &mut log_rx,
                                 &mut url_rx,
-                                live_guard.as_ref(),
+                                Some(lg),
                                 &mut accumulator,
                                 &mut log_closed,
                                 pause_budget,
                             )
                             .await;
                             let _ = pause_tx.send(false);
-                            if let Some(lg) = &live_guard {
-                                lg.set_pause_reason(None);
-                            }
+                            lg.set_pause_reason(None);
                             wait_res.map(|()| json!({ "resumed": true }))
                         } else {
                             let step_exec = tokio::time::timeout(
@@ -1333,11 +1376,20 @@ async fn cancel(
     Ok(Json(job_clone))
 }
 
-async fn stats(State(inner): State<Arc<Inner>>) -> Json<fluxwright::MetricsSnapshot> {
-    match &inner.engine {
-        Some(engine) => Json(engine.metrics().await),
-        None => Json(Default::default()),
+async fn stats(State(inner): State<Arc<Inner>>) -> Json<Value> {
+    let (snap, memory_ceiling_mb) = match &inner.engine {
+        Some(engine) => (engine.metrics().await, engine.config().memory_ceiling_mb),
+        None => (fluxwright::MetricsSnapshot::default(), 0),
+    };
+    let mut val = serde_json::to_value(snap).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("memory_ceiling_mb".into(), json!(memory_ceiling_mb));
+        obj.insert(
+            "memory_ceiling_bytes".into(),
+            json!(memory_ceiling_mb.saturating_mul(1024 * 1024)),
+        );
     }
+    Json(val)
 }
 
 async fn list_profiles(State(inner): State<Arc<Inner>>) -> Result<Json<Value>, ApiError> {

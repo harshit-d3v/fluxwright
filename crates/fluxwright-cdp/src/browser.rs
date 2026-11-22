@@ -1133,6 +1133,9 @@ impl CdpBrowser {
                 else {
                     return;
                 };
+                if self.external_sessions.lock().unwrap().contains(&sid) {
+                    return;
+                }
                 let (ctx, owner_page, opener_id) = self.session_owner_context(&sid).await;
                 let ctx_setup = match ctx.as_deref() {
                     Some(c) => self.setups.lock().await.get(c).cloned(),
@@ -1196,6 +1199,9 @@ impl CdpBrowser {
             // on, dismiss alert/confirm/prompt.
             "Page.javascriptDialogOpening" => {
                 if let Some(sid) = ev.session_id.clone() {
+                    if self.external_sessions.lock().unwrap().contains(&sid) {
+                        return;
+                    }
                     let (_, owner_page, opener_id) = self.session_owner_context(&sid).await;
                     let dialog_tx = {
                         let ps = self.page_setups.lock().await;
@@ -1242,6 +1248,9 @@ impl CdpBrowser {
                 ) else {
                     return;
                 };
+                if self.external_sessions.lock().unwrap().contains(&sid) {
+                    return;
+                }
                 let ctx = self.context_of_session(&sid).await;
                 let is_proxy = ev.params["authChallenge"]["source"] == "Proxy";
                 let mut response = json!({ "response": "Default" });

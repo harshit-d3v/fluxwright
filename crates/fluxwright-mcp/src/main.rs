@@ -38,11 +38,13 @@ struct Tab {
     page: PageLease,
     net_buf: Arc<std::sync::Mutex<VecDeque<NetRecord>>>,
     net_task: tokio::task::JoinHandle<()>,
+    popup_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Tab {
     fn drop(&mut self) {
         self.net_task.abort();
+        self.popup_task.abort();
     }
 }
 
@@ -52,6 +54,7 @@ struct State {
     engine: Option<BrowserEngine>,
     active: usize,
     next_tab_id: usize,
+    context_gen: u64,
 }
 
 #[derive(Clone)]
@@ -206,13 +209,14 @@ impl FluxwrightMcp {
                 engine: None,
                 active: 0,
                 next_tab_id: 1,
+                context_gen: 0,
             })),
             headless,
             tool_router: Self::tool_router(),
         }
     }
 
-    async fn ensure_context(st: &mut State, headless: bool) -> Result<(), McpError> {
+    async fn ensure_context(st: &mut State, headless: bool) -> fluxwright::Result<()> {
         if st.engine.is_none() {
             let engine = BrowserEngine::builder()
                 .max_browsers(2)
@@ -220,8 +224,7 @@ impl FluxwrightMcp {
                 .headless(headless)
                 .acquire_timeout(Duration::from_secs(60))
                 .build()
-                .await
-                .map_err(internal)?;
+                .await?;
             st.engine = Some(engine);
         }
         let ctx_closed = st.context.as_ref().is_some_and(ContextLease::is_closed);
@@ -231,17 +234,19 @@ impl FluxwrightMcp {
                 .as_ref()
                 .expect("made above")
                 .acquire_context()
-                .await
-                .map_err(internal)?;
+                .await?;
             st.context = Some(ctx);
+            st.context_gen += 1;
         }
         Ok(())
     }
 
-    async fn attach_tab(page: PageLease, id: usize) -> Result<Tab, McpError> {
-        if !any_url() {
-            netguard::guard_requests(&page).await.map_err(internal)?;
-        }
+    fn wrap_tab(
+        page: PageLease,
+        id: usize,
+        state: Arc<Mutex<State>>,
+        context_gen: u64,
+    ) -> Tab {
         let mut rx = page.subscribe_network();
         let net_buf = Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(64)));
         let buf = net_buf.clone();
@@ -250,17 +255,51 @@ impl FluxwrightMcp {
                 record_net_event(&buf, ev);
             }
         });
-        Ok(Tab {
+        let mut popup_rx = page.subscribe_popups();
+        let popup_task = tokio::spawn(async move {
+            while let Some(popup_page) = popup_rx.recv().await {
+                if !any_url() {
+                    if let Err(err) = netguard::guard_requests(&popup_page).await {
+                        tracing::warn!(%err, "failed to guard popup requests");
+                        continue;
+                    }
+                }
+                let mut st = state.lock().await;
+                if st.context_gen != context_gen || popup_page.is_closed() {
+                    continue;
+                }
+                let popup_id = st.next_tab_id;
+                st.next_tab_id += 1;
+                let popup_tab =
+                    Self::wrap_tab(popup_page, popup_id, Arc::clone(&state), context_gen);
+                st.tabs.push(popup_tab);
+            }
+        });
+        Tab {
             id,
             page,
             net_buf,
             net_task,
-        })
+            popup_task,
+        }
+    }
+
+    async fn attach_tab(
+        page: PageLease,
+        id: usize,
+        state: Arc<Mutex<State>>,
+        context_gen: u64,
+    ) -> fluxwright::Result<Tab> {
+        if !any_url() {
+            netguard::guard_requests(&page).await?;
+        }
+        Ok(Self::wrap_tab(page, id, state, context_gen))
     }
 
     /// Replaces the current context with a fresh single-tab context and returns a guard to that tab.
-    async fn open_fresh(&self) -> Result<MappedMutexGuard<'_, Tab>, McpError> {
+    async fn open_fresh(&self) -> fluxwright::Result<MappedMutexGuard<'_, Tab>> {
         let mut st = self.state.lock().await;
+        st.context_gen += 1;
         st.tabs.clear();
         st.context = None;
         st.active = 0;
@@ -270,18 +309,18 @@ impl FluxwrightMcp {
             .as_ref()
             .expect("made above")
             .new_page()
-            .await
-            .map_err(internal)?;
+            .await?;
         let id = st.next_tab_id;
         st.next_tab_id += 1;
-        let tab = Self::attach_tab(page, id).await?;
+        let ctx_gen = st.context_gen;
+        let tab = Self::attach_tab(page, id, Arc::clone(&self.state), ctx_gen).await?;
         st.tabs.push(tab);
         st.active = 0;
         Ok(MutexGuard::map(st, |s| &mut s.tabs[0]))
     }
 
     /// Returns a lock-held guard to the active tab, creating an engine/context/tab if empty.
-    async fn active_tab(&self) -> Result<MappedMutexGuard<'_, Tab>, McpError> {
+    async fn active_tab(&self) -> fluxwright::Result<MappedMutexGuard<'_, Tab>> {
         let mut st = self.state.lock().await;
         st.tabs.retain(|t| !t.page.is_closed());
         if st.tabs.is_empty() {
@@ -291,11 +330,11 @@ impl FluxwrightMcp {
                 .as_ref()
                 .expect("made above")
                 .new_page()
-                .await
-                .map_err(internal)?;
+                .await?;
             let id = st.next_tab_id;
             st.next_tab_id += 1;
-            let tab = Self::attach_tab(page, id).await?;
+            let ctx_gen = st.context_gen;
+            let tab = Self::attach_tab(page, id, Arc::clone(&self.state), ctx_gen).await?;
             st.tabs.push(tab);
             st.active = 0;
         } else if st.active >= st.tabs.len() {
@@ -360,8 +399,12 @@ fn record_net_event(buf: &Arc<std::sync::Mutex<VecDeque<NetRecord>>>, ev: NetEve
     }
 }
 
-fn internal(e: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(e.to_string(), None)
+fn tool_ok(text: impl Into<String>) -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(text)])
+}
+
+fn tool_err(e: impl std::fmt::Display) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(e.to_string())])
 }
 
 /// FLUXWRIGHT_MCP_ANY_URL lifts the URL rules below.
@@ -369,16 +412,12 @@ fn any_url() -> bool {
     std::env::var_os("FLUXWRIGHT_MCP_ANY_URL").is_some()
 }
 
-fn check_url(url: &str) -> Result<(), McpError> {
+fn check_url(url: &str) -> Result<(), String> {
     if any_url() {
         return Ok(());
     }
-    netguard::url_allowed(url).map_err(|why| {
-        McpError::invalid_params(
-            format!("{why}: {url} (FLUXWRIGHT_MCP_ANY_URL=1 allows any URL)"),
-            None,
-        )
-    })
+    netguard::url_allowed(url)
+        .map_err(|why| format!("{why}: {url} (FLUXWRIGHT_MCP_ANY_URL=1 allows any URL)"))
 }
 
 /// `text` cut to at most `max` bytes on a character boundary (a byte cut panicked inside a
@@ -518,53 +557,74 @@ impl FluxwrightMcp {
     async fn open(
         &self,
         Parameters(OpenArgs { url }): Parameters<OpenArgs>,
-    ) -> Result<String, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         if let Some(url) = &url {
-            check_url(url)?;
+            if let Err(msg) = check_url(url) {
+                return Ok(tool_err(msg));
+            }
         }
-        let tab = self.open_fresh().await?;
+        let tab = match self.open_fresh().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
         if let Some(url) = url {
-            tab.page.goto(&url).await.map_err(internal)?;
+            if let Err(e) = tab.page.goto(&url).await {
+                return Ok(tool_err(e));
+            }
             let title = tab.page.title().await.unwrap_or_default();
-            return Ok(format!("opened {url}\ntitle: {title}"));
+            return Ok(tool_ok(format!("opened {url}\ntitle: {title}")));
         }
-        Ok("Chromium page ready (about:blank)".into())
+        Ok(tool_ok("Chromium page ready (about:blank)"))
     }
 
     #[tool(description = "Navigate the active tab to a URL.")]
     async fn goto(
         &self,
         Parameters(UrlArgs { url }): Parameters<UrlArgs>,
-    ) -> Result<String, McpError> {
-        check_url(&url)?;
-        let tab = self.active_tab().await?;
-        tab.page.goto(&url).await.map_err(internal)?;
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(msg) = check_url(&url) {
+            return Ok(tool_err(msg));
+        }
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        if let Err(e) = tab.page.goto(&url).await {
+            return Ok(tool_err(e));
+        }
         let title = tab.page.title().await.unwrap_or_default();
-        Ok(format!("navigated to {url}\ntitle: {title}"))
+        Ok(tool_ok(format!("navigated to {url}\ntitle: {title}")))
     }
 
     #[tool(description = "Return the active tab's title.")]
-    async fn title(&self) -> Result<String, McpError> {
-        self.active_tab().await?.page.title().await.map_err(internal)
+    async fn title(&self) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.title().await {
+            Ok(t) => Ok(tool_ok(t)),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Return the active tab's raw HTML (truncated). Prefer snapshot() or markdown() first.")]
-    async fn content(&self) -> Result<String, McpError> {
-        let html = self
-            .active_tab()
-            .await?
-            .page
-            .content()
-            .await
-            .map_err(internal)?;
-        Ok(truncate(html, 40_000))
+    async fn content(&self) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.content().await {
+            Ok(html) => Ok(tool_ok(truncate(html, 40_000))),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Capture a compact ARIA accessibility tree with short @eN element refs for click/fill/hover/select.")]
     async fn snapshot(
         &self,
         Parameters(args): Parameters<SnapshotArgs>,
-    ) -> Result<String, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         if args.max_depth.is_some_and(|d| d == 0 || d > 64) {
             return Err(McpError::invalid_params("max_depth must be between 1 and 64", None));
         }
@@ -580,8 +640,14 @@ impl FluxwrightMcp {
         if let Some(limit) = args.max_nodes {
             opts.max_nodes = limit;
         }
-        let tab = self.active_tab().await?;
-        let snap = tab.page.aria_snapshot_with(&opts).await.map_err(internal)?;
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        let snap = match tab.page.aria_snapshot_with(&opts).await {
+            Ok(s) => s,
+            Err(e) => return Ok(tool_err(e)),
+        };
         let url = tab.page.url();
         let title = tab.page.title().await.unwrap_or_default();
         let mut out = format!(
@@ -592,87 +658,94 @@ impl FluxwrightMcp {
         if snap.truncated {
             out.push_str("\n\n[snapshot truncated: narrow with max_depth or interactive_only=true]");
         }
-        Ok(truncate(out, 40_000))
+        Ok(tool_ok(truncate(out, 40_000)))
     }
 
     #[tool(description = "Extract visible page content (or a matching selector/main landmark) as clean Markdown.")]
     async fn markdown(
         &self,
         Parameters(args): Parameters<MarkdownArgs>,
-    ) -> Result<String, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let opts = MarkdownOptions {
             selector: args.selector,
             main_content_only: args.main_content_only.unwrap_or(false),
             include_links: args.include_links.unwrap_or(true),
             include_images: args.include_images.unwrap_or(false),
         };
-        let md = self
-            .active_tab()
-            .await?
-            .page
-            .markdown_with(&opts)
-            .await
-            .map_err(internal)?;
-        Ok(truncate(md, 40_000))
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.markdown_with(&opts).await {
+            Ok(md) => Ok(tool_ok(truncate(md, 40_000))),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Click an element by @eN snapshot ref, CSS, text=, or role= selector.")]
     async fn click(
         &self,
         Parameters(SelectorArgs { selector }): Parameters<SelectorArgs>,
-    ) -> Result<String, McpError> {
-        self.active_tab()
-            .await?
-            .page
-            .click(&selector)
-            .await
-            .map_err(internal)?;
-        Ok(format!("clicked {selector}"))
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.click(&selector).await {
+            Ok(()) => Ok(tool_ok(format!("clicked {selector}"))),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Hover over an element by @eN snapshot ref, CSS, text=, or role= selector.")]
     async fn hover(
         &self,
         Parameters(SelectorArgs { selector }): Parameters<SelectorArgs>,
-    ) -> Result<String, McpError> {
-        self.active_tab()
-            .await?
-            .page
-            .hover(&selector, &HoverOptions::default())
-            .await
-            .map_err(internal)?;
-        Ok(format!("hovered {selector}"))
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.hover(&selector, &HoverOptions::default()).await {
+            Ok(()) => Ok(tool_ok(format!("hovered {selector}"))),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Fill an input/textarea by @eN snapshot ref, CSS, text=, or role= selector.")]
     async fn fill(
         &self,
         Parameters(FillArgs { selector, value }): Parameters<FillArgs>,
-    ) -> Result<String, McpError> {
-        self.active_tab()
-            .await?
-            .page
-            .fill(&selector, &value)
-            .await
-            .map_err(internal)?;
-        Ok(format!("filled {selector}"))
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.fill(&selector, &value).await {
+            Ok(()) => Ok(tool_ok(format!("filled {selector}"))),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Press a key (e.g. Enter, Tab, Escape), optionally after focusing selector.")]
     async fn press(
         &self,
         Parameters(PressArgs { key, selector }): Parameters<PressArgs>,
-    ) -> Result<String, McpError> {
-        let tab = self.active_tab().await?;
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
         if let Some(sel) = &selector {
-            tab.page.press(sel, &key, None).await.map_err(internal)?;
-            Ok(format!("pressed {key} on {sel}"))
+            match tab.page.press(sel, &key, None).await {
+                Ok(()) => Ok(tool_ok(format!("pressed {key} on {sel}"))),
+                Err(e) => Ok(tool_err(e)),
+            }
         } else {
-            tab.page
-                .keyboard_press(&key, None)
-                .await
-                .map_err(internal)?;
-            Ok(format!("pressed {key}"))
+            match tab.page.keyboard_press(&key, None).await {
+                Ok(()) => Ok(tool_ok(format!("pressed {key}"))),
+                Err(e) => Ok(tool_err(e)),
+            }
         }
     }
 
@@ -685,16 +758,16 @@ impl FluxwrightMcp {
             label,
             index,
         }): Parameters<SelectArgs>,
-    ) -> Result<String, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let entry = build_select_entry(value, label, index)?;
-        let selected = self
-            .active_tab()
-            .await?
-            .page
-            .select_option(&selector, &[entry], false)
-            .await
-            .map_err(internal)?;
-        Ok(format!("selected {selected:?} on {selector}"))
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.select_option(&selector, &[entry], false).await {
+            Ok(selected) => Ok(tool_ok(format!("selected {selected:?} on {selector}"))),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Scroll an element into view (with selector) or scroll the viewport by wheel deltas.")]
@@ -705,19 +778,23 @@ impl FluxwrightMcp {
             delta_x,
             delta_y,
         }): Parameters<ScrollArgs>,
-    ) -> Result<String, McpError> {
-        let tab = self.active_tab().await?;
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
         if let Some(sel) = &selector {
-            tab.page
-                .scroll_into_view_if_needed(sel)
-                .await
-                .map_err(internal)?;
-            Ok(format!("scrolled {sel} into view"))
+            match tab.page.scroll_into_view_if_needed(sel).await {
+                Ok(()) => Ok(tool_ok(format!("scrolled {sel} into view"))),
+                Err(e) => Ok(tool_err(e)),
+            }
         } else {
             let dx = delta_x.unwrap_or(0.0);
             let dy = delta_y.unwrap_or(500.0);
-            tab.page.mouse_wheel(dx, dy).await.map_err(internal)?;
-            Ok(format!("scrolled by ({dx}, {dy})"))
+            match tab.page.mouse_wheel(dx, dy).await {
+                Ok(()) => Ok(tool_ok(format!("scrolled by ({dx}, {dy})"))),
+                Err(e) => Ok(tool_err(e)),
+            }
         }
     }
 
@@ -730,7 +807,7 @@ impl FluxwrightMcp {
             url,
             timeout_ms,
         }): Parameters<WaitForArgs>,
-    ) -> Result<String, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         if selector.is_none() && url.is_none() {
             return Err(McpError::invalid_params(
                 "wait_for requires selector or url",
@@ -739,8 +816,11 @@ impl FluxwrightMcp {
         }
         let wait_state = parse_wait_state(state.as_deref())?;
         let timeout = timeout_ms.map(|ms| Duration::from_millis(ms.clamp(1, 120_000)));
-        let tab = self.active_tab().await?;
-        with_timeout(timeout, async {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        let res = with_timeout(timeout, async {
             if let Some(sel) = &selector {
                 tab.page.wait_for_selector_state(sel, wait_state).await?;
             }
@@ -749,30 +829,36 @@ impl FluxwrightMcp {
             }
             Ok::<_, fluxwright::Error>(())
         })
-        .await
-        .map_err(internal)?;
-        Ok("wait condition satisfied".into())
+        .await;
+        match res {
+            Ok(()) => Ok(tool_ok("wait condition satisfied")),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Navigate back in session history on the active tab.")]
-    async fn back(&self) -> Result<String, McpError> {
-        let tab = self.active_tab().await?;
-        let moved = tab.page.go_back().await.map_err(internal)?;
-        if moved {
-            Ok(format!("went back to {}", tab.page.url()))
-        } else {
-            Ok("no previous history entry".into())
+    async fn back(&self) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.go_back().await {
+            Ok(true) => Ok(tool_ok(format!("went back to {}", tab.page.url()))),
+            Ok(false) => Ok(tool_ok("no previous history entry")),
+            Err(e) => Ok(tool_err(e)),
         }
     }
 
     #[tool(description = "Navigate forward in session history on the active tab.")]
-    async fn forward(&self) -> Result<String, McpError> {
-        let tab = self.active_tab().await?;
-        let moved = tab.page.go_forward().await.map_err(internal)?;
-        if moved {
-            Ok(format!("went forward to {}", tab.page.url()))
-        } else {
-            Ok("no forward history entry".into())
+    async fn forward(&self) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.go_forward().await {
+            Ok(true) => Ok(tool_ok(format!("went forward to {}", tab.page.url()))),
+            Ok(false) => Ok(tool_ok("no forward history entry")),
+            Err(e) => Ok(tool_err(e)),
         }
     }
 
@@ -780,7 +866,7 @@ impl FluxwrightMcp {
     async fn tabs(
         &self,
         Parameters(TabsArgs { action, index, url }): Parameters<TabsArgs>,
-    ) -> Result<String, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().await;
         st.tabs.retain(|t| !t.page.is_closed());
         if st.active >= st.tabs.len() && !st.tabs.is_empty() {
@@ -789,7 +875,7 @@ impl FluxwrightMcp {
         match action.as_str() {
             "list" => {
                 if st.tabs.is_empty() {
-                    return Ok("no open tabs".into());
+                    return Ok(tool_ok("no open tabs"));
                 }
                 let mut lines = Vec::with_capacity(st.tabs.len());
                 for (i, tab) in st.tabs.iter().enumerate() {
@@ -797,55 +883,79 @@ impl FluxwrightMcp {
                     let title = tab.page.title().await.unwrap_or_default();
                     lines.push(format!("[{i}]{marker} #{} {} — {title}", tab.id, tab.page.url()));
                 }
-                Ok(lines.join("\n"))
+                Ok(tool_ok(lines.join("\n")))
             }
             "new" => {
                 if let Some(u) = &url {
-                    check_url(u)?;
+                    if let Err(msg) = check_url(u) {
+                        return Ok(tool_err(msg));
+                    }
                 }
-                Self::ensure_context(&mut st, self.headless).await?;
-                let page = st
+                if let Err(e) = Self::ensure_context(&mut st, self.headless).await {
+                    return Ok(tool_err(e));
+                }
+                let page = match st
                     .context
                     .as_ref()
                     .expect("made above")
                     .new_page()
                     .await
-                    .map_err(internal)?;
+                {
+                    Ok(p) => p,
+                    Err(e) => return Ok(tool_err(e)),
+                };
                 let id = st.next_tab_id;
                 st.next_tab_id += 1;
-                let tab = Self::attach_tab(page, id).await?;
+                let ctx_gen = st.context_gen;
+                let tab = match Self::attach_tab(page, id, Arc::clone(&self.state), ctx_gen).await {
+                    Ok(t) => t,
+                    Err(e) => return Ok(tool_err(e)),
+                };
                 if let Some(u) = &url {
-                    tab.page.goto(u).await.map_err(internal)?;
+                    if let Err(e) = tab.page.goto(u).await {
+                        return Ok(tool_err(e));
+                    }
                 }
                 st.tabs.push(tab);
                 st.active = st.tabs.len() - 1;
                 let _ = st.tabs[st.active].page.bring_to_front().await;
                 let cur = &st.tabs[st.active];
-                Ok(format!("opened tab {} #{}: {}", st.active, cur.id, cur.page.url()))
+                Ok(tool_ok(format!(
+                    "opened tab {} #{}: {}",
+                    st.active,
+                    cur.id,
+                    cur.page.url()
+                )))
             }
             "switch" => {
                 let idx = resolve_switch_index(st.tabs.len(), index)?;
                 st.active = idx;
-                st.tabs[idx].page.bring_to_front().await.map_err(internal)?;
-                Ok(format!(
+                if let Err(e) = st.tabs[idx].page.bring_to_front().await {
+                    return Ok(tool_err(e));
+                }
+                Ok(tool_ok(format!(
                     "switched to tab {idx} #{}: {}",
                     st.tabs[idx].id,
                     st.tabs[idx].page.url()
-                ))
+                )))
             }
             "close" => {
                 let (remove_idx, new_active) = resolve_close_indices(st.tabs.len(), st.active, index)?;
                 let closed = st.tabs.remove(remove_idx);
                 if st.tabs.is_empty() {
+                    st.context_gen += 1;
                     st.context = None;
                     st.active = 0;
-                    Ok(format!("closed tab {remove_idx} #{} (context now empty)", closed.id))
+                    Ok(tool_ok(format!(
+                        "closed tab {remove_idx} #{} (context now empty)",
+                        closed.id
+                    )))
                 } else {
                     st.active = new_active;
-                    Ok(format!(
+                    Ok(tool_ok(format!(
                         "closed tab {remove_idx} #{}; active tab is {new_active}",
                         closed.id
-                    ))
+                    )))
                 }
             }
             other => Err(McpError::invalid_params(
@@ -859,42 +969,48 @@ impl FluxwrightMcp {
     async fn console(
         &self,
         Parameters(ConsoleArgs { limit }): Parameters<ConsoleArgs>,
-    ) -> Result<String, McpError> {
-        let tab = self.active_tab().await?;
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
         let out = format_console(
             &tab.page.console_messages(),
             &tab.page.page_errors(),
             limit.unwrap_or(50),
         );
-        Ok(truncate(out, 20_000))
+        Ok(tool_ok(truncate(out, 20_000)))
     }
 
     #[tool(description = "Read recent network requests and response statuses/failures captured on the active tab.")]
     async fn network(
         &self,
         Parameters(NetworkArgs { limit, filter }): Parameters<NetworkArgs>,
-    ) -> Result<String, McpError> {
-        let tab = self.active_tab().await?;
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
         let out = {
             let guard = tab.net_buf.lock().unwrap();
             format_net_records(&guard, limit.unwrap_or(50), filter.as_deref())
         };
-        Ok(truncate(out, 20_000))
+        Ok(tool_ok(truncate(out, 20_000)))
     }
 
     #[tool(description = "Evaluate a JavaScript expression in the active tab and return JSON.")]
     async fn evaluate(
         &self,
         Parameters(EvalArgs { expression }): Parameters<EvalArgs>,
-    ) -> Result<String, McpError> {
-        let v = self
-            .active_tab()
-            .await?
-            .page
-            .evaluate(&expression)
-            .await
-            .map_err(internal)?;
-        Ok(v.to_string())
+    ) -> Result<CallToolResult, McpError> {
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        match tab.page.evaluate(&expression).await {
+            Ok(v) => Ok(tool_ok(v.to_string())),
+            Err(e) => Ok(tool_err(e)),
+        }
     }
 
     #[tool(description = "Take a PNG screenshot of the active tab (viewport by default, or full_page=true).")]
@@ -906,13 +1022,14 @@ impl FluxwrightMcp {
             full_page: full_page.unwrap_or(false),
             ..Default::default()
         };
-        let png = self
-            .active_tab()
-            .await?
-            .page
-            .screenshot_with(&opts)
-            .await
-            .map_err(internal)?;
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        let png = match tab.page.screenshot_with(&opts).await {
+            Ok(bytes) => bytes,
+            Err(e) => return Ok(tool_err(e)),
+        };
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
         Ok(CallToolResult::success(vec![ContentBlock::image(
             b64,
@@ -921,12 +1038,13 @@ impl FluxwrightMcp {
     }
 
     #[tool(description = "Close all tabs and destroy the current browser context.")]
-    async fn close(&self) -> Result<String, McpError> {
+    async fn close(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().await;
+        st.context_gen += 1;
         st.tabs.clear();
         st.context = None;
         st.active = 0;
-        Ok("page closed".into())
+        Ok(tool_ok("page closed"))
     }
 }
 
@@ -960,11 +1078,26 @@ async fn main() -> Result<()> {
         .is_some();
 
     tracing::info!(headless, "fluxwright MCP on stdio");
-    let service = FluxwrightMcp::new(headless)
+    let mcp = FluxwrightMcp::new(headless);
+    let state = Arc::clone(&mcp.state);
+    let service = mcp
         .serve(stdio())
         .await
         .inspect_err(|e| tracing::error!("serve: {e}"))?;
-    service.waiting().await?;
+    let wait_res = service.waiting().await;
+    let engine = {
+        let mut st = state.lock().await;
+        st.context_gen += 1;
+        st.tabs.clear();
+        st.context = None;
+        st.engine.take()
+    };
+    if let Some(engine) = engine {
+        if let Err(err) = engine.shutdown(Duration::from_secs(5)).await {
+            tracing::warn!(%err, "error shutting down browser engine");
+        }
+    }
+    wait_res?;
     Ok(())
 }
 
@@ -1211,5 +1344,16 @@ mod tests {
         assert!(serde_json::from_str::<ConsoleArgs>("{}").is_ok());
         assert!(serde_json::from_str::<NetworkArgs>("{}").is_ok());
         assert!(serde_json::from_str::<ScreenshotArgs>("{}").is_ok());
+    }
+
+    #[test]
+    fn tool_results_set_is_error_appropriately() {
+        let ok = tool_ok("ready");
+        assert_eq!(ok.is_error, Some(false));
+        assert_eq!(ok.content.len(), 1);
+
+        let err = tool_err("selector timed out");
+        assert_eq!(err.is_error, Some(true));
+        assert_eq!(err.content.len(), 1);
     }
 }

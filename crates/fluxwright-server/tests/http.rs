@@ -1526,3 +1526,400 @@ async fn persists_named_profile_across_http_jobs() {
     server.shutdown(Duration::ZERO).await.unwrap();
     let _ = std::fs::remove_dir_all(&profiles_dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cdp_gateway_security_presets_dialogs_and_window_bounds() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let img_hits = Arc::new(AtomicUsize::new(0));
+    let img_hits_route = img_hits.clone();
+    let dl_hits = Arc::new(AtomicUsize::new(0));
+    let dl_hits_route = dl_hits.clone();
+    let app = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                axum::response::Html(
+                    "<!doctype html><title>PresetTest</title><img id='pic' src='/pic.png'><a id='dl' href='/download-test' download='escape.txt'>dl</a>",
+                )
+            }),
+        )
+        .route(
+            "/pic.png",
+            axum::routing::get(move || {
+                img_hits_route.fetch_add(1, Ordering::SeqCst);
+                async { ([(axum::http::header::CONTENT_TYPE, "image/png")], vec![0u8; 4]) }
+            }),
+        )
+        .route(
+            "/download-test",
+            axum::routing::get(move || {
+                dl_hits_route.fetch_add(1, Ordering::SeqCst);
+                async {
+                    (
+                        [
+                            (
+                                axum::http::header::CONTENT_TYPE,
+                                "application/octet-stream",
+                            ),
+                            (
+                                axum::http::header::CONTENT_DISPOSITION,
+                                "attachment; filename=\"escape.txt\"",
+                            ),
+                        ],
+                        "blocked-host-write",
+                    )
+                }
+            }),
+        );
+    let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_url = format!("http://127.0.0.1:{}/", app_listener.local_addr().unwrap().port());
+    let app_task = tokio::spawn(async move { axum::serve(app_listener, app).await.unwrap() });
+
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let server = HttpServer::new(engine.clone(), ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    let mut ws = connect_cdp_ws(
+        &format!("ws://{addr}/cdp?resource_preset=scraping"),
+        Some(TOKEN),
+    )
+    .await;
+
+    // 1. Primary context: create target, verify image blocking and confirm() dialog handling.
+    let tid1 = cdp_rpc(&mut ws, 1, "Target.createTarget", json!({ "url": "about:blank" }), None)
+        .await["result"]["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sid1 = cdp_rpc(
+        &mut ws,
+        2,
+        "Target.attachToTarget",
+        json!({ "targetId": tid1, "flatten": true }),
+        None,
+    )
+    .await["result"]["sessionId"]
+    .as_str()
+    .unwrap()
+    .to_string();
+    cdp_rpc(&mut ws, 3, "Page.enable", json!({}), Some(&sid1)).await;
+
+    // 2. Security boundary checks: DOM.setFileInputFiles, downloadPath clamping/validation, file:///, cloud metadata.
+    let file_err = cdp_rpc(
+        &mut ws,
+        4,
+        "DOM.setFileInputFiles",
+        json!({ "files": ["/etc/hosts"], "nodeId": 1 }),
+        Some(&sid1),
+    )
+    .await;
+    assert_eq!(file_err["error"]["code"], -32000, "{file_err}");
+
+    let dl_bad_type = cdp_rpc(
+        &mut ws,
+        5,
+        "Browser.setDownloadBehavior",
+        json!({ "behavior": "allow", "downloadPath": 42 }),
+        None,
+    )
+    .await;
+    assert_eq!(dl_bad_type["error"]["code"], -32602, "{dl_bad_type}");
+
+    let forbidden_dl_dir = std::env::temp_dir().join(format!(
+        "fluxwright-http-forbidden-dl-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&forbidden_dl_dir).unwrap();
+    let forbidden_dl_str = forbidden_dl_dir.to_string_lossy().into_owned();
+
+    // Caller-supplied downloadPath is clamped to the lease's ephemeral dir (Playwright connectOverCDP compatible).
+    let dl_browser_ok = cdp_rpc(
+        &mut ws,
+        6,
+        "Browser.setDownloadBehavior",
+        json!({ "behavior": "allow", "downloadPath": forbidden_dl_str }),
+        None,
+    )
+    .await;
+    assert!(dl_browser_ok.get("error").is_none(), "{dl_browser_ok}");
+
+    let dl_page_ok = cdp_rpc(
+        &mut ws,
+        61,
+        "Page.setDownloadBehavior",
+        json!({ "behavior": "allow", "downloadPath": forbidden_dl_str }),
+        Some(&sid1),
+    )
+    .await;
+    assert!(dl_page_ok.get("error").is_none(), "{dl_page_ok}");
+
+    let nav_file_err = cdp_rpc(
+        &mut ws,
+        7,
+        "Page.navigate",
+        json!({ "url": "file:///etc/hosts" }),
+        Some(&sid1),
+    )
+    .await;
+    assert_eq!(nav_file_err["error"]["code"], -32000, "{nav_file_err}");
+
+    let nav_imds_err = cdp_rpc(
+        &mut ws,
+        8,
+        "Page.navigate",
+        json!({ "url": "http://169.254.169.254/latest/meta-data/" }),
+        Some(&sid1),
+    )
+    .await;
+    assert_eq!(nav_imds_err["error"]["code"], -32000, "{nav_imds_err}");
+
+    let create_file_err = cdp_rpc(
+        &mut ws,
+        9,
+        "Target.createTarget",
+        json!({ "url": "file:///etc/hosts" }),
+        None,
+    )
+    .await;
+    assert_eq!(create_file_err["error"]["code"], -32000, "{create_file_err}");
+
+    // 3. Newly allowlisted Browser methods + windowId ownership check.
+    let win_res = cdp_rpc(
+        &mut ws,
+        10,
+        "Browser.getWindowForTarget",
+        json!({ "targetId": tid1 }),
+        None,
+    )
+    .await;
+    assert!(win_res.get("error").is_none(), "{win_res}");
+    let wid = win_res["result"]["windowId"].as_i64().unwrap();
+
+    let set_bounds_ok = cdp_rpc(
+        &mut ws,
+        11,
+        "Browser.setWindowBounds",
+        json!({ "windowId": wid, "bounds": { "width": 900, "height": 700 } }),
+        None,
+    )
+    .await;
+    assert!(set_bounds_ok.get("error").is_none(), "{set_bounds_ok}");
+
+    let set_bounds_bad = cdp_rpc(
+        &mut ws,
+        12,
+        "Browser.setWindowBounds",
+        json!({ "windowId": 999_999, "bounds": { "width": 900, "height": 700 } }),
+        None,
+    )
+    .await;
+    assert_eq!(set_bounds_bad["error"]["code"], -32000, "{set_bounds_bad}");
+
+    let set_perm_ok = cdp_rpc(
+        &mut ws,
+        13,
+        "Browser.setPermission",
+        json!({ "permission": { "name": "notifications" }, "setting": "denied" }),
+        None,
+    )
+    .await;
+    assert!(set_perm_ok.get("error").is_none(), "{set_perm_ok}");
+
+    // 4. Verify resource_preset=scraping blocks images on primary context.
+    cdp_rpc(&mut ws, 14, "Page.navigate", json!({ "url": app_url }), Some(&sid1)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for seq in 15.. {
+            let res = cdp_rpc(
+                &mut ws,
+                seq,
+                "Runtime.evaluate",
+                json!({ "expression": "document.readyState === 'complete' && document.title === 'PresetTest'", "returnByValue": true }),
+                Some(&sid1),
+            )
+            .await;
+            if res["result"]["result"]["value"] == json!(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("primary page loaded");
+    assert_eq!(img_hits.load(Ordering::SeqCst), 0, "scraping preset must block image on primary context");
+
+    // 4b. Trigger a real download and verify ZERO files land in caller-supplied forbidden_dl_dir.
+    let _ = cdp_rpc(
+        &mut ws,
+        450,
+        "Runtime.evaluate",
+        json!({ "expression": "document.getElementById('dl').click()", "userGesture": true }),
+        Some(&sid1),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while dl_hits.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("download endpoint hit");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let leaked_files: Vec<_> = std::fs::read_dir(&forbidden_dl_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        leaked_files.is_empty(),
+        "caller-supplied downloadPath must never be written to: {leaked_files:?}"
+    );
+    let _ = std::fs::remove_dir_all(&forbidden_dl_dir);
+
+    // 5. Verify confirm() dialog is NOT auto-dismissed by CdpBrowser and can be accepted by client.
+    let eval_msg = json!({
+        "id": 500,
+        "sessionId": sid1,
+        "method": "Runtime.evaluate",
+        "params": { "expression": "window.confirm('allow?')", "returnByValue": true }
+    });
+    ws.send(Message::Text(eval_msg.to_string().into())).await.unwrap();
+    let confirm_result = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut handled = false;
+        while let Some(Ok(Message::Text(txt))) = ws.next().await {
+            let v: Value = serde_json::from_str(&txt).unwrap();
+            if v.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening")
+                && !handled
+            {
+                handled = true;
+                let accept_msg = json!({
+                    "id": 501,
+                    "sessionId": sid1,
+                    "method": "Page.handleJavaScriptDialog",
+                    "params": { "accept": true }
+                });
+                ws.send(Message::Text(accept_msg.to_string().into())).await.unwrap();
+            } else if v.get("id").and_then(Value::as_u64) == Some(500) {
+                return v;
+            }
+        }
+        panic!("ws closed waiting for confirm() result");
+    })
+    .await
+    .expect("dialog accept timed out");
+    assert_eq!(
+        confirm_result["result"]["result"]["value"],
+        json!(true),
+        "confirm() must return true when client accepts dialog: {confirm_result}"
+    );
+
+    // 6. Pipelined Target.createBrowserContext must strictly enforce MAX_EXTRA_CONTEXTS (4).
+    for seq in 600..606 {
+        let req = json!({
+            "id": seq,
+            "method": "Target.createBrowserContext",
+            "params": { "disposeOnDetach": true }
+        });
+        ws.send(Message::Text(req.to_string().into())).await.unwrap();
+    }
+    let mut created_contexts = Vec::new();
+    let mut rejected_contexts = 0usize;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut seen = 0usize;
+        while seen < 6 {
+            let Some(Ok(Message::Text(txt))) = ws.next().await else {
+                panic!("ws closed during pipelined createBrowserContext");
+            };
+            let v: Value = serde_json::from_str(&txt).unwrap();
+            if let Some(id) = v.get("id").and_then(Value::as_u64) {
+                if (600..606).contains(&id) {
+                    seen += 1;
+                    if let Some(cid) = v["result"]["browserContextId"].as_str() {
+                        created_contexts.push(cid.to_string());
+                    } else if v["error"]["code"] == -32000 {
+                        rejected_contexts += 1;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("pipelined createBrowserContext timed out");
+    assert_eq!(created_contexts.len(), 4, "exactly 4 extra contexts allowed");
+    assert_eq!(rejected_contexts, 2, "excess pipelined contexts must be rejected");
+
+    // 7. Child context also enforces resource_preset=scraping.
+    let child_ctx = &created_contexts[0];
+    let tid2 = cdp_rpc(
+        &mut ws,
+        700,
+        "Target.createTarget",
+        json!({ "url": "about:blank", "browserContextId": child_ctx }),
+        None,
+    )
+    .await["result"]["targetId"]
+    .as_str()
+    .unwrap()
+    .to_string();
+    let sid2 = cdp_rpc(
+        &mut ws,
+        701,
+        "Target.attachToTarget",
+        json!({ "targetId": tid2, "flatten": true }),
+        None,
+    )
+    .await["result"]["sessionId"]
+    .as_str()
+    .unwrap()
+    .to_string();
+    cdp_rpc(&mut ws, 702, "Page.navigate", json!({ "url": app_url }), Some(&sid2)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for seq in 703.. {
+            let res = cdp_rpc(
+                &mut ws,
+                seq,
+                "Runtime.evaluate",
+                json!({ "expression": "document.readyState === 'complete' && document.title === 'PresetTest'", "returnByValue": true }),
+                Some(&sid2),
+            )
+            .await;
+            if res["result"]["result"]["value"] == json!(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("child context page loaded");
+    assert_eq!(img_hits.load(Ordering::SeqCst), 0, "scraping preset must block image on child context");
+
+    drop(ws);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if engine.metrics().await.active_leases == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("lease released cleanly");
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_handle.abort();
+    app_task.abort();
+}

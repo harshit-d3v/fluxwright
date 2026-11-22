@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -149,7 +150,7 @@ impl McpClient {
         }
     }
 
-    async fn call_tool(&mut self, id: u64, name: &str, arguments: Value) -> String {
+    async fn call_tool_raw(&mut self, id: u64, name: &str, arguments: Value) -> Value {
         let resp = self
             .request(
                 id,
@@ -160,15 +161,32 @@ impl McpClient {
                 })),
             )
             .await;
-        let result = &resp["result"];
+        resp["result"].clone()
+    }
+
+    async fn call_tool(&mut self, id: u64, name: &str, arguments: Value) -> String {
+        let result = self.call_tool_raw(id, name, arguments).await;
         assert_ne!(
             result.get("isError").and_then(Value::as_bool),
             Some(true),
-            "tool {name} returned isError=true: {resp}"
+            "tool {name} returned isError=true: {result}"
         );
         result["content"][0]["text"]
             .as_str()
-            .unwrap_or_else(|| panic!("expected text content for tool {name}: {resp}"))
+            .unwrap_or_else(|| panic!("expected text content for tool {name}: {result}"))
+            .to_string()
+    }
+
+    async fn call_tool_expect_error(&mut self, id: u64, name: &str, arguments: Value) -> String {
+        let result = self.call_tool_raw(id, name, arguments).await;
+        assert_eq!(
+            result.get("isError").and_then(Value::as_bool),
+            Some(true),
+            "expected tool {name} to return isError=true, got: {result}"
+        );
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected error text content for tool {name}: {result}"))
             .to_string()
     }
 
@@ -220,8 +238,33 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
         "onclick=\"document.getElementById('status').textContent = 'Applied: ' + document.getElementById('msg').value\">",
         "Apply</button>",
         "<p id=\"status\">Pending</p>",
-        "</main></body></html>"
+        "<button id=\"hover-btn\" type=\"button\" ",
+        "onmouseenter=\"document.getElementById('hover-out').textContent = 'Hovered'\">Hover Me</button>",
+        "<span id=\"hover-out\">Idle</span>",
+        "<input id=\"key-in\" type=\"text\" ",
+        "onkeydown=\"if (event.key === 'Enter') document.getElementById('key-out').textContent = 'PressedEnter'\">",
+        "<span id=\"key-out\">None</span>",
+        "<select id=\"color\"><option value=\"red\">Red</option><option value=\"blue\">Blue</option></select>",
+        "<a id=\"popup-link\" href=\"/popup\" target=\"_blank\">Open Popup</a>",
+        "<span id=\"net-done\">loading</span>",
+        "<div style=\"height:2000px\">Spacer</div>",
+        "<div id=\"bottom\">Bottom Anchor</div>",
+        "</main>",
+        "<script>",
+        "console.log('mcp-console-hello');",
+        "fetch('/api/ping').then(r => r.json()).then(() => { document.getElementById('net-done').textContent = 'ping-ok'; });",
+        "</script>",
+        "</body></html>"
     );
+    let page2_html = concat!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<title>MCP Page Two</title></head><body><h1>Second Page</h1></body></html>"
+    );
+    let popup_html = concat!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<title>MCP Popup</title></head><body><h1>Popup Window</h1></body></html>"
+    );
+    let ping_json = r#"{"ok":true}"#;
 
     let task = tokio::spawn(async move {
         loop {
@@ -254,6 +297,21 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
                         html.len()
+                    )
+                } else if path == "/page2" {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page2_html}",
+                        page2_html.len()
+                    )
+                } else if path == "/popup" {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{popup_html}",
+                        popup_html.len()
+                    )
+                } else if path == "/api/ping" {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ping_json}",
+                        ping_json.len()
                     )
                 } else {
                     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -359,7 +417,196 @@ async fn mcp_stdio_e2e_handshake_snapshot_refs_and_markdown() {
         "expected updated DOM text in markdown:\n{md}"
     );
 
-    let closed = client.call_tool(9, "close", json!({})).await;
+    // 4. title + wait_for (network fetch completion) + console + network
+    let page_title = client.call_tool(9, "title", json!({})).await;
+    assert_eq!(page_title, "MCP Stdio E2E");
+
+    let waited = client
+        .call_tool(10, "wait_for", json!({ "selector": "text=ping-ok", "timeout_ms": 10_000 }))
+        .await;
+    assert!(waited.contains("satisfied"), "{waited}");
+
+    let console_out = client.call_tool(11, "console", json!({ "limit": 20 })).await;
+    assert!(
+        console_out.contains("mcp-console-hello"),
+        "expected console log entry:\n{console_out}"
+    );
+
+    let net_out = client
+        .call_tool(12, "network", json!({ "limit": 20, "filter": "/api/ping" }))
+        .await;
+    assert!(
+        net_out.contains("/api/ping") && net_out.contains("200"),
+        "expected /api/ping 200 in network log:\n{net_out}"
+    );
+
+    // 5. hover, press, select, scroll, evaluate
+    let _ = client.call_tool(13, "hover", json!({ "selector": "#hover-btn" })).await;
+    let _ = client
+        .call_tool(14, "press", json!({ "selector": "#key-in", "key": "Enter" }))
+        .await;
+    let _ = client
+        .call_tool(15, "select", json!({ "selector": "#color", "label": "Blue" }))
+        .await;
+    let _ = client.call_tool(16, "scroll", json!({ "delta_y": 400 })).await;
+    let mut seq = 17u64;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let wheel_y = client
+                .call_tool(seq, "evaluate", json!({ "expression": "window.scrollY > 0" }))
+                .await;
+            seq += 1;
+            if wheel_y == "true" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("expected wheel scroll to advance scrollY");
+
+    let _ = client.call_tool(seq, "scroll", json!({ "selector": "#bottom" })).await;
+    seq += 1;
+    let dom_state = client
+        .call_tool(
+            seq,
+            "evaluate",
+            json!({
+                "expression": "JSON.stringify([document.getElementById('hover-out').textContent, document.getElementById('key-out').textContent, document.getElementById('color').value, window.scrollY > 500])"
+            }),
+        )
+        .await;
+    seq += 1;
+    assert_eq!(
+        dom_state,
+        r#""[\"Hovered\",\"PressedEnter\",\"blue\",true]""#,
+        "unexpected interaction DOM state: {dom_state}"
+    );
+
+    // 6. screenshot returns valid PNG image content block
+    let shot_res = client.call_tool_raw(seq, "screenshot", json!({})).await;
+    seq += 1;
+    assert_ne!(shot_res.get("isError").and_then(Value::as_bool), Some(true), "{shot_res}");
+    assert_eq!(shot_res["content"][0]["type"], json!("image"), "{shot_res}");
+    assert_eq!(shot_res["content"][0]["mimeType"], json!("image/png"), "{shot_res}");
+    let png_b64 = shot_res["content"][0]["data"]
+        .as_str()
+        .expect("screenshot base64 data");
+    let png_bytes = base64::engine::general_purpose::STANDARD
+        .decode(png_b64)
+        .expect("valid base64 screenshot");
+    assert_eq!(&png_bytes[..8], b"\x89PNG\r\n\x1a\n");
+
+    // 7. goto /page2 -> back -> forward -> back
+    let page2_url = format!("{base_url}page2");
+    let _ = client.call_tool(seq, "goto", json!({ "url": page2_url })).await;
+    seq += 1;
+    assert_eq!(client.call_tool(seq, "title", json!({})).await, "MCP Page Two");
+    seq += 1;
+    let went_back = client.call_tool(seq, "back", json!({})).await;
+    seq += 1;
+    assert!(went_back.contains("went back"), "{went_back}");
+    assert_eq!(client.call_tool(seq, "title", json!({})).await, "MCP Stdio E2E");
+    seq += 1;
+    let went_fwd = client.call_tool(seq, "forward", json!({})).await;
+    seq += 1;
+    assert!(went_fwd.contains("went forward"), "{went_fwd}");
+    assert_eq!(client.call_tool(seq, "title", json!({})).await, "MCP Page Two");
+    seq += 1;
+    let _ = client.call_tool(seq, "back", json!({})).await;
+    seq += 1;
+
+    // 8. tabs: new -> list -> switch -> popup captured in tabs -> close
+    let opened_tab = client
+        .call_tool(seq, "tabs", json!({ "action": "new", "url": page2_url }))
+        .await;
+    seq += 1;
+    assert!(opened_tab.contains("opened tab 1"), "{opened_tab}");
+    let tab_list = client.call_tool(seq, "tabs", json!({ "action": "list" })).await;
+    seq += 1;
+    assert!(tab_list.contains("[0]") && tab_list.contains("[1]*"), "{tab_list}");
+    assert!(tab_list.contains("MCP Page Two"), "{tab_list}");
+
+    let switched = client
+        .call_tool(seq, "tabs", json!({ "action": "switch", "index": 0 }))
+        .await;
+    seq += 1;
+    assert!(switched.contains("switched to tab 0"), "{switched}");
+    assert_eq!(client.call_tool(seq, "title", json!({})).await, "MCP Stdio E2E");
+    seq += 1;
+
+    // Click target=_blank link and verify popup tab appears in tabs(action="list")
+    let _ = client.call_tool(seq, "click", json!({ "selector": "#popup-link" })).await;
+    seq += 1;
+    let popup_list = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let list = client.call_tool(seq, "tabs", json!({ "action": "list" })).await;
+            seq += 1;
+            if list.contains("/popup") && list.contains("MCP Popup") {
+                return list;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("popup tab did not appear in MCP tabs list");
+    assert!(popup_list.contains("[2]"), "{popup_list}");
+
+    let closed_popup = client
+        .call_tool(seq, "tabs", json!({ "action": "close", "index": 2 }))
+        .await;
+    seq += 1;
+    assert!(closed_popup.contains("closed tab 2"), "{closed_popup}");
+    let closed_tab1 = client
+        .call_tool(seq, "tabs", json!({ "action": "close", "index": 1 }))
+        .await;
+    seq += 1;
+    assert!(closed_tab1.contains("closed tab 1"), "{closed_tab1}");
+
+    // 9. Runtime & SSRF errors return MCP tool error (`isError: true`), not JSON-RPC -32603.
+    let ssrf_file = client
+        .call_tool_expect_error(seq, "goto", json!({ "url": "file:///etc/passwd" }))
+        .await;
+    seq += 1;
+    assert!(ssrf_file.contains("http"), "{ssrf_file}");
+
+    let ssrf_imds = client
+        .call_tool_expect_error(
+            seq,
+            "goto",
+            json!({ "url": "http://169.254.169.254/latest/meta-data/" }),
+        )
+        .await;
+    seq += 1;
+    assert!(ssrf_imds.contains("blocked"), "{ssrf_imds}");
+
+    let sel_err = client
+        .call_tool_expect_error(
+            seq,
+            "wait_for",
+            json!({ "selector": "#definitely-missing-el", "timeout_ms": 300 }),
+        )
+        .await;
+    seq += 1;
+    assert!(!sel_err.is_empty());
+
+    let bad_css_err = client
+        .call_tool_expect_error(seq, "click", json!({ "selector": ":::invalid[" }))
+        .await;
+    seq += 1;
+    assert!(!bad_css_err.is_empty());
+
+    let js_err = client
+        .call_tool_expect_error(
+            seq,
+            "evaluate",
+            json!({ "expression": "(() => { throw new Error('mcp-runtime-boom'); })()" }),
+        )
+        .await;
+    seq += 1;
+    assert!(js_err.contains("mcp-runtime-boom"), "{js_err}");
+
+    let closed = client.call_tool(seq, "close", json!({})).await;
     assert!(closed.contains("page closed"), "{closed}");
 
     client.shutdown_cleanly().await;

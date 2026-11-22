@@ -246,17 +246,44 @@ async fn main() -> Result<()> {
     }
 }
 
-fn server_config(max_jobs: usize, journal: Option<std::path::PathBuf>) -> Result<(String, ServerConfig)> {
+fn server_config_for(
+    is_worker: bool,
+    max_jobs: usize,
+    journal: Option<std::path::PathBuf>,
+) -> Result<(String, ServerConfig)> {
     anyhow::ensure!((1..=4096).contains(&max_jobs), "--max-jobs must be between 1 and 4096");
-    let token = std::env::var("FLUXWRIGHT_SERVER_TOKEN").map_err(|_| {
-        anyhow::anyhow!(
-            "set FLUXWRIGHT_SERVER_TOKEN to a random token (32-256 printable ASCII characters)"
-        )
-    })?;
-    let mut config = ServerConfig::new(token.clone())?;
+    let server_env = std::env::var("FLUXWRIGHT_SERVER_TOKEN").ok();
+    let worker_env = worker_token_from_env();
+    let (local_token, join_token) = resolve_serve_tokens(is_worker, server_env, worker_env)?;
+    let mut config = ServerConfig::new(local_token)?;
+    if is_worker {
+        // Validate the coordinator worker token upfront as well.
+        let _ = ServerConfig::new(join_token.clone())?;
+    }
     config.max_jobs = max_jobs;
     config.journal = journal;
-    Ok((token, config))
+    Ok((join_token, config))
+}
+
+fn resolve_serve_tokens(
+    is_worker: bool,
+    server_token: Option<String>,
+    worker_token: Option<String>,
+) -> Result<(String, String)> {
+    let server_token = server_token.filter(|v| !v.is_empty());
+    let worker_token = worker_token.filter(|v| !v.is_empty());
+    match (is_worker, server_token, worker_token) {
+        (true, Some(st), Some(wt)) => Ok((st, wt)),
+        (true, Some(st), None) => Ok((st.clone(), st)),
+        (true, None, Some(wt)) => Ok((wt.clone(), wt)),
+        (true, None, None) => anyhow::bail!(
+            "set FLUXWRIGHT_WORKER_TOKEN (or FLUXWRIGHT_SERVER_TOKEN) to a random token (32-256 printable ASCII characters)"
+        ),
+        (false, Some(st), _) => Ok((st.clone(), st)),
+        (false, None, _) => anyhow::bail!(
+            "set FLUXWRIGHT_SERVER_TOKEN to a random token (32-256 printable ASCII characters)"
+        ),
+    }
 }
 
 fn worker_token_from_env() -> Option<String> {
@@ -270,7 +297,7 @@ async fn coordinator_daemon(
     max_jobs: usize,
     journal: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let (_token, mut config) = server_config(max_jobs, journal)?;
+    let (_token, mut config) = server_config_for(false, max_jobs, journal)?;
     let separate_worker_auth = if let Some(wt) = worker_token_from_env() {
         config = config.with_worker_token(wt)?;
         true
@@ -310,9 +337,9 @@ async fn http_daemon(
     proxies: Vec<String>,
     adaptive_concurrency: bool,
 ) -> Result<()> {
-    let (token, mut config) = server_config(max_jobs, journal)?;
-    config.allow_query_token = allow_query_token;
     let is_worker = join.is_some();
+    let (join_token, mut config) = server_config_for(is_worker, max_jobs, journal)?;
+    config.allow_query_token = allow_query_token;
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
     let mut builder = BrowserEngine::builder();
@@ -361,7 +388,6 @@ async fn http_daemon(
                 .max_browsers
                 .saturating_mul(engine.config().max_contexts_per_browser)
                 .max(1);
-            let join_token = worker_token_from_env().unwrap_or(token);
             let handle = fluxwright_server::spawn_worker(
                 engine.clone(),
                 url.clone(),
@@ -889,6 +915,37 @@ mod tests {
         let session = tokio::spawn(async move { daemon_session(server, engine).await });
         rpc_roundtrip(client, b"{\"op\":\"Doctor\"}").await.expect("roundtrip ok");
         session.await.expect("join").expect("daemon_session ok");
+    }
+
+    #[test]
+    fn resolve_serve_tokens_allows_worker_token_only_with_join() {
+        let srv = "server_token_0123456789abcdef0123456789abcdef".to_string();
+        let wrk = "worker_token_fedcba9876543210fedcba9876543210".to_string();
+
+        // Worker with ONLY FLUXWRIGHT_WORKER_TOKEN succeeds (least-privilege isolation).
+        assert_eq!(
+            resolve_serve_tokens(true, None, Some(wrk.clone())).unwrap(),
+            (wrk.clone(), wrk.clone())
+        );
+        // Worker with both tokens keeps them separated.
+        assert_eq!(
+            resolve_serve_tokens(true, Some(srv.clone()), Some(wrk.clone())).unwrap(),
+            (srv.clone(), wrk.clone())
+        );
+        // Worker with only server token falls back to server token.
+        assert_eq!(
+            resolve_serve_tokens(true, Some(srv.clone()), None).unwrap(),
+            (srv.clone(), srv.clone())
+        );
+        // Worker with neither fails.
+        assert!(resolve_serve_tokens(true, None, None).is_err());
+
+        // Standalone serve requires FLUXWRIGHT_SERVER_TOKEN even if FLUXWRIGHT_WORKER_TOKEN is set.
+        assert!(resolve_serve_tokens(false, None, Some(wrk)).is_err());
+        assert_eq!(
+            resolve_serve_tokens(false, Some(srv.clone()), None).unwrap(),
+            (srv.clone(), srv)
+        );
     }
 
     #[cfg(unix)]

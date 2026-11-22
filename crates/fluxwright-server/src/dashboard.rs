@@ -643,9 +643,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const engineRss = fleet.engine_rss_bytes || 0;
         const treeRss = fleet.browser_tree_rss_bytes || 0;
         const totalMem = engineRss + treeRss;
+        const memCeiling = srv.memory_ceiling_bytes || ((srv.memory_ceiling_mb || 0) * 1024 * 1024);
+        const memPct = memCeiling > 0 ? Math.min(100, Math.max(0, (totalMem / memCeiling) * 100)) : 0;
+        const meterMem = document.getElementById('meter-mem');
+        if (meterMem) {
+          meterMem.style.width = memPct.toFixed(1) + '%';
+          meterMem.style.background = memPct >= 90 ? 'var(--danger)' : memPct >= 75 ? 'var(--warning)' : 'var(--primary)';
+        }
         document.getElementById('val-mem-total').textContent = formatBytes(totalMem);
         document.getElementById('val-mem-sub').textContent =
-          formatBytes(engineRss) + ' engine \u00b7 ' + formatBytes(treeRss) + ' tree';
+          formatBytes(engineRss) + ' engine \u00b7 ' + formatBytes(treeRss) + ' tree' +
+          (memCeiling > 0 ? ' / ' + formatBytes(memCeiling) : '');
 
         const totalJobs = (srv.succeeded_jobs || 0) + (srv.failed_jobs || 0) + (srv.cancelled_jobs || 0);
         document.getElementById('val-jobs-total').textContent = totalJobs;
@@ -918,6 +926,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
       let liveWs = null;
       let liveSessionState = null;
+      let liveOpenSeq = 0;
+      let mouseDragging = false;
       let frameWidth = 1280;
       let frameHeight = 800;
       let fpsWindow = [];
@@ -943,6 +953,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
 
       function closeLiveViewerState() {
+        liveOpenSeq += 1;
+        mouseDragging = false;
         if (liveWs) {
           const ws = liveWs;
           liveWs = null;
@@ -965,6 +977,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           return;
         }
         closeLiveViewerState();
+        const reqSeq = ++liveOpenSeq;
         liveTitle.textContent = 'Live Session: ' + sessionId.slice(0, 12);
         liveEmpty.textContent = 'Connecting live stream...';
         if (!liveDialog.open) liveDialog.showModal();
@@ -973,6 +986,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             method: 'POST',
             headers: { Authorization: 'Bearer ' + token },
           });
+          if (reqSeq !== liveOpenSeq || !liveDialog.open) return;
           if (res.status === 401) {
             liveDialog.close();
             askForToken();
@@ -983,10 +997,12 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             return;
           }
           const ticketInfo = await res.json();
+          if (reqSeq !== liveOpenSeq || !liveDialog.open) return;
           const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
           const ws = new WebSocket(proto + location.host + ticketInfo.ws_url);
           liveWs = ws;
           ws.addEventListener('message', function (ev) {
+            if (liveWs !== ws) return;
             let msg;
             try {
               msg = JSON.parse(ev.data);
@@ -1018,12 +1034,14 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           ws.addEventListener('close', function () {
             if (liveWs === ws) {
               liveWs = null;
+              mouseDragging = false;
               if (liveFrame.hidden) {
                 liveEmpty.hidden = false;
               }
             }
           });
         } catch (err) {
+          if (reqSeq !== liveOpenSeq || !liveDialog.open) return;
           liveEmpty.textContent = 'Failed to connect live stream.';
           liveEmpty.hidden = false;
         }
@@ -1039,9 +1057,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       function mapCoords(e) {
         const rect = liveFrame.getBoundingClientRect();
         if (!rect.width || !rect.height) return { x: 0, y: 0 };
+        const rawX = ((e.clientX - rect.left) / rect.width) * frameWidth;
+        const rawY = ((e.clientY - rect.top) / rect.height) * frameHeight;
         return {
-          x: Math.round(((e.clientX - rect.left) / rect.width) * frameWidth * 100) / 100,
-          y: Math.round(((e.clientY - rect.top) / rect.height) * frameHeight * 100) / 100,
+          x: Math.round(Math.min(frameWidth, Math.max(0, rawX)) * 100) / 100,
+          y: Math.round(Math.min(frameHeight, Math.max(0, rawY)) * 100) / 100,
         };
       }
 
@@ -1049,6 +1069,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         if (b === 0) return 'left';
         if (b === 1) return 'middle';
         if (b === 2) return 'right';
+        return 'none';
+      }
+
+      function mouseButtonFromMask(mask) {
+        if (mask & 1) return 'left';
+        if (mask & 2) return 'right';
+        if (mask & 4) return 'middle';
         return 'none';
       }
 
@@ -1063,6 +1090,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       liveFrame.addEventListener('mousedown', function (e) {
         if (!liveInteractive.checked) return;
         e.preventDefault();
+        mouseDragging = true;
         liveStage.focus();
         const pt = mapCoords(e);
         sendLive({
@@ -1071,14 +1099,20 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           x: pt.x,
           y: pt.y,
           button: mouseButton(e.button),
+          buttons: e.buttons || 0,
           clickCount: e.detail || 1,
           modifiers: modBits(e),
         });
       });
 
-      liveFrame.addEventListener('mouseup', function (e) {
-        if (!liveInteractive.checked) return;
-        e.preventDefault();
+      window.addEventListener('mouseup', function (e) {
+        if (!liveDialog.open || !liveInteractive.checked) {
+          mouseDragging = false;
+          return;
+        }
+        if (!mouseDragging && e.target !== liveFrame) return;
+        mouseDragging = false;
+        if (e.target === liveFrame) e.preventDefault();
         const pt = mapCoords(e);
         sendLive({
           type: 'mouse',
@@ -1086,23 +1120,27 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           x: pt.x,
           y: pt.y,
           button: mouseButton(e.button),
+          buttons: e.buttons || 0,
           clickCount: e.detail || 1,
           modifiers: modBits(e),
         });
       });
 
-      liveFrame.addEventListener('mousemove', function (e) {
-        if (!liveInteractive.checked) return;
+      window.addEventListener('mousemove', function (e) {
+        if (!liveDialog.open || !liveInteractive.checked) return;
+        if (!mouseDragging && e.target !== liveFrame) return;
         const now = performance.now();
         if (now - lastMoveAt < 33) return;
         lastMoveAt = now;
         const pt = mapCoords(e);
+        const mask = e.buttons || 0;
         sendLive({
           type: 'mouse',
           event: 'mouseMoved',
           x: pt.x,
           y: pt.y,
-          button: 'none',
+          button: mouseButtonFromMask(mask),
+          buttons: mask,
           modifiers: modBits(e),
         });
       });
