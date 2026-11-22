@@ -2752,6 +2752,7 @@ function applyFilter(loc, options, label) {
     'blur',
     'scrollIntoViewIfNeeded',
     'dragTo',
+    'fill',
     'press',
     'pressSequentially',
     'type',
