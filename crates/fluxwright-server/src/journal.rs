@@ -90,6 +90,20 @@ impl Journal {
     }
 }
 
+impl crate::store::JobStore for Journal {
+    fn submitted(&self, job: &crate::Job, request: &Value) {
+        Journal::submitted(self, job.id, request);
+    }
+
+    fn finished(&self, job: &crate::Job, _now_ms: u64) {
+        Journal::done(self, job.id);
+    }
+
+    fn invalid_pending(&self, id: Uuid) {
+        Journal::done(self, id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

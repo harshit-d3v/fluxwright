@@ -794,6 +794,7 @@ fn eviction_keeps_active_jobs() {
             record(JobStatus::Running),
         ]),
         workers: HashMap::new(),
+        last_leased_per_host: HashMap::new(),
         succeeded_jobs: 0,
         failed_jobs: 0,
         cancelled_jobs: 0,
@@ -1829,4 +1830,493 @@ async fn stats_and_dashboard_snapshot_expose_memory_ceiling() {
     assert_eq!(snap["server"]["memory_ceiling_bytes"], 2048u64 * 1024 * 1024);
 
     srv.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[test]
+fn job_target_host_normalizes_first_goto_url() {
+    let req_with_url = |steps: Value| -> JobRequest {
+        serde_json::from_value(json!({ "steps": steps })).unwrap()
+    };
+
+    assert_eq!(
+        job_target_host(&req_with_url(json!([
+            { "action": "add_init_script", "script": "window.x = 1" },
+            { "action": "goto", "url": "https://User:Pass@Sub.Example.COM.:8443/path?a=1#frag" },
+            { "action": "goto", "url": "https://second.example.com/" }
+        ])))
+        .as_deref(),
+        Some("sub.example.com")
+    );
+    assert_eq!(
+        job_target_host(&req_with_url(json!([
+            { "action": "goto", "url": "http://[::1]:8080/page" }
+        ])))
+        .as_deref(),
+        Some("::1")
+    );
+    assert_eq!(
+        job_target_host(&req_with_url(json!([
+            { "action": "goto", "url": "about:blank" }
+        ]))),
+        None
+    );
+    assert_eq!(
+        job_target_host(&req_with_url(json!([{ "action": "title" }]))),
+        None
+    );
+}
+
+#[tokio::test]
+async fn rejects_both_journal_and_store_on_server_start() {
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.journal = Some(std::env::temp_dir().join("conflict.jsonl"));
+    cfg.store = Some(std::env::temp_dir().join("conflict.sqlite"));
+    assert!(matches!(
+        HttpServer::coordinator(cfg),
+        Err(ConfigError::ConflictingStore)
+    ));
+}
+
+#[tokio::test]
+async fn coordinator_sqlite_store_preserves_finished_results_and_replays_unfinished_jobs() {
+    let db_path =
+        std::env::temp_dir().join(format!("fluxwright-coord-store-{}.sqlite", Uuid::new_v4()));
+    let _cleanup = || {
+        let _ = std::fs::remove_file(&db_path);
+        for suffix in ["-wal", "-shm"] {
+            let mut s = db_path.as_os_str().to_os_string();
+            s.push(suffix);
+            let _ = std::fs::remove_file(std::path::Path::new(&s));
+        }
+    };
+
+    let start_coord = |max_jobs: usize, ttl: Duration| {
+        let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+        cfg.max_jobs = max_jobs;
+        cfg.store = Some(db_path.clone());
+        cfg.result_ttl = ttl;
+        HttpServer::coordinator(cfg).unwrap()
+    };
+
+    let coord1 = start_coord(8, Duration::from_secs(3600));
+    let j_ok = submit_priority(&coord1, "normal", 0).await;
+    let j_fail = submit_priority(&coord1, "normal", 0).await;
+    let j_cancel = submit_priority(&coord1, "normal", 0).await;
+    let j_running = submit_priority(&coord1, "normal", 0).await;
+    let j_queued = submit_priority(&coord1, "normal", 0).await;
+
+    assert_eq!(
+        call(
+            &coord1,
+            "DELETE",
+            &format!("/v1/jobs/{}", j_cancel.id),
+            Body::empty()
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // Lease 3 jobs -> j_ok, j_fail, j_running.
+    let lease = body(
+        call(
+            &coord1,
+            "POST",
+            "/v1/workers/w1/lease",
+            r#"{"max_jobs":3}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(lease["jobs"].as_array().unwrap().len(), 3);
+
+    let ok_res = call(
+        &coord1,
+        "POST",
+        &format!("/v1/jobs/{}/result", j_ok.id),
+        &json!({
+            "worker": "w1",
+            "status": "succeeded",
+            "attempts": 1,
+            "step_index": 0,
+            "results": ["Recovered Title"]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(ok_res.status(), StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let fail_res = call(
+        &coord1,
+        "POST",
+        &format!("/v1/jobs/{}/result", j_fail.id),
+        &json!({
+            "worker": "w1",
+            "status": "failed",
+            "attempts": 1,
+            "step_index": 0,
+            "error": "boom-error",
+            "failure_evidence": {
+                "console": [{ "kind": "error", "text": "console-err" }],
+                "network": [],
+                "screenshot": "iVBORmock"
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(fail_res.status(), StatusCode::OK);
+
+    // Stop coord1 while j_running is still leased and j_queued is still queued.
+    coord1.shutdown(Duration::ZERO).await.unwrap();
+    drop(coord1);
+
+    // Restart with max_jobs = 5: 2 pending + all 3 finished fit.
+    let coord2 = start_coord(5, Duration::from_secs(3600));
+
+    let got_ok = body(
+        call(
+            &coord2,
+            "GET",
+            &format!("/v1/jobs/{}", j_ok.id),
+            Body::empty(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(got_ok["status"], "succeeded");
+    assert_eq!(got_ok["results"], json!(["Recovered Title"]));
+
+    let got_fail = body(
+        call(
+            &coord2,
+            "GET",
+            &format!("/v1/jobs/{}", j_fail.id),
+            Body::empty(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(got_fail["status"], "failed");
+    assert_eq!(got_fail["error"], "boom-error");
+    assert_eq!(got_fail["failure_evidence"]["screenshot"], "iVBORmock");
+
+    let got_cancel = body(
+        call(
+            &coord2,
+            "GET",
+            &format!("/v1/jobs/{}", j_cancel.id),
+            Body::empty(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(got_cancel["status"], "cancelled");
+
+    // Both unfinished jobs are queued again with no worker assigned.
+    for pending_id in [j_running.id, j_queued.id] {
+        let st = body(
+            call(
+                &coord2,
+                "GET",
+                &format!("/v1/jobs/{pending_id}"),
+                Body::empty(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st["status"], "queued");
+        assert_eq!(st["attempts"], 0);
+    }
+
+    // A worker can lease both unfinished jobs cleanly.
+    let leased2 = body(
+        call(
+            &coord2,
+            "POST",
+            "/v1/workers/w2/lease",
+            r#"{"max_jobs":5}"#,
+        )
+        .await,
+    )
+    .await;
+    let leased_ids: Vec<String> = leased2["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        leased_ids,
+        vec![j_running.id.to_string(), j_queued.id.to_string()]
+    );
+    coord2.shutdown(Duration::ZERO).await.unwrap();
+    drop(coord2);
+
+    // Restart with max_jobs = 3 -> 2 pending + 1 newest finished (j_fail).
+    let coord_bounded = start_coord(3, Duration::from_secs(3600));
+    assert_eq!(
+        call(
+            &coord_bounded,
+            "GET",
+            &format!("/v1/jobs/{}", j_fail.id),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &coord_bounded,
+            "GET",
+            &format!("/v1/jobs/{}", j_cancel.id),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    coord_bounded.shutdown(Duration::ZERO).await.unwrap();
+    drop(coord_bounded);
+
+    // Restart with TTL = 0 -> all terminal jobs purged, pending jobs preserved.
+    let coord3 = start_coord(8, Duration::ZERO);
+    for done_id in [j_ok.id, j_fail.id, j_cancel.id] {
+        assert_eq!(
+            call(
+                &coord3,
+                "GET",
+                &format!("/v1/jobs/{done_id}"),
+                Body::empty(),
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    for pending_id in [j_running.id, j_queued.id] {
+        assert_eq!(
+            call(
+                &coord3,
+                "GET",
+                &format!("/v1/jobs/{pending_id}"),
+                Body::empty(),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+    coord3.shutdown(Duration::ZERO).await.unwrap();
+    drop(coord3);
+    _cleanup();
+}
+
+async fn submit_url(server: &HttpServer, url: &str, priority: &str) -> Job {
+    let payload = json!({
+        "priority": priority,
+        "retries": 1,
+        "steps": [{ "action": "goto", "url": url }, { "action": "title" }],
+    });
+    let response = call(server, "POST", "/v1/jobs", payload.to_string()).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    serde_json::from_value(body(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn coordinator_enforces_global_per_host_concurrency_without_hol_blocking() {
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.max_jobs = 16;
+    cfg.max_concurrency_per_host = Some(1);
+    let coord = HttpServer::coordinator(cfg).unwrap();
+
+    // High-priority A1 & A2, followed by Low-priority B1.
+    let a1 = submit_url(&coord, "https://host-a.example/1", "high").await;
+    let a2 = submit_url(&coord, "https://HOST-A.example:443/2", "high").await;
+    let b1 = submit_url(&coord, "https://host-b.example/1", "low").await;
+
+    // Worker 1 asks for up to 3 jobs: gets A1 and B1 (skips A2 without HOL blocking).
+    let l1 = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w1/lease",
+            r#"{"max_jobs":3}"#,
+        )
+        .await,
+    )
+    .await;
+    let ids1: Vec<String> = l1["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids1, vec![a1.id.to_string(), b1.id.to_string()]);
+
+    // Worker 2 cannot lease A2 while A1 is still running on worker 1.
+    let l2 = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w2/lease",
+            r#"{"max_jobs":3}"#,
+        )
+        .await,
+    )
+    .await;
+    assert!(l2["jobs"].as_array().unwrap().is_empty());
+
+    // Once worker 1 finishes A1, worker 2 can immediately lease A2.
+    let res = call(
+        &coord,
+        "POST",
+        &format!("/v1/jobs/{}/result", a1.id),
+        &json!({
+            "worker": "w1",
+            "status": "succeeded",
+            "attempts": 1,
+            "step_index": 1,
+            "results": [null, "ok"]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let l3 = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w2/lease",
+            r#"{"max_jobs":1}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(l3["jobs"][0]["id"], a2.id.to_string());
+
+    // Releasing A2 drops running count so another worker can lease it right away.
+    assert_eq!(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w2/release",
+            &json!({ "jobs": [a2.id] }).to_string(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    coord.set_lease_timeout(Duration::from_millis(50));
+    let l4 = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w3/lease",
+            r#"{"max_jobs":1}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(l4["jobs"][0]["id"], a2.id.to_string());
+
+    // Lease expiration also frees the per-host slot so another worker can run A2.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let l5 = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w4/lease",
+            r#"{"max_jobs":1}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(l5["jobs"][0]["id"], a2.id.to_string());
+
+    coord.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
+async fn coordinator_enforces_global_per_host_delay_across_workers_without_hol_blocking() {
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.max_jobs = 16;
+    cfg.min_delay_per_host = Some(Duration::from_millis(120));
+    let coord = HttpServer::coordinator(cfg).unwrap();
+
+    let a1 = submit_url(&coord, "https://rate.example/1", "normal").await;
+    let a2 = submit_url(&coord, "https://rate.example/2", "normal").await;
+    let b1 = submit_url(&coord, "https://other.example/1", "normal").await;
+
+    // Even in one batch with uncapped concurrency, only A1 and B1 lease immediately; A2 waits.
+    let l1 = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w1/lease",
+            r#"{"max_jobs":3}"#,
+        )
+        .await,
+    )
+    .await;
+    let ids1: Vec<String> = l1["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids1, vec![a1.id.to_string(), b1.id.to_string()]);
+
+    // Finish A1 quickly; A2 still must wait for min_delay_per_host.
+    assert_eq!(
+        call(
+            &coord,
+            "POST",
+            &format!("/v1/jobs/{}/result", a1.id),
+            &json!({
+                "worker": "w1",
+                "status": "succeeded",
+                "attempts": 1,
+                "step_index": 1,
+                "results": [null, "ok"]
+            })
+            .to_string(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let l_early = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w2/lease",
+            r#"{"max_jobs":2}"#,
+        )
+        .await,
+    )
+    .await;
+    assert!(l_early["jobs"].as_array().unwrap().is_empty());
+
+    // After delay passes, worker 2 leases A2.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let l_after = body(
+        call(
+            &coord,
+            "POST",
+            "/v1/workers/w2/lease",
+            r#"{"max_jobs":2}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(l_after["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(l_after["jobs"][0]["id"], a2.id.to_string());
+
+    coord.shutdown(Duration::ZERO).await.unwrap();
 }

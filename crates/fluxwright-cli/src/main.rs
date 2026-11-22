@@ -48,8 +48,14 @@ enum Cmd {
         #[arg(long)]
         min_host_delay_ms: Option<NonZeroU64>,
         /// Keep accepted jobs in this file, and queue the unfinished ones again on start.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "store")]
         journal: Option<std::path::PathBuf>,
+        /// Persist accepted jobs and completed results in a SQLite database file across restarts.
+        #[arg(long, conflicts_with = "journal")]
+        store: Option<std::path::PathBuf>,
+        /// How long finished job results remain valid in the SQLite store (seconds).
+        #[arg(long, default_value_t = 3600)]
+        result_ttl_secs: u64,
         /// Pull and execute jobs from a coordinator URL (e.g. http://127.0.0.1:7331).
         #[arg(long)]
         join: Option<String>,
@@ -85,9 +91,21 @@ enum Cmd {
         /// Active and retained completed jobs combined (1-4096).
         #[arg(long, default_value = "128")]
         max_jobs: NonZeroUsize,
-        /// Keep accepted jobs in this file, and queue the unfinished ones again on start.
+        /// Concurrent running jobs that may target one host at once across all workers.
         #[arg(long)]
+        max_per_host: Option<NonZeroUsize>,
+        /// Milliseconds between leasing consecutive jobs targeting the same host across the cluster.
+        #[arg(long)]
+        min_host_delay_ms: Option<NonZeroU64>,
+        /// Keep accepted jobs in this file, and queue the unfinished ones again on start.
+        #[arg(long, conflicts_with = "store")]
         journal: Option<std::path::PathBuf>,
+        /// Persist accepted jobs and completed results in a SQLite database file across restarts.
+        #[arg(long, conflicts_with = "journal")]
+        store: Option<std::path::PathBuf>,
+        /// How long finished job results remain valid in the SQLite store (seconds).
+        #[arg(long, default_value_t = 3600)]
+        result_ttl_secs: u64,
     },
     Start {
         #[arg(long, default_value_t = 4)]
@@ -160,6 +178,8 @@ async fn main() -> Result<()> {
             max_per_host,
             min_host_delay_ms,
             journal,
+            store,
+            result_ttl_secs,
             join,
             worker_id,
             prewarm_contexts,
@@ -187,6 +207,8 @@ async fn main() -> Result<()> {
                 max_per_host,
                 min_host_delay_ms,
                 journal,
+                store,
+                result_ttl_secs,
                 join,
                 worker_id,
                 prewarm_contexts,
@@ -202,8 +224,23 @@ async fn main() -> Result<()> {
         Cmd::Coordinate {
             listen,
             max_jobs,
+            max_per_host,
+            min_host_delay_ms,
             journal,
-        } => coordinator_daemon(listen, max_jobs.get(), journal).await,
+            store,
+            result_ttl_secs,
+        } => {
+            coordinator_daemon(
+                listen,
+                max_jobs.get(),
+                max_per_host,
+                min_host_delay_ms,
+                journal,
+                store,
+                result_ttl_secs,
+            )
+            .await
+        }
         Cmd::Start {
             max_browsers,
             max_contexts,
@@ -250,8 +287,14 @@ fn server_config_for(
     is_worker: bool,
     max_jobs: usize,
     journal: Option<std::path::PathBuf>,
+    store: Option<std::path::PathBuf>,
+    result_ttl_secs: u64,
 ) -> Result<(String, ServerConfig)> {
     anyhow::ensure!((1..=4096).contains(&max_jobs), "--max-jobs must be between 1 and 4096");
+    anyhow::ensure!(
+        !(journal.is_some() && store.is_some()),
+        "cannot specify both --journal and --store"
+    );
     let server_env = std::env::var("FLUXWRIGHT_SERVER_TOKEN").ok();
     let worker_env = worker_token_from_env();
     let (local_token, join_token) = resolve_serve_tokens(is_worker, server_env, worker_env)?;
@@ -262,6 +305,8 @@ fn server_config_for(
     }
     config.max_jobs = max_jobs;
     config.journal = journal;
+    config.store = store;
+    config.result_ttl = Duration::from_secs(result_ttl_secs);
     Ok((join_token, config))
 }
 
@@ -295,9 +340,16 @@ fn worker_token_from_env() -> Option<String> {
 async fn coordinator_daemon(
     address: SocketAddr,
     max_jobs: usize,
+    max_per_host: Option<NonZeroUsize>,
+    min_host_delay_ms: Option<NonZeroU64>,
     journal: Option<std::path::PathBuf>,
+    store: Option<std::path::PathBuf>,
+    result_ttl_secs: u64,
 ) -> Result<()> {
-    let (_token, mut config) = server_config_for(false, max_jobs, journal)?;
+    let (_token, mut config) =
+        server_config_for(false, max_jobs, journal, store, result_ttl_secs)?;
+    config.max_concurrency_per_host = max_per_host.map(NonZeroUsize::get);
+    config.min_delay_per_host = min_host_delay_ms.map(|ms| Duration::from_millis(ms.get()));
     let separate_worker_auth = if let Some(wt) = worker_token_from_env() {
         config = config.with_worker_token(wt)?;
         true
@@ -327,6 +379,8 @@ async fn http_daemon(
     max_per_host: Option<NonZeroUsize>,
     min_host_delay_ms: Option<NonZeroU64>,
     journal: Option<std::path::PathBuf>,
+    store: Option<std::path::PathBuf>,
+    result_ttl_secs: u64,
     join: Option<String>,
     worker_id: Option<String>,
     prewarm_contexts: usize,
@@ -338,7 +392,8 @@ async fn http_daemon(
     adaptive_concurrency: bool,
 ) -> Result<()> {
     let is_worker = join.is_some();
-    let (join_token, mut config) = server_config_for(is_worker, max_jobs, journal)?;
+    let (join_token, mut config) =
+        server_config_for(is_worker, max_jobs, journal, store, result_ttl_secs)?;
     config.allow_query_token = allow_query_token;
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -674,6 +729,8 @@ mod tests {
                 max_per_host,
                 min_host_delay_ms,
                 journal,
+                store,
+                result_ttl_secs,
                 join,
                 worker_id,
                 prewarm_contexts,
@@ -688,6 +745,7 @@ mod tests {
                     max_per_host.is_none()
                         && min_host_delay_ms.is_none()
                         && journal.is_none()
+                        && store.is_none()
                         && join.is_none()
                         && worker_id.is_none()
                         && channel.is_none()
@@ -695,6 +753,7 @@ mod tests {
                         && profiles_dir.is_none()
                         && proxies.is_empty()
                 );
+                assert_eq!(result_ttl_secs, 3600);
                 assert!(!allow_query_token);
                 assert!(!adaptive_concurrency);
                 assert_eq!(prewarm_contexts, 0);
@@ -724,8 +783,12 @@ mod tests {
             "--proxy",
             "socks5://127.0.0.1:1080",
             "--adaptive-concurrency",
+            "--store",
+            "/tmp/fw-jobs.sqlite",
+            "--result-ttl-secs",
+            "120",
         ])
-        .expect("serve launch/prewarm flags should parse");
+        .expect("serve launch/prewarm/store flags should parse");
         match custom.cmd {
             Cmd::Serve {
                 prewarm_contexts,
@@ -735,6 +798,8 @@ mod tests {
                 profiles_dir,
                 proxies,
                 adaptive_concurrency,
+                store,
+                result_ttl_secs,
                 ..
             } => {
                 assert_eq!(prewarm_contexts, 2);
@@ -747,10 +812,64 @@ mod tests {
                     vec!["http://127.0.0.1:8080", "socks5://127.0.0.1:1080"]
                 );
                 assert!(adaptive_concurrency);
+                assert_eq!(store.as_deref(), Some(std::path::Path::new("/tmp/fw-jobs.sqlite")));
+                assert_eq!(result_ttl_secs, 120);
             }
             _ => panic!("expected Cmd::Serve"),
         }
-        assert!(Cli::try_parse_from(["fluxwright", "coordinate", "--max-jobs", "256"]).is_ok());
+        match Cli::try_parse_from([
+            "fluxwright",
+            "coordinate",
+            "--max-jobs",
+            "256",
+            "--store",
+            "/tmp/coord.sqlite",
+            "--result-ttl-secs",
+            "600",
+            "--max-per-host",
+            "2",
+            "--min-host-delay-ms",
+            "250",
+        ])
+        .expect("coordinate store and host-limit flags should parse")
+        .cmd
+        {
+            Cmd::Coordinate {
+                max_jobs,
+                max_per_host,
+                min_host_delay_ms,
+                journal,
+                store,
+                result_ttl_secs,
+                ..
+            } => {
+                assert_eq!(max_jobs.get(), 256);
+                assert_eq!(max_per_host.map(NonZeroUsize::get), Some(2));
+                assert_eq!(min_host_delay_ms.map(NonZeroU64::get), Some(250));
+                assert!(journal.is_none());
+                assert_eq!(store.as_deref(), Some(std::path::Path::new("/tmp/coord.sqlite")));
+                assert_eq!(result_ttl_secs, 600);
+            }
+            _ => panic!("expected Cmd::Coordinate"),
+        }
+        assert!(Cli::try_parse_from([
+            "fluxwright",
+            "serve",
+            "--journal",
+            "a.jsonl",
+            "--store",
+            "b.sqlite",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "fluxwright",
+            "coordinate",
+            "--journal",
+            "a.jsonl",
+            "--store",
+            "b.sqlite",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from([
             "fluxwright",
             "serve",

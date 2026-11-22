@@ -1923,3 +1923,91 @@ async fn cdp_gateway_security_presets_dialogs_and_window_bounds() {
     srv_handle.abort();
     app_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_sqlite_store_preserves_completed_and_failed_evidence_across_restart() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let db_path =
+        std::env::temp_dir().join(format!("fluxwright-http-store-{}.sqlite", uuid::Uuid::new_v4()));
+
+    let build_server = || async {
+        let engine = BrowserEngine::builder()
+            .max_browsers(1)
+            .max_contexts_per_browser(1)
+            .memory_ceiling_mb(16_384)
+            .acquire_timeout(Duration::from_secs(60))
+            .build()
+            .await
+            .unwrap();
+        let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+        cfg.store = Some(db_path.clone());
+        cfg.result_ttl = Duration::from_secs(3600);
+        HttpServer::new(engine, cfg).unwrap()
+    };
+
+    let srv1 = build_server().await;
+    let ok_sub = submit(
+        &srv1,
+        json!({ "steps": [
+            { "action": "goto", "url": format!("{}/forms", fixture.base_url) },
+            { "action": "title" }
+        ] }),
+    )
+    .await;
+    let fail_sub = submit(
+        &srv1,
+        json!({ "steps": [
+            { "action": "goto", "url": format!("{}/forms", fixture.base_url) },
+            { "action": "evaluate", "expression": "(() => { console.error('persist-err'); throw new Error('store-fail'); })()" }
+        ] }),
+    )
+    .await;
+
+    let ok_done = finish(&srv1, ok_sub).await;
+    assert_eq!(ok_done.status, JobStatus::Succeeded, "{:?}", ok_done.error);
+    let fail_done = finish(&srv1, fail_sub).await;
+    assert_eq!(fail_done.status, JobStatus::Failed);
+
+    srv1.shutdown(Duration::from_secs(5)).await.unwrap();
+    drop(srv1);
+
+    let srv2 = build_server().await;
+    let (ok_status, ok_body) =
+        request(&srv2, "GET", &format!("/v1/jobs/{}", ok_done.id), Value::Null).await;
+    assert_eq!(ok_status, StatusCode::OK);
+    let restored_ok: Job = serde_json::from_value(ok_body).unwrap();
+    assert_eq!(restored_ok.status, JobStatus::Succeeded);
+    assert_eq!(restored_ok.results.unwrap()[1], "forms");
+
+    let (fail_status, fail_body) = request(
+        &srv2,
+        "GET",
+        &format!("/v1/jobs/{}", fail_done.id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(fail_status, StatusCode::OK);
+    let restored_fail: Job = serde_json::from_value(fail_body).unwrap();
+    assert_eq!(restored_fail.status, JobStatus::Failed);
+    assert!(restored_fail
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("store-fail"));
+    let ev = restored_fail
+        .evidence()
+        .expect("failure evidence should survive restart");
+    assert!(ev
+        .screenshot
+        .as_deref()
+        .is_some_and(|s| s.starts_with("iVBOR")));
+
+    srv2.shutdown(Duration::from_secs(5)).await.unwrap();
+    fixture.abort();
+    let _ = std::fs::remove_file(&db_path);
+    for suffix in ["-wal", "-shm"] {
+        let mut s = db_path.as_os_str().to_os_string();
+        s.push(suffix);
+        let _ = std::fs::remove_file(std::path::Path::new(&s));
+    }
+}

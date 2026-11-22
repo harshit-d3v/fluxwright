@@ -644,3 +644,583 @@ async fn cluster_coordinator_and_workers_e2e() {
         "expected worker-b to complete the requeued failover job: {after_failover}"
     );
 }
+
+async fn wait_for_healthz(addr: SocketAddr, procs: &ManagedProcs) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok((200, _)) = http_request(addr, "GET", "/healthz", None, None).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("coordinator did not become healthy\nlogs:\n{}", procs.dump_logs()));
+}
+
+async fn wait_for_workers_online(addr: SocketAddr, names: &[&str], procs: &ManagedProcs) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, body) =
+                http_json(addr, "GET", "/v1/workers", Some(SERVER_TOKEN), None).await;
+            assert_eq!(status, 200, "{body}");
+            let all_online = names.iter().all(|name| {
+                body["workers"].as_array().is_some_and(|list| {
+                    list.iter()
+                        .any(|w| w["worker"] == *name && w["status"] == "online")
+                })
+            });
+            if all_online {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "workers {names:?} did not register online\nlogs:\n{}",
+            procs.dump_logs()
+        )
+    });
+}
+
+async fn wait_for_terminal_job(addr: SocketAddr, job_id: &str, procs: &ManagedProcs) -> Value {
+    let path = format!("/v1/jobs/{job_id}");
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let (status, job) = http_json(addr, "GET", &path, Some(SERVER_TOKEN), None).await;
+            assert_eq!(status, 200, "unexpected GET {path} status: {job}");
+            if matches!(
+                job["status"].as_str(),
+                Some("succeeded") | Some("failed") | Some("cancelled")
+            ) {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for job {job_id}\nlogs:\n{}", procs.dump_logs()))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_sqlite_store_preserves_finished_and_replays_queued_across_restart() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_addr = listener.local_addr().unwrap();
+    let fixture_base = format!("http://{fixture_addr}");
+
+    let hold_started = Arc::new(Notify::new());
+    let (hold_release_tx, hold_release_rx) = tokio::sync::watch::channel(false);
+    let hold_started_srv = hold_started.clone();
+
+    let fixture_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let hold_started = hold_started_srv.clone();
+            let mut release_rx = hold_release_rx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut filled = 0usize;
+                loop {
+                    match stream.read(&mut buf[filled..]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            filled += n;
+                            if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n")
+                                || filled == buf.len()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let req_text = std::str::from_utf8(&buf[..filled]).unwrap_or("");
+                let path = req_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path == "/hold" {
+                    if !*release_rx.borrow() {
+                        hold_started.notify_one();
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            release_rx.wait_for(|v| *v),
+                        )
+                        .await;
+                    }
+                    "<!doctype html><title>Hold Released OK</title><h1>Hold Done</h1>"
+                } else {
+                    "<!doctype html><title>Store E2E Page</title><h1>Store Worker OK</h1>"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    let _fixture_guard = AbortOnDrop(fixture_task);
+
+    let tmp = TempDirGuard::new("fluxwright-cluster-sqlite-e2e");
+    let store_path = tmp.0.join("coord.sqlite");
+    let store_str = store_path.to_str().expect("UTF-8 temp path").to_string();
+
+    let port1 = free_port();
+    let coord1_addr: SocketAddr = format!("127.0.0.1:{port1}").parse().unwrap();
+    let coord1_listen = coord1_addr.to_string();
+    let coord1_url = format!("http://{coord1_listen}");
+
+    let mut procs = ManagedProcs::new();
+    procs.spawn(
+        "coordinator-1",
+        &[
+            "coordinate",
+            "--listen",
+            &coord1_listen,
+            "--store",
+            &store_str,
+        ],
+    );
+    wait_for_healthz(coord1_addr, &procs).await;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&store_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "SQLite store must be owner-only 0o600");
+    }
+
+    procs.spawn_worker_only_token(
+        "worker-a",
+        &[
+            "serve",
+            "--join",
+            &coord1_url,
+            "--worker-id",
+            "worker-a",
+            "--max-browsers",
+            "1",
+            "--max-contexts",
+            "1",
+        ],
+    );
+    wait_for_workers_online(coord1_addr, &["worker-a"], &procs).await;
+
+    // 1. Succeeded job persisted in SQLite.
+    let (s1, b1) = http_json(
+        coord1_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": format!("{fixture_base}/") },
+                { "action": "title" },
+                { "action": "text_content", "selector": "h1" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s1, 202, "{b1}");
+    let job1_id = b1["id"].as_str().unwrap().to_string();
+    let done1 = wait_for_job(coord1_addr, &job1_id, &procs).await;
+    assert_eq!(done1["results"][1], json!("Store E2E Page"));
+    assert_eq!(done1["results"][2], json!("Store Worker OK"));
+
+    // 2. Failed job with failure_evidence persisted in SQLite.
+    let (s2, b2) = http_json(
+        coord1_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": format!("{fixture_base}/") },
+                { "action": "evaluate", "expression": "(() => { console.error('e2e-store-err'); throw new Error('e2e-store-fail'); })()" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s2, 202, "{b2}");
+    let job2_id = b2["id"].as_str().unwrap().to_string();
+    let done2 = wait_for_terminal_job(coord1_addr, &job2_id, &procs).await;
+    assert_eq!(done2["status"], json!("failed"), "{done2}");
+
+    // 3. Running job (held on /hold) + 4. Queued job (waiting behind worker-a's 1 slot).
+    let (s3, b3) = http_json(
+        coord1_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": format!("{fixture_base}/hold") },
+                { "action": "title" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s3, 202, "{b3}");
+    let job3_id = b3["id"].as_str().unwrap().to_string();
+
+    tokio::time::timeout(Duration::from_secs(30), hold_started.notified())
+        .await
+        .unwrap_or_else(|_| panic!("worker-a did not start /hold\nlogs:\n{}", procs.dump_logs()));
+
+    let (s4, b4) = http_json(
+        coord1_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": format!("{fixture_base}/") },
+                { "action": "title" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(s4, 202, "{b4}");
+    let job4_id = b4["id"].as_str().unwrap().to_string();
+
+    // Kill coordinator-1 and worker-a mid-flight, then allow /hold to return fast on replay.
+    procs.kill_and_wait("coordinator-1").await;
+    procs.kill_and_wait("worker-a").await;
+    let _ = hold_release_tx.send(true);
+
+    // Restart coordinator-2 with the same --store SQLite DB.
+    let port2 = free_port();
+    let coord2_addr: SocketAddr = format!("127.0.0.1:{port2}").parse().unwrap();
+    let coord2_listen = coord2_addr.to_string();
+    let coord2_url = format!("http://{coord2_listen}");
+    procs.spawn(
+        "coordinator-2",
+        &[
+            "coordinate",
+            "--listen",
+            &coord2_listen,
+            "--store",
+            &store_str,
+        ],
+    );
+    wait_for_healthz(coord2_addr, &procs).await;
+
+    // Before starting any worker, completed/failed jobs are already pollable and pending jobs are Queued.
+    let (g1, r1) = http_json(
+        coord2_addr,
+        "GET",
+        &format!("/v1/jobs/{job1_id}"),
+        Some(SERVER_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(g1, 200, "{r1}");
+    assert_eq!(r1["status"], json!("succeeded"));
+    assert_eq!(r1["results"][1], json!("Store E2E Page"));
+    assert_eq!(r1["results"][2], json!("Store Worker OK"));
+
+    let (g2, r2) = http_json(
+        coord2_addr,
+        "GET",
+        &format!("/v1/jobs/{job2_id}"),
+        Some(SERVER_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(g2, 200, "{r2}");
+    assert_eq!(r2["status"], json!("failed"));
+    assert!(r2["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("e2e-store-fail"));
+    assert!(
+        r2["failure_evidence"]["screenshot"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("iVBOR")),
+        "expected failure screenshot to survive restart: {r2}"
+    );
+
+    for pending_id in [&job3_id, &job4_id] {
+        let (gp, rp) = http_json(
+            coord2_addr,
+            "GET",
+            &format!("/v1/jobs/{pending_id}"),
+            Some(SERVER_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(gp, 200, "{rp}");
+        assert_eq!(rp["status"], json!("queued"), "{rp}");
+    }
+
+    // Start worker-b and verify both replayed jobs complete.
+    procs.spawn_worker_only_token(
+        "worker-b",
+        &[
+            "serve",
+            "--join",
+            &coord2_url,
+            "--worker-id",
+            "worker-b",
+            "--max-browsers",
+            "1",
+            "--max-contexts",
+            "2",
+        ],
+    );
+    wait_for_workers_online(coord2_addr, &["worker-b"], &procs).await;
+
+    let done3 = wait_for_job(coord2_addr, &job3_id, &procs).await;
+    assert_eq!(done3["results"][1], json!("Hold Released OK"));
+    let done4 = wait_for_job(coord2_addr, &job4_id, &procs).await;
+    assert_eq!(done4["results"][1], json!("Store E2E Page"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_coordinator_max_per_host_limits_concurrent_host_a_and_runs_host_b_immediately() {
+    // Host A (127.0.0.1:<portA>): holds /slow until released and tracks peak concurrent requests.
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    let active_a = Arc::new(AtomicUsize::new(0));
+    let max_concurrent_a = Arc::new(AtomicUsize::new(0));
+    let hits_a = Arc::new(AtomicUsize::new(0));
+    let first_a_entered = Arc::new(Notify::new());
+    let (release_a_tx, release_a_rx) = tokio::sync::watch::channel(false);
+
+    let active_a_srv = active_a.clone();
+    let max_a_srv = max_concurrent_a.clone();
+    let hits_a_srv = hits_a.clone();
+    let entered_srv = first_a_entered.clone();
+    let task_a = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener_a.accept().await else {
+                break;
+            };
+            let active = active_a_srv.clone();
+            let max_c = max_a_srv.clone();
+            let hits = hits_a_srv.clone();
+            let entered = entered_srv.clone();
+            let mut release_rx = release_a_rx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut filled = 0usize;
+                loop {
+                    match stream.read(&mut buf[filled..]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            filled += n;
+                            if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n")
+                                || filled == buf.len()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_c.fetch_max(cur, Ordering::SeqCst);
+                if hit == 1 {
+                    entered.notify_one();
+                }
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    release_rx.wait_for(|v| *v),
+                )
+                .await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                let body = "<!doctype html><title>Host A OK</title><h1>Host A</h1>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    let _guard_a = AbortOnDrop(task_a);
+
+    // Host B (localhost:<portB>): distinct normalized hostname ("localhost" vs "127.0.0.1").
+    // Bind 127.0.0.1 and best-effort [::1] on the same port so `localhost` connects immediately on all OSes.
+    let listener_b4 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_b = listener_b4.local_addr().unwrap().port();
+    let listener_b6 = TcpListener::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port_b)))
+        .await
+        .ok();
+    let hits_b = Arc::new(AtomicUsize::new(0));
+
+    let serve_b = |listener: TcpListener, hits: Arc<AtomicUsize>| {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut filled = 0usize;
+                    loop {
+                        match stream.read(&mut buf[filled..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                filled += n;
+                                if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n")
+                                    || filled == buf.len()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let body = "<!doctype html><title>Host B OK</title><h1>Host B</h1>";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        })
+    };
+    let _guard_b4 = AbortOnDrop(serve_b(listener_b4, hits_b.clone()));
+    let _guard_b6 = listener_b6.map(|l| AbortOnDrop(serve_b(l, hits_b.clone())));
+
+    let coord_port = free_port();
+    let coord_addr: SocketAddr = format!("127.0.0.1:{coord_port}").parse().unwrap();
+    let coord_listen = coord_addr.to_string();
+    let coord_url = format!("http://{coord_listen}");
+
+    let mut procs = ManagedProcs::new();
+    procs.spawn(
+        "coordinator",
+        &[
+            "coordinate",
+            "--listen",
+            &coord_listen,
+            "--max-per-host",
+            "1",
+        ],
+    );
+    wait_for_healthz(coord_addr, &procs).await;
+
+    for wid in ["worker-1", "worker-2"] {
+        procs.spawn_worker_only_token(
+            wid,
+            &[
+                "serve",
+                "--join",
+                &coord_url,
+                "--worker-id",
+                wid,
+                "--max-browsers",
+                "1",
+                "--max-contexts",
+                "1",
+            ],
+        );
+    }
+    wait_for_workers_online(coord_addr, &["worker-1", "worker-2"], &procs).await;
+
+    // Submit Job A1 on Host A (holds on /slow).
+    let (sa1, ba1) = http_json(
+        coord_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": format!("http://127.0.0.1:{port_a}/slow") },
+                { "action": "title" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(sa1, 202, "{ba1}");
+    let job_a1_id = ba1["id"].as_str().unwrap().to_string();
+
+    tokio::time::timeout(Duration::from_secs(30), first_a_entered.notified())
+        .await
+        .unwrap_or_else(|_| panic!("job A1 did not enter Host A\nlogs:\n{}", procs.dump_logs()));
+
+    // Queue Job A2 (same host as A1) BEFORE Job B1 (different host).
+    let (sa2, ba2) = http_json(
+        coord_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": format!("http://127.0.0.1:{port_a}/slow") },
+                { "action": "title" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(sa2, 202, "{ba2}");
+    let job_a2_id = ba2["id"].as_str().unwrap().to_string();
+
+    let (sb1, bb1) = http_json(
+        coord_addr,
+        "POST",
+        "/v1/jobs",
+        Some(SERVER_TOKEN),
+        Some(&json!({
+            "steps": [
+                { "action": "goto", "url": format!("http://localhost:{port_b}/fast") },
+                { "action": "title" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(sb1, 202, "{bb1}");
+    let job_b1_id = bb1["id"].as_str().unwrap().to_string();
+
+    // Job B1 must finish immediately on the second worker while A1 is still held and A2 waits.
+    let done_b1 = wait_for_job(coord_addr, &job_b1_id, &procs).await;
+    assert_eq!(done_b1["results"][1], json!("Host B OK"));
+
+    // Wait >3 worker poll cycles while A1 is still held; A2 must remain queued and Host A hit once.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert_eq!(
+        hits_a.load(Ordering::SeqCst),
+        1,
+        "Host A must not receive a second concurrent request while Job A1 is active"
+    );
+    let (ga2, state_a2) = http_json(
+        coord_addr,
+        "GET",
+        &format!("/v1/jobs/{job_a2_id}"),
+        Some(SERVER_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(ga2, 200);
+    assert_eq!(
+        state_a2["status"],
+        json!("queued"),
+        "Job A2 must stay queued while Host A is at --max-per-host 1: {state_a2}"
+    );
+
+    // Release Host A gate so A1 finishes and A2 can run next.
+    let _ = release_a_tx.send(true);
+    let done_a1 = wait_for_job(coord_addr, &job_a1_id, &procs).await;
+    let done_a2 = wait_for_job(coord_addr, &job_a2_id, &procs).await;
+    assert_eq!(done_a1["results"][1], json!("Host A OK"));
+    assert_eq!(done_a2["results"][1], json!("Host A OK"));
+    assert_eq!(
+        max_concurrent_a.load(Ordering::SeqCst),
+        1,
+        "peak concurrency on Host A must never exceed 1"
+    );
+    assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+    assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+}

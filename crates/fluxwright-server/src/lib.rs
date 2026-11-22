@@ -10,6 +10,7 @@ mod job;
 mod journal;
 mod live;
 pub mod prometheus;
+mod store;
 pub mod telemetry;
 
 #[cfg(test)]
@@ -34,7 +35,9 @@ use tokio::task::AbortHandle;
 use tracing::Instrument;
 use uuid::Uuid;
 
-pub use cluster::{spawn_worker, WorkerHandle, WorkerInfo, WorkerStatus, WorkersSummary};
+pub use cluster::{
+    job_target_host, spawn_worker, WorkerHandle, WorkerInfo, WorkerStatus, WorkersSummary,
+};
 pub use dashboard::dashboard_html;
 pub use job::{
     ConsoleEntry, FailureEvidence, Job, JobPriority, JobRequest, JobStatus, NavigationWait,
@@ -59,8 +62,17 @@ pub struct ServerConfig {
     pub max_jobs: usize,
     /// A file that keeps accepted jobs across restarts: jobs that had not ended when the server
     /// stopped are queued again, under their old ids, when it starts. A job that was running
-    /// runs again from its first step.
+    /// runs again from its first step. Cannot be combined with `store`.
     pub journal: Option<std::path::PathBuf>,
+    /// A SQLite database file (`--store`) that persists accepted jobs and completed results
+    /// across restarts. Cannot be combined with `journal`.
+    pub store: Option<std::path::PathBuf>,
+    /// How long finished job snapshots remain valid in `store` before being purged (default 3600s).
+    pub result_ttl: Duration,
+    /// Coordinator-wide maximum concurrent running jobs targeting the same host across all workers.
+    pub max_concurrency_per_host: Option<usize>,
+    /// Coordinator-wide minimum delay between leasing consecutive jobs targeting the same host.
+    pub min_delay_per_host: Option<Duration>,
     /// Allow `?token=<token>` authentication on `/cdp` and `/json/version` for CDP clients that
     /// cannot send custom WebSocket headers. Disabled by default.
     pub allow_query_token: bool,
@@ -70,6 +82,7 @@ pub struct ServerConfig {
 }
 
 const DEFAULT_LEASE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_RESULT_TTL_SECS: u64 = 3_600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -79,6 +92,10 @@ pub enum ConfigError {
     InvalidCapacity,
     #[error("the job journal could not be opened: {0}")]
     Journal(std::io::Error),
+    #[error("the job store could not be opened: {0}")]
+    Store(String),
+    #[error("cannot specify both journal and store")]
+    ConflictingStore,
     #[error("invalid coordinator configuration: {0}")]
     InvalidCoordinator(String),
 }
@@ -98,6 +115,10 @@ impl ServerConfig {
             worker_token: None,
             max_jobs: 128,
             journal: None,
+            store: None,
+            result_ttl: Duration::from_secs(DEFAULT_RESULT_TTL_SECS),
+            max_concurrency_per_host: None,
+            min_delay_per_host: None,
             allow_query_token: false,
             allow_any_url: false,
         })
@@ -122,6 +143,8 @@ pub(crate) struct Inner {
     token: Vec<u8>,
     worker_token: Option<Vec<u8>>,
     max_jobs: usize,
+    max_concurrency_per_host: Option<usize>,
+    min_delay_per_host_ms: Option<u64>,
     allow_query_token: bool,
     allow_any_url: bool,
     lease_ms: AtomicU64,
@@ -131,13 +154,14 @@ pub(crate) struct Inner {
     total_cdp_sessions: AtomicU64,
     live: live::LiveRegistry,
     registry: Mutex<Registry>,
-    journal: Option<journal::Journal>,
+    store: Option<Box<dyn store::JobStore>>,
 }
 
 struct Registry {
     accepting: bool,
     jobs: VecDeque<Record>,
     workers: HashMap<String, cluster::WorkerRecord>,
+    last_leased_per_host: HashMap<String, u64>,
     succeeded_jobs: u64,
     failed_jobs: u64,
     cancelled_jobs: u64,
@@ -182,7 +206,7 @@ impl Inner {
     }
 
     /// Expires overdue worker leases under the registry lock, runs `f`, and flushes newly
-    /// terminal job IDs to the journal once the lock is dropped.
+    /// terminal job snapshots to the durable store once the lock is dropped.
     pub(crate) fn with_registry<T>(&self, f: impl FnOnce(&mut Registry, u64) -> T) -> T {
         let now = now_ms();
         let (out, expired) = {
@@ -190,8 +214,8 @@ impl Inner {
             let expired = cluster::expire_leases(&mut registry, now);
             (f(&mut registry, now), expired)
         };
-        for id in expired {
-            self.journal_done(id);
+        for job in expired {
+            self.store_finished(&job);
         }
         out
     }
@@ -306,9 +330,21 @@ impl Inner {
 }
 
 impl Inner {
-    fn journal_done(&self, id: Uuid) {
-        if let Some(journal) = &self.journal {
-            journal.done(id);
+    fn store_submitted(&self, job: &Job, request: &Value) {
+        if let Some(store) = &self.store {
+            store.submitted(job, request);
+        }
+    }
+
+    fn store_finished(&self, job: &Job) {
+        if let Some(store) = &self.store {
+            store.finished(job, now_ms());
+        }
+    }
+
+    fn store_invalid_pending(&self, id: Uuid) {
+        if let Some(store) = &self.store {
+            store.invalid_pending(id);
         }
     }
 }
@@ -348,19 +384,25 @@ impl HttpServer {
         if !(1..=4096).contains(&config.max_jobs) {
             return Err(ConfigError::InvalidCapacity);
         }
-        let (journal, unfinished) = match &config.journal {
-            Some(path) => {
-                let (journal, jobs) = journal::Journal::open(path).map_err(ConfigError::Journal)?;
-                (Some(journal), jobs)
-            }
-            None => (None, Vec::new()),
+        let now = now_ms();
+        let (store, loaded) = match store::open_job_store(&config, now)? {
+            Some((store, loaded)) => (Some(store), Some(loaded)),
+            None => (None, None),
         };
+        let max_concurrency_per_host = config.max_concurrency_per_host.filter(|n| *n > 0);
+        let min_delay_per_host_ms = config
+            .min_delay_per_host
+            .filter(|d| !d.is_zero())
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+            .filter(|ms| *ms > 0);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let inner = Arc::new(Inner {
             engine,
             token: config.token.into_bytes(),
             worker_token: config.worker_token.map(String::into_bytes),
             max_jobs: config.max_jobs,
+            max_concurrency_per_host,
+            min_delay_per_host_ms,
             allow_query_token: config.allow_query_token,
             allow_any_url: config.allow_any_url,
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
@@ -373,32 +415,100 @@ impl HttpServer {
                 accepting: true,
                 jobs: VecDeque::new(),
                 workers: HashMap::new(),
+                last_leased_per_host: HashMap::new(),
                 succeeded_jobs: 0,
                 failed_jobs: 0,
                 cancelled_jobs: 0,
                 expired_leases: 0,
             }),
-            journal,
+            store,
         });
-        // All of them, even past max_jobs: they were accepted once, and new work waits for room.
-        let mut registry = inner.registry.lock().unwrap();
-        for (id, request) in unfinished {
-            match serde_json::from_value::<JobRequest>(request) {
-                Ok(request) if request.validate().is_ok() => {
-                    tracing::info!(job_id = %id, "queued again from the journal");
-                    enqueue(
-                        &inner,
-                        &mut registry,
-                        id,
-                        request,
-                        JobTraceContext::from_headers(None),
-                    );
+
+        if let Some(loaded) = loaded {
+            let mut valid_pending = Vec::new();
+            let mut invalid_ids = Vec::new();
+            for item in loaded.pending {
+                match serde_json::from_value::<JobRequest>(item.request) {
+                    Ok(request)
+                        if request.validate().is_ok()
+                            && (inner.engine.is_some()
+                                || !request
+                                    .steps
+                                    .iter()
+                                    .any(|s| matches!(s, Step::PauseForHuman { .. }))) =>
+                    {
+                        let mut trace_ctx = JobTraceContext::new();
+                        if let Some(tid) = item.job.as_ref().and_then(|j| j.trace_id.clone()) {
+                            trace_ctx.trace_id = tid;
+                        }
+                        let job = match item.job {
+                            Some(mut j) => {
+                                j.id = item.id;
+                                j.status = JobStatus::Queued;
+                                j.started_at = None;
+                                j.finished_at = None;
+                                j.attempts = 0;
+                                j.step_index = None;
+                                j.results = None;
+                                j.error = None;
+                                j.failure_evidence = None;
+                                if j.trace_id.is_none() {
+                                    j.trace_id = Some(trace_ctx.trace_id.clone());
+                                }
+                                j
+                            }
+                            None => Job {
+                                id: item.id,
+                                status: JobStatus::Queued,
+                                submitted_at: now,
+                                started_at: None,
+                                finished_at: None,
+                                attempts: 0,
+                                step_index: None,
+                                results: None,
+                                error: None,
+                                trace_id: Some(trace_ctx.trace_id.clone()),
+                                failure_evidence: None,
+                            },
+                        };
+                        valid_pending.push((job, request, trace_ctx));
+                    }
+                    // Written by a version with other rules: it cannot run, so it is over.
+                    _ => invalid_ids.push(item.id),
                 }
-                // Written by a version with other rules: it cannot run, so it is over.
-                _ => inner.journal_done(id),
             }
+            for id in invalid_ids {
+                inner.store_invalid_pending(id);
+            }
+
+            let finished_room = config.max_jobs.saturating_sub(valid_pending.len());
+            let mut kept_finished: Vec<_> =
+                loaded.finished.into_iter().take(finished_room).collect();
+            kept_finished.reverse();
+
+            // All pending jobs stay queued even past max_jobs: they were accepted once, and new
+            // work waits for room. Non-expired finished jobs fill remaining capacity newest-first.
+            let mut registry = inner.registry.lock().unwrap();
+            for item in kept_finished {
+                let request = serde_json::from_str::<JobRequest>(&item.request_json)
+                    .unwrap_or_else(|_| fallback_finished_request());
+                registry.jobs.push_back(Record {
+                    job: item.job,
+                    request,
+                    abort: None,
+                    worker: None,
+                    lease_until: None,
+                });
+            }
+            for (job, request, trace_ctx) in valid_pending {
+                tracing::info!(job_id = %job.id, "queued again from the durable store");
+                enqueue_job(&inner, &mut registry, job, request, trace_ctx);
+            }
+            registry
+                .jobs
+                .make_contiguous()
+                .sort_by_key(|r| r.job.submitted_at);
         }
-        drop(registry);
         if inner.engine.is_none() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let weak = Arc::downgrade(&inner);
@@ -663,11 +773,11 @@ async fn submit(
         }
 
         let id = Uuid::new_v4();
+        let job = new_queued_job(id, &trace_ctx);
         // Before the worker starts, so a job is never running without being on file.
-        if let Some(journal) = &inner.journal {
-            journal.submitted(id, &raw);
-        }
-        Ok(enqueue(&inner, registry, id, request, trace_ctx))
+        inner.store_submitted(&job, &raw);
+        enqueue_job(&inner, registry, job.clone(), request, trace_ctx);
+        Ok(job)
     }) {
         Ok(job) => job,
         Err(error_response) => return Ok(error_response),
@@ -687,16 +797,8 @@ async fn submit(
     Ok(response)
 }
 
-/// Registers a job as queued and starts its local worker if running with an engine.
-/// In coordinator mode, the job waits in `Queued` state for a remote worker lease.
-fn enqueue(
-    inner: &Arc<Inner>,
-    registry: &mut Registry,
-    id: Uuid,
-    request: JobRequest,
-    trace_ctx: JobTraceContext,
-) -> Job {
-    let job = Job {
+fn new_queued_job(id: Uuid, trace_ctx: &JobTraceContext) -> Job {
+    Job {
         id,
         status: JobStatus::Queued,
         submitted_at: now_ms(),
@@ -708,7 +810,34 @@ fn enqueue(
         error: None,
         trace_id: Some(trace_ctx.trace_id.clone()),
         failure_evidence: None,
-    };
+    }
+}
+
+fn fallback_finished_request() -> JobRequest {
+    JobRequest {
+        steps: Vec::new(),
+        timeout_ms: 60_000,
+        retries: 0,
+        priority: JobPriority::Normal,
+        resource_preset: None,
+        block_resources: Vec::new(),
+        block_url_patterns: Vec::new(),
+        profile: None,
+        persist_profile: true,
+        proxy_session: None,
+    }
+}
+
+/// Registers a job as queued and starts its local worker if running with an engine.
+/// In coordinator mode, the job waits in `Queued` state for a remote worker lease.
+fn enqueue_job(
+    inner: &Arc<Inner>,
+    registry: &mut Registry,
+    job: Job,
+    request: JobRequest,
+    trace_ctx: JobTraceContext,
+) {
+    let id = job.id;
     if let Some(engine) = inner.engine.clone() {
         let weak = Arc::downgrade(inner);
         let worker_state = weak.clone();
@@ -718,7 +847,7 @@ fn enqueue(
             execute_job(engine, req_clone, Some(worker_state), id, trace_ctx, 0, progress).await
         });
         registry.jobs.push_back(Record {
-            job: job.clone(),
+            job,
             request,
             abort: Some(task.abort_handle()),
             worker: None,
@@ -735,14 +864,13 @@ fn enqueue(
         });
     } else {
         registry.jobs.push_back(Record {
-            job: job.clone(),
+            job,
             request,
             abort: None,
             worker: None,
             lease_until: None,
         });
     }
-    job
 }
 
 /// Records how a job's worker ended, and counts it, unless the job already ended (a cancel).
@@ -751,7 +879,7 @@ fn finish_job(
     id: Uuid,
     outcome: Result<fluxwright::Result<Vec<Value>>, tokio::task::JoinError>,
 ) {
-    let finished_status = inner.with_registry(|registry, now| {
+    let finished_job = inner.with_registry(|registry, now| {
         let record = registry.find_mut(id)?;
         record.abort = None;
         if record.job.status.terminal() {
@@ -779,16 +907,15 @@ fn finish_job(
                 );
             }
         }
-        let status = record.job.status;
-        match status {
+        match record.job.status {
             JobStatus::Succeeded => registry.succeeded_jobs += 1,
             _ => registry.failed_jobs += 1,
         }
-        Some(status)
+        Some(record.job.clone())
     });
-    if let Some(status) = finished_status {
-        inner.journal_done(id);
-        tracing::info!(job_id = %id, ?status, "HTTP job finished");
+    if let Some(job) = finished_job {
+        inner.store_finished(&job);
+        tracing::info!(job_id = %id, status = ?job.status, "HTTP job finished");
     }
 }
 
@@ -1371,7 +1498,7 @@ async fn cancel(
     }
     if finished {
         // A job the client cancelled is over. One the shutdown cancels is not: it runs again.
-        inner.journal_done(id);
+        inner.store_finished(&job_clone);
     }
     Ok(Json(job_clone))
 }
