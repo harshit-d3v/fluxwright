@@ -1240,3 +1240,220 @@ async fn executes_snapshot_and_markdown_steps() {
     server.shutdown(Duration::from_secs(5)).await.unwrap();
     srv_handle.abort();
 }
+
+async fn get_authed(server: &HttpServer, method: &str, path: &str) -> (StatusCode, Value) {
+    let response = server
+        .router()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), MAX_RESULT_BYTES * 2).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_screencast_and_human_in_the_loop_job() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            axum::response::Html(concat!(
+                "<!doctype html><style>",
+                "body{margin:0}",
+                "#in{position:fixed;left:20px;top:20px;width:240px;height:40px;font-size:18px}",
+                "#btn{position:fixed;left:20px;top:80px;width:120px;height:40px}",
+                "</style>",
+                "<input id='in' type='text'>",
+                "<button id='btn' onclick=\"document.getElementById('out').textContent=document.getElementById('in').value\">Apply</button>",
+                "<div id='out'></div>"
+            ))
+        }),
+    );
+    let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_url = format!("http://127.0.0.1:{}", app_listener.local_addr().unwrap().port());
+    let app_task = tokio::spawn(async move { axum::serve(app_listener, app).await.unwrap() });
+
+    let server = server().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    let sub = submit(
+        &server,
+        json!({
+            "timeout_ms": 60_000,
+            "steps": [
+                { "action": "goto", "url": app_url },
+                { "action": "pause_for_human", "message": "Enter human value", "timeout_ms": 30_000 },
+                { "action": "text_content", "selector": "#out" }
+            ]
+        }),
+    )
+    .await;
+    let job_id = sub.id.to_string();
+
+    // Wait until the job is registered live and paused at pause_for_human.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (_, live) = get_authed(&server, "GET", "/v1/live").await;
+            if let Some(sess) = live["sessions"]
+                .as_array()
+                .and_then(|arr| arr.iter().find(|s| s["id"] == job_id))
+            {
+                if sess["paused"] == true && sess["pause_reason"] == "Enter human value" {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("live paused session did not appear");
+
+    // Mint single-use ticket and connect WebSocket without Bearer header.
+    let (status, ticket_json) = get_authed(&server, "POST", &format!("/v1/live/{job_id}/ticket")).await;
+    assert_eq!(status, StatusCode::OK, "{ticket_json}");
+    let ws_path = ticket_json["ws_url"].as_str().unwrap().to_string();
+    let ws_url = format!("ws://{addr}{ws_path}");
+    let mut ws = connect_cdp_ws(&ws_url, None).await;
+
+    // Reusing the same single-use ticket must be rejected (401 Unauthorized).
+    let replay_err = tokio_tungstenite::connect_async(&ws_url).await.unwrap_err();
+    assert!(
+        matches!(
+            replay_err,
+            tokio_tungstenite::tungstenite::Error::Http(ref resp) if resp.status() == StatusCode::UNAUTHORIZED
+        ),
+        "expected HTTP 401 on ticket replay, got {replay_err:?}"
+    );
+
+    // Wait for status + at least one valid JPEG frame.
+    let mut saw_status = false;
+    let mut saw_jpeg = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !(saw_status && saw_jpeg) {
+            let msg = ws.next().await.expect("ws stream open").unwrap();
+            if let Message::Text(text) = msg {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                match v["type"].as_str() {
+                    Some("status") => {
+                        assert_eq!(v["paused"], true);
+                        saw_status = true;
+                    }
+                    Some("frame") => {
+                        let b64 = v["data"].as_str().unwrap();
+                        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+                        assert!(bytes.starts_with(&[0xFF, 0xD8]), "frame is not JPEG");
+                        saw_jpeg = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for status + JPEG screencast frame");
+
+    // Drive the paused page as a human operator via HITL WebSocket messages.
+    for cmd in [
+        json!({ "type": "mouse", "event": "mousePressed", "x": 80, "y": 40, "button": "left", "clickCount": 1 }),
+        json!({ "type": "mouse", "event": "mouseReleased", "x": 80, "y": 40, "button": "left", "clickCount": 1 }),
+        json!({ "type": "text", "text": "human-42" }),
+        json!({ "type": "mouse", "event": "mousePressed", "x": 60, "y": 100, "button": "left", "clickCount": 1 }),
+        json!({ "type": "mouse", "event": "mouseReleased", "x": 60, "y": 100, "button": "left", "clickCount": 1 }),
+        json!({ "type": "resume" }),
+    ] {
+        ws.send(Message::Text(cmd.to_string().into())).await.unwrap();
+    }
+
+    let job = finish(&server, sub).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+    let results = job.results.unwrap();
+    assert_eq!(results[1], json!({ "resumed": true }));
+    assert_eq!(results[2], json!("human-42"));
+
+    drop(ws);
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_handle.abort();
+    app_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_screencast_attaches_to_cdp_gateway_session() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let server = HttpServer::new(engine, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    let mut ws_cdp = connect_cdp_ws(&format!("ws://{addr}/cdp?initial_page=true"), Some(TOKEN)).await;
+
+    let cdp_live_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (_, live) = get_authed(&server, "GET", "/v1/live").await;
+            if let Some(sess) = live["sessions"]
+                .as_array()
+                .and_then(|arr| arr.iter().find(|s| s["kind"] == "cdp"))
+            {
+                return sess["id"].as_str().unwrap().to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("CDP live session did not register");
+
+    let mut ws_live = connect_cdp_ws(&format!("ws://{addr}/v1/live/{cdp_live_id}/ws"), Some(TOKEN)).await;
+    let saw_jpeg = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(Ok(msg)) = ws_live.next().await {
+            if let Message::Text(text) = msg {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                if v["type"] == "frame" {
+                    let b64 = v["data"].as_str().unwrap();
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+                    return bytes.starts_with(&[0xFF, 0xD8]);
+                }
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for CDP live screencast frame");
+    assert!(saw_jpeg);
+
+    // Detaching the live viewer must leave the underlying /cdp gateway session healthy.
+    drop(ws_live);
+    let targets = cdp_rpc(&mut ws_cdp, 1, "Target.getTargets", json!({}), None).await;
+    assert!(!targets["result"]["targetInfos"].as_array().unwrap().is_empty());
+
+    drop(ws_cdp);
+    server.shutdown(Duration::ZERO).await.unwrap();
+    srv_handle.abort();
+}

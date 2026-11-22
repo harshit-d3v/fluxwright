@@ -1872,6 +1872,10 @@ impl PageLease {
         self.page.target_id()
     }
 
+    pub fn cdp_connection(&self) -> Arc<fluxwright_cdp::Connection> {
+        self.context.browser.connection()
+    }
+
     pub fn opener_target_id(&self) -> Option<&str> {
         self.page.opener_id()
     }

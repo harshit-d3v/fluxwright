@@ -1471,3 +1471,61 @@ async fn coordinator_background_reaper_expires_overdue_leases_proactively() {
 
     server.shutdown(Duration::ZERO).await.unwrap();
 }
+
+#[tokio::test]
+async fn live_endpoints_enforce_auth_validate_ids_and_serve_accessible_viewer() {
+    let srv = server(2).await;
+    let fake_id = Uuid::new_v4();
+
+    // Missing Bearer token and ?token= query param are rejected on all live/pause endpoints.
+    for (method, path) in [
+        ("GET", "/v1/live"),
+        ("POST", "/v1/live/job-1/ticket"),
+        ("GET", "/v1/live/job-1/ws"),
+        ("POST", &format!("/v1/jobs/{fake_id}/pause")),
+        ("POST", &format!("/v1/jobs/{fake_id}/resume")),
+    ] {
+        let unauth = srv
+            .router()
+            .oneshot(Request::builder().method(method).uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+
+        let query_tok = srv
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(format!("{path}?token={TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(query_tok.status(), StatusCode::UNAUTHORIZED, "{method} {path}?token=");
+    }
+
+    // Authenticated validation & 404 checks.
+    assert_eq!(body(call(&srv, "GET", "/v1/live", Body::empty()).await).await["sessions"], json!([]));
+    assert_eq!(call(&srv, "POST", "/v1/live/missing-id/ticket", Body::empty()).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(call(&srv, "POST", "/v1/jobs/not-a-uuid/pause", Body::empty()).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(call(&srv, "POST", &format!("/v1/jobs/{fake_id}/pause"), Body::empty()).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(call(&srv, "POST", &format!("/v1/jobs/{fake_id}/resume"), Body::empty()).await.status(), StatusCode::NOT_FOUND);
+
+    // Dashboard markup includes native modal live viewer and compliant scroll containment.
+    let dash = srv
+        .router()
+        .oneshot(Request::builder().uri("/dashboard").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(dash.status(), StatusCode::OK);
+    let html = String::from_utf8(to_bytes(dash.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(html.contains("Live Browser Sessions"));
+    assert!(html.contains(r#"id="live-dialog""#));
+    assert!(html.contains("overscroll-behavior: contain"));
+    assert!(!html.contains(r#"role="dialog""#));
+    assert!(!html.contains("aria-modal"));
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+}
