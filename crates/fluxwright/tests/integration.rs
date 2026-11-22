@@ -3028,10 +3028,14 @@ async fn api_request_cookies_and_indexeddb() {
 #[test]
 fn public_reexports_compile() {
     use fluxwright::{
-        find_channel, managed_browsers_dir, Har, HarContentPolicy, HarLog, HarMode, HarNotFound,
-        HarRouteOptions, HarRouter, IgnoreDefaultArgs, RecordHarOptions, ResourcePreset,
-        WebSocketEvent, Worker, WorkerEvent,
+        find_channel, managed_browsers_dir, AriaRef, AriaSnapshot, Har, HarContentPolicy, HarLog,
+        HarMode, HarNotFound, HarRouteOptions, HarRouter, IgnoreDefaultArgs, MarkdownOptions,
+        RecordHarOptions, ResourcePreset, SnapshotOptions, WebSocketEvent, Worker, WorkerEvent,
     };
+    let _ = std::any::type_name::<AriaRef>();
+    let _ = std::any::type_name::<AriaSnapshot>();
+    let _ = std::any::type_name::<MarkdownOptions>();
+    let _ = std::any::type_name::<SnapshotOptions>();
     let _ = std::any::type_name::<IgnoreDefaultArgs>();
     let _ = std::any::type_name::<ResourcePreset>();
     let _ = managed_browsers_dir as fn() -> Option<std::path::PathBuf>;
@@ -3049,4 +3053,106 @@ fn public_reexports_compile() {
     let route = HarRouteOptions::default();
     assert_eq!(rec.effective_content_policy(), HarContentPolicy::Embed);
     assert_eq!(route.not_found, HarNotFound::Abort);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aria_snapshot_refs_and_markdown_extraction() {
+    let app = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>AI Test</title>",
+                    "<header><a href='/nav'>Top Nav</a></header>",
+                    "<main>",
+                    "<h1>Hello Fluxwright</h1>",
+                    "<p>See <a href='https://example.com/docs'>Docs</a>.</p>",
+                    "<span style='display:none'>HIDDEN SECRET</span>",
+                    "<ul><li>One</li><li>Two</li></ul>",
+                    "<pre><code>let x = 42;</code></pre>",
+                    "<table><tr><th>Col</th><th>Val</th></tr><tr><td>k</td><td>v</td></tr></table>",
+                    "<label for='q'>Query</label><input id='q' type='text'>",
+                    "<button onclick=\"document.getElementById('out').textContent=document.getElementById('q').value\">Submit</button>",
+                    "<div id='out'></div>",
+                    "</main>"
+                ))
+            }),
+        )
+        .route("/next", axum::routing::get(|| async { axum::response::Html("<p>Next</p>") }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let srv_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = engine(1, 2).await;
+    let page = eng.acquire().await.unwrap();
+    page.goto(&base).await.unwrap();
+
+    // Full snapshot dedups child StaticText when parent has the same name.
+    let full = page.aria_snapshot().await.unwrap();
+    assert!(full.tree.contains("heading \"Hello Fluxwright\""), "{}", full.tree);
+    assert!(!full.tree.contains("StaticText \"Submit\""), "{}", full.tree);
+
+    // Interactive snapshot + @eN / ref=eN actions.
+    let inter = page
+        .aria_snapshot_with(&fluxwright::SnapshotOptions {
+            interactive_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let input_ref = inter
+        .refs
+        .iter()
+        .find(|r| r.role == "textbox" && r.name == "Query")
+        .expect("textbox ref");
+    let btn_ref = inter
+        .refs
+        .iter()
+        .find(|r| r.role == "button" && r.name == "Submit")
+        .expect("button ref");
+    assert!(inter.tree.contains(&format!("[ref={}]", btn_ref.id)));
+
+    page.fill(format!("@{}", input_ref.id), "ai-ok").await.unwrap();
+    page.click(format!("ref={}", btn_ref.id)).await.unwrap();
+    assert_eq!(page.text_content("#out").await.unwrap().as_deref(), Some("ai-ok"));
+
+    // Clean Markdown extraction: headings, links, lists, code, tables, hidden stripping, main_content_only, selector.
+    let md_main = page
+        .markdown_with(&fluxwright::MarkdownOptions {
+            main_content_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(md_main.contains("# Hello Fluxwright"), "{md_main}");
+    assert!(md_main.contains("[Docs](https://example.com/docs)"), "{md_main}");
+    assert!(md_main.contains("- One"), "{md_main}");
+    assert!(md_main.contains("```\nlet x = 42;\n```"), "{md_main}");
+    assert!(md_main.contains("| Col | Val |"), "{md_main}");
+    assert!(!md_main.contains("HIDDEN SECRET"), "{md_main}");
+    assert!(!md_main.contains("Top Nav"), "{md_main}");
+
+    let md_table = page
+        .markdown_with(&fluxwright::MarkdownOptions {
+            selector: Some("table".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(md_table.starts_with("| Col | Val |"), "{md_table}");
+
+    // Stale @eN ref after navigation must fail immediately as NotActionable.
+    page.goto(&format!("{base}/next")).await.unwrap();
+    let err = page
+        .click(format!("@{}", btn_ref.id))
+        .await
+        .expect_err("stale ref must fail after navigation");
+    assert!(
+        matches!(err, fluxwright::Error::Cdp(_)) && err.to_string().contains("unknown element ref"),
+        "{err:?}"
+    );
+
+    drop(page);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_task.abort();
 }

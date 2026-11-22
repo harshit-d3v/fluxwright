@@ -8,13 +8,13 @@ mod process;
 mod source;
 
 pub use fluxwright_cdp::{
-    filter_cookies, find_channel, managed_browsers_dir, ApiRequestOptions, ApiResponse, CdpEvent,
-    CdpSession, CdpSessionEvent, Connection, CookieFilter, Har, HarBrowser, HarContent,
-    HarContentPolicy, HarCreator, HarEntry, HarHeader, HarLog, HarMode, HarNotFound, HarPostData,
-    HarQueryParam, HarRecorder, HarRequest, HarResponse, HarRouteOptions, HarRouter, HarTimings,
-    IgnoreDefaultArgs, IndexedDbDatabase, IndexedDbIndex, IndexedDbRecord, IndexedDbStore,
-    RecordHarOptions, ResourceType, RouteFetchHandle, RouteFetchOptions, WebSocketEvent, Worker,
-    WorkerEvent,
+    filter_cookies, find_channel, managed_browsers_dir, ApiRequestOptions, ApiResponse, AriaRef,
+    AriaSnapshot, CdpEvent, CdpSession, CdpSessionEvent, Connection, CookieFilter, Har,
+    HarBrowser, HarContent, HarContentPolicy, HarCreator, HarEntry, HarHeader, HarLog, HarMode,
+    HarNotFound, HarPostData, HarQueryParam, HarRecorder, HarRequest, HarResponse, HarRouteOptions,
+    HarRouter, HarTimings, IgnoreDefaultArgs, IndexedDbDatabase, IndexedDbIndex, IndexedDbRecord,
+    IndexedDbStore, MarkdownOptions, RecordHarOptions, ResourceType, RouteFetchHandle,
+    RouteFetchOptions, SnapshotOptions, WebSocketEvent, Worker, WorkerEvent,
 };
 pub use config::{EngineConfig, JobOptions, Priority, QueueFullMode, ResourcePreset};
 pub use error::{Error, Result};

@@ -33,6 +33,7 @@ from . import async_api as _a
 from ._errors import Error, TimeoutError
 from ._native import ConsoleMessage
 from ._types import (
+    AriaSnapshot,
     FilePayload,
     FloatRect,
     Geolocation,
@@ -1385,6 +1386,40 @@ class Page(_Finders):
 
     def content(self) -> str:
         return _run(self._impl.content)
+
+    def aria_snapshot(
+        self,
+        *,
+        interactive_only: bool | None = None,
+        compact: bool | None = None,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
+    ) -> AriaSnapshot:
+        return _run(
+            lambda: self._impl.aria_snapshot(
+                interactive_only=interactive_only,
+                compact=compact,
+                max_depth=max_depth,
+                max_nodes=max_nodes,
+            )
+        )
+
+    def markdown(
+        self,
+        *,
+        selector: str | None = None,
+        main_content_only: bool | None = None,
+        include_links: bool | None = None,
+        include_images: bool | None = None,
+    ) -> str:
+        return _run(
+            lambda: self._impl.markdown(
+                selector=selector,
+                main_content_only=main_content_only,
+                include_links=include_links,
+                include_images=include_images,
+            )
+        )
 
     @property
     def mouse(self) -> Mouse:

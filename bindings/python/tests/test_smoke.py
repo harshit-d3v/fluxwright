@@ -2123,3 +2123,94 @@ def test_launch_prewarm_and_resource_presets():
     finally:
         srv.shutdown()
 
+
+def test_aria_snapshot_and_markdown():
+    class AiHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/next":
+                body = b"<title>Next</title><p>Done</p>"
+            else:
+                body = (
+                    b"<title>AI Fixture</title>"
+                    b'<header><a href="/about">Nav</a></header>'
+                    b"<main>"
+                    b"<h1>Welcome</h1>"
+                    b'<p>Read <a href="https://example.com/docs">the docs</a> carefully.</p>'
+                    b'<span style="display:none">SECRET HIDDEN TEXT</span>'
+                    b"<ul><li>Alpha</li><li>Beta</li></ul>"
+                    b"<pre><code>const x = 1;</code></pre>"
+                    b"<table><tr><th>K</th><th>V</th></tr><tr><td>a</td><td>1</td></tr></table>"
+                    b'<label for="name">Name</label><input id="name" aria-label="Name" type="text">'
+                    b'<button onclick="document.getElementById(\'out\').textContent = document.getElementById(\'name\').value">Apply</button>'
+                    b'<div id="out"></div>'
+                    b"</main>"
+                )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    class AiServer(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    srv = AiServer(("127.0.0.1", 0), AiHandler)
+    base_url = f"http://127.0.0.1:{srv.server_address[1]}"
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    async def run_async():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(max_browsers=1)
+            try:
+                page = await browser.new_page()
+                await page.goto(base_url)
+                snap = await page.aria_snapshot(interactive_only=True)
+                input_ref = next(r for r in snap["refs"] if r["role"] == "textbox" and r["name"] == "Name")
+                btn_ref = next(r for r in snap["refs"] if r["role"] == "button" and r["name"] == "Apply")
+                await page.fill(f"@{input_ref['id']}", "hello")
+                await page.click(f"ref={btn_ref['id']}")
+                assert await page.locator("#out").text_content() == "hello"
+
+                md = await page.markdown(main_content_only=True)
+                assert "# Welcome" in md
+                assert "[the docs](https://example.com/docs)" in md
+                assert "SECRET HIDDEN TEXT" not in md
+                assert "[Nav]" not in md
+
+                md_table = await page.markdown(selector="table")
+                assert "| K | V |" in md_table
+
+                await page.goto(f"{base_url}/next")
+                with pytest.raises(Error, match="unknown element ref|stale"):
+                    await page.click(f"@{btn_ref['id']}")
+                await page.close()
+            finally:
+                await browser.close()
+
+    try:
+        asyncio.run(run_async())
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(max_browsers=1)
+            try:
+                page = browser.new_page()
+                page.goto(base_url)
+                snap = page.aria_snapshot()
+                assert 'heading "Welcome"' in snap["tree"]
+                btn_ref = next(r for r in snap["refs"] if r["role"] == "button" and r["name"] == "Apply")
+                input_ref = next(r for r in snap["refs"] if r["role"] == "textbox" and r["name"] == "Name")
+                page.fill(f"@{input_ref['id']}", "sync-ok")
+                page.click(f"@{btn_ref['id']}")
+                assert page.locator("#out").text_content() == "sync-ok"
+                assert "Alpha" in page.markdown(main_content_only=True)
+                page.close()
+            finally:
+                browser.close()
+    finally:
+        srv.shutdown()
+

@@ -5,7 +5,7 @@ from typing import Any, Literal
 from collections.abc import Awaitable, Mapping, Sequence
 
 from ._errors import Error
-from ._types import FilePayload, FloatRect, PdfMargins, Position
+from ._types import AriaRef, AriaSnapshot, FilePayload, FloatRect, PdfMargins, Position
 
 _Path = str | PathLike[str]
 
@@ -185,6 +185,22 @@ class Page:
         """The timeout in milliseconds for this page's ``goto`` from now on; 0 for none."""
     def title(self) -> Awaitable[str]: ...
     def content(self) -> Awaitable[str]: ...
+    def aria_snapshot(
+        self,
+        *,
+        interactive_only: bool | None = None,
+        compact: bool | None = None,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
+    ) -> Awaitable[AriaSnapshot]: ...
+    def markdown(
+        self,
+        *,
+        selector: str | None = None,
+        main_content_only: bool | None = None,
+        include_links: bool | None = None,
+        include_images: bool | None = None,
+    ) -> Awaitable[str]: ...
     def click(
         self,
         selector: str,

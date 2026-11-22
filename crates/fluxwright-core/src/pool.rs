@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fluxwright_cdp::{
-    http_client::HttpContextDefaults, ApiRequestOptions, ApiResponse, BoundingBox, CdpBrowser,
-    CdpPage, CdpSession, ConsoleMessage, ContextId, CookieFilter, Download, DownloadQueue,
-    FrameInfo, HarNotFound, HarRecorder, HarRouteOptions, HarRouter, InterceptedRequest, LogEntry,
-    PageError, PageLog, PdfOptions, Proxy, RecordHarOptions, ResourceType, ScreenshotOptions,
-    Selector, WebSocketEvent, Worker, WorkerEvent,
+    http_client::HttpContextDefaults, ApiRequestOptions, ApiResponse, AriaSnapshot, BoundingBox,
+    CdpBrowser, CdpPage, CdpSession, ConsoleMessage, ContextId, CookieFilter, Download,
+    DownloadQueue, FrameInfo, HarNotFound, HarRecorder, HarRouteOptions, HarRouter,
+    InterceptedRequest, LogEntry, MarkdownOptions, PageError, PageLog, PdfOptions, Proxy,
+    RecordHarOptions, ResourceType, ScreenshotOptions, Selector, SnapshotOptions, WebSocketEvent,
+    Worker, WorkerEvent,
 };
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -2133,6 +2134,27 @@ impl PageLease {
 
     pub async fn content(&self) -> Result<String> {
         Ok(self.page.content(self.action_timeout()).await?)
+    }
+
+    /// Captures a compact accessibility tree snapshot of the page and caches `@eN` element refs.
+    pub async fn aria_snapshot(&self) -> Result<AriaSnapshot> {
+        self.aria_snapshot_with(&SnapshotOptions::default()).await
+    }
+
+    pub async fn aria_snapshot_with(&self, options: &SnapshotOptions) -> Result<AriaSnapshot> {
+        Ok(self
+            .page
+            .aria_snapshot(options, self.action_timeout())
+            .await?)
+    }
+
+    /// Serializes the visible DOM (or a sub-tree matching `selector`) cleanly to Markdown.
+    pub async fn markdown(&self) -> Result<String> {
+        self.markdown_with(&MarkdownOptions::default()).await
+    }
+
+    pub async fn markdown_with(&self, options: &MarkdownOptions) -> Result<String> {
+        Ok(self.page.markdown(options, self.action_timeout()).await?)
     }
 
     pub async fn evaluate(&self, expression: &str) -> Result<serde_json::Value> {

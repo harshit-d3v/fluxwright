@@ -30,6 +30,7 @@ use crate::log::{DownloadResult, PageLog};
 pub type DownloadQueue = tokio::sync::mpsc::UnboundedReceiver<DownloadResult>;
 use crate::render::ScreenshotOptions;
 use crate::route::InterceptedRequest;
+use crate::snapshot::{extract_ax_ref, AriaSnapshot, MarkdownOptions, SnapshotOptions};
 use crate::error::{Error, Result};
 use crate::worker::{Worker, WorkerEvent, WorkerRegistry};
 
@@ -199,6 +200,9 @@ fn is_js_truthy(obj: &Value) -> bool {
 
 /// Selector engine plus element checks, run in the page or an iframe on every poll.
 const QUERY_JS: &str = include_str!("query.js");
+
+/// Compact DOM-to-Markdown serializer.
+const MARKDOWN_JS: &str = include_str!("markdown.js");
 
 /// What an element call acts on: `query`, inside zero or more iframes (`frames`: one CSS
 /// selector per iframe to enter, outermost first).
@@ -532,18 +536,18 @@ impl Affine {
     }
 }
 
-fn engine_call(sel: &Selector, mode: &str) -> String {
-    engine_call_with(sel, mode, &Value::Null)
-}
-
-fn engine_call_with(sel: &Selector, mode: &str, arg: &Value) -> String {
-    let effective = if sel.strict {
+fn effective_arg(sel: &Selector, arg: &Value) -> Value {
+    if sel.strict {
         let mut obj = arg.as_object().cloned().unwrap_or_default();
         obj.insert("strict".into(), Value::Bool(true));
         Value::Object(obj)
     } else {
         arg.clone()
-    };
+    }
+}
+
+fn engine_call_with(sel: &Selector, mode: &str, arg: &Value) -> String {
+    let effective = effective_arg(sel, arg);
     format!(
         "({QUERY_JS})({}, {}, {})",
         serde_json::to_string(&sel.query).unwrap(),
@@ -619,6 +623,8 @@ pub struct CdpPage {
     pub(crate) keyboard: Arc<std::sync::Mutex<KeyboardState>>,
     pub(crate) url: Arc<tokio::sync::watch::Sender<String>>,
     pub(crate) net: Arc<std::sync::Mutex<NetActivity>>,
+    /// Maps the latest accessibility snapshot's short ref (`"e1"`, `"e2"`, ...) to `backendDOMNodeId`.
+    pub(crate) ax_refs: Arc<std::sync::Mutex<HashMap<String, i64>>>,
 }
 
 impl CdpPage {
@@ -753,6 +759,7 @@ impl CdpPage {
             if ev.session_id.as_deref() == Some(self.sid()) {
                 match ev.method.as_str() {
                     "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
+                        self.ax_refs.lock().unwrap().clear();
                         let full = crate::browser::frame_url(&ev.params["frame"]);
                         if !full.is_empty() {
                             self.set_url(&full);
@@ -786,6 +793,7 @@ impl CdpPage {
 
     /// Navigates and waits for the main frame's lifecycle event, like Playwright's `waitUntil`.
     pub async fn goto(&self, url: &str, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
+        self.ax_refs.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         // Subscribed before navigating, so no lifecycle event can slip past; unbounded, so a
         // busy browser cannot make it lag.
@@ -835,6 +843,7 @@ impl CdpPage {
     }
 
     pub async fn reload(&self, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
+        self.ax_refs.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         let events = self.browser.subscribe_unbounded();
         self.call("Page.reload", json!({}), timeout).await?;
@@ -852,6 +861,7 @@ impl CdpPage {
     }
 
     async fn navigate_history(&self, delta: isize, wait_until: WaitUntil, timeout: Duration) -> Result<bool> {
+        self.ax_refs.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         let hist = self.call("Page.getNavigationHistory", json!({}), timeout).await?;
         let current = hist["currentIndex"].as_i64().unwrap_or(0) as isize;
@@ -888,6 +898,7 @@ impl CdpPage {
     }
 
     pub async fn set_content(&self, html: &str, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
+        self.ax_refs.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         {
             let mut net = self.net.lock().unwrap();
@@ -1298,6 +1309,7 @@ impl CdpPage {
                     return Err(Error::TargetCrashed { status: format!("during {what}") });
                 }
                 "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
+                    self.ax_refs.lock().unwrap().clear();
                     let full = crate::browser::frame_url(&ev.params["frame"]);
                     if !full.is_empty() {
                         self.set_url(&full);
@@ -1487,6 +1499,72 @@ impl CdpPage {
         let v = self
             .evaluate("document.documentElement.outerHTML", timeout)
             .await?;
+        Ok(v.as_str().unwrap_or("").to_string())
+    }
+
+    pub async fn aria_snapshot(&self, opts: &SnapshotOptions, timeout: Duration) -> Result<AriaSnapshot> {
+        let res = self.call("Accessibility.getFullAXTree", json!({}), timeout).await?;
+        let nodes = res["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let snap = crate::snapshot::build_aria_snapshot(nodes, opts);
+        let mut refs = self.ax_refs.lock().unwrap();
+        refs.clear();
+        for item in &snap.refs {
+            refs.insert(item.id.clone(), item.backend_node_id);
+        }
+        Ok(snap)
+    }
+
+    pub async fn markdown(&self, opts: &MarkdownOptions, timeout: Duration) -> Result<String> {
+        let opts_json = json!({
+            "mainContentOnly": opts.main_content_only,
+            "includeLinks": opts.include_links,
+            "includeImages": opts.include_images,
+        });
+        if let Some(ref sel_str) = opts.selector {
+            let sel = Selector::new(sel_str.clone());
+            let (_, scope) = self
+                .wait_element(&sel, Wait::Query { mode: "attached", scroll: false }, timeout)
+                .await?;
+            let found = self
+                .eval_engine(&scope, &sel, "element", &Value::Null, false, timeout)
+                .await?;
+            let Some(obj_id) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
+                return Err(Error::NotActionable {
+                    selector: sel.to_string(),
+                    reason: "element went away".into(),
+                });
+            };
+            let decl = format!("function(o) {{ return ({MARKDOWN_JS})(o, this); }}");
+            let res = self
+                .session_call(
+                    &scope.session,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": obj_id,
+                        "functionDeclaration": decl,
+                        "arguments": [{ "value": opts_json }],
+                        "returnByValue": true,
+                        "awaitPromise": false,
+                    }),
+                    timeout,
+                )
+                .await;
+            let _ = self
+                .session_call(
+                    &scope.session,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": obj_id }),
+                    timeout,
+                )
+                .await;
+            let res = res?;
+            if let Some(err) = js_error(&res) {
+                return Err(err);
+            }
+            return Ok(res["result"]["value"].as_str().unwrap_or("").to_string());
+        }
+        let expr = format!("({MARKDOWN_JS})({}, null)", serde_json::to_string(&opts_json).unwrap());
+        let v = self.evaluate(&expr, timeout).await?;
         Ok(v.as_str().unwrap_or("").to_string())
     }
 
@@ -1781,6 +1859,96 @@ impl CdpPage {
             params["contextId"] = json!(id);
         }
         let res = self.session_call(&scope.session, "Runtime.evaluate", params, timeout).await?;
+        match js_error(&res) {
+            Some(e) => Err(e),
+            None => Ok(res["result"].clone()),
+        }
+    }
+
+    /// Evaluates the selector engine, resolving leading `@eN` / `ref=eN` references through the
+    /// latest accessibility snapshot's `backendDOMNodeId` map before delegating to `QUERY_JS`.
+    async fn eval_engine(
+        &self,
+        scope: &Scope,
+        sel: &Selector,
+        mode: &str,
+        arg: &Value,
+        return_by_value: bool,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let Some(ref_key) = (mode != "clear" && mode != "changed")
+            .then(|| extract_ax_ref(&sel.query))
+            .flatten()
+        else {
+            return self
+                .eval_in(scope, &engine_call_with(sel, mode, arg), return_by_value, timeout)
+                .await;
+        };
+
+        let backend_id = self.ax_refs.lock().unwrap().get(&ref_key).copied();
+        let Some(backend_id) = backend_id else {
+            let reason = format!("unknown element ref @{ref_key}; take a snapshot first");
+            return if return_by_value {
+                Ok(json!({ "value": { "ok": false, "fatal": true, "reason": reason } }))
+            } else {
+                Err(Error::NotActionable { selector: sel.to_string(), reason })
+            };
+        };
+
+        let mut resolve_params = json!({ "backendNodeId": backend_id });
+        if let Some(ctx_id) = scope.context {
+            resolve_params["executionContextId"] = json!(ctx_id);
+        }
+        let resolved = match self
+            .session_call(&scope.session, "DOM.resolveNode", resolve_params, timeout)
+            .await
+        {
+            Ok(v) => Some(v),
+            Err(e) if e.is_retryable() => return Err(e),
+            Err(_) => None,
+        };
+        let obj_id = resolved
+            .as_ref()
+            .and_then(|v| v["object"]["objectId"].as_str())
+            .map(str::to_owned);
+        let Some(obj_id) = obj_id else {
+            let reason = format!("element ref @{ref_key} is stale or detached; take a new snapshot");
+            return if return_by_value {
+                Ok(json!({ "value": { "ok": false, "fatal": true, "reason": reason } }))
+            } else {
+                Err(Error::NotActionable { selector: sel.to_string(), reason })
+            };
+        };
+
+        let effective = effective_arg(sel, arg);
+        let decl = format!("function(s, m, a) {{ return ({QUERY_JS})(s, m, a, this); }}");
+        let res = self
+            .session_call(
+                &scope.session,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": obj_id,
+                    "functionDeclaration": decl,
+                    "arguments": [
+                        { "value": sel.query },
+                        { "value": mode },
+                        { "value": effective },
+                    ],
+                    "returnByValue": return_by_value,
+                    "awaitPromise": true,
+                }),
+                timeout,
+            )
+            .await;
+        let _ = self
+            .session_call(
+                &scope.session,
+                "Runtime.releaseObject",
+                json!({ "objectId": obj_id }),
+                timeout,
+            )
+            .await;
+        let res = res?;
         match js_error(&res) {
             Some(e) => Err(e),
             None => Ok(res["result"].clone()),
@@ -2492,7 +2660,7 @@ impl CdpPage {
     /// and `arg`, in the page's own world as Playwright does, and returns its JSON result.
     pub async fn evaluate_on(&self, sel: &Selector, function: &str, arg: Option<Value>, timeout: Duration) -> Result<Value> {
         let (_, scope) = self.wait_element(sel, Wait::Query { mode: "attached", scroll: false }, timeout).await?;
-        let found = self.eval_in(&scope, &engine_call(sel, "element"), false, timeout).await?;
+        let found = self.eval_engine(&scope, sel, "element", &Value::Null, false, timeout).await?;
         let Some(isolated) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
             return Err(Error::NotActionable { selector: sel.to_string(), reason: "element went away".into() });
         };
@@ -2657,7 +2825,6 @@ impl CdpPage {
                 .map(|_| ());
         }
         // Waiting for it to go: poll until the check that `mode` makes fails.
-        let expr = engine_call(sel, mode);
         let start = Instant::now();
         loop {
             if self.browser.is_dead() {
@@ -2666,7 +2833,7 @@ impl CdpPage {
             match self.scope(&sel.frames, false, timeout).await? {
                 // Its iframe is gone or not there yet, so the element is not there either.
                 Err(_) => return Ok(()),
-                Ok((scope, _)) => match self.eval_in(&scope, &expr, true, timeout).await {
+                Ok((scope, _)) => match self.eval_engine(&scope, sel, mode, &Value::Null, true, timeout).await {
                     Ok(r) if r["value"]["ok"].as_bool() == Some(true) => {}
                     Ok(r) if r["value"]["fatal"].as_bool() == Some(true) => {
                         let reason = r["value"]["reason"].as_str().unwrap_or("unknown").to_string();
@@ -2746,7 +2913,7 @@ impl CdpPage {
         let Ok((scope, _)) = self.scope(&sel.frames, false, timeout).await? else {
             return Ok(None);
         };
-        let v = match self.eval_in(&scope, &engine_call_with(sel, mode, arg), true, timeout).await {
+        let v = match self.eval_engine(&scope, sel, mode, arg, true, timeout).await {
             Ok(r) => r["value"].clone(),
             Err(e) => return Err(e),
         };
@@ -2804,7 +2971,6 @@ impl CdpPage {
             Wait::Click { force } => ("point", true, force),
             Wait::Box => ("box", true, false),
         };
-        let expr = engine_call_with(sel, mode, arg);
         loop {
             if start.elapsed() > timeout {
                 // A timeout like any other, so callers (Python's `except TimeoutError`) see one.
@@ -2821,7 +2987,7 @@ impl CdpPage {
                     continue;
                 }
             };
-            let v = match self.eval_in(&scope, &expr, true, timeout).await {
+            let v = match self.eval_engine(&scope, sel, mode, arg, true, timeout).await {
                 Ok(r) => r["value"].clone(),
                 Err(e) if e.is_retryable() => return Err(e),
                 // Mid-navigation the context can vanish; keep polling.
@@ -2955,7 +3121,7 @@ impl CdpPage {
         let step = |mode: &'static str| {
             let scope = &scope;
             async move {
-                let r = self.eval_in(scope, &engine_call(sel, mode), true, timeout).await?;
+                let r = self.eval_engine(scope, sel, mode, &Value::Null, true, timeout).await?;
                 match r["value"]["ok"].as_bool() {
                     Some(true) => Ok(()),
                     _ => Err(Error::NotActionable {
@@ -3019,9 +3185,11 @@ impl CdpPage {
             return Ok(());
         }
         let r = self
-            .eval_in(
+            .eval_engine(
                 &scope,
-                &engine_call_with(sel, "check_state", &json!({ "want": checked })),
+                sel,
+                "check_state",
+                &json!({ "want": checked }),
                 true,
                 timeout,
             )
@@ -3070,7 +3238,7 @@ impl CdpPage {
                         timeout,
                     )
                     .await?;
-                let found = self.eval_in(&scope, &engine_call(sel, "element"), false, timeout).await?;
+                let found = self.eval_engine(&scope, sel, "element", &Value::Null, false, timeout).await?;
                 let Some(isolated) = found["objectId"].as_str().filter(|_| found["subtype"] == "node") else {
                     return Err(Error::NotActionable {
                         selector: sel.to_string(),

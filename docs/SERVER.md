@@ -200,10 +200,12 @@ failed job returns **409**.
 | `evaluate` | `expression` | JSON value, evaluated in the page, **not** on the host |
 | `title` | None | String |
 | `content` | None | HTML string |
+| `snapshot` | Optional `interactive_only`, `compact` (default `true`), `max_depth` (`1–64`), `max_nodes` (`1–5000`) | `{ "tree": "…", "refs": [{ "id", "role", "name" }], "truncated": bool }` |
+| `markdown` | Optional `selector`, `main_content_only`, `include_links` (default `true`), `include_images` | Markdown string |
 | `screenshot` | Optional `full_page` (default `false`), `type` (`"png"` \| `"jpeg"` \| `"webp"`), `quality` (0–100, JPEG/WebP only), `clip` (`{ x, y, width, height }`), `omit_background` | `{ "mime_type": "image/png" \| "image/jpeg" \| "image/webp", "base64": "…" }` |
 | `pdf` | Optional `format`, `width`, `height`, `margin` (`{ top, right, bottom, left }`), `landscape`, `print_background`, `scale` (0.1–2), `page_ranges`, `prefer_css_page_size`, `display_header_footer`, `header_template`, `footer_template`, `outline`, `tagged` | `{ "mime_type": "application/pdf", "base64": "…" }` |
 
-Selectors support the engine's CSS, `xpath=…` (plus bare `//…` and `..`), `text=…`, `role=…`, and chained `>>` syntax. `wait_until`
+Selectors support the engine's CSS, `@eN` / `ref=eN` snapshot refs, `xpath=…` (plus bare `//…` and `..`), `text=…`, `role=…`, and chained `>>` syntax. `wait_until`
 accepts `load`, `domcontentloaded`, `networkidle`, or `commit`. Explicit `goto` URLs must use
 HTTP/HTTPS or be `about:blank`; this validation is **not** a network isolation policy.
 Unknown request/step fields are rejected instead of silently ignored. Filesystem output paths
