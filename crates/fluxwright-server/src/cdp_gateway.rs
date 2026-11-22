@@ -849,22 +849,8 @@ async fn handle_browser_command(
                 send_error(out_tx, id, None, -32602, "missing targetId");
                 return;
             };
-            match verify_target_owned(conn, state, &tid).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    send_error(
-                        out_tx,
-                        id,
-                        None,
-                        -32000,
-                        "targetId not owned by this CDP lease",
-                    );
-                    return;
-                }
-                Err(e) => {
-                    send_error(out_tx, id, None, -32000, &e);
-                    return;
-                }
+            if !ensure_target_owned(conn, state, out_tx, id, &tid).await {
+                return;
             }
             match attach_target(conn, state, lease, out_tx, &tid, None).await {
                 Ok(sid) => send_result(out_tx, id, None, json!({ "sessionId": sid })),
@@ -898,29 +884,37 @@ async fn handle_browser_command(
                 .await;
             relay_call_result(out_tx, id, None, res);
         }
-        "Target.closeTarget" | "Target.activateTarget" | "Target.getTargetInfo" => {
+        "Target.closeTarget" | "Target.activateTarget" => {
             let Some(tid) = params["targetId"].as_str().map(str::to_owned) else {
                 send_error(out_tx, id, None, -32602, "missing targetId");
                 return;
             };
-            match verify_target_owned(conn, state, &tid).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    send_error(
-                        out_tx,
-                        id,
-                        None,
-                        -32000,
-                        "targetId not owned by this CDP lease",
-                    );
-                    return;
-                }
-                Err(e) => {
-                    send_error(out_tx, id, None, -32000, &e);
-                    return;
-                }
+            if !ensure_target_owned(conn, state, out_tx, id, &tid).await {
+                return;
             }
             let res = conn.call_raw(method, params, None, CDP_CMD_TIMEOUT).await;
+            relay_call_result(out_tx, id, None, res);
+        }
+        "Target.getTargetInfo" => {
+            let tid = match parse_optional_target_id(&params) {
+                Ok(tid) => tid.map(str::to_owned),
+                Err(msg) => {
+                    send_error(out_tx, id, None, -32602, msg);
+                    return;
+                }
+            };
+            let forward_params = if let Some(tid) = tid.as_deref() {
+                if !ensure_target_owned(conn, state, out_tx, id, tid).await {
+                    return;
+                }
+                params
+            } else {
+                // Omitted targetId queries the browser target itself (used by Playwright connectOverCDP).
+                json!({})
+            };
+            let res = conn
+                .call_raw("Target.getTargetInfo", forward_params, None, CDP_CMD_TIMEOUT)
+                .await;
             relay_call_result(out_tx, id, None, res);
         }
         "Target.setDiscoverTargets" => {
@@ -1045,6 +1039,40 @@ async fn filter_and_record_targets(
         }
     }
     out
+}
+
+fn parse_optional_target_id(params: &Value) -> Result<Option<&str>, &'static str> {
+    match params.get("targetId") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(tid)) => Ok(Some(tid.as_str())),
+        Some(_) => Err("invalid targetId"),
+    }
+}
+
+async fn ensure_target_owned(
+    conn: &Arc<Connection>,
+    state: &Arc<Mutex<GatewayState>>,
+    out_tx: &mpsc::UnboundedSender<Message>,
+    id: Option<&Value>,
+    target_id: &str,
+) -> bool {
+    match verify_target_owned(conn, state, target_id).await {
+        Ok(true) => true,
+        Ok(false) => {
+            send_error(
+                out_tx,
+                id,
+                None,
+                -32000,
+                "targetId not owned by this CDP lease",
+            );
+            false
+        }
+        Err(e) => {
+            send_error(out_tx, id, None, -32000, &e);
+            false
+        }
+    }
 }
 
 async fn verify_target_owned(
@@ -1386,5 +1414,20 @@ mod tests {
 
         srv_qt.shutdown(Duration::from_secs(2)).await.unwrap();
         let _ = mock.await;
+    }
+
+    #[test]
+    fn optional_target_id_parses_browser_and_target_queries() {
+        assert_eq!(parse_optional_target_id(&json!({})), Ok(None));
+        assert_eq!(parse_optional_target_id(&json!(null)), Ok(None));
+        assert_eq!(parse_optional_target_id(&json!({ "targetId": null })), Ok(None));
+        assert_eq!(
+            parse_optional_target_id(&json!({ "targetId": "T-1" })),
+            Ok(Some("T-1"))
+        );
+        assert_eq!(
+            parse_optional_target_id(&json!({ "targetId": 123 })),
+            Err("invalid targetId")
+        );
     }
 }
