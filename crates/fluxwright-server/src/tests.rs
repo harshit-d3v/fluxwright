@@ -1529,3 +1529,98 @@ async fn live_endpoints_enforce_auth_validate_ids_and_serve_accessible_viewer() 
 
     srv.shutdown(Duration::ZERO).await.unwrap();
 }
+
+#[tokio::test]
+async fn profile_proxy_endpoints_enforce_auth_validation_and_adaptive_metric() {
+    use fluxwright::{AdaptiveConfig, ProxyPool};
+
+    let srv = server(2).await;
+    for (method, path) in [
+        ("GET", "/v1/profiles"),
+        ("DELETE", "/v1/profiles/acct"),
+        ("GET", "/v1/proxies"),
+    ] {
+        let unauth = srv
+            .router()
+            .oneshot(Request::builder().method(method).uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+
+        let query_tok = srv
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(format!("{path}?token={TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(query_tok.status(), StatusCode::UNAUTHORIZED, "{method} {path}?token=");
+    }
+
+    // Unconfigured profiles/proxies return 404; bad profile name returns 400.
+    assert_eq!(call(&srv, "GET", "/v1/profiles", Body::empty()).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(call(&srv, "DELETE", "/v1/profiles/acct", Body::empty()).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(call(&srv, "GET", "/v1/proxies", Body::empty()).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(call(&srv, "DELETE", "/v1/profiles/bad.name", Body::empty()).await.status(), StatusCode::BAD_REQUEST);
+    srv.shutdown(Duration::ZERO).await.unwrap();
+
+    let dir = std::env::temp_dir().join(format!("fluxwright-srv-prof-{}", Uuid::new_v4()));
+    let proxy_pool = ProxyPool::from_urls(["http://u:secret@127.0.0.1:8080"]).unwrap();
+    let engine = BrowserEngine::builder()
+        .source(Arc::new(NeverStarts))
+        .profiles_dir(&dir)
+        .proxy_pool(proxy_pool)
+        .adaptive_concurrency(AdaptiveConfig {
+            min_concurrency: 1,
+            max_concurrency: 4,
+            initial_concurrency: Some(2),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.max_jobs = 8;
+    let configured = HttpServer::new(engine, cfg).unwrap();
+
+    let list_prof = call(&configured, "GET", "/v1/profiles", Body::empty()).await;
+    assert_eq!(list_prof.status(), StatusCode::OK);
+    assert_eq!(body(list_prof).await["profiles"], json!([]));
+
+    assert_eq!(
+        call(&configured, "DELETE", "/v1/profiles/missing", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let list_prox = call(&configured, "GET", "/v1/proxies", Body::empty()).await;
+    assert_eq!(list_prox.status(), StatusCode::OK);
+    let prox_bytes = to_bytes(list_prox.into_body(), MAX_RESULT_BYTES).await.unwrap();
+    let prox_text = String::from_utf8(prox_bytes.to_vec()).unwrap();
+    assert!(!prox_text.contains("secret"));
+    let prox_json: Value = serde_json::from_str(&prox_text).unwrap();
+    assert_eq!(prox_json["proxies"][0]["server"], "http://127.0.0.1:8080");
+    assert_eq!(prox_json["proxies"][0]["healthy"], true);
+
+    let metrics_resp = call(&configured, "GET", "/metrics", Body::empty()).await;
+    assert_eq!(metrics_resp.status(), StatusCode::OK);
+    let metrics_text = String::from_utf8(
+        to_bytes(metrics_resp.into_body(), MAX_RESULT_BYTES)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        metrics_text.contains("fluxwright_effective_concurrency_limit 2\n"),
+        "{metrics_text}"
+    );
+
+    configured.shutdown(Duration::ZERO).await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

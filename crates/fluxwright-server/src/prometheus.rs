@@ -117,6 +117,13 @@ impl ServerMetrics {
             "gauge",
             self.fleet.memory_per_job_bytes_estimate,
         );
+        write_metric(
+            &mut out,
+            "fluxwright_effective_concurrency_limit",
+            "Active fleet concurrency admission limit (reflects adaptive concurrency when enabled).",
+            "gauge",
+            self.fleet.effective_concurrency_limit,
+        );
 
         // HTTP Server metrics
         out.push_str("# HELP fluxwright_http_jobs_total Total number of HTTP jobs completed by final status.\n");
@@ -236,6 +243,7 @@ mod tests {
                 engine_rss_bytes: 52_428_800,
                 browser_tree_rss_bytes: 314_572_800,
                 memory_per_job_bytes_estimate: 157_286_400,
+                effective_concurrency_limit: 16,
             },
             queued_jobs: 1,
             running_jobs: 1,
@@ -267,5 +275,6 @@ mod tests {
         assert!(text.contains("fluxwright_cluster_lease_expirations_total 3\n"));
         assert!(text.contains("fluxwright_cdp_sessions_active 2\n"));
         assert!(text.contains("fluxwright_cdp_sessions_total 7\n"));
+        assert!(text.contains("fluxwright_effective_concurrency_limit 16\n"));
     }
 }

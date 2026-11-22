@@ -1,3 +1,4 @@
+mod adaptive;
 mod config;
 mod error;
 mod hosts;
@@ -5,8 +6,11 @@ mod metrics;
 pub mod netguard;
 mod pool;
 mod process;
+mod profiles;
+mod proxies;
 mod source;
 
+pub use adaptive::AdaptiveConfig;
 pub use fluxwright_cdp::{
     filter_cookies, find_channel, managed_browsers_dir, ApiRequestOptions, ApiResponse, AriaRef,
     AriaSnapshot, CdpEvent, CdpSession, CdpSessionEvent, Connection, CookieFilter, Har,
@@ -23,4 +27,6 @@ pub use pool::{
     with_timeout, ApiRequestContext, BrowserInfo, ContextLease, Downloads, Engine, EngineBuilder,
     Frame, FrameLocator, Locator, PageLease,
 };
+pub use profiles::{validate_profile_name, ProfileInfo, ProfileStore};
+pub use proxies::{parse_proxy_url, ProxyLease, ProxyPool, ProxyRotation, ProxyStatus};
 pub use source::{BrowserSource, LocalChromium, RemoteCdp};

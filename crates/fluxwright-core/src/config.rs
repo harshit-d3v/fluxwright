@@ -1,9 +1,13 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use fluxwright_cdp::{
     ColorScheme, Emulation, Geolocation, LaunchOptions, Proxy, RecordHarOptions, ResourceType,
     StorageState,
 };
+
+use crate::adaptive::AdaptiveConfig;
+use crate::proxies::ProxyPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePreset {
@@ -85,6 +89,12 @@ pub struct EngineConfig {
     pub max_concurrency_per_host: Option<usize>,
     /// The least time between the starts of two `goto`s to one host. `None`: no delay.
     pub min_delay_per_host: Option<Duration>,
+    /// Optional directory for named persistent browser profiles (`storageState`).
+    pub profiles_dir: Option<PathBuf>,
+    /// Optional pool of outbound proxies used when `JobOptions::proxy` is unset.
+    pub proxy_pool: Option<ProxyPool>,
+    /// Optional AIMD adaptive concurrency limiter driven by memory pressure and job failures.
+    pub adaptive_concurrency: Option<AdaptiveConfig>,
 }
 
 /// Browsers and the fleet's memory budget (MB) for a machine with `cpus` CPUs and
@@ -148,6 +158,9 @@ impl Default for EngineConfig {
             job_timeout: Duration::from_secs(60),
             max_concurrency_per_host: None,
             min_delay_per_host: None,
+            profiles_dir: None,
+            proxy_pool: None,
+            adaptive_concurrency: None,
         }
     }
 }
@@ -179,6 +192,12 @@ pub struct JobOptions {
     pub http_credentials: Option<(String, String)>,
     /// HAR 1.2 recording options for this browser context.
     pub record_har: Option<RecordHarOptions>,
+    /// Named persistent profile (loads `storageState` on acquire, saves on clean completion).
+    pub profile: Option<String>,
+    /// Persist updated `storageState` back to `profile` on clean completion (default `true`).
+    pub persist_profile: bool,
+    /// Sticky session affinity key for `EngineConfig::proxy_pool`.
+    pub proxy_session: Option<String>,
 }
 
 impl Default for JobOptions {
@@ -200,6 +219,9 @@ impl Default for JobOptions {
             base_url: None,
             http_credentials: None,
             record_har: None,
+            profile: None,
+            persist_profile: true,
+            proxy_session: None,
         }
     }
 }
@@ -335,6 +357,21 @@ impl JobOptions {
 
     pub fn resource_preset(mut self, preset: ResourcePreset) -> Self {
         preset.apply(&mut self);
+        self
+    }
+
+    pub fn profile(mut self, name: impl Into<String>) -> Self {
+        self.profile = Some(name.into());
+        self
+    }
+
+    pub fn persist_profile(mut self, persist: bool) -> Self {
+        self.persist_profile = persist;
+        self
+    }
+
+    pub fn proxy_session(mut self, session: impl Into<String>) -> Self {
+        self.proxy_session = Some(session.into());
         self
     }
 }

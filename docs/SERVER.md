@@ -60,6 +60,17 @@ after the restart. Three things to know:
 - The file holds the job steps as sent, URLs and typed values included. It is created
   owner-only on Linux and macOS; put it somewhere only the server can read.
 
+`--profiles-dir <dir>` stores named persistent browser profiles (`storageState` cookies,
+`localStorage`, and IndexedDB) as owner-only JSON files (`0600` on Unix) so jobs with `"profile"`
+resume authenticated sessions cleanly across restarts.
+
+`--proxy <url>` (repeatable) configures an outbound proxy rotation pool
+(`http://`, `https://`, `socks5://`, `socks5h://`, with optional `user:pass@`) featuring sticky
+session affinity (`"proxy_session"`) and exponential cooldown backoff on failures.
+
+`--adaptive-concurrency` enables an AIMD concurrency limiter that backs off under high browser RSS
+pressure or failed jobs and grows smoothly back toward configured capacity while queue demand exists.
+
 Without `--max-browsers` or `--memory-ceiling-mb`, the engine sizes itself to the machine.
 `--max-contexts` defaults to 8 per browser. Ctrl+C (and SIGTERM on Unix) stops admission,
 cancels outstanding jobs, and shuts down Chrome, allowing up to 10 seconds for lease cleanup.
@@ -158,6 +169,9 @@ failed job returns **409**.
   "timeout_ms": 60000,
   "priority": "normal",
   "retries": 0,
+  "profile": "acct-prod",
+  "persist_profile": true,
+  "proxy_session": "user-42",
   "steps": [
     { "action": "goto", "url": "https://example.com", "wait_until": "load" },
     { "action": "text_content", "selector": "h1" },
@@ -253,6 +267,9 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | GET (WS) | `/v1/live/{id}/ws` | Bearer token or single-use `?ticket=` | Live JPEG screencast stream + HITL mouse/keyboard/navigate/pause forwarding (standalone only) |
 | POST | `/v1/jobs/{id}/pause` | Bearer token | Pause a running live job before its next step (standalone only) |
 | POST | `/v1/jobs/{id}/resume` | Bearer token | Resume a paused live job (standalone only) |
+| GET | `/v1/profiles` | Bearer token | List saved named profiles (metadata only; requires `--profiles-dir`) |
+| DELETE | `/v1/profiles/{name}` | Bearer token | Delete a saved named profile (requires `--profiles-dir`) |
+| GET | `/v1/proxies` | Bearer token | Inspect sanitized proxy pool health/cooldown stats (requires `--proxy`) |
 | GET | `/json/version` | Bearer (or `?token=` with `--allow-query-token`) | Standard DevTools discovery JSON pointing at `ws(s)://<host>/cdp` (standalone only) |
 | GET (WS) | `/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Pooled, context-isolated Chrome DevTools Protocol WebSocket gateway (standalone only) |
 
@@ -343,6 +360,7 @@ Exported metrics include:
   - `fluxwright_engine_rss_bytes`: Resident set size of the engine process in bytes.
   - `fluxwright_browser_tree_rss_bytes`: Total resident memory of all managed browser process trees in bytes.
   - `fluxwright_memory_per_job_bytes_estimate`: Estimated browser process-tree RSS divided by active leases in bytes.
+  - `fluxwright_effective_concurrency_limit`: Active concurrency admission limit (reflects AIMD adaptive concurrency when enabled).
 - **Fleet Counters**:
   - `fluxwright_crash_count_total`: Total count of browser crashes detected and recovered.
   - `fluxwright_recycle_count_total`: Total count of browser recycles performed by the engine.
