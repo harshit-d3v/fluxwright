@@ -1073,9 +1073,11 @@ fn dos_datetime_now() -> (u16, u16) {
 
 fn write_zip_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Error::Other(format!("create trace parent dir {}: {e}", dir.display())))?;
     }
-    std::fs::write(path, bytes)?;
+    std::fs::write(path, bytes)
+        .map_err(|e| Error::Other(format!("write trace zip {}: {e}", path.display())))?;
     Ok(())
 }
 
