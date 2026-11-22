@@ -30,6 +30,7 @@ fluxwright-server = { path = "crates/fluxwright-server", version = "0.1.0" }
 benchmark-server = { path = "benchmark-server" }
 
 tokio = { version = "1.47", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # ring, not the default aws-lc-rs: aws-lc needs cmake and nasm on Windows builders.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
