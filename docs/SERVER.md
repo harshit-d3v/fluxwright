@@ -60,6 +60,13 @@ after the restart. Three things to know:
 - The file holds the job steps as sent, URLs and typed values included. It is created
   owner-only on Linux and macOS; put it somewhere only the server can read.
 
+`--store <file>` (mutually exclusive with `--journal`) persists jobs in a SQLite WAL database
+(`busy_timeout = 5000ms`, owner-only `0600` on Linux and macOS) on both `fluxwright serve` and
+`fluxwright coordinate`. Like `--journal`, unfinished jobs (`queued`/`running`) are queued again on
+startup, and unlike `--journal`, completed job snapshots (`results`, `error`, `failure_evidence`,
+`status`, `attempts`, `finished_at`) are also retained across restarts up to `--max-jobs` (newest
+first) and purged once older than `--result-ttl-secs <secs>` (default `3600`).
+
 `--profiles-dir <dir>` stores named persistent browser profiles (`storageState` cookies,
 `localStorage`, and IndexedDB) as owner-only JSON files (`0600` on Unix) so jobs with `"profile"`
 resume authenticated sessions cleanly across restarts.
@@ -245,9 +252,11 @@ or live contexts are shared between jobs. All steps in one job run on the same p
   When full, the oldest submitted completed record is evicted first. Active jobs (including
   cancellation still being processed) are never evicted. If no completed record is available,
   submission returns **429** and `Retry-After: 1`.
-- History is **in-memory and bounded**, not durable. Fetch results promptly. Restarting the
-  server loses all records; evicted/unknown IDs return **404**. Increasing `--max-jobs` increases
-  retained memory (up to roughly 1 MiB of result data per job, plus overhead).
+- History is **in-memory and bounded** by default: without `--store`, restarting the server loses
+  completed results (evicted/unknown/expired IDs return **404**). With `--store <file>`,
+  finished results survive restarts within `--result-ttl-secs` (default `3600`) up to `--max-jobs`.
+  Increasing `--max-jobs` increases retained memory (up to roughly 1 MiB of result data per job,
+  plus overhead).
 
 ## Endpoints
 
@@ -465,7 +474,7 @@ Run one coordinator without local browsers, and join one or more browser-running
 # On the coordinator host (optional dedicated FLUXWRIGHT_WORKER_TOKEN isolates worker routes from client API routes):
 FLUXWRIGHT_SERVER_TOKEN="$CLIENT_TOKEN" \
 FLUXWRIGHT_WORKER_TOKEN="$WORKER_TOKEN" \
-  fluxwright coordinate --listen 10.0.1.10:7331 --journal queue.jsonl
+  fluxwright coordinate --listen 10.0.1.10:7331 --store coord.sqlite --result-ttl-secs 3600 --max-per-host 2 --min-host-delay-ms 250
 
 # On each worker host (supports native https:// TLS or private-network http://;
 # FLUXWRIGHT_SERVER_TOKEN protects the worker's own local listener and need not match $CLIENT_TOKEN):
@@ -474,7 +483,7 @@ FLUXWRIGHT_WORKER_TOKEN="$WORKER_TOKEN" \
   fluxwright serve --join https://coordinator.internal
 ```
 
-Workers pull up to their local capacity (`POST /v1/workers/{worker}/lease`), extend 30-second leases every 10 seconds (`POST /v1/workers/{worker}/heartbeat`), abort client-cancelled jobs, and post results or failure evidence (`POST /v1/jobs/{id}/result`). Those worker routes are exposed only by `fluxwright coordinate`. Expired leases requeue within `retries` or fail with `"worker lost"`. On Ctrl+C / SIGTERM, a worker drains already-leased jobs up to 10 seconds, then calls `POST /v1/workers/{worker}/release` so any still-unfinished jobs return to `queued` without losing an attempt.
+Coordinators also accept `--max-per-host <n>` and `--min-host-delay-ms <ms>` to enforce cluster-wide per-host concurrency and lease spacing across all workers (based on the job's first `goto` host) without head-of-line blocking other hosts, and accept either `--store <file>` (SQLite with `--result-ttl-secs`, default `3600`) or `--journal <file>`. Workers pull up to their local capacity (`POST /v1/workers/{worker}/lease`), extend 30-second leases every 10 seconds (`POST /v1/workers/{worker}/heartbeat`), abort client-cancelled jobs, and post results or failure evidence (`POST /v1/jobs/{id}/result`). Those worker routes are exposed only by `fluxwright coordinate`. Expired leases requeue within `retries` or fail with `"worker lost"`. On Ctrl+C / SIGTERM, a worker drains already-leased jobs up to 10 seconds, then calls `POST /v1/workers/{worker}/release` so any still-unfinished jobs return to `queued` without losing an attempt.
 
 > **Security boundary:** `fluxwright serve --join` supports native `https://` TLS (`rustls` + WebPKI roots, e.g. via a TLS reverse proxy in front of `fluxwright coordinate`) as well as `http://` (non-loopback `http://` logs a warning). Set a dedicated `FLUXWRIGHT_WORKER_TOKEN` on both coordinator and workers so worker credentials cannot call client/operator routes (`POST /v1/jobs`, `/v1/stats`, `/metrics`, `/v1/workers/*` management) and client tokens cannot pull or post worker results; when `FLUXWRIGHT_WORKER_TOKEN` is unset, both fall back to `FLUXWRIGHT_SERVER_TOKEN`. Keep plaintext `http://` links strictly inside a private subnet or VPN.
 

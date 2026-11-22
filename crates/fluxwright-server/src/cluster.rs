@@ -24,8 +24,61 @@ use uuid::Uuid;
 use crate::{
     bounded_error, execute_job, json_len, not_found, parse_id, ApiError, ConfigError,
     ExecutionProgress, FailureEvidence, Inner, Job, JobPriority, JobRequest, JobStatus,
-    JobTraceContext, MAX_RESULT_BYTES,
+    JobTraceContext, Step, MAX_RESULT_BYTES,
 };
+
+const MAX_TRACKED_HOSTS: usize = 4096;
+
+/// Extracts the normalized lowercase target host from the job's first `Step::Goto { url, .. }`.
+/// Returns `None` when the job has no `goto` step or targets a non-network URL such as `about:blank`.
+pub fn job_target_host(req: &JobRequest) -> Option<String> {
+    req.steps
+        .iter()
+        .find_map(|step| match step {
+            Step::Goto { url, .. } => Some(url.as_str()),
+            _ => None,
+        })
+        .and_then(extract_url_host)
+}
+
+fn extract_url_host(url: &str) -> Option<String> {
+    let cleaned: String = url
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let (scheme, rest) = cleaned.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#', '\\']).next()?;
+    let host_port = authority.rsplit('@').next()?;
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next()?,
+        None => host_port.split(':').next()?,
+    };
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn record_last_leased(
+    map: &mut HashMap<String, u64>,
+    host: String,
+    now: u64,
+    min_delay_ms: Option<u64>,
+) {
+    if map.len() >= MAX_TRACKED_HOSTS && !map.contains_key(&host) {
+        if let Some(delay) = min_delay_ms {
+            map.retain(|_, ts| now.saturating_sub(*ts) < delay);
+        }
+        if map.len() >= MAX_TRACKED_HOSTS {
+            if let Some(oldest) = map.iter().min_by_key(|(_, ts)| **ts).map(|(h, _)| h.clone()) {
+                map.remove(&oldest);
+            }
+        }
+    }
+    map.insert(host, now);
+}
 
 const MAX_LEASE_BATCH: usize = 64;
 /// Coordinator stops adding queued jobs to one lease response past 2 MiB so batches stay fast and
@@ -280,9 +333,9 @@ pub(crate) fn workers_snapshot(
     (workers, summary)
 }
 
-/// Requeues or fails leased jobs whose deadline passed without a heartbeat, returning job IDs
-/// that reached a terminal state and must be marked done in the journal once unlocked.
-pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Uuid> {
+/// Requeues or fails leased jobs whose deadline passed without a heartbeat, returning terminal
+/// job snapshots that must be persisted to the durable store once unlocked.
+pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Job> {
     let mut done = Vec::new();
     let mut expired_workers = Vec::new();
     for record in &mut registry.jobs {
@@ -302,7 +355,7 @@ pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Uui
                 record.job.finished_at = Some(now);
                 record.job.error = Some("worker lost".into());
                 registry.failed_jobs += 1;
-                done.push(record.job.id);
+                done.push(record.job.clone());
             }
         }
     }
@@ -324,6 +377,8 @@ pub(crate) async fn lease(
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
 
     let lease_ms = inner.lease_ms();
+    let max_per_host = inner.max_concurrency_per_host;
+    let min_delay_ms = inner.min_delay_per_host_ms;
     let leased = inner.with_registry(|registry, now| -> Result<Vec<LeasedJob>, ApiError> {
         if !registry.accepting {
             return Err(ApiError::new(
@@ -340,7 +395,21 @@ pub(crate) async fn lease(
         if draining {
             return Ok(Vec::new());
         }
-        let mut candidates: Vec<(usize, LeasedJob)> =
+
+        let check_host_limits = max_per_host.is_some() || min_delay_ms.is_some();
+        let mut running_per_host: HashMap<String, usize> = HashMap::new();
+        let mut batch_last_leased: HashMap<String, u64> = HashMap::new();
+        if max_per_host.is_some() {
+            for record in &registry.jobs {
+                if record.job.status == JobStatus::Running {
+                    if let Some(host) = job_target_host(&record.request) {
+                        *running_per_host.entry(host).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let mut candidates: Vec<(usize, LeasedJob, Option<String>)> =
             Vec::with_capacity(limit.min(registry.jobs.len()));
         let mut total_bytes: usize = 16; // {"jobs":[]}
         if limit > 0 {
@@ -349,29 +418,59 @@ pub(crate) async fn lease(
                     if candidates.len() >= limit {
                         break 'pick;
                     }
-                    if record.job.status == JobStatus::Queued && record.request.priority == prio {
-                        let candidate = LeasedJob {
-                            id: record.job.id,
-                            request: record.request.clone(),
-                            attempts: record.job.attempts + 1,
-                            trace_id: record.job.trace_id.clone(),
-                        };
-                        let entry_bytes =
-                            json_len(&candidate) + usize::from(!candidates.is_empty());
-                        if !candidates.is_empty()
-                            && total_bytes + entry_bytes > MAX_LEASE_RESPONSE_BYTES
-                        {
-                            break 'pick;
-                        }
-                        total_bytes += entry_bytes;
-                        candidates.push((idx, candidate));
+                    if record.job.status != JobStatus::Queued || record.request.priority != prio {
+                        continue;
                     }
+
+                    let target_host = job_target_host(&record.request);
+                    if check_host_limits {
+                        if let Some(ref host) = target_host {
+                            if let Some(max) = max_per_host {
+                                if running_per_host.get(host).copied().unwrap_or(0) >= max {
+                                    continue;
+                                }
+                            }
+                            if let Some(min_delay) = min_delay_ms {
+                                let last = batch_last_leased
+                                    .get(host)
+                                    .copied()
+                                    .or_else(|| registry.last_leased_per_host.get(host).copied());
+                                if let Some(prev) = last {
+                                    if now.saturating_sub(prev) < min_delay {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let candidate = LeasedJob {
+                        id: record.job.id,
+                        request: record.request.clone(),
+                        attempts: record.job.attempts + 1,
+                        trace_id: record.job.trace_id.clone(),
+                    };
+                    let entry_bytes =
+                        json_len(&candidate) + usize::from(!candidates.is_empty());
+                    if !candidates.is_empty()
+                        && total_bytes + entry_bytes > MAX_LEASE_RESPONSE_BYTES
+                    {
+                        break 'pick;
+                    }
+                    total_bytes += entry_bytes;
+                    if check_host_limits {
+                        if let Some(ref host) = target_host {
+                            *running_per_host.entry(host.clone()).or_insert(0) += 1;
+                            batch_last_leased.insert(host.clone(), now);
+                        }
+                    }
+                    candidates.push((idx, candidate, target_host));
                 }
             }
         }
 
         let mut leased = Vec::with_capacity(candidates.len());
-        for (idx, item) in candidates {
+        for (idx, item, target_host) in candidates {
             let record = &mut registry.jobs[idx];
             record.job.status = JobStatus::Running;
             record.job.started_at.get_or_insert(now);
@@ -380,6 +479,9 @@ pub(crate) async fn lease(
             record.job.failure_evidence = None;
             record.worker = Some(worker.clone());
             record.lease_until = Some(now.saturating_add(lease_ms));
+            if let Some(host) = target_host {
+                record_last_leased(&mut registry.last_leased_per_host, host, now, min_delay_ms);
+            }
             leased.push(item);
         }
         Ok(leased)
@@ -550,7 +652,7 @@ pub(crate) async fn result(
     })?;
 
     if finished {
-        inner.journal_done(id);
+        inner.store_finished(&job);
         tracing::info!(job_id = %id, status = ?job.status, worker = %req.worker, "cluster job finished");
     }
     Ok(Json(job))
