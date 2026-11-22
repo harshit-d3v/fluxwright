@@ -273,7 +273,7 @@ impl LiveRegistry {
     }
 
     fn acquire_viewer(&self) -> Result<ViewerGuard, ApiError> {
-        let res = self.active_viewers.fetch_update(
+        let res = self.active_viewers.try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |cur| (cur < MAX_LIVE_VIEWERS).then_some(cur + 1),

@@ -53,6 +53,7 @@ const DASHBOARD_JOBS: usize = 100;
 /// No Debug implementation: the bearer token must not appear in logs.
 pub struct ServerConfig {
     token: String,
+    worker_token: Option<String>,
     /// Bounds running, queued and retained completed jobs together. Completed jobs are evicted
     /// oldest-first to admit new work; active jobs are never evicted.
     pub max_jobs: usize,
@@ -79,17 +80,31 @@ pub enum ConfigError {
     InvalidCoordinator(String),
 }
 
+fn validate_token(token: &str) -> Result<(), ConfigError> {
+    if !(32..=256).contains(&token.len()) || !token.bytes().all(|c| c.is_ascii_graphic()) {
+        return Err(ConfigError::InvalidToken);
+    }
+    Ok(())
+}
+
 impl ServerConfig {
     pub fn new(token: String) -> Result<Self, ConfigError> {
-        if !(32..=256).contains(&token.len()) || !token.bytes().all(|c| c.is_ascii_graphic()) {
-            return Err(ConfigError::InvalidToken);
-        }
+        validate_token(&token)?;
         Ok(Self {
             token,
+            worker_token: None,
             max_jobs: 128,
             journal: None,
             allow_query_token: false,
         })
+    }
+
+    /// Configures a separate bearer token required for coordinator worker endpoints
+    /// (`/v1/workers/{worker}/lease|heartbeat|release` and `/v1/jobs/{id}/result`).
+    pub fn with_worker_token(mut self, token: String) -> Result<Self, ConfigError> {
+        validate_token(&token)?;
+        self.worker_token = Some(token);
+        Ok(self)
     }
 }
 
@@ -101,6 +116,7 @@ pub struct HttpServer {
 pub(crate) struct Inner {
     engine: Option<BrowserEngine>,
     token: Vec<u8>,
+    worker_token: Option<Vec<u8>>,
     max_jobs: usize,
     allow_query_token: bool,
     lease_ms: AtomicU64,
@@ -326,6 +342,7 @@ impl HttpServer {
         let inner = Arc::new(Inner {
             engine,
             token: config.token.into_bytes(),
+            worker_token: config.worker_token.map(String::into_bytes),
             max_jobs: config.max_jobs,
             allow_query_token: config.allow_query_token,
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
@@ -397,25 +414,29 @@ impl HttpServer {
             .route("/v1/events", get(dashboard::dashboard_events))
             .route("/metrics", get(metrics_endpoint));
 
-        let mut protected = Router::new();
+        let mut worker_routes = Router::new();
         // Worker cluster endpoints belong strictly to coordinators (`engine == None`); exposing
         // them on a standalone `serve` instance would lease out jobs that it also runs locally.
         if self.inner.engine.is_none() {
             small = small
                 .route("/v1/workers", get(cluster::list_workers))
                 .route("/v1/workers/{worker}", delete(cluster::remove_worker))
-                .route("/v1/workers/{worker}/drain", post(cluster::drain_worker))
+                .route("/v1/workers/{worker}/drain", post(cluster::drain_worker));
+            let worker_small = Router::new()
                 .route("/v1/workers/{worker}/lease", post(cluster::lease))
                 .route("/v1/workers/{worker}/heartbeat", post(cluster::heartbeat))
-                .route("/v1/workers/{worker}/release", post(cluster::release));
-            protected = protected
+                .route("/v1/workers/{worker}/release", post(cluster::release))
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
+            let worker_result = Router::new()
                 .route("/v1/jobs/{id}/result", post(cluster::result))
                 .layer(DefaultBodyLimit::max(MAX_RESULT_BYTES * 2 + MAX_REQUEST_BYTES));
+            worker_routes = worker_small.merge(worker_result).route_layer(
+                middleware::from_fn_with_state(self.inner.clone(), authorize_worker),
+            );
         }
 
         let mut protected = small
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-            .merge(protected);
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
         let mut live_ws = Router::new();
         if self.inner.engine.is_some() {
             protected = protected
@@ -449,6 +470,7 @@ impl HttpServer {
             .route("/dashboard", get(dashboard::dashboard_html))
             .route("/", get(dashboard::dashboard_html))
             .merge(protected)
+            .merge(worker_routes)
             .merge(live_ws)
             .fallback(|| async {
                 ApiError::new(StatusCode::NOT_FOUND, "not_found", "endpoint not found")
@@ -488,16 +510,33 @@ impl HttpServer {
     }
 }
 
-/// The `Authorization` header by default; `/cdp` and `/json/version` also accept `?token=` when
-/// `ServerConfig::allow_query_token` is explicitly enabled for CDP clients that cannot set headers.
-async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next) -> Response {
-    let header_valid = request
+fn bearer_token(request: &Request) -> Option<&[u8]> {
+    request
         .headers()
         .get(header::AUTHORIZATION)
         // RFC 9110: the auth scheme is case-insensitive.
         .and_then(|value| value.as_bytes().split_at_checked(7))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(b"Bearer "))
-        .is_some_and(|(_, supplied)| same_token(supplied, &inner.token));
+        .map(|(_, supplied)| supplied)
+}
+
+fn unauthorized_response() -> Response {
+    let mut response = ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "a bearer token is required",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+/// The `Authorization` header by default; `/cdp` and `/json/version` also accept `?token=` when
+/// `ServerConfig::allow_query_token` is explicitly enabled for CDP clients that cannot set headers.
+async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next) -> Response {
+    let header_valid = bearer_token(&request).is_some_and(|supplied| same_token(supplied, &inner.token));
 
     let path = request.uri().path();
     let query_valid = !header_valid
@@ -510,16 +549,19 @@ async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next
             .is_some_and(|supplied| same_token(&supplied, &inner.token));
 
     if !header_valid && !query_valid {
-        let mut response = ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "a bearer token is required",
-        )
-        .into_response();
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        return response;
+        return unauthorized_response();
+    }
+    next.run(request).await
+}
+
+async fn authorize_worker(
+    State(inner): State<Arc<Inner>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let expected = inner.worker_token.as_deref().unwrap_or(&inner.token);
+    if !bearer_token(&request).is_some_and(|supplied| same_token(supplied, expected)) {
+        return unauthorized_response();
     }
     next.run(request).await
 }

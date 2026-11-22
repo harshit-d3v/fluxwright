@@ -1,6 +1,6 @@
 # Many machines (experimental cluster mode)
 
-Status: experimental in `0.7.0`. Core coordinator (`fluxwright coordinate`) and pulling worker loop (`fluxwright serve --join`) are implemented. Remaining hardening items: SQLite store, separate worker token, native worker TLS, coordinator-wide per-host limits, and a worker table on the dashboard.
+Status: experimental in `0.7.0` (hardened in `0.9.0` with separate `FLUXWRIGHT_WORKER_TOKEN` isolation and native `https://` TLS support on `--join`). Remaining items: SQLite store, coordinator-wide per-host limits, and multi-coordinator HA.
 
 ## Goal
 
@@ -21,7 +21,7 @@ clients ──HTTP──▶ coordinator ◀──HTTP (pull)── worker (fluxw
 Two roles, one binary:
 
 - **Coordinator** (`fluxwright coordinate [--listen ADDR] [--max-jobs N] [--journal FILE]`): the public job API (`POST /v1/jobs`, `GET` and `DELETE /v1/jobs/{id}`), plus worker lease, heartbeat, and result endpoints (not mounted on standalone `fluxwright serve`), with no browsers of its own. Bind a private network interface (for example `10.0.1.10:7331`) when workers run on other hosts.
-- **Worker** (`fluxwright serve --join <http://coordinator-url> [--worker-id NAME]`): today's server (defaulting `--listen` to `127.0.0.1:0` when `--join` is passed), plus a pull loop that asks the coordinator for work, heartbeats on a dedicated background task every 10 seconds, aborts cancelled jobs, drains in-flight work on clean shutdown, and posts outcomes (with failure evidence) back. `--join` speaks `http://` only (`https://` is rejected) and authenticates with `FLUXWRIGHT_SERVER_TOKEN`, so the worker-to-coordinator link **must** stay on a trusted private network or pass through a local TLS tunnel/WireGuard VPN.
+- **Worker** (`fluxwright serve --join <http|https://coordinator-url> [--worker-id NAME]`): today's server (defaulting `--listen` to `127.0.0.1:0` when `--join` is passed), plus a pull loop that asks the coordinator for work, heartbeats on a dedicated background task every 10 seconds, aborts cancelled jobs, drains in-flight work on clean shutdown, and posts outcomes (with failure evidence) back. `--join` supports native `https://` TLS (`rustls` + WebPKI roots) as well as `http://` (for private/loopback links), and authenticates worker pull/heartbeat/release/result calls with `FLUXWRIGHT_WORKER_TOKEN` when set on both coordinator and worker (falling back to `FLUXWRIGHT_SERVER_TOKEN` when unset).
 
 Workers pull; the coordinator never connects to a worker. So workers need no open port, sit
 behind NAT without trouble, and a new one joins by starting.
@@ -56,15 +56,14 @@ Side effects can repeat. A job that clicked "buy" and then lost its worker, hit 
 
 ## Current limits vs planned hardening
 
-Implemented in `0.7.0` (experimental):
+Implemented in `0.7.0` (experimental) and hardened in `0.9.0`:
 - One coordinator process with in-memory bounded job ring (`--max-jobs`) and optional `--journal` file replay for unfinished jobs.
 - Pull-based leases (`POST /v1/workers/{worker}/lease`), priority + FIFO ordering, 2 MiB batch size cap per lease response, 30 s lease expiration/requeue, dedicated 10 s heartbeat task (`POST /v1/workers/{worker}/heartbeat`), cancellation propagation, `409 Conflict` rejection on late worker results (`POST /v1/jobs/{id}/result`), and graceful worker drain with post-grace `POST /v1/workers/{worker}/release` back into `queued` without counting an attempt.
+- Separate `FLUXWRIGHT_WORKER_TOKEN` bearer authentication isolating worker pull/result endpoints from client job/operator endpoints, plus native `https://` TLS support (`rustls` + WebPKI roots) on `fluxwright serve --join` (`0.9.0`).
 
 Planned for later versions:
 - **SQLite store** behind the journal interface, retaining finished results for a configurable TTL across coordinator restarts.
 - **Per-host limits across the cluster** (`--max-per-host` / `--min-host-delay-ms` currently apply per worker).
-- **Separate worker auth token** and **native `https://` client support** on `--join` (currently `FLUXWRIGHT_SERVER_TOKEN` and unencrypted `http://` only, so keep worker-to-coordinator traffic on a trusted private network or local TLS tunnel).
-- **Coordinator worker metrics and dashboard table** (active workers, last heartbeat, lease expirations).
 
 ## Design choices
 

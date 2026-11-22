@@ -2,15 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-/// Memory of each root in `roots` plus every descendant, counted so that a tree sums without
-/// counting shared pages once per process: see [`footprint`].
-///
-/// One sysinfo refresh covering every root. Calling this per-pid on the Tokio
-/// runtime stalls the reactor under load.
-pub fn process_trees_memory_bytes(roots: &[u32]) -> u64 {
-    process_tree_memory_map(roots).values().copied().sum()
-}
-
 pub fn process_tree_memory_map(roots: &[u32]) -> HashMap<u32, u64> {
     if roots.is_empty() {
         return HashMap::new();

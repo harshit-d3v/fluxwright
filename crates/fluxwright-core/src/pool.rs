@@ -37,6 +37,8 @@ struct Inner {
     adaptive: Option<AdaptiveController>,
     state: Mutex<State>,
     admit: Notify,
+    queue_space: Notify,
+    last_maintenance: Mutex<Option<Instant>>,
     /// When the fleet's memory was last walked (never: `None`), and each browser root's footprint.
     rss_cache: Mutex<(Option<Instant>, HashMap<u32, u64>)>,
     rss_refreshing: AtomicBool,
@@ -140,10 +142,11 @@ impl ContextGuard {
     }
 
     async fn dispose(&self, completed: bool) {
-        let _ = std::fs::remove_dir_all(&self.download_dir);
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let dir = self.download_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
@@ -158,10 +161,13 @@ impl ContextGuard {
     }
 
     fn dispose_in_background(self: &Arc<Self>, completed: bool) {
-        let _ = std::fs::remove_dir_all(&self.download_dir);
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let dir = self.download_dir.clone();
+        self.runtime.spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(dir);
+        });
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
@@ -181,10 +187,13 @@ impl ContextGuard {
 
 impl Drop for ContextGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.download_dir);
         if self.disposed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let dir = self.download_dir.clone();
+        self.runtime.spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(dir);
+        });
         let completed = !self.failed.load(Ordering::SeqCst);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
@@ -398,9 +407,11 @@ impl Engine {
                 shutting_down: false,
             }),
             admit: Notify::new(),
+            queue_space: Notify::new(),
+            last_maintenance: Mutex::new(None),
             rss_cache: Mutex::new((None, HashMap::new())),
             rss_refreshing: AtomicBool::new(false),
-            grants: Arc::new(tokio::sync::Semaphore::new(24)),
+            grants: Arc::new(tokio::sync::Semaphore::new(hard_max.clamp(24, 128))),
         });
         // Weak: an engine dropped without shutdown() must free its browsers (see Inner's Drop),
         // and this loop holding it would keep it alive forever.
@@ -625,7 +636,7 @@ impl Engine {
             if st.shutting_down {
                 return Err(Error::ShuttingDown);
             }
-            drop_abandoned(&mut st.queue);
+            notify_n(&self.inner.queue_space, drop_abandoned(&mut st.queue));
             if st.queue.len() >= self.inner.config.queue_capacity {
                 match self.inner.config.queue_full_mode {
                     QueueFullMode::Error => return Err(Error::QueueFull),
@@ -636,7 +647,7 @@ impl Engine {
                             if start.elapsed() > timeout {
                                 return Err(Error::AcquireTimeout);
                             }
-                            let notified = self.inner.admit.notified();
+                            let notified = self.inner.queue_space.notified();
                             tokio::pin!(notified);
                             notified.as_mut().enable();
                             {
@@ -646,7 +657,7 @@ impl Engine {
                                 if st.shutting_down {
                                     return Err(Error::ShuttingDown);
                                 }
-                                drop_abandoned(&mut st.queue);
+                                notify_n(&self.inner.queue_space, drop_abandoned(&mut st.queue));
                                 if st.queue.len() < self.inner.config.queue_capacity {
                                     st.queue.push_back(Waiter {
                                         priority,
@@ -684,7 +695,7 @@ impl Engine {
     }
 
     fn pump(&self) {
-        self.inner.admit.notify_waiters();
+        self.inner.admit.notify_one();
     }
 
     pub async fn run<F, Fut, T>(&self, opts: JobOptions, f: F) -> Result<T>
@@ -829,7 +840,8 @@ impl Engine {
                     None
                 }
             };
-            self.inner.admit.notify_waiters();
+            self.inner.admit.notify_one();
+            self.inner.queue_space.notify_waiters();
             if let Some(browsers) = browsers {
                 break browsers;
             }
@@ -921,19 +933,34 @@ impl State {
 
 impl Inner {
     async fn dispatch(self: Arc<Self>) -> Result<bool> {
-        self.reap().await;
-        self.recycle().await;
-        {
+        let run_maintenance = {
+            let mut last = self.last_maintenance.lock().await;
+            let due = last.is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if run_maintenance {
+            self.reap().await;
+            self.recycle().await;
+        }
+        let can_dispatch_now = {
             let mut st = self.state.lock().await;
             if st.shutting_down {
                 return Ok(false);
             }
-            drop_abandoned(&mut st.queue);
-            if !st.can_dispatch(&self.config) {
-                drop(st);
-                self.maybe_prewarm().await;
-                return Ok(false);
+            notify_n(&self.queue_space, drop_abandoned(&mut st.queue));
+            st.can_dispatch(&self.config)
+        };
+        if !can_dispatch_now {
+            if !run_maintenance {
+                *self.last_maintenance.lock().await = Some(Instant::now());
+                self.reap().await;
+                self.recycle().await;
             }
+            self.maybe_prewarm().await;
+            return Ok(false);
         }
         // Over the memory ceiling no new browser starts; one already running still takes work.
         let ceiling = self.config.memory_ceiling_mb * 1024 * 1024;
@@ -951,40 +978,63 @@ impl Inner {
             }
             tree > ceiling
         };
-        let permit = match self.grants.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => return Ok(false),
-        };
-        let mut excess_warm: Option<(Arc<CdpBrowser>, WarmContext)> = None;
-        let (waiter, reservation) = {
+        let mut excess_warm: Vec<(Arc<CdpBrowser>, WarmContext)> = Vec::new();
+        let mut batch: Vec<(Waiter, Reservation, tokio::sync::OwnedSemaphorePermit)> = Vec::new();
+        let mut abandoned_total = 0usize;
+        {
             let mut st = self.state.lock().await;
             if st.shutting_down {
                 return Ok(false);
             }
-            drop_abandoned(&mut st.queue);
-            if let Some(ref adaptive) = self.adaptive {
-                let in_flight: usize =
-                    st.browsers.iter().map(|s| s.active).sum::<usize>() + st.launching;
-                if in_flight >= adaptive.limit() {
-                    return Ok(false);
+            abandoned_total += drop_abandoned(&mut st.queue);
+            loop {
+                if let Some(ref adaptive) = self.adaptive {
+                    let in_flight: usize =
+                        st.browsers.iter().map(|s| s.active).sum::<usize>() + st.launching;
+                    if in_flight >= adaptive.limit() {
+                        break;
+                    }
                 }
-            }
-            let idx = st.next_reusable_browser(self.config.max_contexts_per_browser);
-            if idx.is_none() && (over_ceiling || !st.can_launch_for_queue(&self.config)) {
-                return Ok(false);
-            }
-            let Some(waiter) = pick_waiter(&mut st.queue) else {
-                return Ok(false);
-            };
-            let reservation = if waiter.proxy.is_none() {
-                if let Some(wi) = st.next_warm_browser(self.config.max_contexts_per_browser) {
-                    let warm = st.browsers[wi].warm.pop_front().unwrap();
-                    st.browsers[wi].active += 1;
-                    st.counters.acquires += 1;
-                    st.counters.acquires_reused_browser += 1;
-                    st.counters.warm_context_hits += 1;
-                    Reservation::Warm(st.browsers[wi].browser.clone(), warm)
+                let idx = st.next_reusable_browser(self.config.max_contexts_per_browser);
+                if idx.is_none() && (over_ceiling || !st.can_launch_for_queue(&self.config)) {
+                    break;
+                }
+                if st.queue.is_empty() {
+                    break;
+                }
+                let Ok(permit) = self.grants.clone().try_acquire_owned() else {
+                    break;
+                };
+                let (waiter, picked_abandoned) = pick_waiter(&mut st.queue);
+                abandoned_total += picked_abandoned;
+                let Some(waiter) = waiter else {
+                    break;
+                };
+                let reservation = if waiter.proxy.is_none() {
+                    if let Some(wi) = st.next_warm_browser(self.config.max_contexts_per_browser) {
+                        let warm = st.browsers[wi].warm.pop_front().unwrap();
+                        st.browsers[wi].active += 1;
+                        st.counters.acquires += 1;
+                        st.counters.acquires_reused_browser += 1;
+                        st.counters.warm_context_hits += 1;
+                        Reservation::Warm(st.browsers[wi].browser.clone(), warm)
+                    } else if let Some(i) = idx {
+                        st.browsers[i].active += 1;
+                        st.counters.acquires += 1;
+                        st.counters.acquires_reused_browser += 1;
+                        Reservation::Reuse(st.browsers[i].browser.clone())
+                    } else {
+                        st.launching += 1;
+                        Reservation::Launch
+                    }
                 } else if let Some(i) = idx {
+                    if st.browsers[i].active + st.browsers[i].warm.len()
+                        >= self.config.max_contexts_per_browser
+                    {
+                        if let Some(evicted) = st.browsers[i].warm.pop_back() {
+                            excess_warm.push((st.browsers[i].browser.clone(), evicted));
+                        }
+                    }
                     st.browsers[i].active += 1;
                     st.counters.acquires += 1;
                     st.counters.acquires_reused_browser += 1;
@@ -992,39 +1042,34 @@ impl Inner {
                 } else {
                     st.launching += 1;
                     Reservation::Launch
-                }
-            } else if let Some(i) = idx {
-                if st.browsers[i].active + st.browsers[i].warm.len()
-                    >= self.config.max_contexts_per_browser
-                {
-                    if let Some(evicted) = st.browsers[i].warm.pop_back() {
-                        excess_warm = Some((st.browsers[i].browser.clone(), evicted));
-                    }
-                }
-                st.browsers[i].active += 1;
-                st.counters.acquires += 1;
-                st.counters.acquires_reused_browser += 1;
-                Reservation::Reuse(st.browsers[i].browser.clone())
-            } else {
-                st.launching += 1;
-                Reservation::Launch
-            };
-            (waiter, reservation)
-        };
-        if let Some((browser, evicted)) = excess_warm {
+                };
+                batch.push((waiter, reservation, permit));
+            }
+        }
+        notify_n(&self.queue_space, abandoned_total + batch.len());
+        if batch.is_empty() {
+            self.maybe_prewarm().await;
+            return Ok(false);
+        }
+        for (browser, evicted) in excess_warm {
             tokio::spawn(async move {
-                let _ = std::fs::remove_dir_all(&evicted.download_dir);
+                let dir = evicted.download_dir;
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(dir);
+                });
                 let _ = browser.dispose_context(&evicted.context).await;
             });
         }
-        let inner = self.clone();
-        tokio::spawn(async move {
-            let res = inner.prepare_context(waiter.proxy.as_ref(), reservation).await;
-            let _ = waiter.tx.send(res);
-            drop(permit);
-            inner.maybe_prewarm().await;
-            inner.admit.notify_waiters();
-        });
+        for (waiter, reservation, permit) in batch {
+            let inner = self.clone();
+            tokio::spawn(async move {
+                let res = inner.prepare_context(waiter.proxy.as_ref(), reservation).await;
+                let _ = waiter.tx.send(res);
+                drop(permit);
+                inner.admit.notify_one();
+                inner.maybe_prewarm().await;
+            });
+        }
         Ok(true)
     }
 
@@ -1058,7 +1103,7 @@ impl Inner {
                 };
                 *me.rss_cache.lock().await = (Some(Instant::now()), by_pid);
                 me.rss_refreshing.store(false, Ordering::SeqCst);
-                me.admit.notify_waiters();
+                me.admit.notify_one();
             });
         }
         tree
@@ -1101,7 +1146,7 @@ impl Inner {
         let mut to_spawn: Vec<(Arc<CdpBrowser>, tokio::sync::OwnedSemaphorePermit)> = Vec::new();
         {
             let mut st = self.state.lock().await;
-            if st.shutting_down {
+            if st.shutting_down || !st.queue.is_empty() {
                 return;
             }
             for s in st.browsers.iter_mut() {
@@ -1177,7 +1222,7 @@ impl Inner {
                     let _ = std::fs::remove_dir_all(&w.download_dir);
                     let _ = browser.dispose_context(&w.context).await;
                 }
-                inner.admit.notify_waiters();
+                inner.admit.notify_one();
             });
         }
     }
@@ -1307,7 +1352,7 @@ impl Inner {
             let tree: u64 = self.rss_cache.lock().await.1.values().copied().sum();
             adaptive.on_outcome(completed, has_queue_demand, tree, ceiling);
         }
-        self.admit.notify_waiters();
+        self.admit.notify_one();
     }
 
     async fn reap(&self) {
@@ -1332,43 +1377,12 @@ impl Inner {
         }
     }
 
-    async fn recycle(&self) {
+    async fn recycle(self: &Arc<Self>) {
         let now = Instant::now();
         let rss_limit = self.config.recycle_rss_mb;
         let rss_by_pid = if rss_limit.is_some() {
-            let pids: Vec<u32> = {
-                let st = self.state.lock().await;
-                st.browsers
-                    .iter()
-                    .filter(|s| !s.crashed && s.browser.pid > 0)
-                    .map(|s| s.browser.pid)
-                    .collect()
-            };
-            if pids.is_empty() {
-                HashMap::new()
-            } else {
-                let cached = {
-                    let cache = self.rss_cache.lock().await;
-                    if cache.0.is_some_and(|t| t.elapsed() < Duration::from_millis(500))
-                        && pids.iter().all(|p| cache.1.contains_key(p))
-                    {
-                        Some(cache.1.clone())
-                    } else {
-                        None
-                    }
-                };
-                match cached {
-                    Some(map) => map,
-                    None => {
-                        let map =
-                            tokio::task::spawn_blocking(move || process_tree_memory_map(&pids))
-                                .await
-                                .unwrap_or_default();
-                        *self.rss_cache.lock().await = (Some(Instant::now()), map.clone());
-                        map
-                    }
-                }
-            }
+            let _ = self.browser_tree_rss().await;
+            self.rss_cache.lock().await.1.clone()
         } else {
             HashMap::new()
         };
@@ -1450,22 +1464,35 @@ impl Inner {
     }
 }
 
-fn pick_waiter(queue: &mut VecDeque<Waiter>) -> Option<Waiter> {
-    drop_abandoned(queue);
-    let best_pri = queue.iter().map(|w| w.priority).max()?;
-    let idx = queue
+fn notify_n(notify: &Notify, n: usize) {
+    for _ in 0..n {
+        notify.notify_one();
+    }
+}
+
+fn pick_waiter(queue: &mut VecDeque<Waiter>) -> (Option<Waiter>, usize) {
+    let abandoned = drop_abandoned(queue);
+    let Some(best_pri) = queue.iter().map(|w| w.priority).max() else {
+        return (None, abandoned);
+    };
+    let Some(idx) = queue
         .iter()
         .enumerate()
         .filter(|(_, w)| w.priority == best_pri)
         .min_by_key(|(_, w)| w.queued_at)
-        .map(|(i, _)| i)?;
-    queue.remove(idx)
+        .map(|(i, _)| i)
+    else {
+        return (None, abandoned);
+    };
+    (queue.remove(idx), abandoned)
 }
 
 /// Waiters whose caller timed out or gave up (the receiver is gone). Left queued, they count
 /// against `queue_capacity` and get a page built that nobody takes.
-fn drop_abandoned(queue: &mut VecDeque<Waiter>) {
+fn drop_abandoned(queue: &mut VecDeque<Waiter>) -> usize {
+    let before = queue.len();
     queue.retain(|w| !w.tx.is_closed());
+    before - queue.len()
 }
 
 async fn apply_context_blocking(guard: &ContextGuard, opts: &JobOptions) -> Result<()> {
@@ -4117,6 +4144,89 @@ mod tests {
         let _ = inflight.await;
         assert!(eng.inner.state.lock().await.browsers.is_empty());
         assert_eq!(eng.inner.state.lock().await.launching, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_dispatch_admits_waiters_and_wakes_queue_waiters() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        struct MockWsSource(std::net::SocketAddr);
+        impl BrowserSource for MockWsSource {
+            fn launch(
+                &self,
+                _opts: &LaunchOptions,
+            ) -> Pin<Box<dyn Future<Output = CdpResult<Arc<CdpBrowser>>> + Send + '_>> {
+                let addr = self.0;
+                Box::pin(async move { CdpBrowser::connect(&format!("ws://{addr}")).await })
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seq = Arc::new(AtomicUsize::new(1));
+        let srv = tokio::spawn({
+            let seq = seq.clone();
+            async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let seq = seq.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                            return;
+                        };
+                        while let Some(Ok(Message::Text(text))) = ws.next().await {
+                            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
+                                break;
+                            };
+                            let result = match msg["method"].as_str() {
+                                Some("Target.createBrowserContext") => {
+                                    let n = seq.fetch_add(1, Ordering::SeqCst);
+                                    serde_json::json!({ "browserContextId": format!("ctx-{n}") })
+                                }
+                                _ => serde_json::json!({}),
+                            };
+                            let reply =
+                                serde_json::json!({ "id": msg["id"], "result": result }).to_string();
+                            if ws.send(Message::Text(reply.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(2)
+            .max_contexts_per_browser(2)
+            .memory_ceiling_mb(0)
+            .queue_capacity(2)
+            .queue_full_mode(QueueFullMode::Wait)
+            .acquire_timeout(Duration::from_secs(5))
+            .source(Arc::new(MockWsSource(addr)))
+            .build()
+            .await
+            .unwrap();
+
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                let eng = eng.clone();
+                tokio::spawn(async move {
+                    let ctx = eng.acquire_context().await.unwrap();
+                    ctx.close().await.unwrap();
+                })
+            })
+            .collect();
+
+        for j in jobs {
+            tokio::time::timeout(Duration::from_secs(5), j)
+                .await
+                .expect("waiter timed out under QueueFullMode::Wait")
+                .unwrap();
+        }
+        eng.shutdown(Duration::from_secs(2)).await.unwrap();
+        srv.abort();
     }
 
     #[test]
