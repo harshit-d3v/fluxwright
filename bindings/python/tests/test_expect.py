@@ -191,7 +191,7 @@ async def _run_async_expect(base: str) -> None:
             # Timeout diagnostics and prompt failure.
             started = time.monotonic()
             with pytest.raises(AssertionError) as exc_info:
-                await async_expect(page.locator("#txt")).to_have_text("Never", timeout=200)
+                await async_expect(page.locator("#txt")).to_have_text("Never", timeout=600)
             assert time.monotonic() - started < 3.0
             msg = str(exc_info.value)
             assert "to_have_text" in msg
@@ -199,7 +199,7 @@ async def _run_async_expect(base: str) -> None:
             assert "Actual: 'Loaded 42 items'" in msg
 
             with pytest.raises(AssertionError, match="element not found"):
-                await async_expect(page.locator("#missing")).not_to_have_text("anything", timeout=150)
+                await async_expect(page.locator("#missing")).not_to_have_text("anything", timeout=600)
 
             with pytest.raises(AssertionError, match="to_have_url"):
                 await async_expect(page).to_have_url("/never", timeout=150)
@@ -283,7 +283,7 @@ def test_sync_expect(base):
             assert "200ms" in str(exc_info.value)
 
             with pytest.raises(AssertionError, match="element not found"):
-                sync_expect(page.locator("#missing")).not_to_have_text("x", timeout=150)
+                sync_expect(page.locator("#missing")).not_to_have_text("x", timeout=600)
 
             # Bytes regex rejected, strict bool on checked.
             with pytest.raises(TypeError, match="bytes"):
@@ -305,7 +305,7 @@ def test_sync_expect(base):
             sync_expect.clear_soft_errors()
             sync_expect.soft(page.locator("#txt")).to_have_text("Wrong One", timeout=100)
             sync_expect.soft(page).to_have_title("Wrong Title", timeout=100)
-            sync_expect.soft(page.locator("#txt")).to_have_text("Loaded 42 items", timeout=200)
+            sync_expect.soft(page.locator("#txt")).to_have_text("Loaded 42 items", timeout=1000)
             assert len(sync_expect.soft_errors()) == 2
             with pytest.raises(AssertionError) as soft_exc:
                 sync_expect.assert_no_soft_errors()

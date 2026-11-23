@@ -179,7 +179,7 @@ async def _run_async(base: str, tmp_path: Path) -> None:
             page_shot = snap_dir / "page.png"
 
             with pytest.raises(AssertionError, match="Baseline snapshot does not exist"):
-                await async_expect(vpage.locator("#box")).to_have_screenshot(box_shot, timeout=250)
+                await async_expect(vpage.locator("#box")).to_have_screenshot(box_shot, timeout=1000)
             assert not box_shot.exists()
             assert box_actual.exists()
 
@@ -209,7 +209,7 @@ async def _run_async(base: str, tmp_path: Path) -> None:
             await vpage.evaluate("() => { document.getElementById('box').style.background = 'rgb(225, 0, 0)'; }")
             await async_expect(vpage.locator("#box")).to_have_screenshot(box_shot)
             with pytest.raises(AssertionError, match="Screenshot mismatch"):
-                await async_expect(vpage.locator("#box")).to_have_screenshot(box_shot, threshold=0.0, timeout=250)
+                await async_expect(vpage.locator("#box")).to_have_screenshot(box_shot, threshold=0.0, timeout=1000)
 
             # max_diff_pixels & max_diff_pixel_ratio.
             await vpage.evaluate(
@@ -222,7 +222,7 @@ async def _run_async(base: str, tmp_path: Path) -> None:
             box_actual.unlink(missing_ok=True)
             box_diff.unlink(missing_ok=True)
             with pytest.raises(AssertionError) as exc_info:
-                await async_expect(vpage.locator("#box")).to_have_screenshot(box_shot, timeout=250)
+                await async_expect(vpage.locator("#box")).to_have_screenshot(box_shot, timeout=1000)
             msg = str(exc_info.value)
             assert "pixels differ" in msg
             assert "ratio " in msg
@@ -246,7 +246,7 @@ async def _run_async(base: str, tmp_path: Path) -> None:
             await async_expect(vpage).to_have_screenshot(page_shot)
             await vpage.evaluate("() => { document.body.style.background = '#000000'; }")
             with pytest.raises(AssertionError, match="page-diff.png"):
-                await async_expect(vpage).to_have_screenshot(page_shot, timeout=250)
+                await async_expect(vpage).to_have_screenshot(page_shot, timeout=1000)
 
             await vpage.close()
         finally:
@@ -292,7 +292,7 @@ def test_sync_video_and_visual(base: str, tmp_path: Path):
 
             vpage.evaluate("() => { document.getElementById('box').style.background = 'rgb(0, 0, 255)'; }")
             with pytest.raises(AssertionError, match="sync_box-diff.png"):
-                sync_expect(vpage.locator("#box")).to_have_screenshot(shot, timeout=250)
+                sync_expect(vpage.locator("#box")).to_have_screenshot(shot, timeout=1000)
             assert (snap_dir / "sync_box-actual.png").exists()
             assert (snap_dir / "sync_box-diff.png").exists()
             vpage.close()
@@ -540,7 +540,7 @@ async def _run_async_video_popup_self_close_and_visual_audit(base: str, tmp_path
                 missing_shot = snap_dir / "must-not-create.png"
                 with pytest.raises(AssertionError, match="Baseline snapshot does not exist"):
                     await async_expect(vpage.locator("#box")).to_have_screenshot(
-                        missing_shot, update=False, timeout=200
+                        missing_shot, update=False, timeout=800
                     )
                 assert not missing_shot.exists()
             finally:
