@@ -2648,7 +2648,16 @@ async fn cdp_session_send_events_and_oopif() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let base = format!("http://127.0.0.1:{port}");
 
-    let eng = engine(1, 2).await;
+    let eng = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .memory_ceiling_mb(16_384)
+        .queue_capacity(64)
+        .acquire_timeout(Duration::from_secs(60))
+        .args(["--site-per-process"])
+        .build()
+        .await
+        .expect("engine");
     let mut opts = JobOptions::default();
     opts.base_url = Some(base);
     let ctx = eng.acquire_context_with(&opts).await.unwrap();

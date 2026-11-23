@@ -362,7 +362,6 @@ pub(crate) fn build_chrome_args(opts: &LaunchOptions, user_data_dir: &Path) -> V
         "--no-service-autorun".to_string(),
         "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,GlobalMediaControls,LensOverlay,PaintHolding".to_string(),
         "--disable-dev-shm-usage".to_string(),
-        "--site-per-process".to_string(),
         format!(
             "--crash-dumps-dir={}",
             user_data_dir.join("Crashpad").display()
@@ -852,7 +851,6 @@ mod tests {
 
         let def = build_chrome_args(&LaunchOptions::default(), tmp.path());
         assert!(def.iter().any(|a| a == "--mute-audio"));
-        assert!(def.iter().any(|a| a == "--site-per-process"));
         assert!(def.iter().any(|a| a.starts_with("--disable-features=")));
         assert!(def.iter().any(|a| a == transport));
 
@@ -865,7 +863,6 @@ mod tests {
             tmp.path(),
         );
         assert!(!all_ignored.iter().any(|a| a == "--mute-audio"));
-        assert!(!all_ignored.iter().any(|a| a == "--site-per-process"));
         assert!(!all_ignored.iter().any(|a| a == "--no-first-run"));
         assert!(all_ignored.iter().any(|a| a == transport));
         assert!(all_ignored.iter().any(|a| a.starts_with("--user-data-dir=")));

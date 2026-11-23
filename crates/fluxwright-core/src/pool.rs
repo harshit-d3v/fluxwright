@@ -1297,7 +1297,7 @@ impl Inner {
                 return;
             }
             for s in st.browsers.iter_mut() {
-                if s.crashed || s.draining || s.browser.connection_dead() {
+                if s.crashed || s.draining || s.browser.connection_dead() || s.active > 0 {
                     continue;
                 }
                 let max_warm = target_per_browser
