@@ -3612,8 +3612,10 @@ async fn page_and_context_route_times_and_fallback_overrides() {
     use axum::{body::Bytes, extract::Request, routing::any, Json, Router};
     use fluxwright::{Fulfill, Overrides, RouteOptions, UrlPattern};
 
-    let app = Router::new().route(
-        "/echo/{*rest}",
+    let app = Router::new()
+        .route("/home", axum::routing::get(|| async { "home" }))
+        .route(
+            "/echo/{*rest}",
         any(|req: Request| async move {
             let method = req.method().to_string();
             let uri = req.uri().to_string();
@@ -3663,22 +3665,35 @@ async fn page_and_context_route_times_and_fallback_overrides() {
     .unwrap();
 
     let page = ctx.new_page().await.unwrap();
-    page.goto(&format!("{base}/echo/home")).await.unwrap();
+    page.goto(&format!("{base}/home")).await.unwrap();
 
-    // Older page route inspects accumulated overrides from newer page route, then adds its own and falls back to context route.
+    // Older page route inspects accumulated overrides when coming from outer route, adds X-Mid, and falls back to context route.
     page.route("**/echo/*", |route| async move {
-        assert_eq!(route.request().header("x-outer"), Some("from-outer"));
-        assert_eq!(route.request().method(), "POST");
-        assert_eq!(route.request().post_data(), Some("outer-payload"));
         let mut headers = route.request().headers().to_vec();
-        headers.push(("X-Mid".into(), "from-mid".into()));
-        route
-            .fallback(Overrides {
-                url: Some(format!("{}/echo/rewritten?ok=1", route.request().url().split("/echo/").next().unwrap())),
-                headers: Some(headers),
-                ..Default::default()
-            })
-            .await
+        if route.request().header("x-outer").is_some() {
+            assert_eq!(route.request().header("x-outer"), Some("from-outer"));
+            assert_eq!(route.request().method(), "POST");
+            assert_eq!(route.request().post_data(), Some("outer-payload"));
+            headers.push(("X-Mid".into(), "from-mid".into()));
+            let origin = route.request().url().split("/echo/").next().unwrap();
+            route
+                .fallback(Overrides {
+                    url: Some(format!("{origin}/echo/rewritten?ok=1")),
+                    headers: Some(headers),
+                    ..Default::default()
+                })
+                .await
+        } else {
+            assert_eq!(route.request().method(), "GET");
+            assert_eq!(route.request().post_data(), None);
+            headers.push(("X-Mid".into(), "direct-only".into()));
+            route
+                .fallback(Overrides {
+                    headers: Some(headers),
+                    ..Default::default()
+                })
+                .await
+        }
     })
     .await
     .unwrap();
@@ -3745,11 +3760,20 @@ async fn page_and_context_route_times_and_fallback_overrides() {
 
     // Request 3: times:2 handler is gone, so /echo/start hits the older **/echo/* route directly (without x-outer).
     let third = page
-        .evaluate("fetch('/echo/start').then(r => r.text())")
+        .evaluate("fetch('/echo/start').then(r => r.json())")
         .await
         .unwrap();
-    assert!(third.as_str().is_some());
-    assert_eq!(ctx_seen.lock().unwrap().len(), 2);
+    assert_eq!(third["method"], json!("GET"));
+    assert_eq!(third["uri"], json!("/echo/start"));
+    assert_eq!(third["headers"]["x-mid"], json!("direct-only"));
+    assert!(third["headers"].get("x-outer").is_none());
+
+    let seen = ctx_seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].contains("outer=from-outer mid=from-mid"));
+    assert!(seen[1].contains("outer=from-outer mid=from-mid"));
+    assert!(seen[2].contains("outer=none mid=direct-only"));
+    drop(seen);
 
     page.close().await.unwrap();
     ctx.close().await.unwrap();

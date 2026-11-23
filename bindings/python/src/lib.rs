@@ -1827,7 +1827,6 @@ fn parse_load_state(state: Option<&str>) -> PyResult<fluxwright::WaitUntil> {
     }
 }
 
-#[pymethods]
 fn to_clock_time(time_ms: Option<f64>, time_iso: Option<String>) -> PyResult<fluxwright::ClockTime> {
     match (time_ms, time_iso) {
         (Some(ms), None) => Ok(fluxwright::ClockTime::Ms(ms)),
@@ -1851,6 +1850,7 @@ fn to_clock_ticks(
     }
 }
 
+#[pymethods]
 impl Page {
     #[new]
     fn new(lease: &Bound<'_, Lease>) -> PyResult<Self> {
@@ -3107,9 +3107,10 @@ impl Page {
         time_ms: Option<f64>,
         time_iso: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let time = match (time_ms, time_iso) {
-            (None, None) => None,
-            _ => Some(to_clock_time(time_ms, time_iso)?),
+        let time = if time_ms.is_none() && time_iso.is_none() {
+            None
+        } else {
+            Some(to_clock_time(time_ms, time_iso)?)
         };
         let opts = fluxwright::ClockInstallOptions { time };
         run(py, &self.lease, move |p| {

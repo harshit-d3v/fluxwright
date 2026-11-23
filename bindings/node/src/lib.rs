@@ -2947,9 +2947,10 @@ impl Page {
 
     #[napi(js_name = "_clockInstall")]
     pub async fn clock_install(&self, time_ms: Option<f64>, time_iso: Option<String>) -> Result<()> {
-        let time = match (time_ms, time_iso) {
-            (None, None) => None,
-            _ => Some(to_clock_time(time_ms, time_iso)?),
+        let time = if time_ms.is_none() && time_iso.is_none() {
+            None
+        } else {
+            Some(to_clock_time(time_ms, time_iso)?)
         };
         let opts = fluxwright::ClockInstallOptions { time };
         with_page(self.lease.clone(), move |p| {
