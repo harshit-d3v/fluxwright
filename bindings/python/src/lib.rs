@@ -1017,12 +1017,81 @@ fn length(value: &Bound<'_, PyAny>, what: &str) -> PyResult<String> {
     options::<Length>(value, what).map(Length::text)
 }
 
+fn extract_mask_selectors(
+    mask: Option<&Bound<'_, PyAny>>,
+    expected_lease: &LeaseSlot,
+) -> PyResult<Vec<String>> {
+    let Some(val) = mask else {
+        return Ok(Vec::new());
+    };
+    if val.is_none() {
+        return Ok(Vec::new());
+    }
+    if val.is_instance_of::<PyString>() || val.is_instance_of::<PyBytes>() {
+        return Err(PyTypeError::new_err(
+            "screenshot: mask must be a sequence of Locator or str",
+        ));
+    }
+    let iter = val
+        .try_iter()
+        .map_err(|_| PyTypeError::new_err("screenshot: mask must be a sequence of Locator or str"))?;
+    let mut out = Vec::new();
+    for item in iter {
+        let item = item?;
+        if let Ok(s) = item.extract::<String>() {
+            if s.trim().is_empty() {
+                return Err(PyValueError::new_err(
+                    "screenshot: mask selector must not be empty",
+                ));
+            }
+            out.push(s);
+            continue;
+        }
+        let mut cur = item.clone();
+        let mut found: Option<(LeaseSlot, fluxwright::Selector)> = None;
+        for _ in 0..3 {
+            if let Ok(loc) = cur.extract::<PyRef<'_, Locator>>() {
+                found = Some((loc.lease.clone(), loc.selector.clone()));
+                break;
+            }
+            match cur.getattr("_impl") {
+                Ok(next) => cur = next,
+                Err(_) => break,
+            }
+        }
+        let Some((loc_lease, sel)) = found else {
+            return Err(PyTypeError::new_err(
+                "screenshot: mask entries must be Locator or str",
+            ));
+        };
+        if !Arc::ptr_eq(&loc_lease, expected_lease) {
+            return Err(PyValueError::new_err(
+                "screenshot: mask locator must belong to the same page",
+            ));
+        }
+        if !sel.frames.is_empty() {
+            return Err(PyValueError::new_err(
+                "screenshot: mask locators inside frame_locator are not supported",
+            ));
+        }
+        out.push(sel.query);
+    }
+    Ok(out)
+}
+
 /// The screenshot type as Playwright picks it: `type`, else the extension of `path`, else PNG.
+#[allow(clippy::too_many_arguments)]
 fn shot_options(
+    lease: &LeaseSlot,
     path: Option<&Path>,
     kind: Option<&str>,
     quality: Option<u32>,
     omit_background: Option<bool>,
+    annotate: Option<bool>,
+    mask: Option<&Bound<'_, PyAny>>,
+    mask_color: Option<String>,
+    animations: Option<&str>,
+    caret: Option<&str>,
 ) -> PyResult<fluxwright::ScreenshotOptions> {
     let kind = match (kind, path) {
         (Some(k), _) => Some(k),
@@ -1049,13 +1118,42 @@ fn shot_options(
     if format == fluxwright::ImageFormat::Png && quality.is_some() {
         return Err(PyValueError::new_err("screenshot: quality is for JPEG only"));
     }
-    Ok(fluxwright::ScreenshotOptions {
+    let animations = match animations {
+        None => None,
+        Some("allow") => Some(fluxwright::ScreenshotAnimations::Allow),
+        Some("disabled") => Some(fluxwright::ScreenshotAnimations::Disabled),
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "screenshot: animations must be 'allow' or 'disabled', not {other:?}"
+            )));
+        }
+    };
+    let caret = match caret {
+        None => None,
+        Some("hide") => Some(fluxwright::ScreenshotCaret::Hide),
+        Some("initial") => Some(fluxwright::ScreenshotCaret::Initial),
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "screenshot: caret must be 'hide' or 'initial', not {other:?}"
+            )));
+        }
+    };
+    let mask = extract_mask_selectors(mask, lease)?;
+    let opts = fluxwright::ScreenshotOptions {
         format,
         // Over 255 becomes 255, which the engine rejects as over 100.
         quality: quality.map(|q| q.min(255) as u8),
         omit_background: omit_background.unwrap_or(false),
+        annotate: annotate.unwrap_or(false),
+        mask,
+        mask_color,
+        animations,
+        caret,
         ..Default::default()
-    })
+    };
+    opts.validate()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(opts)
 }
 
 /// Saved storage: what `storage_state()` returned, or the path of the JSON file it saved.
@@ -1918,7 +2016,7 @@ impl Page {
         run(py, &self.lease, |p| Box::pin(p.content()))
     }
 
-    #[pyo3(signature = (*, interactive_only=None, compact=None, max_depth=None, max_nodes=None))]
+    #[pyo3(signature = (*, interactive_only=None, compact=None, max_depth=None, max_nodes=None, diff=None))]
     fn aria_snapshot<'py>(
         &self,
         py: Python<'py>,
@@ -1926,11 +2024,13 @@ impl Page {
         compact: Option<bool>,
         max_depth: Option<usize>,
         max_nodes: Option<usize>,
+        diff: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut opts = fluxwright::SnapshotOptions {
             interactive_only: interactive_only.unwrap_or(false),
             compact: compact.unwrap_or(true),
             max_depth,
+            diff: diff.unwrap_or(false),
             ..Default::default()
         };
         if let Some(limit) = max_nodes {
@@ -2557,7 +2657,7 @@ impl Page {
     /// `type` is not given). `clip` is `{x, y, width, height}` relative to the viewport, or to
     /// the page with `full_page`.
     #[pyo3(signature = (*, path=None, full_page=None, r#type=None, quality=None, clip=None, omit_background=None,
-        timeout=None))]
+        annotate=None, mask=None, mask_color=None, animations=None, caret=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn screenshot<'py>(
         &self,
@@ -2568,10 +2668,26 @@ impl Page {
         quality: Option<u32>,
         clip: Option<Bound<'py, PyAny>>,
         omit_background: Option<bool>,
+        annotate: Option<bool>,
+        mask: Option<Bound<'py, PyAny>>,
+        mask_color: Option<String>,
+        animations: Option<String>,
+        caret: Option<String>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let timeout = call_timeout(timeout);
-        let mut shot = shot_options(path.as_deref(), r#type.as_deref(), quality, omit_background)?;
+        let mut shot = shot_options(
+            &self.lease,
+            path.as_deref(),
+            r#type.as_deref(),
+            quality,
+            omit_background,
+            annotate,
+            mask.as_ref(),
+            mask_color,
+            animations.as_deref(),
+            caret.as_deref(),
+        )?;
         shot.full_page = full_page.unwrap_or(false);
         if let Some(clip) = clip {
             let c: ClipRect = options(&clip, "clip")?;
@@ -3667,7 +3783,9 @@ impl Locator {
 
     /// PNG or JPEG of the element, once it is visible and still; with `path`, also written
     /// there (its extension picks the type when `type` is not given).
-    #[pyo3(signature = (*, path=None, r#type=None, quality=None, omit_background=None, timeout=None))]
+    #[pyo3(signature = (*, path=None, r#type=None, quality=None, omit_background=None,
+        annotate=None, mask=None, mask_color=None, animations=None, caret=None, timeout=None))]
+    #[allow(clippy::too_many_arguments)]
     fn screenshot<'py>(
         &self,
         py: Python<'py>,
@@ -3675,10 +3793,26 @@ impl Locator {
         r#type: Option<String>,
         quality: Option<u32>,
         omit_background: Option<bool>,
+        annotate: Option<bool>,
+        mask: Option<Bound<'py, PyAny>>,
+        mask_color: Option<String>,
+        animations: Option<String>,
+        caret: Option<String>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let timeout = call_timeout(timeout);
-        let shot = shot_options(path.as_deref(), r#type.as_deref(), quality, omit_background)?;
+        let shot = shot_options(
+            &self.lease,
+            path.as_deref(),
+            r#type.as_deref(),
+            quality,
+            omit_background,
+            annotate,
+            mask.as_ref(),
+            mask_color,
+            animations.as_deref(),
+            caret.as_deref(),
+        )?;
         let sel = self.selector.clone();
         let lease = self.lease.clone();
         future_into_py(py, async move {

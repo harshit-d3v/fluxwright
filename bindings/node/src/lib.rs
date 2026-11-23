@@ -105,6 +105,8 @@ pub struct AriaSnapshot {
     pub tree: String,
     pub refs: Vec<AriaRef>,
     pub truncated: bool,
+    pub is_diff: bool,
+    pub changed: bool,
 }
 
 #[napi(object)]
@@ -113,6 +115,7 @@ pub struct AriaSnapshotOptions {
     pub compact: Option<bool>,
     pub max_depth: Option<u32>,
     pub max_nodes: Option<u32>,
+    pub diff: Option<bool>,
 }
 
 #[napi(object)]
@@ -1739,6 +1742,18 @@ pub struct ScreenshotOptions {
     pub clip: Option<BoundingBox>,
     /// A transparent background instead of the default white one (PNG).
     pub omit_background: Option<bool>,
+    /// Overlay Set-of-Marks `@eN` labels on interactive controls before capture.
+    pub annotate: Option<bool>,
+    /// Selectors to cover with colored mask boxes during capture.
+    pub mask: Option<Vec<String>>,
+    /// CSS color for `mask` overlays (default "#FF00FF").
+    pub mask_color: Option<String>,
+    /// Whether CSS animations and transitions are allowed or disabled during capture.
+    #[napi(ts_type = "'allow' | 'disabled'")]
+    pub animations: Option<String>,
+    /// Whether the text caret is hidden or left at its initial appearance during capture.
+    #[napi(ts_type = "'hide' | 'initial'")]
+    pub caret: Option<String>,
     /// Milliseconds; 0 for no timeout. Default: the page's or the engine's action timeout.
     pub timeout: Option<f64>,
 }
@@ -1786,14 +1801,41 @@ fn shot_options(options: Option<ScreenshotOptions>) -> Result<fluxwright::Screen
     if format == fluxwright::ImageFormat::Png && o.quality.is_some() {
         return Err(Error::from_reason("screenshot: quality is for JPEG only"));
     }
-    Ok(fluxwright::ScreenshotOptions {
+    let animations = match o.animations.as_deref() {
+        None => None,
+        Some("allow") => Some(fluxwright::ScreenshotAnimations::Allow),
+        Some("disabled") => Some(fluxwright::ScreenshotAnimations::Disabled),
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "screenshot: animations must be 'allow' or 'disabled', not {other:?}"
+            )));
+        }
+    };
+    let caret = match o.caret.as_deref() {
+        None => None,
+        Some("hide") => Some(fluxwright::ScreenshotCaret::Hide),
+        Some("initial") => Some(fluxwright::ScreenshotCaret::Initial),
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "screenshot: caret must be 'hide' or 'initial', not {other:?}"
+            )));
+        }
+    };
+    let opts = fluxwright::ScreenshotOptions {
         full_page: o.full_page.unwrap_or(false),
         format,
         // Over 255 becomes 255, which the engine rejects as over 100.
         quality: o.quality.map(|q| q.min(255) as u8),
         clip: o.clip.map(|c| fluxwright::Clip { x: c.x, y: c.y, width: c.width, height: c.height }),
         omit_background: o.omit_background.unwrap_or(false),
-    })
+        annotate: o.annotate.unwrap_or(false),
+        mask: o.mask.unwrap_or_default(),
+        mask_color: o.mask_color,
+        animations,
+        caret,
+    };
+    opts.validate().map_err(|e| Error::from_reason(e.to_string()))?;
+    Ok(opts)
 }
 
 fn pdf_options(options: Option<PdfOptions>) -> fluxwright::PdfOptions {
@@ -2396,11 +2438,13 @@ impl Page {
             compact: None,
             max_depth: None,
             max_nodes: None,
+            diff: None,
         });
         let mut opts = fluxwright::SnapshotOptions {
             interactive_only: o.interactive_only.unwrap_or(false),
             compact: o.compact.unwrap_or(true),
             max_depth: o.max_depth.map(|v| v as usize),
+            diff: o.diff.unwrap_or(false),
             ..Default::default()
         };
         if let Some(limit) = o.max_nodes {
@@ -2418,6 +2462,8 @@ impl Page {
                 .map(|r| AriaRef { id: r.id, role: r.role, name: r.name })
                 .collect(),
             truncated: snap.truncated,
+            is_diff: snap.is_diff,
+            changed: snap.changed,
         })
     }
 

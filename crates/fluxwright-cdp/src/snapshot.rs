@@ -16,6 +16,8 @@ pub struct SnapshotOptions {
     pub max_depth: Option<usize>,
     /// Maximum number of emitted nodes before truncating (`Default`: 1500).
     pub max_nodes: usize,
+    /// Return a compact line-level diff against the previous snapshot on the page (`Default`: `false`).
+    pub diff: bool,
 }
 
 impl Default for SnapshotOptions {
@@ -25,6 +27,7 @@ impl Default for SnapshotOptions {
             compact: true,
             max_depth: None,
             max_nodes: 1500,
+            diff: false,
         }
     }
 }
@@ -45,6 +48,8 @@ pub struct AriaSnapshot {
     pub tree: String,
     pub refs: Vec<AriaRef>,
     pub truncated: bool,
+    pub is_diff: bool,
+    pub changed: bool,
 }
 
 /// Controls how [`crate::CdpPage::markdown`] serializes a page or element.
@@ -136,6 +141,8 @@ pub fn build_aria_snapshot(raw_nodes: &[Value], opts: &SnapshotOptions) -> AriaS
             tree: String::new(),
             refs: Vec::new(),
             truncated: !raw_nodes.is_empty() && opts.max_nodes == 0,
+            is_diff: false,
+            changed: true,
         };
     }
 
@@ -184,7 +191,188 @@ pub fn build_aria_snapshot(raw_nodes: &[Value], opts: &SnapshotOptions) -> AriaS
         tree: ctx.lines.join("\n"),
         refs: ctx.refs,
         truncated: ctx.truncated,
+        is_diff: false,
+        changed: true,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffOp {
+    Equal(usize, usize),
+    Delete(usize),
+    Insert(usize),
+}
+
+/// Computes a compact line-level unified diff between two formatted ARIA snapshot trees.
+pub fn diff_snapshot_trees(prev: &str, next: &str) -> String {
+    if prev == next {
+        return "(no changes)".into();
+    }
+    let old_lines: Vec<&str> = if prev.is_empty() {
+        Vec::new()
+    } else {
+        prev.lines().collect()
+    };
+    let new_lines: Vec<&str> = if next.is_empty() {
+        Vec::new()
+    } else {
+        next.lines().collect()
+    };
+
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < (old_lines.len() - prefix)
+        && suffix < (new_lines.len() - prefix)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_mid = &old_lines[prefix..old_lines.len() - suffix];
+    let new_mid = &new_lines[prefix..new_lines.len() - suffix];
+
+    let mut ops = Vec::with_capacity(old_lines.len() + new_lines.len());
+    for i in 0..prefix {
+        ops.push(DiffOp::Equal(i, i));
+    }
+
+    let n = old_mid.len();
+    let m = new_mid.len();
+    if n == 0 {
+        for j in 0..m {
+            ops.push(DiffOp::Insert(prefix + j));
+        }
+    } else if m == 0 {
+        for i in 0..n {
+            ops.push(DiffOp::Delete(prefix + i));
+        }
+    } else if (n + 1).saturating_mul(m + 1) <= 2_500_000 {
+        let cols = m + 1;
+        let mut dp = vec![0u32; (n + 1) * cols];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                dp[i * cols + j] = if old_mid[i] == new_mid[j] {
+                    dp[(i + 1) * cols + (j + 1)] + 1
+                } else {
+                    dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+                };
+            }
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < n && j < m {
+            if old_mid[i] == new_mid[j] {
+                ops.push(DiffOp::Equal(prefix + i, prefix + j));
+                i += 1;
+                j += 1;
+            } else if dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)] {
+                ops.push(DiffOp::Delete(prefix + i));
+                i += 1;
+            } else {
+                ops.push(DiffOp::Insert(prefix + j));
+                j += 1;
+            }
+        }
+        while i < n {
+            ops.push(DiffOp::Delete(prefix + i));
+            i += 1;
+        }
+        while j < m {
+            ops.push(DiffOp::Insert(prefix + j));
+            j += 1;
+        }
+    } else {
+        for i in 0..n {
+            ops.push(DiffOp::Delete(prefix + i));
+        }
+        for j in 0..m {
+            ops.push(DiffOp::Insert(prefix + j));
+        }
+    }
+
+    for k in 0..suffix {
+        ops.push(DiffOp::Equal(
+            old_lines.len() - suffix + k,
+            new_lines.len() - suffix + k,
+        ));
+    }
+
+    const CONTEXT: usize = 1;
+    let mut raw_hunks: Vec<(usize, usize)> = Vec::new();
+    let mut idx = 0usize;
+    while idx < ops.len() {
+        if matches!(ops[idx], DiffOp::Equal(_, _)) {
+            idx += 1;
+            continue;
+        }
+        let mut end = idx + 1;
+        while end < ops.len() && !matches!(ops[end], DiffOp::Equal(_, _)) {
+            end += 1;
+        }
+        let mut h_start = idx.saturating_sub(CONTEXT);
+        if h_start == 1 {
+            // Avoid skipping a single leading line only to replace it with a hunk header.
+            h_start = 0;
+        }
+        let h_end = (end + CONTEXT).min(ops.len());
+        if let Some(last) = raw_hunks.last_mut() {
+            if h_start <= last.1 + 1 {
+                last.1 = last.1.max(h_end);
+            } else {
+                raw_hunks.push((h_start, h_end));
+            }
+        } else {
+            raw_hunks.push((h_start, h_end));
+        }
+        idx = end;
+    }
+
+    if raw_hunks.is_empty() {
+        return "(no changes)".into();
+    }
+
+    let mut out = Vec::new();
+    for (h_start, h_end) in raw_hunks {
+        if h_start > 0 {
+            let (mut old_first, mut new_first) = (None, None);
+            let (mut old_cnt, mut new_cnt) = (0usize, 0usize);
+            for op in &ops[h_start..h_end] {
+                match *op {
+                    DiffOp::Equal(oi, ni) => {
+                        old_first.get_or_insert(oi + 1);
+                        new_first.get_or_insert(ni + 1);
+                        old_cnt += 1;
+                        new_cnt += 1;
+                    }
+                    DiffOp::Delete(oi) => {
+                        old_first.get_or_insert(oi + 1);
+                        old_cnt += 1;
+                    }
+                    DiffOp::Insert(ni) => {
+                        new_first.get_or_insert(ni + 1);
+                        new_cnt += 1;
+                    }
+                }
+            }
+            let o_start = old_first.unwrap_or(1);
+            let n_start = new_first.unwrap_or(1);
+            out.push(format!("@@ -{o_start},{old_cnt} +{n_start},{new_cnt} @@"));
+        }
+        for op in &ops[h_start..h_end] {
+            match *op {
+                DiffOp::Equal(oi, _) => out.push(format!("  {}", old_lines[oi])),
+                DiffOp::Delete(oi) => out.push(format!("- {}", old_lines[oi])),
+                DiffOp::Insert(ni) => out.push(format!("+ {}", new_lines[ni])),
+            }
+        }
+    }
+    out.join("\n")
 }
 
 struct WalkCtx<'a> {
@@ -535,7 +723,52 @@ mod tests {
             },
         );
         assert!(capped.truncated);
+        assert!(!capped.is_diff);
+        assert!(capped.changed);
         assert_eq!(capped.lines_count(), 2);
+    }
+
+    #[test]
+    fn diff_snapshot_trees_reports_no_changes_compact_hunks_and_edges() {
+        let base = "\
+- RootWebArea \"App\"
+  - heading \"Title\" [ref=e1] [level=1]
+  - button \"Save\" [ref=e2]
+  - link \"Docs\" [ref=e3]";
+        assert_eq!(diff_snapshot_trees(base, base), "(no changes)");
+
+        let changed = "\
+- RootWebArea \"App\"
+  - heading \"Title\" [ref=e1] [level=1]
+  - button \"Saved\" [ref=e2]
+  - status \"Done\"
+  - link \"Docs\" [ref=e3]";
+        let diff = diff_snapshot_trees(base, changed);
+        assert_eq!(
+            diff,
+            [
+                "  - RootWebArea \"App\"",
+                "    - heading \"Title\" [ref=e1] [level=1]",
+                "-   - button \"Save\" [ref=e2]",
+                "+   - button \"Saved\" [ref=e2]",
+                "+   - status \"Done\"",
+                "    - link \"Docs\" [ref=e3]",
+            ]
+            .join("\n")
+        );
+
+        let many_old: Vec<String> = (1..=30).map(|i| format!("  - item {i}")).collect();
+        let mut many_new = many_old.clone();
+        many_new[14] = "  - item 15 [updated]".into();
+        let hunk_diff = diff_snapshot_trees(&many_old.join("\n"), &many_new.join("\n"));
+        assert!(hunk_diff.contains("@@ -14,3 +14,3 @@"), "{hunk_diff}");
+        assert!(hunk_diff.contains("-   - item 15"), "{hunk_diff}");
+        assert!(hunk_diff.contains("+   - item 15 [updated]"), "{hunk_diff}");
+        assert!(!hunk_diff.contains("item 1\n"), "{hunk_diff}");
+        assert!(!hunk_diff.contains("item 30"), "{hunk_diff}");
+
+        assert_eq!(diff_snapshot_trees("", "- button \"Go\""), "+ - button \"Go\"");
+        assert_eq!(diff_snapshot_trees("- button \"Go\"", ""), "- - button \"Go\"");
     }
 
     trait LineCount {

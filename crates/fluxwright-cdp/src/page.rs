@@ -640,6 +640,8 @@ pub struct CdpPage {
     pub(crate) net: Arc<std::sync::Mutex<NetActivity>>,
     /// Maps the latest accessibility snapshot's short ref (`"e1"`, `"e2"`, ...) to `backendDOMNodeId`.
     pub(crate) ax_refs: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// Cached formatted tree from the most recent `aria_snapshot` call for `diff: true`.
+    pub(crate) last_snapshot: Arc<std::sync::Mutex<Option<String>>>,
     /// Pre-subscribed session-routed CDP event stream for popups so early console/network events aren't missed.
     #[allow(clippy::type_complexity)]
     pub(crate) early_log_events: Arc<
@@ -1530,13 +1532,46 @@ impl CdpPage {
     }
 
     pub async fn aria_snapshot(&self, opts: &SnapshotOptions, timeout: Duration) -> Result<AriaSnapshot> {
+        self.capture_aria_snapshot(opts, true, timeout).await
+    }
+
+    pub(crate) async fn capture_aria_snapshot(
+        &self,
+        opts: &SnapshotOptions,
+        update_diff_cache: bool,
+        timeout: Duration,
+    ) -> Result<AriaSnapshot> {
         let res = self.call("Accessibility.getFullAXTree", json!({}), timeout).await?;
         let nodes = res["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-        let snap = crate::snapshot::build_aria_snapshot(nodes, opts);
-        let mut refs = self.ax_refs.lock().unwrap();
-        refs.clear();
-        for item in &snap.refs {
-            refs.insert(item.id.clone(), item.backend_node_id);
+        let mut snap = crate::snapshot::build_aria_snapshot(nodes, opts);
+        {
+            let mut refs = self.ax_refs.lock().unwrap();
+            refs.clear();
+            for item in &snap.refs {
+                refs.insert(item.id.clone(), item.backend_node_id);
+            }
+        }
+        if update_diff_cache {
+            let mut last = self.last_snapshot.lock().unwrap();
+            let full_tree = snap.tree.clone();
+            if opts.diff {
+                if let Some(ref prev_tree) = *last {
+                    if prev_tree == &full_tree {
+                        snap.tree = "(no changes)".into();
+                        snap.is_diff = true;
+                        snap.changed = false;
+                    } else {
+                        snap.tree = crate::snapshot::diff_snapshot_trees(prev_tree, &full_tree);
+                        snap.is_diff = true;
+                        snap.changed = true;
+                        *last = Some(full_tree);
+                    }
+                    return Ok(snap);
+                }
+            }
+            *last = Some(full_tree);
+            snap.is_diff = false;
+            snap.changed = true;
         }
         Ok(snap)
     }
@@ -2856,13 +2891,218 @@ impl CdpPage {
         Ok(())
     }
 
+    pub(crate) async fn eval_isolated(&self, expression: &str, timeout: Duration) -> Result<Value> {
+        let scope = self
+            .world(self.sid(), &self.target_id.0, Affine::ID, Affine::ID, timeout)
+            .await
+            .unwrap_or_else(|| self.main_scope());
+        self.eval_in(&scope, expression, true, timeout).await
+    }
+
+    pub(crate) async fn collect_mask_rects(
+        &self,
+        selectors: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<(f64, f64, f64, f64)>> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = self
+            .world(self.sid(), &self.target_id.0, Affine::ID, Affine::ID, timeout)
+            .await
+            .unwrap_or_else(|| self.main_scope());
+        let mut rects = Vec::new();
+        for raw_sel in selectors {
+            let sel = Selector::new(raw_sel.clone());
+            let res = self
+                .eval_engine(&scope, &sel, "rects", &Value::Null, true, timeout)
+                .await?;
+            let val = &res["value"];
+            if val["ok"].as_bool() != Some(true) {
+                let reason = val["reason"].as_str().unwrap_or("invalid mask selector");
+                return Err(Error::Other(format!("screenshot mask {raw_sel:?}: {reason}")));
+            }
+            if let Some(arr) = val["rects"].as_array() {
+                for r in arr {
+                    let (Some(x), Some(y), Some(w), Some(h)) = (
+                        r["x"].as_f64(),
+                        r["y"].as_f64(),
+                        r["width"].as_f64(),
+                        r["height"].as_f64(),
+                    ) else {
+                        continue;
+                    };
+                    if x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
+                        rects.push((x, y, w, h));
+                    }
+                }
+            }
+        }
+        Ok(rects)
+    }
+
+    pub(crate) async fn collect_som_boxes(
+        &self,
+        include_offscreen: bool,
+        timeout: Duration,
+    ) -> Result<Vec<(String, f64, f64, f64, f64)>> {
+        let is_html = self
+            .eval_isolated(
+                "Boolean(document && document.documentElement && (document.body || (typeof HTMLDocument !== 'undefined' && document instanceof HTMLDocument)))",
+                timeout,
+            )
+            .await
+            .ok()
+            .and_then(|v| v["value"].as_bool())
+            .unwrap_or(false);
+        if !is_html {
+            return Ok(Vec::new());
+        }
+        let Ok(snap) = self
+            .capture_aria_snapshot(
+                &SnapshotOptions {
+                    interactive_only: true,
+                    ..Default::default()
+                },
+                false,
+                timeout,
+            )
+            .await
+        else {
+            return Ok(Vec::new());
+        };
+        if snap.refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        const SOM_GROUP: &str = "__fw_som";
+        let resolve_futs = snap.refs.iter().map(|r| {
+            self.call(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": r.backend_node_id, "objectGroup": SOM_GROUP }),
+                timeout,
+            )
+        });
+        let resolved = futures_util::future::join_all(resolve_futs).await;
+
+        let mut pairs = Vec::with_capacity(snap.refs.len());
+        for (aria_ref, res) in snap.refs.iter().zip(resolved.into_iter()) {
+            if let Ok(v) = res {
+                if let Some(obj_id) = v["object"]["objectId"].as_str() {
+                    pairs.push((aria_ref.id.clone(), obj_id.to_string()));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        const BOX_FN: &str = r#"function(includeOffscreen) {
+            if (!this || this.nodeType !== 1 || !this.isConnected) return null;
+            const win = (this.ownerDocument && this.ownerDocument.defaultView) || window;
+            const st = win.getComputedStyle(this);
+            if (st.display === 'none' || st.visibility === 'hidden') return null;
+            const r = this.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return null;
+            let x = r.x, y = r.y;
+            let curWin = win;
+            while (curWin && curWin !== window) {
+                const fe = curWin.frameElement;
+                if (!fe) break;
+                const fr = fe.getBoundingClientRect();
+                x += fr.left + (fe.clientLeft || 0);
+                y += fr.top + (fe.clientTop || 0);
+                curWin = curWin.parent;
+            }
+            if (!includeOffscreen) {
+                if (x + r.width <= 0 || x >= window.innerWidth || y + r.height <= 0 || y >= window.innerHeight) {
+                    return null;
+                }
+            }
+            return { x, y, width: r.width, height: r.height };
+        }"#;
+
+        let box_futs = pairs.iter().map(|(_, obj_id)| {
+            self.call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": obj_id,
+                    "functionDeclaration": BOX_FN,
+                    "arguments": [{ "value": include_offscreen }],
+                    "returnByValue": true,
+                    "awaitPromise": false,
+                }),
+                timeout,
+            )
+        });
+        let box_results = futures_util::future::join_all(box_futs).await;
+        let _ = self
+            .call(
+                "Runtime.releaseObjectGroup",
+                json!({ "objectGroup": SOM_GROUP }),
+                timeout.max(Duration::from_secs(1)),
+            )
+            .await;
+
+        let mut boxes = Vec::new();
+        for ((id, _), res) in pairs.into_iter().zip(box_results.into_iter()) {
+            let Ok(v) = res else {
+                continue;
+            };
+            let b = &v["result"]["value"];
+            if let (Some(x), Some(y), Some(w), Some(h)) = (
+                b["x"].as_f64(),
+                b["y"].as_f64(),
+                b["width"].as_f64(),
+                b["height"].as_f64(),
+            ) {
+                if x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
+                    boxes.push((id, x, y, w, h));
+                }
+            }
+        }
+        Ok(boxes)
+    }
+
+    async fn element_screenshot_with_scope_styles(
+        &self,
+        scope: &Scope,
+        params: Value,
+        options: &ScreenshotOptions,
+        has_iframe: bool,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let style_css = if has_iframe {
+            options.style_css()
+        } else {
+            None
+        };
+        if let Some(ref css) = style_css {
+            let js = crate::render::inject_style_js(css);
+            let _ = self.eval_in(scope, &js, true, timeout).await;
+        }
+        let res = self.capture(params, options, timeout).await;
+        if style_css.is_some() {
+            let _ = self
+                .eval_in(
+                    scope,
+                    crate::render::REMOVE_SCREENSHOT_STYLE_JS,
+                    true,
+                    timeout.max(Duration::from_secs(2)),
+                )
+                .await;
+        }
+        res
+    }
+
     /// PNG of the first match, once it is visible and still. Elements in iframes, below the
     /// fold, or taller than the viewport work too.
     pub async fn element_screenshot(&self, sel: &Selector, options: &ScreenshotOptions, timeout: Duration) -> Result<Vec<u8>> {
+        options.validate()?;
         if options.full_page || options.clip.is_some() {
             return Err(Error::Other("element screenshot: full_page and clip are for page screenshots".into()));
         }
-        let (b, _) = self.wait_element(sel, Wait::Box, timeout).await?;
+        let (b, scope) = self.wait_element(sel, Wait::Box, timeout).await?;
         // The box is in viewport coordinates; the clip is in document coordinates.
         let m = self.call("Page.getLayoutMetrics", json!({}), timeout).await?;
         let vp = if m["cssLayoutViewport"].is_object() { &m["cssLayoutViewport"] } else { &m["layoutViewport"] };
@@ -2877,7 +3117,8 @@ impl CdpPage {
                 "scale": 1
             }
         });
-        self.capture(params, options, timeout).await
+        self.element_screenshot_with_scope_styles(&scope, params, options, !sel.frames.is_empty(), timeout)
+            .await
     }
 
     /// Waits until the element is visible (Playwright's default `waitForSelector` state):
@@ -3921,6 +4162,7 @@ mod tests {
             url: Arc::new(tokio::sync::watch::Sender::new("about:blank".into())),
             net: Default::default(),
             ax_refs: Default::default(),
+            last_snapshot: Default::default(),
             early_log_events: Default::default(),
         }
     }

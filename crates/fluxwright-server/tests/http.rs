@@ -2011,3 +2011,113 @@ async fn standalone_sqlite_store_preserves_completed_and_failed_evidence_across_
         let _ = std::fs::remove_file(std::path::Path::new(&s));
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn executes_snapshot_diff_and_screenshot_annotate_mask_steps() {
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            axum::response::Html(concat!(
+                "<!doctype html><style>",
+                "body{margin:0;background:#fff}",
+                "#secret{position:fixed;left:10px;top:10px;width:60px;height:60px;background:#fff}",
+                "#btn{position:fixed;left:10px;top:90px;width:90px;height:32px}",
+                "</style>",
+                "<div id='secret'>Secret</div>",
+                "<button id='btn' onclick=\"document.getElementById('out').innerHTML='<button id=added>Added</button>'\">Run</button>",
+                "<div id='out'>idle</div>"
+            ))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let app_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let server = server().await;
+
+    // Invalid mask_color and >32 mask entries must be rejected cleanly at /v1/jobs.
+    let (bad_color_status, _) = request(
+        &server,
+        "POST",
+        "/v1/jobs",
+        json!({
+            "steps": [
+                { "action": "screenshot", "mask": ["#secret"], "mask_color": "red;evil" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(bad_color_status, StatusCode::BAD_REQUEST);
+
+    let many_masks: Vec<String> = (0..33).map(|i| format!("#m{i}")).collect();
+    let (many_mask_status, _) = request(
+        &server,
+        "POST",
+        "/v1/jobs",
+        json!({
+            "steps": [
+                { "action": "screenshot", "mask": many_masks }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(many_mask_status, StatusCode::BAD_REQUEST);
+
+    let sub = submit(
+        &server,
+        json!({
+            "steps": [
+                { "action": "goto", "url": app_url },
+                { "action": "snapshot", "diff": true },
+                { "action": "snapshot", "diff": true },
+                { "action": "click", "selector": "#btn" },
+                { "action": "snapshot", "diff": true },
+                {
+                    "action": "screenshot",
+                    "annotate": true,
+                    "mask": ["#secret"],
+                    "mask_color": "#00FF00",
+                    "animations": "disabled",
+                    "caret": "hide"
+                },
+                {
+                    "action": "evaluate",
+                    "expression": "!document.getElementById('__fluxwright_som_overlay') && !document.getElementById('__fluxwright_mask_overlay') && !document.getElementById('__fluxwright_screenshot_style')"
+                }
+            ]
+        }),
+    )
+    .await;
+
+    let job = finish(&server, sub).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+    let results = job.results.unwrap();
+
+    let s1 = &results[1];
+    assert_eq!(s1["is_diff"], false, "{s1}");
+    assert_eq!(s1["changed"], true, "{s1}");
+    assert!(s1["tree"].as_str().unwrap_or("").contains("button \"Run\""), "{s1}");
+
+    let s2 = &results[2];
+    assert_eq!(s2["is_diff"], true, "{s2}");
+    assert_eq!(s2["changed"], false, "{s2}");
+    assert_eq!(s2["tree"], "(no changes)", "{s2}");
+
+    let s3 = &results[4];
+    assert_eq!(s3["is_diff"], true, "{s3}");
+    assert_eq!(s3["changed"], true, "{s3}");
+    assert!(s3["tree"].as_str().unwrap_or("").contains("button \"Added\""), "{s3}");
+
+    assert_eq!(results[5]["mime_type"], "image/png");
+    let shot_b64 = results[5]["base64"].as_str().expect("screenshot base64");
+    let shot_bytes = base64::engine::general_purpose::STANDARD
+        .decode(shot_b64)
+        .unwrap();
+    let img = fluxwright::decode_png(&shot_bytes).unwrap();
+    let off = ((40 * img.width + 40) * 4) as usize;
+    assert_eq!(&img.data[off..off + 4], &[0, 255, 0, 255]);
+    assert_eq!(results[6], true);
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    app_task.abort();
+}

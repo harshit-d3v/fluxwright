@@ -33,6 +33,9 @@ export interface ToHaveScreenshotOptions {
   maxDiffPixels?: number
   maxDiffPixelRatio?: number
   animations?: 'disabled' | 'allow'
+  caret?: 'hide' | 'initial'
+  mask?: Array<string | Locator>
+  maskColor?: string
   timeout?: number
   update?: boolean
   omitBackground?: boolean
@@ -520,7 +523,7 @@ declare module './index' {
     /** Exceptions nothing caught so far, as `Error` objects. */
     pageErrors(): Promise<Error[]>
     /** Also writes the image to `path`; without `type`, its extension picks PNG or JPEG. */
-    screenshot(options?: ScreenshotOptions & { path?: string }): Promise<Buffer>
+    screenshot(options?: Omit<ScreenshotOptions, 'mask'> & { path?: string; mask?: Array<string | Locator> }): Promise<Buffer>
     /** Changes CSS `media` and/or `prefers-color-scheme`; `null` resets either. */
     emulateMedia(options?: {
       media?: 'screen' | 'print' | null
@@ -747,6 +750,6 @@ declare module './index' {
       options?: { timeout?: number },
     ): Promise<Awaited<R>>
     /** Also writes the image to `path`; without `type`, its extension picks PNG or JPEG. */
-    screenshot(options?: Omit<ScreenshotOptions, 'fullPage' | 'clip'> & { path?: string }): Promise<Buffer>
+    screenshot(options?: Omit<ScreenshotOptions, 'fullPage' | 'clip' | 'mask'> & { path?: string; mask?: Array<string | Locator> }): Promise<Buffer>
   }
 }

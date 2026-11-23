@@ -369,6 +369,45 @@ async fn visual_regression_to_have_screenshot() {
     assert!(tmp.path().join("snapshots").join("page-actual.png").exists());
     assert!(tmp.path().join("snapshots").join("page-diff.png").exists());
 
+    // Mask + mask_color hides changing inner region in locator to_have_screenshot_with.
+    let masked_shot = tmp.path().join("snapshots").join("masked.png");
+    expect_locator(&page.locator("#box"))
+        .to_have_screenshot_with(
+            &masked_shot,
+            &ToHaveScreenshotOptions::default()
+                .mask(["#dot"])
+                .mask_color("rgb(0, 255, 0)")
+                .update(true),
+        )
+        .await
+        .unwrap();
+    page.evaluate("document.getElementById('dot').style.background = '#ffff00';")
+        .await
+        .unwrap();
+    expect_locator(&page.locator("#box"))
+        .timeout(Duration::from_millis(500))
+        .to_have_screenshot_with(
+            &masked_shot,
+            &ToHaveScreenshotOptions::default()
+                .mask(["#dot"])
+                .mask_color("rgb(0, 255, 0)"),
+        )
+        .await
+        .unwrap();
+
+    // Invalid mask_color rejects cleanly.
+    let bad_mask = expect_locator(&page.locator("#box"))
+        .timeout(Duration::from_millis(200))
+        .to_have_screenshot_with(
+            &masked_shot,
+            &ToHaveScreenshotOptions::default()
+                .mask(["#dot"])
+                .mask_color("red;bad"),
+        )
+        .await
+        .unwrap_err();
+    assert!(bad_mask.to_string().contains("mask_color"), "{bad_mask}");
+
     page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
 }

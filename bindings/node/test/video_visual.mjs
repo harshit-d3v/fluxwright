@@ -191,6 +191,10 @@ try {
     await assert.rejects(() => expect(plain).toHaveScreenshot('', { timeout: 100 }), TypeError)
     await assert.rejects(() => expect(plain).toHaveScreenshot('x.png', { threshold: 2 }), TypeError)
     await assert.rejects(() => expect(plain).toHaveScreenshot('x.png', { animations: 'bogus' }), TypeError)
+    await assert.rejects(() => expect(plain).toHaveScreenshot('x.png', { caret: 'bogus' }), TypeError)
+    await assert.rejects(() => expect(plain).toHaveScreenshot('x.png', { maskColor: 'red;bad' }), TypeError)
+    await assert.rejects(() => expect(plain).toHaveScreenshot('x.png', { mask: '#dot' }), TypeError)
+    await assert.rejects(() => expect(plain).toHaveScreenshot('x.png', { mask: [123] }), TypeError)
     await assert.rejects(() => expect(plain).not.toHaveScreenshot('x.png'), /not is not supported/)
     await plain.close()
   }
@@ -347,6 +351,22 @@ try {
       () => expect(page).toHaveScreenshot(pageShot, { timeout: 250 }),
       /page-diff\.png/,
     )
+
+    // mask + maskColor hides changing inner region in locator.toHaveScreenshot.
+    const maskedShot = join(snapDir, 'masked.png')
+    await expect(page.locator('#box')).toHaveScreenshot(maskedShot, {
+      mask: [page.locator('#dot')],
+      maskColor: 'rgb(0, 255, 0)',
+      update: true,
+    })
+    await page.evaluate(() => {
+      document.getElementById('dot').style.background = '#ffff00'
+    })
+    await expect(page.locator('#box')).toHaveScreenshot(maskedShot, {
+      mask: ['#dot'],
+      maskColor: 'rgb(0, 255, 0)',
+      timeout: 500,
+    })
 
     await page.close()
   }

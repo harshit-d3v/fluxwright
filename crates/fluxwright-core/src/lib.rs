@@ -22,7 +22,8 @@ pub use fluxwright_cdp::{
     HarNotFound, HarPostData, HarQueryParam, HarRecorder, HarRequest, HarResponse, HarRouteOptions,
     HarRouter, HarTimings, IgnoreDefaultArgs, IndexedDbDatabase, IndexedDbIndex, IndexedDbRecord,
     IndexedDbStore, MarkdownOptions, RecordHarOptions, ResourceType, RouteFetchHandle,
-    RouteFetchOptions, SnapshotOptions, WebSocketEvent, Worker, WorkerEvent,
+    RouteFetchOptions, ScreenshotAnimations, ScreenshotCaret, SnapshotOptions, WebSocketEvent,
+    Worker, WorkerEvent,
 };
 pub use config::{EngineConfig, JobOptions, Priority, QueueFullMode, ResourcePreset};
 pub use error::{Error, Result};

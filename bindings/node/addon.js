@@ -7,6 +7,7 @@ const { Script } = require('node:vm')
 const { createExpect } = require('./expect.js')
 const { Tracing } = require('./tracing.js')
 const { Video, VideoRecorder, validateRecordVideoOptions } = require('./video.js')
+const { validateMaskColor, resolveMaskSelectors } = require('./visual.js')
 
 // Like Playwright, `{ path }` creates missing folders (`.auth/state.json`).
 async function save(path, data) {
@@ -36,7 +37,18 @@ const NONE = {}
 const EXACT = { exact: true }
 const STATE = { state: ['attached', 'detached', 'visible', 'hidden'] }
 const TIMEOUT = { timeout: true }
-const SHOT = { path: true, type: ['png', 'jpeg'], quality: true, omitBackground: true, timeout: true }
+const SHOT = {
+  path: true,
+  type: ['png', 'jpeg'],
+  quality: true,
+  omitBackground: true,
+  annotate: true,
+  mask: true,
+  maskColor: true,
+  animations: ['allow', 'disabled'],
+  caret: ['hide', 'initial'],
+  timeout: true,
+}
 const PDF = {
   path: true,
   format: true,
@@ -358,6 +370,11 @@ async function answerDialog(listeners, native) {
 const popupWired = new WeakSet()
 const pageContext = new WeakMap()
 const targetPage = new WeakMap()
+const ownerPage = (obj) => {
+  if (!obj || typeof obj !== 'object') return null
+  if (obj.constructor?.name === 'Page') return obj
+  return targetPage.get(obj)?.deref() ?? null
+}
 const contextRouteGetters = new WeakMap()
 let suppressLocatorDepth = 0
 
@@ -2393,6 +2410,30 @@ try {
   native.Page.prototype.pageErrors = async function () {
     return (await pageErrors.call(this)).map(toError)
   }
+  const origAriaSnapshot = native.Page.prototype.ariaSnapshot
+  native.Page.prototype.ariaSnapshot = async function (options) {
+    checkOptions('page.ariaSnapshot', options, {
+      interactiveOnly: true,
+      compact: true,
+      maxDepth: true,
+      maxNodes: true,
+      diff: true,
+    })
+    for (const bKey of ['interactiveOnly', 'compact', 'diff']) {
+      if (options?.[bKey] != null && typeof options[bKey] !== 'boolean') {
+        throw new TypeError(`page.ariaSnapshot: ${bKey} must be a boolean`)
+      }
+    }
+    for (const nKey of ['maxDepth', 'maxNodes']) {
+      if (
+        options?.[nKey] != null &&
+        (typeof options[nKey] !== 'number' || !Number.isInteger(options[nKey]) || options[nKey] < 0)
+      ) {
+        throw new TypeError(`page.ariaSnapshot: ${nKey} must be a non-negative integer`)
+      }
+    }
+    return origAriaSnapshot.call(this, options)
+  }
   for (const [Class, label, allowed] of [
     [native.Page, 'page', { fullPage: true, clip: true, ...SHOT }],
     [native.Locator, 'locator', SHOT],
@@ -2403,6 +2444,15 @@ try {
       if (options?.clip != null) {
         checkOptions(`${label}.screenshot clip`, options.clip, { x: true, y: true, width: true, height: true })
       }
+      if (options?.annotate != null && typeof options.annotate !== 'boolean') {
+        throw new TypeError(`${label}.screenshot: annotate must be a boolean`)
+      }
+      if (options?.maskColor != null) {
+        validateMaskColor(`${label}.screenshot`, options.maskColor)
+      }
+      const pageObj = this instanceof native.Page ? this : ownerPage(this)
+      const resolvedMask =
+        options?.mask != null ? resolveMaskSelectors(`${label}.screenshot`, options.mask, pageObj, ownerPage) : undefined
       // As Playwright: without a type, the path's extension picks it.
       let type = options?.type
       if (!type && options?.path) {
@@ -2410,7 +2460,14 @@ try {
         type = ext === 'png' ? 'png' : ext === 'jpg' || ext === 'jpeg' ? 'jpeg' : undefined
         if (!type) throw new TypeError(`${label}.screenshot: ${options.path}: only .png, .jpg and .jpeg are supported`)
       }
-      const image = await screenshot.call(this, type ? { ...options, type } : options)
+      const forwarded = options
+        ? {
+            ...options,
+            ...(type ? { type } : {}),
+            ...(resolvedMask !== undefined ? { mask: resolvedMask } : {}),
+          }
+        : options
+      const image = await screenshot.call(this, forwarded)
       if (options?.path) await save(options.path, image)
       return image
     }
@@ -2552,11 +2609,6 @@ function applyFilter(loc, options, label) {
   guard(native.Page, 'page', true, builders)
   guard(native.FrameLocator, 'frameLocator', true, builders)
   guard(native.Locator, 'locator', true, builders)
-  const ownerPage = (obj) => {
-    if (!obj || typeof obj !== 'object') return null
-    if (obj instanceof native.Page) return obj
-    return targetPage.get(obj)?.deref() ?? null
-  }
   const linkPage = (source, target) => {
     const page = ownerPage(source)
     if (page && target && (target instanceof native.Locator || target instanceof native.FrameLocator)) {

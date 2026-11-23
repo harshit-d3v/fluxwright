@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import struct
 import zlib
 from collections.abc import Sequence
@@ -556,3 +557,48 @@ def should_update_snapshots(explicit_update: bool | None) -> bool:
         return bool(explicit_update)
     val = os.environ.get("FLUXWRIGHT_UPDATE_SNAPSHOTS", "").strip().lower()
     return val in ("1", "true", "yes", "all")
+
+
+_MASK_COLOR_FNS = frozenset(
+    {"rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch", "color", "color-mix"}
+)
+
+
+def validate_mask_color(method: str, color: Any) -> str:
+    if not isinstance(color, str):
+        raise TypeError(f"{method}: mask_color must be a CSS color str, got {type(color).__name__}")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in color):
+        raise ValueError(f"{method}: mask_color must not contain control characters")
+    trimmed = color.strip()
+    if not trimmed or len(trimmed) > 128:
+        raise ValueError(f"{method}: mask_color must be a 1-128 character CSS color")
+    if re.search(r'[;:{}"\'<>\\]|/\*|\*/|//', trimmed):
+        raise ValueError(f"{method}: invalid mask_color {color!r}")
+    if trimmed.startswith("#"):
+        if re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", trimmed):
+            return trimmed
+        raise ValueError(f"{method}: invalid hex mask_color {color!r}")
+    fn_match = re.fullmatch(r"([a-zA-Z-]+)\(([\s\S]*)\)", trimmed)
+    if fn_match:
+        fname = fn_match.group(1).lower()
+        inner = fn_match.group(2)
+        if fname not in _MASK_COLOR_FNS or not inner.strip() or re.search(r"(?:url|expression|var)\s*\(", inner, re.I):
+            raise ValueError(f"{method}: invalid mask_color {color!r}")
+        depth = 1
+        for ch in inner:
+            if ch == "(":
+                if fname != "color-mix":
+                    raise ValueError(f"{method}: invalid mask_color {color!r}")
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 1:
+                    raise ValueError(f"{method}: invalid mask_color {color!r}")
+            elif not re.match(r"[a-zA-Z0-9 ,.%+\-/#]", ch):
+                raise ValueError(f"{method}: invalid mask_color {color!r}")
+        if depth != 1:
+            raise ValueError(f"{method}: invalid mask_color {color!r}")
+        return trimmed
+    if re.fullmatch(r"[a-zA-Z]+", trimmed):
+        return trimmed
+    raise ValueError(f"{method}: invalid mask_color {color!r}")

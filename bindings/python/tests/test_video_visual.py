@@ -248,6 +248,28 @@ async def _run_async(base: str, tmp_path: Path) -> None:
             with pytest.raises(AssertionError, match="page-diff.png"):
                 await async_expect(vpage).to_have_screenshot(page_shot, timeout=1000)
 
+            # mask + mask_color hides changing inner region in async to_have_screenshot.
+            masked_shot = snap_dir / "masked.png"
+            await async_expect(vpage.locator("#box")).to_have_screenshot(
+                masked_shot,
+                mask=[vpage.locator("#dot")],
+                mask_color="rgb(0, 255, 0)",
+                update=True,
+            )
+            await vpage.evaluate("() => { document.getElementById('dot').style.background = '#ffff00'; }")
+            await async_expect(vpage.locator("#box")).to_have_screenshot(
+                masked_shot,
+                mask=["#dot"],
+                mask_color="rgb(0, 255, 0)",
+                timeout=1000,
+            )
+            with pytest.raises(ValueError, match="mask_color"):
+                await async_expect(vpage.locator("#box")).to_have_screenshot(
+                    masked_shot,
+                    mask=["#dot"],
+                    mask_color="red;bad",
+                )
+
             await vpage.close()
         finally:
             await browser.close()
@@ -295,6 +317,23 @@ def test_sync_video_and_visual(base: str, tmp_path: Path):
                 sync_expect(vpage.locator("#box")).to_have_screenshot(shot, timeout=1000)
             assert (snap_dir / "sync_box-actual.png").exists()
             assert (snap_dir / "sync_box-diff.png").exists()
+
+            # mask + mask_color hides changing inner region in sync to_have_screenshot.
+            sync_masked = snap_dir / "sync_masked.png"
+            sync_expect(vpage.locator("#box")).to_have_screenshot(
+                sync_masked,
+                mask=[vpage.locator("#dot")],
+                mask_color="rgb(0, 255, 0)",
+                update=True,
+            )
+            vpage.evaluate("() => { document.getElementById('dot').style.background = '#ffff00'; }")
+            sync_expect(vpage.locator("#box")).to_have_screenshot(
+                sync_masked,
+                mask=["#dot"],
+                mask_color="rgb(0, 255, 0)",
+                timeout=1000,
+            )
+
             vpage.close()
         finally:
             browser.close()
@@ -395,6 +434,53 @@ def test_visual_codec_alpha_validation_and_paths(tmp_path: Path, monkeypatch: py
                 clip=bad_clip,  # type: ignore[arg-type]
                 update=None,
             )
+
+    with pytest.raises(ValueError, match="mask_color"):
+        _validate_screenshot_options(
+            "test",
+            threshold=None,
+            max_diff_pixels=None,
+            max_diff_pixel_ratio=None,
+            animations=None,
+            timeout=None,
+            default_timeout=1000.0,
+            omit_background=None,
+            full_page=None,
+            clip=None,
+            update=None,
+            mask=["#dot"],
+            mask_color="red;bad",
+        )
+    with pytest.raises(ValueError, match="caret"):
+        _validate_screenshot_options(
+            "test",
+            threshold=None,
+            max_diff_pixels=None,
+            max_diff_pixel_ratio=None,
+            animations=None,
+            timeout=None,
+            default_timeout=1000.0,
+            omit_background=None,
+            full_page=None,
+            clip=None,
+            update=None,
+            caret="bogus",  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="mask"):
+        _validate_screenshot_options(
+            "test",
+            threshold=None,
+            max_diff_pixels=None,
+            max_diff_pixel_ratio=None,
+            animations=None,
+            timeout=None,
+            default_timeout=1000.0,
+            omit_background=None,
+            full_page=None,
+            clip=None,
+            update=None,
+            mask="#dot",  # type: ignore[arg-type]
+        )
 
     # 6. _run_to_have_screenshot: timeout=0 still requires 2 matching frames, and OSError fails immediately.
     png_a = encode_png(2, 2, bytes([255, 0, 0, 255] * 4))
