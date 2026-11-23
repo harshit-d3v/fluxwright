@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 DEFAULT_TIMEOUT_MS = 5000.0
 POLL_INTERVAL_S = 0.05
 MIN_PROBE_TIMEOUT_MS = 50.0
-MAX_PROBE_TIMEOUT_MS = 250.0
+MAX_PROBE_TIMEOUT_MS = 500.0
 
 _ProbeKind = Literal["value", "not-attached", "transient"]
 _ProbeResult = tuple[_ProbeKind, bool, str]
