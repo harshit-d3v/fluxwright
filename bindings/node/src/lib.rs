@@ -2295,6 +2295,22 @@ fn parse_load_state(state: Option<&str>) -> Result<fluxwright::WaitUntil> {
     }
 }
 
+fn to_clock_time(time_ms: Option<f64>, time_iso: Option<String>) -> Result<fluxwright::ClockTime> {
+    match (time_ms, time_iso) {
+        (Some(ms), None) => Ok(fluxwright::ClockTime::Ms(ms)),
+        (None, Some(iso)) => Ok(fluxwright::ClockTime::Iso(iso)),
+        _ => Err(Error::from_reason("clock time must specify either timeMs or timeIso")),
+    }
+}
+
+fn to_clock_ticks(ticks_ms: Option<f64>, ticks_text: Option<String>) -> Result<fluxwright::ClockTicks> {
+    match (ticks_ms, ticks_text) {
+        (Some(ms), None) => Ok(fluxwright::ClockTicks::Ms(ms)),
+        (None, Some(text)) => Ok(fluxwright::ClockTicks::Text(text)),
+        _ => Err(Error::from_reason("clock ticks must specify either ticksMs or ticksText")),
+    }
+}
+
 #[napi]
 impl Page {
     /// Every cookie in this page's context, plus localStorage of the current origin. Pass it
@@ -2925,6 +2941,72 @@ impl Page {
     pub async fn add_init_script(&self, source: String) -> Result<()> {
         with_page(self.lease.clone(), move |p| {
             Box::pin(async move { p.add_init_script(&source).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_clockInstall")]
+    pub async fn clock_install(&self, time_ms: Option<f64>, time_iso: Option<String>) -> Result<()> {
+        let time = match (time_ms, time_iso) {
+            (None, None) => None,
+            _ => Some(to_clock_time(time_ms, time_iso)?),
+        };
+        let opts = fluxwright::ClockInstallOptions { time };
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.clock().install_with(&opts).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_clockPauseAt")]
+    pub async fn clock_pause_at(&self, time_ms: Option<f64>, time_iso: Option<String>) -> Result<()> {
+        let time = to_clock_time(time_ms, time_iso)?;
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.clock().pause_at(time).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_clockSetFixedTime")]
+    pub async fn clock_set_fixed_time(&self, time_ms: Option<f64>, time_iso: Option<String>) -> Result<()> {
+        let time = to_clock_time(time_ms, time_iso)?;
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.clock().set_fixed_time(time).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_clockSetSystemTime")]
+    pub async fn clock_set_system_time(&self, time_ms: Option<f64>, time_iso: Option<String>) -> Result<()> {
+        let time = to_clock_time(time_ms, time_iso)?;
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.clock().set_system_time(time).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_clockFastForward")]
+    pub async fn clock_fast_forward(&self, ticks_ms: Option<f64>, ticks_text: Option<String>) -> Result<()> {
+        let ticks = to_clock_ticks(ticks_ms, ticks_text)?;
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.clock().fast_forward(ticks).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_clockRunFor")]
+    pub async fn clock_run_for(&self, ticks_ms: Option<f64>, ticks_text: Option<String>) -> Result<()> {
+        let ticks = to_clock_ticks(ticks_ms, ticks_text)?;
+        with_page(self.lease.clone(), move |p| {
+            Box::pin(async move { p.clock().run_for(ticks).await })
+        })
+        .await
+    }
+
+    #[napi(js_name = "_clockResume")]
+    pub async fn clock_resume(&self) -> Result<()> {
+        with_page(self.lease.clone(), |p| {
+            Box::pin(async move { p.clock().resume().await })
         })
         .await
     }

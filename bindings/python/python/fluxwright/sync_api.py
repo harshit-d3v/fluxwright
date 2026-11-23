@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import datetime
 import logging
 import re
 import threading
@@ -222,6 +223,8 @@ def _bridge_route(
     async_target: Any,
     url: URLMatch,
     handler: Callable[..., Any],
+    *,
+    times: int | None = None,
 ) -> None:
     loop = _event_loop()
     with_request = _a._takes_request(handler)
@@ -231,8 +234,8 @@ def _bridge_route(
         # The loop's default pool: a handler waiting on the page holds up no other request.
         return loop.run_in_executor(None, lambda: handler(*args))
 
+    _run(async_target.route, url, bridge, times=times)
     bridges.append((url, handler, bridge))
-    _run(async_target.route, url, bridge)
 
 
 def _unbridge_route(
@@ -1183,6 +1186,34 @@ class Touchscreen:
         _run(self._impl.tap, x, y)
 
 
+class Clock:
+    """Fake clock controls for ``Date``, ``performance.now``, ``setTimeout``, ``setInterval``, and ``requestAnimationFrame``."""
+
+    def __init__(self, impl: _a.Clock) -> None:
+        self._impl = impl
+
+    def install(self, *, time: int | float | str | datetime.datetime | None = None) -> None:
+        _run(self._impl.install, time=time)
+
+    def pause_at(self, time: int | float | str | datetime.datetime) -> None:
+        _run(self._impl.pause_at, time)
+
+    def set_fixed_time(self, time: int | float | str | datetime.datetime) -> None:
+        _run(self._impl.set_fixed_time, time)
+
+    def set_system_time(self, time: int | float | str | datetime.datetime) -> None:
+        _run(self._impl.set_system_time, time)
+
+    def fast_forward(self, ticks: int | float | str) -> None:
+        _run(self._impl.fast_forward, ticks)
+
+    def run_for(self, ticks: int | float | str) -> None:
+        _run(self._impl.run_for, ticks)
+
+    def resume(self) -> None:
+        _run(self._impl.resume)
+
+
 class APIResponse:
     """HTTP response returned by ``APIRequestContext`` and ``route.fetch()``."""
 
@@ -1358,9 +1389,16 @@ class Route:
         """Fails the request: ``failed`` (the default), ``aborted``, ``blockedbyclient``, ..."""
         _run(self._impl.abort, error_code)
 
-    def fallback(self) -> None:
+    def fallback(
+        self,
+        *,
+        url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        post_data: str | bytes | None = None,
+    ) -> None:
         """Leaves the request to the next matching handler: the one added before this one."""
-        _run(self._impl.fallback)
+        _run(self._impl.fallback, url=url, method=method, headers=headers, post_data=post_data)
 
 
 class EventInfo(Generic[T]):
@@ -1512,6 +1550,10 @@ class Page(_Finders):
     @property
     def touchscreen(self) -> Touchscreen:
         return Touchscreen(self._impl.touchscreen)
+
+    @property
+    def clock(self) -> Clock:
+        return Clock(self._impl.clock)
 
     def click(
         self,
@@ -1944,11 +1986,11 @@ class Page(_Finders):
         with self._expect(self._impl.expect_popup, predicate, timeout, _wrap_page) as info:
             yield info
 
-    def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
+    def route(self, url: URLMatch, handler: Callable[..., Any], *, times: int | None = None) -> None:
         """Hands matching requests to ``handler(route)`` or ``handler(route, request)``, on a
         worker thread, as Playwright's ``page.route``. The handler added last runs first; an
         unanswered request continues. Call it before navigating."""
-        _bridge_route(self._route_bridges, self._impl, url, handler)
+        _bridge_route(self._route_bridges, self._impl, url, handler, times=times)
 
     def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         """Removes the handlers added for ``url`` (only ``handler``, when given)."""
@@ -2363,10 +2405,10 @@ class BrowserContext:
     def new_page(self) -> Page:
         return _wrap_page(_run(self._impl.new_page))
 
-    def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
+    def route(self, url: URLMatch, handler: Callable[..., Any], *, times: int | None = None) -> None:
         """``page.route`` for all pages and popups in this context; added before ``new_page()``, it
         applies from the first request."""
-        _bridge_route(self._route_bridges, self._impl, url, handler)
+        _bridge_route(self._route_bridges, self._impl, url, handler, times=times)
 
     def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         _unbridge_route(self._route_bridges, self._impl, url, handler)

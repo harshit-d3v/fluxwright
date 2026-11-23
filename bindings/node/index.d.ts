@@ -262,6 +262,13 @@ export declare class Page {
   _keyboardInsertText(text: string): Promise<void>
   _touchscreenTap(x: number, y: number): Promise<void>
   _addInitScript(source: string): Promise<void>
+  _clockInstall(timeMs?: number | undefined | null, timeIso?: string | undefined | null): Promise<void>
+  _clockPauseAt(timeMs?: number | undefined | null, timeIso?: string | undefined | null): Promise<void>
+  _clockSetFixedTime(timeMs?: number | undefined | null, timeIso?: string | undefined | null): Promise<void>
+  _clockSetSystemTime(timeMs?: number | undefined | null, timeIso?: string | undefined | null): Promise<void>
+  _clockFastForward(ticksMs?: number | undefined | null, ticksText?: string | undefined | null): Promise<void>
+  _clockRunFor(ticksMs?: number | undefined | null, ticksText?: string | undefined | null): Promise<void>
+  _clockResume(): Promise<void>
   _addScriptTag(url?: string | undefined | null, content?: string | undefined | null, scriptType?: string | undefined | null): Promise<void>
   _addStyleTag(url?: string | undefined | null, content?: string | undefined | null): Promise<void>
   _onBinding(handler: (arg: BindingCallEvent) => void): void

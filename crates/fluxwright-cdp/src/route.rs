@@ -32,13 +32,31 @@ pub struct RouteFetchHandle {
     url: String,
     method: String,
     headers: Vec<(String, String)>,
-    post_data: Option<String>,
+    post_data: Option<Vec<u8>>,
     conn: Arc<Connection>,
     context_id: String,
     defaults: HttpContextDefaults,
 }
 
 impl RouteFetchHandle {
+    /// Returns a handle with `overrides` applied on top of this request's fields.
+    pub fn with_overrides(&self, o: &Overrides) -> Self {
+        let mut next = self.clone();
+        if let Some(ref url) = o.url {
+            next.url = url.clone();
+        }
+        if let Some(ref method) = o.method {
+            next.method = method.clone();
+        }
+        if let Some(ref headers) = o.headers {
+            next.headers = normalize_headers(headers.clone());
+        }
+        if let Some(ref post_data) = o.post_data {
+            next.post_data = Some(post_data.clone());
+        }
+        next
+    }
+
     pub async fn fetch(&self, opts: &RouteFetchOptions) -> Result<ApiResponse> {
         let target_url = opts.url.as_deref().unwrap_or(&self.url);
         let method = opts.method.clone().unwrap_or_else(|| self.method.clone());
@@ -61,10 +79,7 @@ impl RouteFetchHandle {
             method: Some(method),
             headers: caller_headers,
             params: Vec::new(),
-            data: opts
-                .post_data
-                .clone()
-                .or_else(|| self.post_data.as_ref().map(|s| s.as_bytes().to_vec())),
+            data: opts.post_data.clone().or_else(|| self.post_data.clone()),
             fail_on_status_code: false,
             max_redirects: opts.max_redirects,
             timeout: opts.timeout,
@@ -116,6 +131,27 @@ impl Fulfill {
     }
 }
 
+/// Options for `page.route` and `context.route`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteOptions {
+    /// Maximum number of times this route handler is invoked before being removed.
+    pub times: Option<usize>,
+}
+
+/// Normalizes HTTP header names to lowercase while preserving the latest value per key.
+pub fn normalize_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    for (k, v) in headers {
+        let kl = k.to_ascii_lowercase();
+        if let Some(existing) = out.iter_mut().find(|(ek, _)| *ek == kl) {
+            existing.1 = v;
+        } else {
+            out.push((kl, v));
+        }
+    }
+    out
+}
+
 /// Changes to make before the request goes on. `headers` replaces all of them.
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
@@ -123,6 +159,31 @@ pub struct Overrides {
     pub method: Option<String>,
     pub headers: Option<Vec<(String, String)>>,
     pub post_data: Option<Vec<u8>>,
+}
+
+impl Overrides {
+    /// Applies any fields set in `next` on top of `self`, normalizing overridden header names.
+    pub fn merge(&mut self, next: Overrides) {
+        if let Some(url) = next.url {
+            self.url = Some(url);
+        }
+        if let Some(method) = next.method {
+            self.method = Some(method);
+        }
+        if let Some(headers) = next.headers {
+            self.headers = Some(normalize_headers(headers));
+        }
+        if let Some(post_data) = next.post_data {
+            self.post_data = Some(post_data);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.url.is_none()
+            && self.method.is_none()
+            && self.headers.is_none()
+            && self.post_data.is_none()
+    }
 }
 
 struct Reply {
@@ -221,7 +282,7 @@ impl InterceptedRequest {
             url: self.url.clone(),
             method: self.method.clone(),
             headers: self.headers.clone(),
-            post_data: self.post_data.clone(),
+            post_data: self.post_data.as_ref().map(|s| s.as_bytes().to_vec()),
             conn: self.reply.conn.clone(),
             context_id: self.context_id.clone(),
             defaults: self.defaults.clone(),
@@ -358,5 +419,39 @@ mod tests {
             assert_eq!(error_reason(code).unwrap(), expected);
         }
         assert!(error_reason("bogus").is_err());
+    }
+
+    #[test]
+    fn overrides_merge_and_normalize_headers() {
+        let mut base = Overrides::default();
+        assert!(base.is_empty());
+        base.merge(Overrides {
+            url: Some("https://example.com/v1".into()),
+            method: Some("POST".into()),
+            headers: Some(vec![
+                ("X-Custom".into(), "first".into()),
+                ("Content-Type".into(), "text/plain".into()),
+            ]),
+            post_data: Some(b"body-1".to_vec()),
+        });
+        assert!(!base.is_empty());
+        base.merge(Overrides {
+            headers: Some(vec![
+                ("X-Custom".into(), "one".into()),
+                ("x-custom".into(), "two".into()),
+                ("Accept".into(), "application/json".into()),
+            ]),
+            ..Default::default()
+        });
+        assert_eq!(base.url.as_deref(), Some("https://example.com/v1"));
+        assert_eq!(base.method.as_deref(), Some("POST"));
+        assert_eq!(base.post_data.as_deref(), Some(b"body-1".as_slice()));
+        assert_eq!(
+            base.headers,
+            Some(vec![
+                ("x-custom".into(), "two".into()),
+                ("accept".into(), "application/json".into()),
+            ])
+        );
     }
 }

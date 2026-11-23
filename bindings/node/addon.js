@@ -146,6 +146,14 @@ const PAGE = {
 }
 const FULFILL = { status: true, headers: true, contentType: true, body: true, json: true, path: true, response: true }
 const CONTINUE = { url: true, method: true, headers: true, postData: true }
+const ROUTE = {
+  times: (v, m) => {
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw new TypeError(`${m}: must be a non-negative integer`)
+    }
+  },
+}
+const CLOCK_INSTALL = { time: true }
 const ROUTE_FETCH = { url: true, method: true, headers: true, postData: true, maxRedirects: true, timeout: true }
 const API_REQ = { method: true, headers: true, params: true, data: true, form: true, multipart: true, failOnStatusCode: true, maxRedirects: true, timeout: true }
 const BUTTON = ['left', 'right', 'middle']
@@ -1187,22 +1195,90 @@ function urlMatcher(pattern) {
   return (url) => regex.test(url)
 }
 
+function normalizeRouteHeaders(headers) {
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+    throw new TypeError('route: headers must be an object')
+  }
+  const out = {}
+  for (const [k, v] of Object.entries(headers)) {
+    out[k.toLowerCase()] = String(v)
+  }
+  return out
+}
+
+function normalizeClockTime(method, value) {
+  if (value instanceof Date) {
+    const ms = value.getTime()
+    if (!Number.isFinite(ms)) throw new TypeError(`${method}: time must be a valid Date`)
+    return { ms, iso: null }
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`${method}: time must be a finite number`)
+    return { ms: value, iso: null }
+  }
+  if (typeof value === 'string') {
+    if (!value.trim()) throw new TypeError(`${method}: time string must not be empty`)
+    return { ms: null, iso: value }
+  }
+  throw new TypeError(`${method}: time must be a number, string, or Date`)
+}
+
+function normalizeClockTicks(method, value) {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new TypeError(`${method}: ticks must be a non-negative finite number`)
+    }
+    return { ms: value, text: null }
+  }
+  if (typeof value === 'string') {
+    if (!value.trim()) throw new TypeError(`${method}: ticks string must not be empty`)
+    return { ms: null, text: value }
+  }
+  throw new TypeError(`${method}: ticks must be a non-negative number or "MM:SS" / "HH:MM:SS" string`)
+}
+
 // page.route / unroute with Playwright's Route and Request. The handler added last runs first;
 // route.fallback() passes the request to the next matching one, and unmatched requests continue.
 async function dispatchRoutes(list, extra, native) {
-  const request = toRequest(native)
+  const acc = {}
+  const state = {
+    url: native.url,
+    method: native.method,
+    headers: { ...native.headers },
+    postData: native.postData ?? null,
+  }
   let answered = false
+  const groups = [[...list], [...extra]]
   try {
-    for (const handlers of [list, extra]) {
+    for (const handlers of groups) {
       for (let i = handlers.length - 1; i >= 0; i--) {
+        const entry = handlers[i]
+        if (entry.removed) continue
         // A URL function is user code: one that throws counts as no match.
         let matched = false
         try {
-          matched = handlers[i].matches(native.url)
+          matched = entry.matches(state.url)
         } catch (err) {
           console.error('[fluxwright] a page.route URL matcher failed:', err)
         }
         if (!matched) continue
+        if (entry.remaining !== undefined) {
+          if (entry.remaining <= 0) continue
+          entry.remaining -= 1
+          if (entry.remaining === 0) {
+            entry.removed = true
+            const idx = entry.owner.indexOf(entry)
+            if (idx !== -1) entry.owner.splice(idx, 1)
+          }
+        }
+        const request = {
+          url: () => state.url,
+          method: () => state.method,
+          headers: () => ({ ...state.headers }),
+          postData: () => state.postData,
+          resourceType: () => native.resourceType,
+          failure: () => null,
+        }
         // The first answer wins; it is set when the call starts, so an answer still under way
         // when the handler returns is waited for, not taken as no answer. One that comes after
         // the handler returned is too late: the request went on without it.
@@ -1221,14 +1297,14 @@ async function dispatchRoutes(list, extra, native) {
             if (returned) return late('route')
             if (answer || fellBack) throw new Error('route is already handled')
             checkOptions('route.fetch', o, ROUTE_FETCH)
-            let postData = o.postData
+            let postData = o.postData !== undefined ? o.postData : acc.postData
             if (postData !== undefined && !Buffer.isBuffer(postData) && typeof postData !== 'string') {
               postData = JSON.stringify(postData)
             }
             const raw = await native.fetch({
-              url: o.url,
-              method: o.method,
-              headers: o.headers,
+              url: o.url ?? acc.url,
+              method: o.method ?? acc.method,
+              headers: o.headers !== undefined ? o.headers : acc.headers,
               postData,
               maxRedirects: o.maxRedirects,
               timeoutMs: o.timeout,
@@ -1279,18 +1355,54 @@ async function dispatchRoutes(list, extra, native) {
           continue: (o = {}) =>
             answerWith(async () => {
               checkOptions('route.continue', o, CONTINUE)
-              return native.continue({ url: o.url, method: o.method, headers: o.headers, postData: o.postData })
+              const merged = {
+                url: o.url !== undefined ? o.url : acc.url,
+                method: o.method !== undefined ? o.method : acc.method,
+                headers: o.headers !== undefined ? normalizeRouteHeaders(o.headers) : acc.headers,
+                postData: o.postData !== undefined ? o.postData : acc.postData,
+              }
+              return native.continue(merged)
             }),
           abort: (errorCode) => answerWith(() => native.abort(errorCode)),
           fallback: async (o) => {
             if (returned) return late('route')
-            checkOptions('route.fallback', o, NONE)
-            if (answer) throw new Error('route is already handled')
-            fellBack = true
+            checkOptions('route.fallback', o, CONTINUE)
+            if (answer || fellBack) throw new Error('route is already handled')
+            if (o != null) {
+              if (o.url != null && typeof o.url !== 'string') {
+                throw new TypeError('route.fallback: url must be a string')
+              }
+              if (o.method != null && typeof o.method !== 'string') {
+                throw new TypeError('route.fallback: method must be a string')
+              }
+              const normHeaders = o.headers != null ? normalizeRouteHeaders(o.headers) : undefined
+              if (o.postData != null && !Buffer.isBuffer(o.postData) && typeof o.postData !== 'string') {
+                throw new TypeError('route.fallback: postData must be a string or Buffer')
+              }
+              fellBack = true
+              if (o.url != null) {
+                acc.url = o.url
+                state.url = o.url
+              }
+              if (o.method != null) {
+                acc.method = o.method
+                state.method = o.method
+              }
+              if (normHeaders !== undefined) {
+                acc.headers = normHeaders
+                state.headers = normHeaders
+              }
+              if (o.postData != null) {
+                acc.postData = o.postData
+                state.postData = Buffer.isBuffer(o.postData) ? o.postData.toString('utf8') : o.postData
+              }
+            } else {
+              fellBack = true
+            }
           },
         }
         try {
-          await handlers[i].handler(route, request)
+          await entry.handler(route, request)
           returned = true
           if (fellBack && !answer) continue
           if (answer) {
@@ -1307,7 +1419,11 @@ async function dispatchRoutes(list, extra, native) {
     }
   } finally {
     // No answer, or one that failed: let the request through rather than hang the page.
-    if (!answered) await native.continue().catch(() => {})
+    if (!answered) {
+      const hasAcc =
+        acc.url !== undefined || acc.method !== undefined || acc.headers !== undefined || acc.postData !== undefined
+      await (hasAcc ? native.continue(acc) : native.continue()).catch(() => {})
+    }
   }
 }
 
@@ -1330,7 +1446,7 @@ function installRoutes(Page) {
   // failed start is tried again by the next call).
   const starts = new WeakMap()
   Page.prototype.route = async function (url, handler, options) {
-    checkOptions('page.route', options, NONE)
+    checkOptions('page.route', options, ROUTE)
     let list = routes.get(this)
     if (!list) {
       list = []
@@ -1344,12 +1460,17 @@ function installRoutes(Page) {
       start.catch(() => starts.get(this) === start && starts.delete(this))
     }
     await start
-    list.push({ url, handler, matches: urlMatcher(url) })
+    if (options?.times !== 0) {
+      list.push({ url, handler, matches: urlMatcher(url), remaining: options?.times, removed: false, owner: list })
+    }
   }
   Page.prototype.unroute = async function (url, handler) {
     const list = routes.get(this) || []
     for (let i = list.length - 1; i >= 0; i--) {
-      if (list[i].url === url && (!handler || list[i].handler === handler)) list.splice(i, 1)
+      if (list[i].url === url && (!handler || list[i].handler === handler)) {
+        list[i].removed = true
+        list.splice(i, 1)
+      }
     }
   }
   Page.prototype.routeFromHAR = function (har, options) {
@@ -1761,7 +1882,7 @@ class BrowserContext {
 
   // page.route for all pages and popups in this context; added before newPage(), it applies from the first request.
   async route(url, handler, options) {
-    checkOptions('browserContext.route', options, NONE)
+    checkOptions('browserContext.route', options, ROUTE)
     if (this.#closed) throw new Error('browserContext.route: the context is closed')
     if (!this.#routeStart) {
       const ref = new WeakRef(this)
@@ -1775,12 +1896,22 @@ class BrowserContext {
       })
     }
     await this.#routeStart
-    this.#routes.push({ url, handler, matches: urlMatcher(url) })
+    if (options?.times !== 0) {
+      this.#routes.push({
+        url,
+        handler,
+        matches: urlMatcher(url),
+        remaining: options?.times,
+        removed: false,
+        owner: this.#routes,
+      })
+    }
   }
 
   async unroute(url, handler) {
     for (let i = this.#routes.length - 1; i >= 0; i--) {
       if (this.#routes[i].url === url && (!handler || this.#routes[i].handler === handler)) {
+        this.#routes[i].removed = true
         this.#routes.splice(i, 1)
       }
     }
@@ -2862,12 +2993,56 @@ function applyFilter(loc, options, label) {
               page._touchscreenTap(x, y),
             ),
         },
+        clock: {
+          install: async (options) => {
+            checkOptions('clock.install', options, CLOCK_INSTALL)
+            const parsed =
+              options?.time != null
+                ? normalizeClockTime('clock.install', options.time)
+                : { ms: null, iso: null }
+            return traceAction(page, 'Clock', 'install', 'clock.install', {}, () =>
+              page._clockInstall(parsed.ms, parsed.iso),
+            )
+          },
+          pauseAt: async (time) => {
+            const parsed = normalizeClockTime('clock.pauseAt', time)
+            return traceAction(page, 'Clock', 'pauseAt', 'clock.pauseAt', {}, () =>
+              page._clockPauseAt(parsed.ms, parsed.iso),
+            )
+          },
+          setFixedTime: async (time) => {
+            const parsed = normalizeClockTime('clock.setFixedTime', time)
+            return traceAction(page, 'Clock', 'setFixedTime', 'clock.setFixedTime', {}, () =>
+              page._clockSetFixedTime(parsed.ms, parsed.iso),
+            )
+          },
+          setSystemTime: async (time) => {
+            const parsed = normalizeClockTime('clock.setSystemTime', time)
+            return traceAction(page, 'Clock', 'setSystemTime', 'clock.setSystemTime', {}, () =>
+              page._clockSetSystemTime(parsed.ms, parsed.iso),
+            )
+          },
+          fastForward: async (ticks) => {
+            const parsed = normalizeClockTicks('clock.fastForward', ticks)
+            return traceAction(page, 'Clock', 'fastForward', 'clock.fastForward', {}, () =>
+              page._clockFastForward(parsed.ms, parsed.text),
+            )
+          },
+          runFor: async (ticks) => {
+            const parsed = normalizeClockTicks('clock.runFor', ticks)
+            return traceAction(page, 'Clock', 'runFor', 'clock.runFor', {}, () =>
+              page._clockRunFor(parsed.ms, parsed.text),
+            )
+          },
+          resume: async () =>
+            traceAction(page, 'Clock', 'resume', 'clock.resume', {}, () => page._clockResume()),
+        },
       }
       devices.set(page, d)
     }
     return d
   }
-  for (const name of ['mouse', 'keyboard', 'touchscreen']) {
+  for (const name of ['mouse', 'keyboard', 'touchscreen', 'clock']) {
     Object.defineProperty(native.Page.prototype, name, {
       get() {
         return deviceState(this)[name]

@@ -16,12 +16,13 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
 
 import pytest
 
 from fluxwright import Error, TimeoutError
-from fluxwright.async_api import async_playwright
+from fluxwright.async_api import Request, Route, async_playwright
 from fluxwright.sync_api import sync_playwright
 
 # A page that asks "leave this page?" once its button was clicked (Chrome wants a user gesture).
@@ -2359,4 +2360,311 @@ def test_snapshot_diff_and_som_mask():
             page.close()
         finally:
             browser.close()
+
+
+def test_clock_and_route_times_fallback_parity() -> None:
+    import datetime
+    import json as _json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class EchoHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def _handle(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+            if self.path == "/clock-a":
+                html = b"""<!doctype html><script>
+                    window.__bootNow = Date.now();
+                    window.__bootIso = new Date().toISOString();
+                    window.__events = [];
+                    window.__ivCount = 0;
+                    window.__rafCount = 0;
+                    setTimeout(() => {
+                        window.__events.push('t1500:' + Date.now());
+                        Promise.resolve().then(() => {
+                            setTimeout(() => window.__events.push('micro:' + Date.now()), 100);
+                        });
+                    }, 1500);
+                    const iv = setInterval(() => {
+                        window.__ivCount++;
+                        window.__events.push('iv:' + window.__ivCount + ':' + Date.now());
+                    }, 1000);
+                    window.__stopIv = () => clearInterval(iv);
+                    requestAnimationFrame(() => { window.__rafCount++; });
+                </script>"""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
+            if self.path == "/clock-b":
+                html = b"""<!doctype html><script>
+                    window.__step2Now = Date.now();
+                    window.__step2Instance = new Date() instanceof Date;
+                    window.__step2DateFn = typeof Date();
+                    window.__step2Utc = Date.UTC(2024, 1, 2, 8, 0, 0);
+                    window.__step2Parse = Date.parse('2024-02-02T08:00:00Z');
+                </script>"""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
+            payload = _json.dumps(
+                {
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": raw_body,
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self) -> None:
+            self._handle()
+
+        def do_POST(self) -> None:
+            self._handle()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), EchoHandler)
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+
+    try:
+        async def _async_case() -> None:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(max_browsers=1)
+                try:
+                    # 1. Async Clock tests.
+                    page = await browser.new_page()
+                    dt = datetime.datetime(2024, 2, 2, 8, 0, 0, tzinfo=datetime.timezone.utc)
+                    t0 = int(dt.timestamp() * 1000)
+                    await page.clock.install(time=dt)
+                    await page.clock.pause_at(t0)
+                    await page.goto(f"{base}/clock-a")
+                    assert await page.evaluate("() => window.__bootNow") == t0
+                    assert await page.evaluate("() => window.__bootIso") == "2024-02-02T08:00:00.000Z"
+
+                    perf0 = await page.evaluate("() => performance.now()")
+                    await asyncio.sleep(0.08)
+                    assert await page.evaluate("() => Date.now()") == t0
+                    assert await page.evaluate("() => performance.now()") == perf0
+                    assert await page.evaluate("() => window.__ivCount") == 0
+
+                    await page.clock.run_for(2500)
+                    perf1 = await page.evaluate("() => performance.now()")
+                    assert abs((perf1 - perf0) - 2500) < 1e-6
+                    assert await page.evaluate("() => Date.now()") == t0 + 2500
+                    assert await page.evaluate("() => window.__ivCount") == 2
+                    assert await page.evaluate("() => window.__rafCount") == 1
+                    assert await page.evaluate("() => window.__events") == [
+                        f"iv:1:{t0 + 1000}",
+                        f"t1500:{t0 + 1500}",
+                        f"micro:{t0 + 1600}",
+                        f"iv:2:{t0 + 2000}",
+                    ]
+
+                    await page.clock.fast_forward("05:00")
+                    assert await page.evaluate("() => window.__ivCount") == 3
+                    assert await page.evaluate("() => Date.now()") == t0 + 2500 + 300_000
+                    await page.clock.fast_forward("00:00:10")
+                    assert await page.evaluate("() => window.__ivCount") == 4
+                    assert await page.evaluate("() => Date.now()") == t0 + 2500 + 310_000
+                    await page.evaluate("() => window.__stopIv()")
+
+                    await page.goto(f"{base}/clock-b")
+                    assert await page.evaluate("() => window.__step2Now") == t0 + 2500 + 310_000
+                    assert await page.evaluate("() => window.__step2Instance") is True
+                    assert await page.evaluate("() => window.__step2DateFn") == "string"
+                    assert await page.evaluate("() => window.__step2Utc") == t0
+                    assert await page.evaluate("() => window.__step2Parse") == t0
+
+                    fixed_ts = int(datetime.datetime(2025, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+                    await page.clock.set_fixed_time("2025-01-01T00:00:00Z")
+                    await page.evaluate(
+                        "() => { window.__fixedFired = 0; setTimeout(() => { window.__fixedFired = Date.now(); }, 200); }"
+                    )
+                    p_before = await page.evaluate("() => performance.now()")
+                    await page.clock.run_for(500)
+                    p_after = await page.evaluate("() => performance.now()")
+                    assert abs((p_after - p_before) - 500) < 1e-6
+                    assert await page.evaluate("() => Date.now()") == fixed_ts
+                    assert await page.evaluate("() => window.__fixedFired") == fixed_ts
+
+                    await page.clock.set_system_time(t0)
+                    assert await page.evaluate("() => Date.now()") == t0
+
+                    await page.evaluate(
+                        "() => { window.__resumedFired = false; setTimeout(() => { window.__resumedFired = true; }, 40); }"
+                    )
+                    await page.clock.resume()
+                    for _ in range(40):
+                        if await page.evaluate("() => window.__resumedFired"):
+                            break
+                        await asyncio.sleep(0.02)
+                    assert await page.evaluate("() => window.__resumedFired") is True
+                    assert await page.evaluate("() => Date.now()") > t0
+
+                    with pytest.raises(ValueError):
+                        await page.clock.fast_forward(-1)
+                    with pytest.raises(TypeError):
+                        await page.clock.fast_forward(True)  # type: ignore[arg-type]
+                    with pytest.raises(ValueError):
+                        await page.clock.run_for(float("nan"))
+                    with pytest.raises(Error, match="ClockTicks"):
+                        await page.clock.fast_forward("01:60")
+                    with pytest.raises(Error, match="ClockTime"):
+                        await page.clock.set_fixed_time("2024-02-30T00:00:00Z")
+                    await page.close()
+
+                    # 2. Async route({ times }) and route.fallback(overrides) across page -> context -> server.
+                    ctx = await browser.new_context(base_url=base)
+                    try:
+                        with pytest.raises(ValueError):
+                            await ctx.route("**/echo/*", lambda r: r.abort(), times=-1)
+                        with pytest.raises(TypeError):
+                            await ctx.route("**/echo/*", lambda r: r.abort(), times=True)  # type: ignore[arg-type]
+
+                        ctx_log: list[dict[str, Any]] = []
+
+                        async def ctx_handler(route: Route, request: Request) -> None:
+                            ctx_log.append(
+                                {
+                                    "url": request.url,
+                                    "method": request.method,
+                                    "x_outer": request.headers.get("x-outer"),
+                                    "x_mid": request.headers.get("x-mid"),
+                                    "post_data": request.post_data,
+                                }
+                            )
+                            await route.fallback()
+
+                        await ctx.route("**/echo/*", ctx_handler, times=2)
+                        rp = await ctx.new_page()
+                        await rp.goto("/echo/init")
+
+                        async def mid_handler(route: Route, request: Request) -> None:
+                            if request.headers.get("x-outer"):
+                                assert request.method == "POST"
+                                assert request.post_data == "from-outer"
+                                await route.fallback(
+                                    url=f"{base}/echo/final?step=2",
+                                    headers={**request.headers, "X-Mid": "from-mid"},
+                                )
+                                return
+                            await route.fulfill(json={"directToOlder": True})
+
+                        await rp.route("**/echo/*", mid_handler)
+
+                        double_err: list[str] = []
+
+                        async def outer_handler(route: Route, request: Request) -> None:
+                            await route.fallback(
+                                method="POST",
+                                headers={**request.headers, "X-Outer": "from-outer"},
+                                post_data=b"from-outer",
+                            )
+                            try:
+                                await route.fallback()
+                            except Error as exc:
+                                double_err.append(str(exc))
+
+                        await rp.route("**/echo/start", outer_handler, times=2)
+                        zero_hits = 0
+
+                        def zero_handler(route: Route) -> Any:
+                            nonlocal zero_hits
+                            zero_hits += 1
+                            return route.fulfill(body="never")
+
+                        await rp.route("**/echo/start", zero_handler, times=0)
+
+                        for _ in range(2):
+                            res = await rp.evaluate("() => fetch('/echo/start').then(r => r.json())")
+                            assert res["method"] == "POST"
+                            assert res["path"] == "/echo/final?step=2"
+                            assert res["headers"]["x-outer"] == "from-outer"
+                            assert res["headers"]["x-mid"] == "from-mid"
+                            assert res["body"] == "from-outer"
+
+                        assert double_err and "already handled" in double_err[0]
+                        assert zero_hits == 0
+                        assert len(ctx_log) == 2
+                        assert ctx_log[0]["x_outer"] == "from-outer"
+                        assert ctx_log[0]["x_mid"] == "from-mid"
+                        assert ctx_log[0]["post_data"] == "from-outer"
+
+                        third = await rp.evaluate("() => fetch('/echo/start').then(r => r.json())")
+                        assert third == {"directToOlder": True}
+                        fourth = await rp.evaluate("() => fetch('/echo/other').then(r => r.json())")
+                        assert fourth == {"directToOlder": True}
+                        assert len(ctx_log) == 2
+                        await rp.close()
+                    finally:
+                        await ctx.close()
+                finally:
+                    await browser.close()
+
+        asyncio.run(_async_case())
+
+        # 3. Sync Clock & Route({ times }) / fallback(overrides) parity.
+        with sync_playwright() as p:
+            browser = p.chromium.launch(max_browsers=1)
+            try:
+                page = browser.new_page()
+                t0 = 1_706_860_800_000
+                page.clock.install(time=t0)
+                page.clock.pause_at(t0)
+                page.goto(f"{base}/clock-a")
+                assert page.evaluate("() => window.__bootNow") == t0
+                page.clock.run_for(2500)
+                assert page.evaluate("() => window.__ivCount") == 2
+                page.clock.fast_forward("01:00")
+                assert page.evaluate("() => Date.now()") == t0 + 2500 + 60_000
+                page.clock.set_fixed_time("2025-02-02T00:00:00Z")
+                assert page.evaluate("() => new Date().toISOString()") == "2025-02-02T00:00:00.000Z"
+                page.clock.set_system_time(t0)
+                assert page.evaluate("() => Date.now()") == t0
+                page.clock.resume()
+                page.close()
+
+                ctx = browser.new_context(base_url=base)
+                try:
+                    rp = ctx.new_page()
+                    rp.goto("/echo/init")
+                    rp.route(
+                        "**/echo/*",
+                        lambda route, req: route.fulfill(
+                            json={"seen": req.headers.get("x-sync"), "method": req.method, "body": req.post_data}
+                        ),
+                    )
+                    rp.route(
+                        "**/echo/sync",
+                        lambda route, req: route.fallback(
+                            method="POST",
+                            headers={**req.headers, "X-Sync": "yes"},
+                            post_data="sync-body",
+                        ),
+                        times=1,
+                    )
+                    first = rp.evaluate("() => fetch('/echo/sync').then(r => r.json())")
+                    assert first == {"seen": "yes", "method": "POST", "body": "sync-body"}
+                    second = rp.evaluate("() => fetch('/echo/sync').then(r => r.json())")
+                    assert second == {"seen": None, "method": "GET", "body": None}
+                    rp.close()
+                finally:
+                    ctx.close()
+            finally:
+                browser.close()
+    finally:
+        srv.shutdown()
 
