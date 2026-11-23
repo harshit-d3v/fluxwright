@@ -33,7 +33,7 @@ const FEATURES: { name: string; text: string; api: string }[] = [
   },
   {
     name: "Full Playwright-style API",
-    text: "Locators, cross-origin frameLocator, page.route, page.pdf(), HAR 1.2 record/replay, prewarmContexts, ResourcePreset, multi-tab contexts, APIRequestContext, and newCDPSession.",
+    text: "Locators, cross-origin frameLocator, page.clock, route({ times }) & route.fallback(overrides), screenshot masking, page.pdf(), HAR 1.2 record/replay, prewarmContexts, ResourcePreset, multi-tab contexts, APIRequestContext, and newCDPSession.",
     api: "page.getByRole()",
   },
   {
@@ -53,18 +53,18 @@ const FEATURES: { name: string; text: string; api: string }[] = [
   },
   {
     name: "Live screencast & HITL",
-    text: "Watch live JPEG streams in /dashboard, pause any session with pause_for_human, drive mouse, keyboard, and navigation remotely, and resume cleanly.",
-    api: "/dashboard",
+    text: "Watch live JPEG streams in /dashboard, generate signed read-only or interactive embeddable Live View URLs, pause sessions with pause_for_human, drive mouse/keyboard/navigation remotely, and resume cleanly.",
+    api: "/v1/live/{id}/embed",
   },
   {
     name: "HTTP server & cluster mode",
-    text: "Bearer-authenticated job API, Prometheus /metrics, W3C traceparent spans, --journal and SQLite --store persistence with result TTL, Docker image, and pull-based fluxwright coordinate clusters with TLS and cluster-wide per-host limits.",
+    text: "Bearer-authenticated job API, signed HMAC-SHA256 webhooks, OTLP/HTTP JSON trace export, Prometheus /metrics, W3C traceparent spans, --journal and SQLite --store persistence, Docker image, and pull-based fluxwright coordinate clusters.",
     api: "fluxwright serve",
   },
   {
     name: "Built for AI agents",
-    text: "21-tool MCP server for Claude, Codex, and Cursor, plus native @eN accessibility tree snapshots and clean HTML-to-Markdown extraction.",
-    api: "fluxwright-mcp",
+    text: "21-tool MCP server over stdio or Streamable HTTP (--http) with per-session isolation, diff-only @eN ARIA snapshots, Set-of-Marks annotated screenshots, and clean Markdown extraction.",
+    api: "fluxwright-mcp --http",
   },
 ];
 
@@ -82,16 +82,17 @@ const STEPS: { title: string; text: string }[] = [
   },
 ];
 
-// GitHub Actions benchmarks run 44920620633 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.36), 21 November 2026.
+// GitHub Actions benchmarks run 45227204313 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.36), 23 November 2026.
 const BENCH: { setup: string; flux: number; pw: number }[] = [
-  { setup: "1 browser, 10 pages (100 jobs)", flux: 38.3, pw: 30.9 },
-  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 45.5, pw: 33.6 },
-  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 44.6, pw: 33.9 },
-  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 41.3, pw: 34.4 },
-  { setup: "200 scraping jobs (images + fonts)", flux: 31.9, pw: 26.8 },
-  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 39.3, pw: 23.2 },
+  { setup: "1 browser, 10 pages (100 jobs)", flux: 42.8, pw: 36.7 },
+  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 50.7, pw: 34.6 },
+  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 48.5, pw: 36.7 },
+  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 47.3, pw: 41.7 },
+  { setup: "100 PDFs (8 browsers × 2 pages)", flux: 52.0, pw: 41.6 },
+  { setup: "200 scraping jobs (images + fonts)", flux: 38.2, pw: 31.0 },
+  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 49.2, pw: 23.2 },
 ];
-const BENCH_MAX = 50;
+const BENCH_MAX = 55;
 
 const TS_EXAMPLE = `import { chromium } from "fluxwright";
 
@@ -232,7 +233,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.10.0, open source under Apache-2.0. Prebuilt for Windows, macOS, and Linux (x64 &amp; ARM64) on npm, PyPI, and GitHub Releases.
+              Version 0.11.0, open source under Apache-2.0. Prebuilt for Windows (x64 &amp; ARM64), macOS, and Linux (x64, ARM64 &amp; static musl) on npm, PyPI, and GitHub Releases.
             </p>
           </div>
           <FleetBoard />
@@ -348,10 +349,10 @@ export default function Home() {
               </tbody>
             </table>
             <p className="note bench-note">
-              Measured on GitHub&apos;s ubuntu-latest runner (4 vCPU, 21 November 2026,
+              Measured on GitHub&apos;s ubuntu-latest runner (4 vCPU, 23 November 2026,
               chrome-headless-shell 158.0.8127.36). Fluxwright beat Playwright and Puppeteer in
               all 8 scenarios with 0.0% failures and 0 leaked processes; in chaos mode Playwright
-              dropped 71.6% of jobs and Puppeteer 73.0%. A shared cloud runner varies from run to
+              and Puppeteer dropped 69.9% of jobs. A shared cloud runner varies from run to
               run. Run it yourself from the repository&apos;s Actions tab (benchmarks), and measure
               your own workload with <code>cargo run --release -p fluxwright-benchmarks</code>.
             </p>
