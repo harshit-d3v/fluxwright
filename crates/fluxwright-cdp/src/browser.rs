@@ -961,7 +961,7 @@ impl CdpBrowser {
                 // Subscribe before resuming a popup so its initial console/network events
                 // are buffered until `collect_logs` takes ownership of the stream.
                 let early_log_events = if ty == "page" && effective_opener.is_some() {
-                    Some(self.conn.subscribe_unbounded())
+                    Some(self.conn.subscribe_session(&session_id))
                 } else {
                     None
                 };
@@ -2472,7 +2472,6 @@ async fn prepare_session(
         }
         if let Some(ref s) = setup {
             if !s.urls.is_empty() {
-                calls.push(("Network.enable", json!({})));
                 calls.push(("Network.setBlockedURLs", json!({ "urls": s.urls })));
             }
         }
