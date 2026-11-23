@@ -83,15 +83,6 @@ fn remove_dir_if_exists(dir: &std::path::Path) {
     }
 }
 
-fn spawn_remove_dir_if_exists(dir: &std::path::Path, runtime: &tokio::runtime::Handle) {
-    if matches!(dir.try_exists(), Ok(true)) {
-        let owned = dir.to_path_buf();
-        runtime.spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(owned);
-        });
-    }
-}
-
 /// An engine dropped without `shutdown()` kills its browsers: their own tasks keep them alive
 /// until Chrome exits.
 impl Drop for Inner {
@@ -189,7 +180,10 @@ impl ContextGuard {
             let _ = rec.finish().await;
         }
         let _ = self.browser.dispose_context(&self.context).await;
-        spawn_remove_dir_if_exists(&self.download_dir, &self.runtime);
+        if matches!(self.download_dir.try_exists(), Ok(true)) {
+            let dir = self.download_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
+        }
         self.engine.release_slot(&self.browser, completed).await;
     }
 
@@ -198,6 +192,7 @@ impl ContextGuard {
             return;
         }
         self.tracing.shutdown();
+        remove_dir_if_exists(&self.download_dir);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
@@ -214,7 +209,6 @@ impl ContextGuard {
                 let _ = rec.finish().await;
             }
             let _ = guard.browser.dispose_context(&guard.context).await;
-            spawn_remove_dir_if_exists(&guard.download_dir, &guard.runtime);
             guard.engine.release_slot(&guard.browser, completed).await;
         });
     }
@@ -226,7 +220,7 @@ impl Drop for ContextGuard {
             return;
         }
         self.tracing.shutdown();
-        let dir = std::mem::take(&mut self.download_dir);
+        remove_dir_if_exists(&self.download_dir);
         let completed = !self.failed.load(Ordering::SeqCst);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
@@ -238,7 +232,6 @@ impl Drop for ContextGuard {
         let browser = self.browser.clone();
         let ctx = self.context.clone();
         let engine = self.engine.clone();
-        let runtime = self.runtime.clone();
         self.runtime.spawn(async move {
             for rec in recorders {
                 let _ = rec.finish().await;
@@ -247,7 +240,6 @@ impl Drop for ContextGuard {
                 let _ = rec.finish().await;
             }
             let _ = browser.dispose_context(&ctx).await;
-            spawn_remove_dir_if_exists(&dir, &runtime);
             engine.release_slot(&browser, completed).await;
         });
     }
