@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::connection::{CdpEvent, Connection};
+use crate::connection::{CdpEvent, Connection, SessionRouter, SessionSubscription};
 use crate::events::{decode_ws_frame, BodySource, Loaded, NetEvent, NetRequest, NetResponse, WebSocketEvent};
 
 /// Per kind; older entries are dropped first.
@@ -217,8 +217,33 @@ pub(crate) struct Watch {
 /// Runs until aborted: records console calls, uncaught exceptions and finished downloads from
 /// the page and every child target session (iframes in other processes, workers) that attaches
 /// under it. Separate top-level popup page targets get their own `CdpPage` and `PageLog`.
+#[cfg(test)]
 pub(crate) async fn collect(
+    events: UnboundedReceiver<Arc<CdpEvent>>,
+    watch: Watch,
+    log: Arc<Mutex<PageLog>>,
+    downloads: UnboundedSender<DownloadResult>,
+    conn: Arc<Connection>,
+) {
+    collect_routed(events, None, watch, log, downloads, conn).await;
+}
+
+/// Session-routed variant of [`collect`] that dynamically registers child iframe/worker sessions
+/// with the connection's session router as they attach and removes them as they detach.
+pub(crate) async fn collect_session(
+    sub: SessionSubscription,
+    watch: Watch,
+    log: Arc<Mutex<PageLog>>,
+    downloads: UnboundedSender<DownloadResult>,
+    conn: Arc<Connection>,
+) {
+    let (events, router) = sub.into_parts();
+    collect_routed(events, Some(router), watch, log, downloads, conn).await;
+}
+
+async fn collect_routed(
     mut events: UnboundedReceiver<Arc<CdpEvent>>,
+    router: Option<SessionRouter>,
     watch: Watch,
     log: Arc<Mutex<PageLog>>,
     downloads: UnboundedSender<DownloadResult>,
@@ -251,10 +276,19 @@ pub(crate) async fn collect(
                 if is_child_target {
                     if let Some(s) = e.params["sessionId"].as_str() {
                         sessions.insert(s.to_string());
+                        if let Some(ref router) = router {
+                            router.add_session(s);
+                        }
                     }
                     if ty == "iframe" {
                         if let Some(t) = e.params["targetInfo"]["targetId"].as_str() {
                             frames.insert(t.to_string());
+                        }
+                    }
+                } else if !ctx_matches && matches!(ty, "iframe" | "worker") {
+                    if let Some(s) = e.params["sessionId"].as_str() {
+                        if let Some(ref router) = router {
+                            router.remove_session(s);
                         }
                     }
                 }
@@ -267,8 +301,12 @@ pub(crate) async fn collect(
                 frames.remove(&str_of("frameId"));
             }
             "Target.detachedFromTarget" => {
-                if sessions.remove(&str_of("sessionId")) {
+                let sid = str_of("sessionId");
+                if sessions.remove(&sid) {
                     frames.remove(&str_of("targetId"));
+                    if let Some(ref router) = router {
+                        router.remove_session(&sid);
+                    }
                 }
             }
             "Browser.downloadWillBegin" if browser_wide && frames.contains(&str_of("frameId")) => {
@@ -747,5 +785,88 @@ mod tests {
             net_urls,
             vec!["https://example.test/opener", "https://example.test/iframe"]
         );
+    }
+
+    #[tokio::test]
+    async fn collect_session_receives_child_and_browser_wide_events_skips_unrelated() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let events = [
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "params": { "type": "log", "args": [{ "type": "string", "value": "from-page" }] },
+                    "sessionId": "s-page"
+                }),
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "params": { "type": "log", "args": [{ "type": "string", "value": "from-other" }] },
+                    "sessionId": "s-other"
+                }),
+                json!({
+                    "method": "Target.attachedToTarget",
+                    "params": {
+                        "sessionId": "s-iframe",
+                        "targetInfo": { "targetId": "f-iframe", "type": "iframe", "browserContextId": "c1" }
+                    },
+                    "sessionId": "s-page"
+                }),
+                json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "params": { "type": "log", "args": [{ "type": "string", "value": "from-iframe" }] },
+                    "sessionId": "s-iframe"
+                }),
+                json!({
+                    "method": "Browser.downloadWillBegin",
+                    "params": {
+                        "frameId": "f-main",
+                        "guid": "dl-1",
+                        "url": "https://example.test/dl",
+                        "suggestedFilename": "f.bin"
+                    }
+                }),
+                json!({
+                    "method": "Browser.downloadProgress",
+                    "params": { "guid": "dl-1", "state": "completed" }
+                }),
+            ];
+            for ev in events {
+                ws.send(Message::Text(ev.to_string().into())).await.unwrap();
+            }
+            let _ = ws.close(None).await;
+        });
+
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+        let sub = conn.subscribe_session("s-page");
+        let log = Arc::new(Mutex::new(PageLog::default()));
+        let (dl_tx, mut dl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = Watch {
+            session: "s-page".into(),
+            main_frame: "f-main".into(),
+            context: "c1".into(),
+            download_dir: PathBuf::from("downloads"),
+        };
+        let handle = tokio::spawn(collect_session(sub, watch, log.clone(), dl_tx, conn));
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = server.await;
+
+        let texts: Vec<String> = log
+            .lock()
+            .unwrap()
+            .console
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(texts, vec!["from-page", "from-iframe"]);
+        let dl = dl_rx.try_recv().unwrap().unwrap();
+        assert_eq!(dl.suggested_filename, "f.bin");
     }
 }

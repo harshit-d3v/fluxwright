@@ -640,12 +640,10 @@ pub struct CdpPage {
     pub(crate) net: Arc<std::sync::Mutex<NetActivity>>,
     /// Maps the latest accessibility snapshot's short ref (`"e1"`, `"e2"`, ...) to `backendDOMNodeId`.
     pub(crate) ax_refs: Arc<std::sync::Mutex<HashMap<String, i64>>>,
-    /// Pre-subscribed CDP event stream for popups so early console/network events aren't missed.
+    /// Pre-subscribed session-routed CDP event stream for popups so early console/network events aren't missed.
     #[allow(clippy::type_complexity)]
     pub(crate) early_log_events: Arc<
-        std::sync::Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<Arc<crate::connection::CdpEvent>>>,
-        >,
+        std::sync::Mutex<Option<crate::connection::SessionSubscription>>,
     >,
 }
 
@@ -2792,9 +2790,33 @@ impl CdpPage {
             .lock()
             .unwrap()
             .take()
-            .unwrap_or_else(|| self.browser.subscribe_unbounded());
-        let task = tokio::spawn(crate::log::collect(events, watch, log.clone(), tx, self.browser.clone()));
+            .unwrap_or_else(|| self.browser.subscribe_session(&self.session_id.0));
+        let task = tokio::spawn(crate::log::collect_session(events, watch, log.clone(), tx, self.browser.clone()));
         (log, rx, task)
+    }
+
+    /// Installs channels for dialogs, file choosers, exposed bindings, and popups in a single
+    /// `page_setups` lock acquisition.
+    #[allow(clippy::type_complexity)]
+    pub async fn install_event_channels(
+        &self,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<crate::events::Dialog>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::events::FileChooser>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::events::BindingCall>,
+        tokio::sync::mpsc::UnboundedReceiver<CdpPage>,
+    ) {
+        let (dlg_tx, dlg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fc_tx, fc_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (bind_tx, bind_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pop_tx, pop_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ps = self.page_setups.lock().await;
+        let setup = ps.entry(self.target_id.0.clone()).or_default();
+        setup.dialogs = Some(dlg_tx);
+        setup.file_choosers = Some(fc_tx);
+        setup.bindings = Some(bind_tx);
+        setup.popups = Some(pop_tx);
+        (dlg_rx, fc_rx, bind_rx, pop_rx)
     }
 
     /// Hands dialogs of this page and its iframes to the returned queue instead of

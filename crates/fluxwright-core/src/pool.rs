@@ -51,12 +51,20 @@ struct Inner {
 struct State {
     browsers: Vec<Slot>,
     queue: VecDeque<Waiter>,
+    mixed_priorities: bool,
     counters: Counters,
     launching: usize,
     shutting_down: bool,
 }
 
 impl State {
+    fn push_waiter(&mut self, waiter: Waiter) {
+        if waiter.priority != Priority::Normal {
+            self.mixed_priorities = true;
+        }
+        self.queue.push_back(waiter);
+    }
+
     /// Browsers that count toward `max_browsers`: those that can still take a lease. A draining
     /// or dead one is on its way out, so its replacement may start at once; counting it stopped
     /// the whole pool (with one browser) until its last job ended. The memory ceiling still
@@ -69,6 +77,12 @@ impl State {
     }
 }
 
+fn remove_dir_if_exists(dir: &std::path::Path) {
+    if matches!(dir.try_exists(), Ok(true)) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// An engine dropped without `shutdown()` kills its browsers: their own tasks keep them alive
 /// until Chrome exits.
 impl Drop for Inner {
@@ -76,7 +90,7 @@ impl Drop for Inner {
         if let Ok(st) = self.state.try_lock() {
             for s in &st.browsers {
                 for w in &s.warm {
-                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                    remove_dir_if_exists(&w.download_dir);
                 }
                 s.browser.start_kill();
             }
@@ -105,6 +119,7 @@ struct Slot {
 struct Waiter {
     priority: Priority,
     proxy: Option<Proxy>,
+    eager_page: bool,
     queued_at: Instant,
     tx: tokio::sync::oneshot::Sender<Result<Arc<ContextGuard>>>,
 }
@@ -151,8 +166,6 @@ impl ContextGuard {
             return;
         }
         self.tracing.shutdown();
-        let dir = self.download_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
@@ -167,6 +180,10 @@ impl ContextGuard {
             let _ = rec.finish().await;
         }
         let _ = self.browser.dispose_context(&self.context).await;
+        if matches!(self.download_dir.try_exists(), Ok(true)) {
+            let dir = self.download_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
+        }
         self.engine.release_slot(&self.browser, completed).await;
     }
 
@@ -175,7 +192,7 @@ impl ContextGuard {
             return;
         }
         self.tracing.shutdown();
-        let _ = std::fs::remove_dir_all(&self.download_dir);
+        remove_dir_if_exists(&self.download_dir);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
@@ -203,7 +220,7 @@ impl Drop for ContextGuard {
             return;
         }
         self.tracing.shutdown();
-        let _ = std::fs::remove_dir_all(&self.download_dir);
+        remove_dir_if_exists(&self.download_dir);
         let completed = !self.failed.load(Ordering::SeqCst);
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
@@ -311,6 +328,7 @@ pub struct ContextLease {
     action_timeout: Option<Duration>,
     navigation_timeout: Option<Duration>,
     binding_listeners: Listeners<fluxwright_cdp::BindingCall>,
+    context_bindings_installed: Arc<tokio::sync::OnceCell<()>>,
     binding_handlers: Arc<std::sync::Mutex<HashMap<String, BindingHandler>>>,
     binding_dispatch_started: AtomicBool,
 }
@@ -372,6 +390,20 @@ type BindingHandler = Arc<
         + Sync,
 >;
 
+fn deliver_newest<T>(item: T, listeners: &Listeners<T>) {
+    let mut item = Some(item);
+    let mut listeners = listeners.lock().unwrap();
+    while let (Some(tx), Some(v)) = (listeners.last(), item.take()) {
+        match tx.send(v) {
+            Ok(()) => break,
+            Err(back) => {
+                item = Some(back.0);
+                listeners.pop();
+            }
+        }
+    }
+}
+
 /// Routes events (dialogs, file choosers) to the newest listener still subscribed; an
 /// unhandled event is dropped cleanly. Ends with the context.
 fn route_newest<T: Send + 'static>(
@@ -380,16 +412,37 @@ fn route_newest<T: Send + 'static>(
 ) {
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
-            let mut item = Some(item);
-            let mut listeners = listeners.lock().unwrap();
-            while let (Some(tx), Some(v)) = (listeners.last(), item.take()) {
-                match tx.send(v) {
-                    Ok(()) => break,
-                    Err(back) => {
-                        item = Some(back.0);
-                        listeners.pop();
-                    }
-                }
+            deliver_newest(item, &listeners);
+        }
+    });
+}
+
+fn spawn_page_event_router(
+    mut dialogs_rx: tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::Dialog>,
+    dialog_listeners: Listeners<fluxwright_cdp::Dialog>,
+    mut file_choosers_rx: tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::FileChooser>,
+    file_chooser_listeners: Listeners<fluxwright_cdp::FileChooser>,
+    mut bindings_rx: tokio::sync::mpsc::UnboundedReceiver<fluxwright_cdp::BindingCall>,
+    binding_listeners: Listeners<fluxwright_cdp::BindingCall>,
+) {
+    tokio::spawn(async move {
+        let mut d_open = true;
+        let mut f_open = true;
+        let mut b_open = true;
+        while d_open || f_open || b_open {
+            tokio::select! {
+                res = dialogs_rx.recv(), if d_open => match res {
+                    Some(item) => deliver_newest(item, &dialog_listeners),
+                    None => d_open = false,
+                },
+                res = file_choosers_rx.recv(), if f_open => match res {
+                    Some(item) => deliver_newest(item, &file_chooser_listeners),
+                    None => f_open = false,
+                },
+                res = bindings_rx.recv(), if b_open => match res {
+                    Some(item) => deliver_newest(item, &binding_listeners),
+                    None => b_open = false,
+                },
             }
         }
     });
@@ -418,6 +471,7 @@ impl Engine {
             state: Mutex::new(State {
                 browsers: Vec::new(),
                 queue: VecDeque::new(),
+                mixed_priorities: false,
                 counters: Counters::default(),
                 launching: 0,
                 shutting_down: false,
@@ -477,13 +531,14 @@ impl Engine {
     }
 
     pub async fn acquire_with(&self, priority: Priority, timeout: Duration) -> Result<PageLease> {
-        let guard = self.acquire_context_guard(priority, None, timeout).await?;
+        let guard = self.acquire_context_guard(priority, None, timeout, true).await?;
         let ctx = ContextLease {
             guard,
             base_url: None,
             action_timeout: None,
             navigation_timeout: None,
             binding_listeners: Listeners::default(),
+            context_bindings_installed: Arc::default(),
             binding_handlers: Default::default(),
             binding_dispatch_started: AtomicBool::new(false),
         };
@@ -514,6 +569,10 @@ impl Engine {
 
     /// Acquires an isolated browser context configured with `opts`; open tabs via [`ContextLease::new_page`].
     pub async fn acquire_context_with(&self, opts: &JobOptions) -> Result<ContextLease> {
+        self.acquire_context_inner(opts, false).await
+    }
+
+    async fn acquire_context_inner(&self, opts: &JobOptions, eager_page: bool) -> Result<ContextLease> {
         let loaded_profile_state = if let Some(ref profile_name) = opts.profile {
             validate_profile_name(profile_name)?;
             let Some(store) = self.inner.profiles.as_ref() else {
@@ -552,9 +611,16 @@ impl Engine {
         }
         let timeout_budget = opts.timeout.unwrap_or(self.inner.config.acquire_timeout);
         let guard = self
-            .acquire_context_guard(opts.priority, effective_proxy.clone(), timeout_budget)
+            .acquire_context_guard(
+                opts.priority,
+                effective_proxy.clone(),
+                timeout_budget,
+                eager_page,
+            )
             .await?;
-        *guard.proxy_lease.lock().unwrap() = proxy_lease;
+        if proxy_lease.is_some() {
+            *guard.proxy_lease.lock().unwrap() = proxy_lease;
+        }
         if let (Some(profile_name), Some(store)) = (&opts.profile, &self.inner.profiles) {
             if opts.persist_profile {
                 *guard.profile_target.lock().unwrap() =
@@ -576,42 +642,68 @@ impl Engine {
         if let Some(ref rv) = opts.record_video {
             *guard.record_video.lock().unwrap() = Some(rv.clone());
         }
-        *guard.http_defaults.lock().unwrap() = HttpContextDefaults {
-            base_url: opts.base_url.clone(),
-            extra_http_headers: opts.emulation.extra_http_headers.clone(),
-            user_agent: opts.emulation.user_agent.clone(),
-            http_credentials: opts.http_credentials.clone(),
-            proxy: effective_proxy,
-        };
-        let setup_res = async {
-            apply_context_blocking(&guard, opts).await?;
-            let timeout = Duration::from_secs(5);
-            if let Some(creds) = &opts.http_credentials {
-                guard
-                    .browser
-                    .context_set_http_credentials(&guard.context, creds, timeout)
-                    .await?;
-            }
-            guard
-                .browser
-                .context_grant_permissions(&guard.context, &opts.permissions, timeout)
-                .await?;
-            if let Some(state) = effective_storage_state {
-                guard
-                    .browser
-                    .context_set_storage_state(&guard.context, state, timeout)
-                    .await?;
-            }
-            guard
-                .browser
-                .context_emulate(&guard.context, &opts.emulation, timeout)
-                .await?;
-            Ok::<_, Error>(())
+        if opts.base_url.is_some()
+            || !opts.emulation.extra_http_headers.is_empty()
+            || opts.emulation.user_agent.is_some()
+            || opts.http_credentials.is_some()
+            || effective_proxy.is_some()
+        {
+            *guard.http_defaults.lock().unwrap() = HttpContextDefaults {
+                base_url: opts.base_url.clone(),
+                extra_http_headers: opts.emulation.extra_http_headers.clone(),
+                user_agent: opts.emulation.user_agent.clone(),
+                http_credentials: opts.http_credentials.clone(),
+                proxy: effective_proxy,
+            };
         }
-        .await;
-        if let Err(e) = setup_res {
-            guard.dispose(false).await;
-            return Err(e);
+        let has_blocking = opts.block_images
+            || opts.block_fonts
+            || opts.block_media
+            || opts.block_stylesheets
+            || opts.block_scripts
+            || !opts.block_url_patterns.is_empty();
+        let has_setup = has_blocking
+            || opts.http_credentials.is_some()
+            || !opts.permissions.is_empty()
+            || effective_storage_state.is_some()
+            || !opts.emulation.is_empty();
+        if has_setup {
+            let setup_res = async {
+                if has_blocking {
+                    apply_context_blocking(&guard, opts).await?;
+                }
+                let timeout = Duration::from_secs(5);
+                if let Some(creds) = &opts.http_credentials {
+                    guard
+                        .browser
+                        .context_set_http_credentials(&guard.context, creds, timeout)
+                        .await?;
+                }
+                if !opts.permissions.is_empty() {
+                    guard
+                        .browser
+                        .context_grant_permissions(&guard.context, &opts.permissions, timeout)
+                        .await?;
+                }
+                if let Some(state) = effective_storage_state {
+                    guard
+                        .browser
+                        .context_set_storage_state(&guard.context, state, timeout)
+                        .await?;
+                }
+                if !opts.emulation.is_empty() {
+                    guard
+                        .browser
+                        .context_emulate(&guard.context, &opts.emulation, timeout)
+                        .await?;
+                }
+                Ok::<_, Error>(())
+            }
+            .await;
+            if let Err(e) = setup_res {
+                guard.dispose(false).await;
+                return Err(e);
+            }
         }
         if let Some(ref har_opts) = opts.record_har {
             let rec = guard
@@ -620,17 +712,13 @@ impl Engine {
                 .await;
             guard.har_recorders.lock().unwrap().push(rec);
         }
-        let binding_listeners = Listeners::default();
-        route_newest(
-            guard.browser.context_bindings(&guard.context).await,
-            binding_listeners.clone(),
-        );
         Ok(ContextLease {
             guard,
             base_url: opts.base_url.clone(),
             action_timeout: None,
             navigation_timeout: None,
-            binding_listeners,
+            binding_listeners: Listeners::default(),
+            context_bindings_installed: Arc::default(),
             binding_handlers: Default::default(),
             binding_dispatch_started: AtomicBool::new(false),
         })
@@ -639,7 +727,13 @@ impl Engine {
     /// A lease set up for `opts`: priority, proxy, resource blocking, permissions, saved
     /// storage and emulation.
     pub async fn acquire_job(&self, opts: &JobOptions) -> Result<PageLease> {
-        let ctx = self.acquire_context_with(opts).await?;
+        let eager_page = opts.profile.is_none()
+            && opts.storage_state.is_none()
+            && opts.record_har.is_none()
+            && opts.record_video.is_none()
+            && opts.emulation.javascript_enabled != Some(false)
+            && !opts.emulation.bypass_csp;
+        let ctx = self.acquire_context_inner(opts, eager_page).await?;
         let mut page = match ctx.new_page().await {
             Ok(p) => p,
             Err(e) => {
@@ -656,6 +750,7 @@ impl Engine {
         priority: Priority,
         proxy: Option<Proxy>,
         timeout: Duration,
+        eager_page: bool,
     ) -> Result<Arc<ContextGuard>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
@@ -663,7 +758,13 @@ impl Engine {
             if st.shutting_down {
                 return Err(Error::ShuttingDown);
             }
-            notify_n(&self.inner.queue_space, drop_abandoned(&mut st.queue));
+            if st.queue.len() >= self.inner.config.queue_capacity {
+                let dropped = drop_abandoned(&mut st.queue);
+                if st.queue.is_empty() {
+                    st.mixed_priorities = false;
+                }
+                notify_n(&self.inner.queue_space, dropped);
+            }
             if st.queue.len() >= self.inner.config.queue_capacity {
                 match self.inner.config.queue_full_mode {
                     QueueFullMode::Error => return Err(Error::QueueFull),
@@ -684,11 +785,16 @@ impl Engine {
                                 if st.shutting_down {
                                     return Err(Error::ShuttingDown);
                                 }
-                                notify_n(&self.inner.queue_space, drop_abandoned(&mut st.queue));
+                                let dropped = drop_abandoned(&mut st.queue);
+                                if st.queue.is_empty() {
+                                    st.mixed_priorities = false;
+                                }
+                                notify_n(&self.inner.queue_space, dropped);
                                 if st.queue.len() < self.inner.config.queue_capacity {
-                                    st.queue.push_back(Waiter {
+                                    st.push_waiter(Waiter {
                                         priority,
                                         proxy,
+                                        eager_page,
                                         queued_at: Instant::now(),
                                         tx,
                                     });
@@ -705,9 +811,10 @@ impl Engine {
                     }
                 }
             } else {
-                st.queue.push_back(Waiter {
+                st.push_waiter(Waiter {
                     priority,
                     proxy,
+                    eager_page,
                     queued_at: Instant::now(),
                     tx,
                 });
@@ -879,7 +986,7 @@ impl Engine {
             let warm: Vec<WarmContext> = s.warm.drain(..).collect();
             closing.spawn(async move {
                 for w in warm {
-                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                    remove_dir_if_exists(&w.download_dir);
                     let _ = s.browser.dispose_context(&w.context).await;
                 }
                 let _ = s.browser.close().await;
@@ -962,13 +1069,22 @@ impl Inner {
     async fn dispatch(self: Arc<Self>) -> Result<bool> {
         self.reap().await;
         self.recycle().await;
-        let can_dispatch_now = {
+        let (can_dispatch_now, mut abandoned_total) = {
             let mut st = self.state.lock().await;
             if st.shutting_down {
                 return Ok(false);
             }
-            notify_n(&self.queue_space, drop_abandoned(&mut st.queue));
-            st.can_dispatch(&self.config)
+            let dropped = if st.queue.is_empty() {
+                0
+            } else {
+                let d = drop_abandoned(&mut st.queue);
+                if st.queue.is_empty() {
+                    st.mixed_priorities = false;
+                }
+                d
+            };
+            notify_n(&self.queue_space, dropped);
+            (st.can_dispatch(&self.config), 0usize)
         };
         if !can_dispatch_now {
             self.maybe_prewarm().await;
@@ -992,13 +1108,11 @@ impl Inner {
         };
         let mut excess_warm: Vec<(Arc<CdpBrowser>, WarmContext)> = Vec::new();
         let mut batch: Vec<(Waiter, Reservation, tokio::sync::OwnedSemaphorePermit)> = Vec::new();
-        let mut abandoned_total = 0usize;
         {
             let mut st = self.state.lock().await;
             if st.shutting_down {
                 return Ok(false);
             }
-            abandoned_total += drop_abandoned(&mut st.queue);
             loop {
                 if let Some(ref adaptive) = self.adaptive {
                     let in_flight: usize =
@@ -1017,7 +1131,9 @@ impl Inner {
                 let Ok(permit) = self.grants.clone().try_acquire_owned() else {
                     break;
                 };
-                let (waiter, picked_abandoned) = pick_waiter(&mut st.queue);
+                let state = &mut *st;
+                let (waiter, picked_abandoned) =
+                    pick_waiter(&mut state.queue, &mut state.mixed_priorities);
                 abandoned_total += picked_abandoned;
                 let Some(waiter) = waiter else {
                     break;
@@ -1066,20 +1182,23 @@ impl Inner {
         for (browser, evicted) in excess_warm {
             tokio::spawn(async move {
                 let dir = evicted.download_dir;
-                tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::remove_dir_all(dir);
-                });
                 let _ = browser.dispose_context(&evicted.context).await;
+                if matches!(dir.try_exists(), Ok(true)) {
+                    tokio::task::spawn_blocking(move || {
+                        let _ = std::fs::remove_dir_all(dir);
+                    });
+                }
             });
         }
         for (waiter, reservation, permit) in batch {
             let inner = self.clone();
             tokio::spawn(async move {
-                let res = inner.prepare_context(waiter.proxy.as_ref(), reservation).await;
+                let res = inner
+                    .prepare_context(waiter.proxy.as_ref(), reservation, waiter.eager_page)
+                    .await;
                 let _ = waiter.tx.send(res);
                 drop(permit);
                 inner.admit.notify_one();
-                inner.maybe_prewarm().await;
             });
         }
         Ok(true)
@@ -1186,18 +1305,19 @@ impl Inner {
                     let ctx = browser.create_context(None).await?;
                     let download_dir = std::env::temp_dir()
                         .join(format!("fluxwright-{}-dl-{}", std::process::id(), ctx.0));
-                    let _ = browser
-                        .context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5))
-                        .await;
-                    match browser.create_page(&ctx, nav_timeout).await {
+                    let (_, page_res) = tokio::join!(
+                        browser.context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5)),
+                        browser.create_page(&ctx, nav_timeout),
+                    );
+                    match page_res {
                         Ok(blank_page) => Ok::<_, fluxwright_cdp::Error>(WarmContext {
                             context: ctx,
                             download_dir,
                             blank_page,
                         }),
                         Err(e) => {
-                            let _ = std::fs::remove_dir_all(&download_dir);
                             let _ = browser.dispose_context(&ctx).await;
+                            remove_dir_if_exists(&download_dir);
                             Err(e)
                         }
                     }
@@ -1231,8 +1351,8 @@ impl Inner {
                     }
                 };
                 if let Some(w) = discarded {
-                    let _ = std::fs::remove_dir_all(&w.download_dir);
                     let _ = browser.dispose_context(&w.context).await;
+                    remove_dir_if_exists(&w.download_dir);
                 }
                 inner.admit.notify_one();
             });
@@ -1243,20 +1363,21 @@ impl Inner {
         self: &Arc<Self>,
         proxy: Option<&Proxy>,
         reservation: Reservation,
+        eager_page: bool,
     ) -> Result<Arc<ContextGuard>> {
         let (browser, warm_page, existing_ctx) = match reservation {
             Reservation::Warm(b, w) => {
                 if self.state.lock().await.shutting_down {
-                    let _ = std::fs::remove_dir_all(&w.download_dir);
                     let _ = b.dispose_context(&w.context).await;
+                    remove_dir_if_exists(&w.download_dir);
                     self.release_slot(&b, false).await;
                     return Err(Error::ShuttingDown);
                 }
                 if !b.connection_dead() && !w.blank_page.is_closed() {
                     (b, Some(w.blank_page), Some((w.context, w.download_dir)))
                 } else {
-                    let _ = std::fs::remove_dir_all(&w.download_dir);
                     let _ = b.dispose_context(&w.context).await;
+                    remove_dir_if_exists(&w.download_dir);
                     (b, None, None)
                 }
             }
@@ -1303,8 +1424,8 @@ impl Inner {
             }
         };
 
-        let (ctx, download_dir) = match existing_ctx {
-            Some(pair) => pair,
+        let (ctx, download_dir, warm_page) = match existing_ctx {
+            Some((ctx, dir)) => (ctx, dir, warm_page),
             None => {
                 let ctx = match browser.create_context(proxy).await {
                     Ok(c) => c,
@@ -1317,11 +1438,27 @@ impl Inner {
                 // Named like profile folders, so the sweep after a crash finds it: `fluxwright-<pid>-…`.
                 let download_dir = std::env::temp_dir()
                     .join(format!("fluxwright-{}-dl-{}", std::process::id(), ctx.0));
-                // Best effort: a Chrome that refuses only loses downloads.
-                let _ = browser
-                    .context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5))
-                    .await;
-                (ctx, download_dir)
+                if eager_page {
+                    let (_, page_res) = tokio::join!(
+                        browser.context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5)),
+                        browser.create_page(&ctx, self.config.navigation_timeout),
+                    );
+                    match page_res {
+                        Ok(page) => (ctx, download_dir, Some(page)),
+                        Err(e) => {
+                            let _ = browser.dispose_context(&ctx).await;
+                            remove_dir_if_exists(&download_dir);
+                            self.release_slot(&browser, false).await;
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    // Best effort: a Chrome that refuses only loses downloads.
+                    let _ = browser
+                        .context_allow_downloads(&ctx, &download_dir, Duration::from_secs(5))
+                        .await;
+                    (ctx, download_dir, None)
+                }
             }
         };
 
@@ -1378,7 +1515,7 @@ impl Inner {
             if dead && st.browsers[i].active == 0 {
                 let mut slot = st.browsers.remove(i);
                 for w in slot.warm.drain(..) {
-                    let _ = std::fs::remove_dir_all(&w.download_dir);
+                    remove_dir_if_exists(&w.download_dir);
                 }
                 st.counters.crash_count += 1;
                 warn!(pid = slot.browser.pid, "removing dead browser");
@@ -1466,8 +1603,13 @@ impl Inner {
         }
         for (browser, w) in to_dispose_warm {
             tokio::spawn(async move {
-                let _ = std::fs::remove_dir_all(&w.download_dir);
                 let _ = browser.dispose_context(&w.context).await;
+                if matches!(w.download_dir.try_exists(), Ok(true)) {
+                    let dir = w.download_dir;
+                    tokio::task::spawn_blocking(move || {
+                        let _ = std::fs::remove_dir_all(dir);
+                    });
+                }
             });
         }
         // Not awaited: dispatch serves every waiter, and a close can take seconds.
@@ -1485,21 +1627,46 @@ fn notify_n(notify: &Notify, n: usize) {
     }
 }
 
-fn pick_waiter(queue: &mut VecDeque<Waiter>) -> (Option<Waiter>, usize) {
-    let abandoned = drop_abandoned(queue);
-    let Some(best_pri) = queue.iter().map(|w| w.priority).max() else {
-        return (None, abandoned);
+fn pick_waiter(queue: &mut VecDeque<Waiter>, mixed_priorities: &mut bool) -> (Option<Waiter>, usize) {
+    let mut abandoned = 0usize;
+    while let Some(front) = queue.front() {
+        if front.tx.is_closed() {
+            queue.pop_front();
+            abandoned += 1;
+        } else {
+            break;
+        }
+    }
+    let picked = if !*mixed_priorities {
+        queue.pop_front()
+    } else {
+        let mut best: Option<(usize, Priority, Instant)> = None;
+        for (i, w) in queue.iter().enumerate() {
+            if w.tx.is_closed() {
+                continue;
+            }
+            match best {
+                None => best = Some((i, w.priority, w.queued_at)),
+                Some((_, bp, bt)) => {
+                    if w.priority > bp || (w.priority == bp && w.queued_at < bt) {
+                        best = Some((i, w.priority, w.queued_at));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((idx, _, _)) => queue.remove(idx),
+            None => {
+                abandoned += queue.len();
+                queue.clear();
+                None
+            }
+        }
     };
-    let Some(idx) = queue
-        .iter()
-        .enumerate()
-        .filter(|(_, w)| w.priority == best_pri)
-        .min_by_key(|(_, w)| w.queued_at)
-        .map(|(i, _)| i)
-    else {
-        return (None, abandoned);
-    };
-    (queue.remove(idx), abandoned)
+    if queue.is_empty() {
+        *mixed_priorities = false;
+    }
+    (picked, abandoned)
 }
 
 /// Waiters whose caller timed out or gave up (the receiver is gone). Left queued, they count
@@ -1553,19 +1720,26 @@ fn build_page_lease(
     Box::pin(async move {
         let lease_id = Uuid::new_v4();
         let (log, downloads, log_task) = page.collect_logs(&context.download_dir);
-        context
-            .tracing
-            .register_page(lease_id, page.clone(), log.clone())
-            .await;
+        if !context.tracing.track_page_if_inactive(lease_id, &page, &log) {
+            context
+                .tracing
+                .register_page(lease_id, page.clone(), log.clone())
+                .await;
+        }
         let dialog_listeners = Listeners::default();
-        route_newest(page.dialogs().await, dialog_listeners.clone());
         let file_chooser_listeners = Listeners::default();
-        route_newest(page.file_choosers().await, file_chooser_listeners.clone());
         let binding_listeners = Listeners::default();
-        route_newest(page.bindings().await, binding_listeners.clone());
-
         let popup_listeners: Listeners<PageLease> = Listeners::default();
-        let mut popups_rx = page.popups().await;
+        let (dialogs_rx, file_choosers_rx, bindings_rx, mut popups_rx) =
+            page.install_event_channels().await;
+        spawn_page_event_router(
+            dialogs_rx,
+            dialog_listeners.clone(),
+            file_choosers_rx,
+            file_chooser_listeners.clone(),
+            bindings_rx,
+            binding_listeners.clone(),
+        );
         let popup_task = tokio::spawn({
             let popup_listeners = popup_listeners.clone();
             let context = context.clone();
@@ -1897,6 +2071,14 @@ impl ContextLease {
         if self.is_closed() {
             return Err(Error::Other("browser context is closed".into()));
         }
+        self.context_bindings_installed
+            .get_or_init(|| async {
+                route_newest(
+                    self.guard.browser.context_bindings(&self.guard.context).await,
+                    self.binding_listeners.clone(),
+                );
+            })
+            .await;
         Ok(self
             .guard
             .browser
@@ -2024,6 +2206,9 @@ impl PageLease {
         F: std::future::Future<Output = Result<T>>,
         P: FnOnce() -> serde_json::Value,
     {
+        if !self.context.tracing.is_active() {
+            return fut.await;
+        }
         self.context
             .tracing
             .trace_action(
@@ -3826,6 +4011,9 @@ impl<'a> Locator<'a> {
         F: std::future::Future<Output = Result<T>>,
         P: FnOnce() -> serde_json::Value,
     {
+        if !self.lease.context.tracing.is_active() {
+            return fut.await;
+        }
         self.lease
             .context
             .tracing
@@ -5123,6 +5311,199 @@ mod tests {
         );
 
         drop(ctx);
+        eng.shutdown(Duration::from_secs(2)).await.unwrap();
+        srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_guard_dispose_skips_absent_dir_and_removes_existing_dir() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        struct MockWsSource(std::net::SocketAddr);
+        impl BrowserSource for MockWsSource {
+            fn launch(
+                &self,
+                _opts: &LaunchOptions,
+            ) -> Pin<Box<dyn Future<Output = CdpResult<Arc<CdpBrowser>>> + Send + '_>> {
+                let addr = self.0;
+                Box::pin(async move { CdpBrowser::connect(&format!("ws://{addr}")).await })
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seq = Arc::new(AtomicUsize::new(1));
+        let srv = tokio::spawn({
+            let seq = seq.clone();
+            async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        break;
+                    };
+                    let result = match msg["method"].as_str() {
+                        Some("Target.createBrowserContext") => {
+                            let n = seq.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!({ "browserContextId": format!("ctx-dl-{n}") })
+                        }
+                        _ => serde_json::json!({}),
+                    };
+                    let reply = serde_json::json!({ "id": msg["id"], "result": result }).to_string();
+                    if ws.send(Message::Text(reply.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(1)
+            .max_contexts_per_browser(2)
+            .memory_ceiling_mb(0)
+            .acquire_timeout(Duration::from_secs(5))
+            .source(Arc::new(MockWsSource(addr)))
+            .build()
+            .await
+            .unwrap();
+
+        let ctx1 = eng.acquire_context().await.unwrap();
+        let absent_dir = ctx1.guard.download_dir.clone();
+        assert!(!absent_dir.exists());
+        ctx1.close().await.unwrap();
+        assert!(!absent_dir.exists());
+
+        let ctx2 = eng.acquire_context().await.unwrap();
+        let existing_dir = ctx2.guard.download_dir.clone();
+        std::fs::create_dir_all(&existing_dir).unwrap();
+        std::fs::write(existing_dir.join("payload.bin"), b"abc").unwrap();
+        assert!(existing_dir.exists());
+        ctx2.close().await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while existing_dir.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !existing_dir.exists(),
+            "existing download_dir should be removed in background: {}",
+            existing_dir.display()
+        );
+
+        eng.shutdown(Duration::from_secs(2)).await.unwrap();
+        srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inactive_tracing_tracks_open_pages_for_later_start() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        struct MockPageWsSource(std::net::SocketAddr);
+        impl BrowserSource for MockPageWsSource {
+            fn launch(
+                &self,
+                _opts: &LaunchOptions,
+            ) -> Pin<Box<dyn Future<Output = CdpResult<Arc<CdpBrowser>>> + Send + '_>> {
+                let addr = self.0;
+                Box::pin(async move { CdpBrowser::connect(&format!("ws://{addr}")).await })
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let mut target_seq = 0usize;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    break;
+                };
+                if msg["method"].as_str() == Some("Target.createTarget") {
+                    target_seq += 1;
+                    let tid = format!("t-{target_seq}");
+                    let sid = format!("s-{target_seq}");
+                    let ctx_id = msg["params"]["browserContextId"].clone();
+                    let reply = serde_json::json!({
+                        "id": msg["id"],
+                        "result": { "targetId": tid }
+                    })
+                    .to_string();
+                    if ws.send(Message::Text(reply.into())).await.is_err() {
+                        break;
+                    }
+                    let attached = serde_json::json!({
+                        "method": "Target.attachedToTarget",
+                        "params": {
+                            "sessionId": sid,
+                            "waitingForDebugger": false,
+                            "targetInfo": {
+                                "targetId": tid,
+                                "type": "page",
+                                "url": "about:blank",
+                                "browserContextId": ctx_id
+                            }
+                        }
+                    })
+                    .to_string();
+                    if ws.send(Message::Text(attached.into())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let result = match msg["method"].as_str() {
+                    Some("Target.createBrowserContext") => {
+                        serde_json::json!({ "browserContextId": "ctx-trace" })
+                    }
+                    _ => serde_json::json!({}),
+                };
+                let reply = serde_json::json!({ "id": msg["id"], "result": result }).to_string();
+                if ws.send(Message::Text(reply.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let eng = Engine::builder()
+            .min_browsers(0)
+            .max_browsers(1)
+            .max_contexts_per_browser(2)
+            .memory_ceiling_mb(0)
+            .acquire_timeout(Duration::from_secs(5))
+            .source(Arc::new(MockPageWsSource(addr)))
+            .build()
+            .await
+            .unwrap();
+
+        let ctx = eng.acquire_context().await.unwrap();
+        assert!(!ctx.guard.tracing.is_active());
+        let page = ctx.new_page().await.unwrap();
+        assert!(!ctx.guard.tracing.is_active());
+        assert_eq!(ctx.guard.tracing.tracked_target_ids(), vec![page.target_id()]);
+
+        // Starting tracing after page creation must still capture the open page.
+        ctx.tracing()
+            .start(crate::TracingStartOptions::default())
+            .await
+            .unwrap();
+        assert!(ctx.guard.tracing.is_active());
+        ctx.tracing().stop(None).await.unwrap();
+
+        drop(page);
+        assert!(ctx.guard.tracing.tracked_target_ids().is_empty());
+
+        ctx.close().await.unwrap();
         eng.shutdown(Duration::from_secs(2)).await.unwrap();
         srv.abort();
     }

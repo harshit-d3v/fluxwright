@@ -220,7 +220,7 @@ impl TraceState {
             name: None,
             title: None,
             origin_instant: Instant::now(),
-            origin_wall_ms: unix_now_ms(),
+            origin_wall_ms: 0.0,
             next_call_seq: 0,
             next_page_seq: 0,
             chunk_seq: 0,
@@ -430,6 +430,44 @@ impl ContextTracing {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.active_flag.load(Ordering::Acquire)
+    }
+
+    /// Synchronously records an open page while tracing is inactive so later `start()` calls
+    /// capture it without constructing/polling an async future on the hot path. Returns `false`
+    /// when tracing is active (caller must await `register_page`).
+    pub(crate) fn track_page_if_inactive(
+        &self,
+        lease_id: Uuid,
+        page: &CdpPage,
+        log: &Arc<std::sync::Mutex<PageLog>>,
+    ) -> bool {
+        if self.is_active() {
+            return false;
+        }
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return true;
+        }
+        if st.active {
+            return false;
+        }
+        st.open_pages.push(TrackedPage {
+            lease_id,
+            page: page.clone(),
+            log: log.clone(),
+        });
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_target_ids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .open_pages
+            .iter()
+            .map(|p| p.page.target_id.0.clone())
+            .collect()
     }
 
     pub(crate) async fn register_page(
@@ -811,6 +849,7 @@ impl ContextTracing {
                 return Err(Error::Other("Tracing has been already started".into()));
             }
             st.active = true;
+            self.active_flag.store(true, Ordering::Release);
             st.session_gen = st.session_gen.wrapping_add(1);
             st.screenshots = options.screenshots;
             st.snapshots = options.snapshots;
@@ -836,7 +875,6 @@ impl ContextTracing {
                 .collect::<Vec<_>>();
             (resolved, session_gen)
         };
-        self.active_flag.store(true, Ordering::Release);
 
         for (lease_id, page, log, page_id) in existing_pages {
             self.attach_page_watchers(
