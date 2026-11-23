@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -29,6 +29,36 @@ function resolveFluxwrightBin() {
   }
   throw new Error(
     `Could not find compiled fluxwright binary (checked ${candidates.join(', ')}; set FLUXWRIGHT_BIN or run cargo build -p fluxwright-cli)`,
+  );
+}
+
+function resolveFluxwrightMcpBin() {
+  if (process.env.FLUXWRIGHT_MCP_BIN) {
+    return process.env.FLUXWRIGHT_MCP_BIN;
+  }
+  const ext = process.platform === 'win32' ? '.exe' : '';
+  const candidates = [
+    path.join(REPO_ROOT, 'target', 'debug', `fluxwright-mcp${ext}`),
+    path.join(REPO_ROOT, 'target', 'release', `fluxwright-mcp${ext}`),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  console.log('[e2e] Building fluxwright-mcp binary via cargo build -p fluxwright-mcp...');
+  const built = spawnSync('cargo', ['build', '-p', 'fluxwright-mcp'], {
+    cwd: REPO_ROOT,
+    stdio: 'inherit',
+  });
+  if (built.status !== 0) {
+    throw new Error(`cargo build -p fluxwright-mcp failed with status ${built.status}`);
+  }
+  if (fs.existsSync(candidates[0])) {
+    return candidates[0];
+  }
+  throw new Error(
+    `Could not find compiled fluxwright-mcp binary after build (checked ${candidates.join(', ')})`,
   );
 }
 
@@ -1018,6 +1048,352 @@ async function runSiteE2E(chromePath) {
   }
 }
 
+async function parseMcpHttpResponse(res, expectedId) {
+  const contentType = res.headers.get('content-type') || '';
+  const body = await res.text();
+  if (contentType.includes('application/json')) {
+    return JSON.parse(body);
+  }
+  const messages = [];
+  let dataLines = [];
+  for (const line of body.split(/\r?\n/)) {
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).replace(/^ /, ''));
+    } else if (line === '') {
+      if (dataLines.length > 0) {
+        const payload = dataLines.join('\n').trim();
+        dataLines = [];
+        if (payload.length > 0) {
+          messages.push(JSON.parse(payload));
+        }
+      }
+    }
+  }
+  if (dataLines.length > 0) {
+    const payload = dataLines.join('\n').trim();
+    if (payload.length > 0) {
+      messages.push(JSON.parse(payload));
+    }
+  }
+  const match =
+    expectedId !== undefined
+      ? messages.find((m) => m.id === expectedId)
+      : messages[0];
+  assert.ok(
+    match,
+    `Expected JSON-RPC response (id=${expectedId}) in MCP SSE payload:\n${body}`,
+  );
+  return match;
+}
+
+function createMcpHttpClient(mcpUrl, token) {
+  let sessionId = null;
+  let nextId = 1;
+
+  const baseHeaders = () => ({
+    Accept: 'application/json, text/event-stream',
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token}`,
+    ...(sessionId
+      ? {
+          'Mcp-Session-Id': sessionId,
+          'MCP-Protocol-Version': '2025-03-26',
+        }
+      : {}),
+  });
+
+  return {
+    get sessionId() {
+      return sessionId;
+    },
+    async initialize(clientName) {
+      const id = nextId++;
+      const res = await fetch(mcpUrl, {
+        method: 'POST',
+        headers: baseHeaders(),
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: clientName, version: '0.1.0' },
+          },
+        }),
+      });
+      assert.equal(res.status, 200, `initialize must return 200 (got ${res.status})`);
+      sessionId = res.headers.get('mcp-session-id');
+      assert.ok(sessionId, 'initialize response must include Mcp-Session-Id header');
+      const initMsg = await parseMcpHttpResponse(res, id);
+      assert.equal(initMsg.error, undefined, `initialize JSON-RPC error: ${JSON.stringify(initMsg)}`);
+      assert.equal(initMsg.result?.serverInfo?.name, 'fluxwright-mcp');
+
+      const notifRes = await fetch(mcpUrl, {
+        method: 'POST',
+        headers: baseHeaders(),
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/initialized',
+        }),
+      });
+      await notifRes.body?.cancel();
+      assert.equal(
+        notifRes.status,
+        202,
+        `notifications/initialized must return 202 (got ${notifRes.status})`,
+      );
+      return initMsg.result;
+    },
+    async request(method, params = undefined) {
+      const id = nextId++;
+      const payload = { jsonrpc: '2.0', id, method };
+      if (params !== undefined) payload.params = params;
+      const res = await fetch(mcpUrl, {
+        method: 'POST',
+        headers: baseHeaders(),
+        body: JSON.stringify(payload),
+      });
+      assert.equal(res.status, 200, `${method} must return 200 (got ${res.status})`);
+      const msg = await parseMcpHttpResponse(res, id);
+      assert.equal(msg.error, undefined, `${method} JSON-RPC error: ${JSON.stringify(msg)}`);
+      return msg.result;
+    },
+    async callTool(name, args = {}) {
+      const result = await this.request('tools/call', { name, arguments: args });
+      assert.notEqual(
+        result?.isError,
+        true,
+        `MCP tool ${name} returned isError=true: ${JSON.stringify(result)}`,
+      );
+      return result?.content?.[0]?.text ?? '';
+    },
+    async closeSession() {
+      const res = await fetch(mcpUrl, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Mcp-Session-Id': sessionId,
+          'MCP-Protocol-Version': '2025-03-26',
+        },
+      });
+      await res.body?.cancel();
+      assert.equal(res.status, 202, `DELETE /mcp must return 202 (got ${res.status})`);
+    },
+  };
+}
+
+async function runMcpStreamableHttpE2E(fixture) {
+  console.log('[e2e] Running fluxwright-mcp Streamable HTTP E2E...');
+  const mcpBin = resolveFluxwrightMcpBin();
+
+  // 1. Fail-closed check: non-loopback --http without >=32-char token or --allow-unauthenticated
+  const envWithoutToken = { ...process.env };
+  delete envWithoutToken.FLUXWRIGHT_MCP_TOKEN;
+  const noAuthNonLoopback = spawnSync(mcpBin, ['--http', '0.0.0.0:0'], {
+    env: envWithoutToken,
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+  assert.notEqual(
+    noAuthNonLoopback.status,
+    0,
+    'fluxwright-mcp --http 0.0.0.0:0 without token must fail closed',
+  );
+  assert.match(
+    noAuthNonLoopback.stderr || '',
+    /FLUXWRIGHT_MCP_TOKEN|--allow-unauthenticated/,
+  );
+
+  const shortTokenNonLoopback = spawnSync(mcpBin, ['--http', '0.0.0.0:0'], {
+    env: { ...envWithoutToken, FLUXWRIGHT_MCP_TOKEN: 'short-token' },
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+  assert.notEqual(
+    shortTokenNonLoopback.status,
+    0,
+    'fluxwright-mcp --http 0.0.0.0:0 with <32-char token must fail closed',
+  );
+
+  // 2. Start authenticated Streamable HTTP server on loopback
+  const mcpToken = crypto.randomBytes(32).toString('hex');
+  const mcpPort = await getFreePort();
+  const mcpBaseUrl = `http://127.0.0.1:${mcpPort}`;
+  const mcpUrl = `${mcpBaseUrl}/mcp`;
+  const mcpLogs = [];
+
+  const mcpProc = spawn(mcpBin, ['--http', `127.0.0.1:${mcpPort}`], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      FLUXWRIGHT_MCP_TOKEN: mcpToken,
+      FLUXWRIGHT_HEADLESS: '1',
+      FLUXWRIGHT_NO_SANDBOX: process.env.FLUXWRIGHT_NO_SANDBOX || '1',
+    },
+  });
+  const captureMcp = (chunk) => {
+    mcpLogs.push(chunk.toString('utf8'));
+    if (mcpLogs.length > 200) mcpLogs.shift();
+  };
+  mcpProc.stdout.on('data', captureMcp);
+  mcpProc.stderr.on('data', captureMcp);
+
+  try {
+    await waitForHealth(mcpBaseUrl, mcpProc, mcpLogs);
+
+    // Verify GET /healthz is unauthenticated and returns expected JSON
+    const healthRes = await fetch(`${mcpBaseUrl}/healthz`);
+    assert.equal(healthRes.status, 200);
+    assert.deepEqual(await healthRes.json(), {
+      status: 'ok',
+      transport: 'streamable-http',
+    });
+
+    // Verify /mcp auth middleware rejects missing and invalid bearer tokens
+    const initPayload = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-03-26',
+        capabilities: {},
+        clientInfo: { name: 'unauth-probe', version: '0.1.0' },
+      },
+    });
+    const mcpHeaders = {
+      Accept: 'application/json, text/event-stream',
+      'Content-Type': 'application/json',
+    };
+    const noTokenRes = await fetch(mcpUrl, {
+      method: 'POST',
+      headers: mcpHeaders,
+      body: initPayload,
+    });
+    await noTokenRes.body?.cancel();
+    assert.equal(noTokenRes.status, 401, 'POST /mcp without Bearer token must return 401');
+
+    const badTokenRes = await fetch(mcpUrl, {
+      method: 'POST',
+      headers: { ...mcpHeaders, Authorization: `Bearer wrong-${mcpToken.slice(6)}` },
+      body: initPayload,
+    });
+    await badTokenRes.body?.cancel();
+    assert.equal(badTokenRes.status, 401, 'POST /mcp with wrong Bearer token must return 401');
+
+    // 3. Real HTTP MCP session A: initialize -> tools/list (21 tools) -> open -> snapshot
+    const clientA = createMcpHttpClient(mcpUrl, mcpToken);
+    const clientB = createMcpHttpClient(mcpUrl, mcpToken);
+
+    await clientA.initialize('e2e-http-a');
+    await clientB.initialize('e2e-http-b');
+    assert.notEqual(clientA.sessionId, clientB.sessionId, 'sessions must receive distinct IDs');
+
+    const listed = await clientA.request('tools/list');
+    const expectedTools = [
+      'open',
+      'goto',
+      'title',
+      'content',
+      'snapshot',
+      'markdown',
+      'click',
+      'hover',
+      'fill',
+      'press',
+      'select',
+      'scroll',
+      'wait_for',
+      'back',
+      'forward',
+      'tabs',
+      'console',
+      'network',
+      'evaluate',
+      'screenshot',
+      'close',
+    ];
+    const actualToolNames = (listed?.tools || []).map((t) => t.name).sort();
+    assert.equal(actualToolNames.length, 21, `expected 21 MCP tools, got ${actualToolNames.length}`);
+    assert.deepEqual(actualToolNames, [...expectedTools].sort());
+
+    const openOut = await clientA.callTool('open', { url: `${fixture.url}/` });
+    assert.match(openOut, /E2E Fixture/);
+
+    const snapOut = await clientA.callTool('snapshot', {});
+    assert.match(snapOut, /Fluxwright E2E Fixture/);
+    assert.match(snapOut, /\[ref=e\d+\]/);
+
+    // 4. Multi-session context isolation: cookies, localStorage, and tabs stay isolated per session
+    await clientA.callTool('evaluate', {
+      expression:
+        "document.cookie = 'mcp_tenant=alpha; Path=/'; localStorage.setItem('mcp_key', 'alpha-secret'); 'ok'",
+    });
+    const tabNewOut = await clientA.callTool('tabs', {
+      action: 'new',
+      url: `${fixture.url}/hitl`,
+    });
+    assert.match(tabNewOut, /opened tab 1/);
+
+    await clientB.callTool('open', { url: `${fixture.url}/` });
+    const rawBStateBefore = await clientB.callTool('evaluate', {
+      expression:
+        "JSON.stringify({ cookie: document.cookie, ls: localStorage.getItem('mcp_key') })",
+    });
+    const bStateBefore = JSON.parse(JSON.parse(rawBStateBefore));
+    assert.doesNotMatch(bStateBefore.cookie, /mcp_tenant=alpha/);
+    assert.equal(bStateBefore.ls, null);
+
+    await clientB.callTool('evaluate', {
+      expression:
+        "document.cookie = 'mcp_tenant=beta; Path=/'; localStorage.setItem('mcp_key', 'beta-secret'); 'ok'",
+    });
+    const bTabs = await clientB.callTool('tabs', { action: 'list' });
+    assert.match(bTabs, /\[0\]\*/);
+    assert.doesNotMatch(bTabs, /\[1\]/);
+
+    await clientA.callTool('tabs', { action: 'switch', index: 0 });
+    const rawAStateAfter = await clientA.callTool('evaluate', {
+      expression:
+        "JSON.stringify({ cookie: document.cookie, ls: localStorage.getItem('mcp_key') })",
+    });
+    const aStateAfter = JSON.parse(JSON.parse(rawAStateAfter));
+    assert.match(aStateAfter.cookie, /mcp_tenant=alpha/);
+    assert.doesNotMatch(aStateAfter.cookie, /mcp_tenant=beta/);
+    assert.equal(aStateAfter.ls, 'alpha-secret');
+
+    // 5. Closing Session A invalidates Session A while keeping Session B operational
+    await clientA.closeSession();
+    const staleRes = await fetch(mcpUrl, {
+      method: 'POST',
+      headers: {
+        ...mcpHeaders,
+        Authorization: `Bearer ${mcpToken}`,
+        'Mcp-Session-Id': clientA.sessionId,
+        'MCP-Protocol-Version': '2025-03-26',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/list' }),
+    });
+    await staleRes.body?.cancel();
+    assert.equal(staleRes.status, 404, 'closed MCP session must return 404');
+
+    const titleB = await clientB.callTool('title', {});
+    assert.equal(titleB, 'E2E Fixture');
+    await clientB.closeSession();
+
+    await stopChild(mcpProc);
+    if (process.platform !== 'win32') {
+      assert.equal(mcpProc.exitCode, 0, 'fluxwright-mcp must exit cleanly with code 0 on SIGTERM');
+    }
+    console.log('[e2e] fluxwright-mcp Streamable HTTP E2E passed.');
+  } catch (err) {
+    console.error('[e2e] MCP server logs:\n' + mcpLogs.join(''));
+    throw err;
+  } finally {
+    await stopChild(mcpProc);
+  }
+}
+
 async function main() {
   const fluxwrightBin = resolveFluxwrightBin();
   const chromePath = resolveChromePath();
@@ -1060,6 +1436,7 @@ async function main() {
     await runCdpGatewayE2E(baseUrl, port, token, fixture);
     await runDashboardHitlE2E(baseUrl, port, token, fixture.url, chromePath);
     await runSiteE2E(chromePath);
+    await runMcpStreamableHttpE2E(fixture);
   } catch (err) {
     console.error('[e2e] Server logs:\n' + serverLogs.join(''));
     throw err;

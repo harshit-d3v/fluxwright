@@ -1,6 +1,6 @@
 # Fluxwright MCP
 
-stdio MCP server so **Claude Desktop**, **Claude Code**, **Codex**, and **Cursor** can drive Fluxwright (Chromium leases).
+MCP server (**stdio** by default, or **Streamable HTTP** via `--http <ADDR>`) so **Claude Desktop**, **Claude Code**, **Codex**, **Cursor**, and remote MCP clients can drive Fluxwright (Chromium leases).
 
 Tools (21):
 - **Navigation & Context**: `open`, `goto`, `back`, `forward`, `tabs`, `close`
@@ -67,15 +67,37 @@ Project file `.cursor/mcp.json` (already added) or Cursor Settings → MCP.
 
 `open` and `goto` take `http` and `https` URLs and `about:blank`. They refuse `file://`, `chrome://` and other schemes, and link-local hosts such as `169.254.169.254` (the cloud metadata service, which hands out instance credentials), however the address is written. A page the agent reads can try to talk it into opening those. Set `FLUXWRIGHT_MCP_ANY_URL=1` to allow any URL.
 
+## Streamable HTTP Transport (`--http`)
+
+Run `fluxwright-mcp` as an HTTP MCP server (for remote agents, containers, or shared local tooling) instead of `stdio`:
+
+```bash
+# Local loopback (optional bearer auth):
+FLUXWRIGHT_HEADLESS=1 fluxwright-mcp --http 127.0.0.1:8088
+
+# Authenticated (required for non-loopback addresses, >= 32 characters):
+export FLUXWRIGHT_MCP_TOKEN="$(openssl rand -hex 32)"
+FLUXWRIGHT_HEADLESS=1 fluxwright-mcp --http 0.0.0.0:8088
+```
+
+Endpoints:
+- `POST /mcp`, `GET /mcp`, `DELETE /mcp`: MCP Streamable HTTP endpoint (`Mcp-Session-Id` per client session).
+- `GET /healthz`: unauthenticated liveness check returning `200 OK` JSON (`{"status":"ok","transport":"streamable-http"}`).
+
+Security & Isolation:
+- **Fail-closed remote binding:** binding `--http <ADDR>` to a non-loopback IP refuses to start unless `FLUXWRIGHT_MCP_TOKEN` is at least 32 characters, or `--allow-unauthenticated` is explicitly passed (use only behind an authenticating TLS reverse proxy or private network).
+- **Bearer authentication:** whenever `FLUXWRIGHT_MCP_TOKEN` is set, `/mcp` requires `Authorization: Bearer <token>` (constant-time comparison), returning `401 Unauthorized` otherwise.
+- **Session isolation:** all HTTP sessions share one lazy `BrowserEngine` fleet while each MCP session receives its own isolated browser context (`ContextLease`) and tab list, cleaned up automatically when the session closes or expires.
+
 ## Where you can deploy
 
-MCP **stdio** is a local child process. The Chrome fleet has to run **next to the server**.
+MCP **stdio** is a local child process; **Streamable HTTP** (`--http`) accepts remote MCP clients over HTTP/SSE. The Chrome fleet still runs **next to the server**.
 
 | Place | Works? | Why |
 |---|---|---|
-| **Your PC** (Claude / Codex / Cursor) | Yes — this is the intended setup | Chrome is already here |
-| **Vercel / Cloudflare / Lambda** | No | No long-lived Chromium, no MCP stdio child |
-| **Docker on a VPS** (Fly.io, Railway, Render, ECS, a cheap VM) | Yes, with caveats | Install Chromium, `FLUXWRIGHT_HEADLESS=1` `FLUXWRIGHT_NO_SANDBOX=1`, reach MCP over HTTP through a stdio→SSE proxy that only you can reach (see below) |
+| **Your PC** (Claude / Codex / Cursor) | Yes — `stdio` or `--http 127.0.0.1:8088` | Chrome is already here |
+| **Vercel / Cloudflare / Lambda** | No | No long-lived Chromium process |
+| **Docker on a VPS** (Fly.io, Railway, Render, ECS, a cheap VM) | Yes | Install Chromium, `FLUXWRIGHT_HEADLESS=1` `FLUXWRIGHT_NO_SANDBOX=1`, run `fluxwright-mcp --http 0.0.0.0:8088` with `FLUXWRIGHT_MCP_TOKEN` behind TLS |
 | **Browserless / Browserbase** | Different product | Hosted Chrome; Fluxwright would need a remote `BrowserSource` (not in this server yet) |
 
 Remote sketch (VPS):
@@ -84,18 +106,15 @@ Remote sketch (VPS):
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p fluxwright-mcp
+RUN cargo build --release --locked -p fluxwright-mcp
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y chromium ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/fluxwright-mcp /usr/local/bin/
 ENV FLUXWRIGHT_HEADLESS=1 FLUXWRIGHT_NO_SANDBOX=1 FLUXWRIGHT_CHROMIUM=/usr/bin/chromium
-# Clients cannot speak stdio over the internet. Put a proxy in front, e.g.
-#   npx -y supergateway --stdio "fluxwright-mcp" --port 8787
-CMD ["fluxwright-mcp"]
+EXPOSE 8088
+CMD ["fluxwright-mcp", "--http", "0.0.0.0:8088"]
 ```
 
-Then point a **remote MCP** client at that HTTP/SSE URL. Claude Desktop still prefers **local stdio**.
-
-**Never publish that port.** The proxy has no login, so anyone who reaches it drives a browser inside your network. Bind it to `127.0.0.1` and connect over SSH (`ssh -L 8787:127.0.0.1:8787 your-vm`) or a VPN, or put a reverse proxy that requires authentication in front of it.
+Pass `FLUXWRIGHT_MCP_TOKEN` (>= 32 random printable ASCII characters) at runtime and put a TLS reverse proxy in front when exposing it outside localhost (`http://<host>:8088/mcp` or `https://<domain>/mcp`). Never pass `--allow-unauthenticated` on a public interface without upstream authentication.

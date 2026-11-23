@@ -1,12 +1,20 @@
-//! Fluxwright MCP server (stdio). Claude Desktop, Codex, and Cursor spawn this
-//! process and call tools to drive a Chromium fleet.
+//! Fluxwright MCP server (stdio by default, or Streamable HTTP via `--http <ADDR>`).
+//! Claude Desktop, Codex, Cursor, and remote MCP clients can call tools to drive a Chromium fleet.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::Result;
+use axum::extract::{Request, State as AxumState};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
 use base64::Engine as _;
+use clap::Parser;
 use fluxwright::{
     netguard, with_timeout, BrowserEngine, ContextLease, HoverOptions, MarkdownOptions, NetEvent,
     PageLease, ScreenshotOptions, SelectEntry, SnapshotOptions, WaitState, WaitUntil,
@@ -15,13 +23,36 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
-    transport::stdio,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            session::local::LocalSessionManager, SessionManager, StreamableHttpServerConfig,
+            StreamableHttpService,
+        },
+    },
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, OnceCell};
 use tracing_subscriber::EnvFilter;
 
 const MAX_NET_RECORDS: usize = 500;
+const MIN_REMOTE_TOKEN_LEN: usize = 32;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "fluxwright-mcp",
+    version,
+    about = "MCP server for Fluxwright (stdio by default, or Streamable HTTP with --http)"
+)]
+struct Cli {
+    /// Serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8088) instead of stdio
+    #[arg(long, value_name = "ADDR")]
+    http: Option<SocketAddr>,
+
+    /// Allow binding a non-loopback --http address without FLUXWRIGHT_MCP_TOKEN
+    #[arg(long, requires = "http")]
+    allow_unauthenticated: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetRecord {
@@ -51,15 +82,23 @@ impl Drop for Tab {
 struct State {
     tabs: Vec<Tab>,
     context: Option<ContextLease>,
-    engine: Option<BrowserEngine>,
     active: usize,
     next_tab_id: usize,
     context_gen: u64,
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        self.context_gen = self.context_gen.wrapping_add(1);
+        self.tabs.clear();
+        self.context = None;
+    }
+}
+
 #[derive(Clone)]
 struct FluxwrightMcp {
     state: Arc<Mutex<State>>,
+    engine: Arc<OnceCell<BrowserEngine>>,
     headless: bool,
     tool_router: ToolRouter<Self>,
 }
@@ -202,39 +241,43 @@ struct ScreenshotArgs {
 
 impl FluxwrightMcp {
     fn new(headless: bool) -> Self {
+        Self::with_engine(Arc::new(OnceCell::new()), headless)
+    }
+
+    fn with_engine(engine: Arc<OnceCell<BrowserEngine>>, headless: bool) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
                 tabs: Vec::new(),
                 context: None,
-                engine: None,
                 active: 0,
                 next_tab_id: 1,
                 context_gen: 0,
             })),
+            engine,
             headless,
             tool_router: Self::tool_router(),
         }
     }
 
-    async fn ensure_context(st: &mut State, headless: bool) -> fluxwright::Result<()> {
-        if st.engine.is_none() {
-            let engine = BrowserEngine::builder()
-                .max_browsers(2)
-                .max_contexts_per_browser(4)
-                .headless(headless)
-                .acquire_timeout(Duration::from_secs(60))
-                .build()
-                .await?;
-            st.engine = Some(engine);
-        }
+    async fn ensure_context(
+        st: &mut State,
+        engine_cell: &OnceCell<BrowserEngine>,
+        headless: bool,
+    ) -> fluxwright::Result<()> {
         let ctx_closed = st.context.as_ref().is_some_and(ContextLease::is_closed);
         if st.context.is_none() || ctx_closed {
-            let ctx = st
-                .engine
-                .as_ref()
-                .expect("made above")
-                .acquire_context()
+            let engine = engine_cell
+                .get_or_try_init(|| async move {
+                    BrowserEngine::builder()
+                        .max_browsers(2)
+                        .max_contexts_per_browser(4)
+                        .headless(headless)
+                        .acquire_timeout(Duration::from_secs(60))
+                        .build()
+                        .await
+                })
                 .await?;
+            let ctx = engine.acquire_context().await?;
             st.context = Some(ctx);
             st.context_gen += 1;
         }
@@ -244,7 +287,7 @@ impl FluxwrightMcp {
     fn wrap_tab(
         page: PageLease,
         id: usize,
-        state: Arc<Mutex<State>>,
+        state: Weak<Mutex<State>>,
         context_gen: u64,
     ) -> Tab {
         let mut rx = page.subscribe_network();
@@ -264,14 +307,17 @@ impl FluxwrightMcp {
                         continue;
                     }
                 }
-                let mut st = state.lock().await;
+                let Some(state_arc) = state.upgrade() else {
+                    break;
+                };
+                let mut st = state_arc.lock().await;
                 if st.context_gen != context_gen || popup_page.is_closed() {
                     continue;
                 }
                 let popup_id = st.next_tab_id;
                 st.next_tab_id += 1;
                 let popup_tab =
-                    Self::wrap_tab(popup_page, popup_id, Arc::clone(&state), context_gen);
+                    Self::wrap_tab(popup_page, popup_id, Arc::downgrade(&state_arc), context_gen);
                 st.tabs.push(popup_tab);
             }
         });
@@ -287,23 +333,22 @@ impl FluxwrightMcp {
     async fn attach_tab(
         page: PageLease,
         id: usize,
-        state: Arc<Mutex<State>>,
+        state: &Arc<Mutex<State>>,
         context_gen: u64,
     ) -> fluxwright::Result<Tab> {
         if !any_url() {
             netguard::guard_requests(&page).await?;
         }
-        Ok(Self::wrap_tab(page, id, state, context_gen))
+        Ok(Self::wrap_tab(page, id, Arc::downgrade(state), context_gen))
     }
 
-    /// Replaces the current context with a fresh single-tab context and returns a guard to that tab.
-    async fn open_fresh(&self) -> fluxwright::Result<MappedMutexGuard<'_, Tab>> {
-        let mut st = self.state.lock().await;
-        st.context_gen += 1;
-        st.tabs.clear();
-        st.context = None;
-        st.active = 0;
-        Self::ensure_context(&mut st, self.headless).await?;
+    async fn create_tab(
+        st: &mut State,
+        state: &Arc<Mutex<State>>,
+        engine: &OnceCell<BrowserEngine>,
+        headless: bool,
+    ) -> fluxwright::Result<Tab> {
+        Self::ensure_context(st, engine, headless).await?;
         let page = st
             .context
             .as_ref()
@@ -313,7 +358,17 @@ impl FluxwrightMcp {
         let id = st.next_tab_id;
         st.next_tab_id += 1;
         let ctx_gen = st.context_gen;
-        let tab = Self::attach_tab(page, id, Arc::clone(&self.state), ctx_gen).await?;
+        Self::attach_tab(page, id, state, ctx_gen).await
+    }
+
+    /// Replaces the current context with a fresh single-tab context and returns a guard to that tab.
+    async fn open_fresh(&self) -> fluxwright::Result<MappedMutexGuard<'_, Tab>> {
+        let mut st = self.state.lock().await;
+        st.context_gen += 1;
+        st.tabs.clear();
+        st.context = None;
+        st.active = 0;
+        let tab = Self::create_tab(&mut st, &self.state, &self.engine, self.headless).await?;
         st.tabs.push(tab);
         st.active = 0;
         Ok(MutexGuard::map(st, |s| &mut s.tabs[0]))
@@ -324,17 +379,7 @@ impl FluxwrightMcp {
         let mut st = self.state.lock().await;
         st.tabs.retain(|t| !t.page.is_closed());
         if st.tabs.is_empty() {
-            Self::ensure_context(&mut st, self.headless).await?;
-            let page = st
-                .context
-                .as_ref()
-                .expect("made above")
-                .new_page()
-                .await?;
-            let id = st.next_tab_id;
-            st.next_tab_id += 1;
-            let ctx_gen = st.context_gen;
-            let tab = Self::attach_tab(page, id, Arc::clone(&self.state), ctx_gen).await?;
+            let tab = Self::create_tab(&mut st, &self.state, &self.engine, self.headless).await?;
             st.tabs.push(tab);
             st.active = 0;
         } else if st.active >= st.tabs.len() {
@@ -891,23 +936,9 @@ impl FluxwrightMcp {
                         return Ok(tool_err(msg));
                     }
                 }
-                if let Err(e) = Self::ensure_context(&mut st, self.headless).await {
-                    return Ok(tool_err(e));
-                }
-                let page = match st
-                    .context
-                    .as_ref()
-                    .expect("made above")
-                    .new_page()
+                let tab = match Self::create_tab(&mut st, &self.state, &self.engine, self.headless)
                     .await
                 {
-                    Ok(p) => p,
-                    Err(e) => return Ok(tool_err(e)),
-                };
-                let id = st.next_tab_id;
-                st.next_tab_id += 1;
-                let ctx_gen = st.context_gen;
-                let tab = match Self::attach_tab(page, id, Arc::clone(&self.state), ctx_gen).await {
                     Ok(t) => t,
                     Err(e) => return Ok(tool_err(e)),
                 };
@@ -1064,8 +1095,261 @@ impl ServerHandler for FluxwrightMcp {
     }
 }
 
+#[derive(Clone)]
+struct ExpectedToken(Arc<Vec<u8>>);
+
+impl ExpectedToken {
+    fn new(token: String) -> Self {
+        Self(Arc::new(token.into_bytes()))
+    }
+}
+
+/// Compare supplied bytes against the expected secret without early exit on byte mismatches.
+fn constant_time_eq(supplied: &[u8], expected: &[u8]) -> bool {
+    let mut diff = supplied.len() ^ expected.len();
+    for (i, &b) in expected.iter().enumerate() {
+        let s = supplied.get(i).copied().unwrap_or(0);
+        diff |= usize::from(s ^ b);
+    }
+    diff == 0
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&[u8]> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.as_bytes().split_at_checked(7)?;
+    if !scheme.eq_ignore_ascii_case(b"Bearer ") {
+        return None;
+    }
+    Some(token)
+}
+
+fn unauthorized_response() -> Response {
+    let mut resp = (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "unauthorized",
+            "message": "valid Authorization: Bearer token required",
+        })),
+    )
+        .into_response();
+    resp.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    resp
+}
+
+async fn require_bearer_auth(
+    AxumState(expected): AxumState<ExpectedToken>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authorized = extract_bearer_token(request.headers())
+        .is_some_and(|supplied| constant_time_eq(supplied, expected.0.as_slice()));
+    if !authorized {
+        return unauthorized_response();
+    }
+    next.run(request).await
+}
+
+fn validate_http_security(
+    addr: SocketAddr,
+    token: Option<&str>,
+    allow_unauthenticated: bool,
+) -> Result<Option<ExpectedToken>> {
+    let token = token.filter(|v| !v.is_empty());
+    if token.is_some_and(|tok| !tok.bytes().all(|b| b.is_ascii_graphic())) {
+        anyhow::bail!(
+            "FLUXWRIGHT_MCP_TOKEN must contain only printable ASCII characters without whitespace"
+        );
+    }
+    if !addr.ip().is_loopback() && !allow_unauthenticated {
+        match token {
+            None => anyhow::bail!(
+                "refusing to bind non-loopback address {addr} without authentication: \
+                 set FLUXWRIGHT_MCP_TOKEN (at least {MIN_REMOTE_TOKEN_LEN} characters) \
+                 or pass --allow-unauthenticated"
+            ),
+            Some(tok) if tok.len() < MIN_REMOTE_TOKEN_LEN => anyhow::bail!(
+                "refusing to bind non-loopback address {addr}: FLUXWRIGHT_MCP_TOKEN must be \
+                 at least {MIN_REMOTE_TOKEN_LEN} characters (got {}), or pass --allow-unauthenticated",
+                tok.len()
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(token.map(|t| ExpectedToken::new(t.to_owned())))
+}
+
+fn build_http_server_config(addr: SocketAddr) -> StreamableHttpServerConfig {
+    let mut config = StreamableHttpServerConfig::default();
+    if addr.ip().is_loopback() {
+        let ip_str = addr.ip().to_string();
+        if !config.allowed_hosts.iter().any(|h| h == &ip_str) {
+            config.allowed_hosts.push(ip_str);
+        }
+    } else {
+        config = config.disable_allowed_hosts();
+    }
+    config
+}
+
+async fn healthz() -> Response {
+    let mut resp = Json(serde_json::json!({
+        "status": "ok",
+        "transport": "streamable-http",
+    }))
+    .into_response();
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
+}
+
+fn build_http_router(
+    engine_cell: Arc<OnceCell<BrowserEngine>>,
+    headless: bool,
+    session_manager: Arc<LocalSessionManager>,
+    http_config: StreamableHttpServerConfig,
+    expected_token: Option<ExpectedToken>,
+) -> Router {
+    let mcp_service = StreamableHttpService::new(
+        move || Ok::<_, std::io::Error>(FluxwrightMcp::with_engine(Arc::clone(&engine_cell), headless)),
+        session_manager,
+        http_config,
+    );
+
+    let mcp_router = Router::new().nest_service("/mcp", mcp_service);
+    let mcp_router = if let Some(token) = expected_token {
+        mcp_router.route_layer(middleware::from_fn_with_state(token, require_bearer_auth))
+    } else {
+        mcp_router
+    };
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(mcp_router)
+}
+
+async fn close_all_sessions(session_manager: &LocalSessionManager) {
+    let ids: Vec<_> = session_manager.sessions.read().await.keys().cloned().collect();
+    for id in ids {
+        let _ = session_manager.close_session(&id).await;
+    }
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+async fn run_stdio(headless: bool) -> Result<()> {
+    tracing::info!(headless, "fluxwright MCP on stdio");
+    let mcp = FluxwrightMcp::new(headless);
+    let state = Arc::clone(&mcp.state);
+    let engine_cell = Arc::clone(&mcp.engine);
+    let service = mcp
+        .serve(stdio())
+        .await
+        .inspect_err(|e| tracing::error!("serve: {e}"))?;
+    let wait_res = service.waiting().await;
+    {
+        let mut st = state.lock().await;
+        st.context_gen = st.context_gen.wrapping_add(1);
+        st.tabs.clear();
+        st.context = None;
+    }
+    if let Some(engine) = engine_cell.get() {
+        if let Err(err) = engine.shutdown(Duration::from_secs(5)).await {
+            tracing::warn!(%err, "error shutting down browser engine");
+        }
+    }
+    wait_res?;
+    Ok(())
+}
+
+async fn run_http(addr: SocketAddr, allow_unauthenticated: bool, headless: bool) -> Result<()> {
+    let raw_token = std::env::var("FLUXWRIGHT_MCP_TOKEN").ok();
+    let expected_token = validate_http_security(addr, raw_token.as_deref(), allow_unauthenticated)?;
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+
+    let engine_cell = Arc::new(OnceCell::new());
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let http_config = build_http_server_config(bound);
+    let ct = http_config.cancellation_token.clone();
+    let auth_enabled = expected_token.is_some();
+
+    let app = build_http_router(
+        Arc::clone(&engine_cell),
+        headless,
+        Arc::clone(&session_manager),
+        http_config,
+        expected_token,
+    );
+
+    if auth_enabled {
+        tracing::info!(%bound, headless, "fluxwright MCP on Streamable HTTP (bearer auth enabled)");
+    } else if !bound.ip().is_loopback() {
+        tracing::warn!(
+            %bound,
+            headless,
+            "fluxwright MCP on non-loopback Streamable HTTP WITHOUT authentication"
+        );
+    } else {
+        tracing::info!(
+            %bound,
+            headless,
+            "fluxwright MCP on loopback Streamable HTTP (no bearer token set)"
+        );
+    }
+
+    let shutdown_ct = ct.clone();
+    let shutdown_sessions = Arc::clone(&session_manager);
+    let serve_res = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            if let Err(err) = shutdown_signal().await {
+                tracing::warn!(%err, "failed waiting for shutdown signal");
+            }
+            tracing::info!("shutting down fluxwright-mcp HTTP server");
+            shutdown_ct.cancel();
+            close_all_sessions(&shutdown_sessions).await;
+        })
+        .await;
+
+    ct.cancel();
+    close_all_sessions(&session_manager).await;
+    if let Some(engine) = engine_cell.get() {
+        if let Err(err) = engine.shutdown(Duration::from_secs(5)).await {
+            tracing::warn!(%err, "error shutting down browser engine");
+        }
+    }
+    serve_res?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("fluxwright=info".parse()?))
         .with_writer(std::io::stderr)
@@ -1077,28 +1361,10 @@ async fn main() -> Result<()> {
         .filter(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .is_some();
 
-    tracing::info!(headless, "fluxwright MCP on stdio");
-    let mcp = FluxwrightMcp::new(headless);
-    let state = Arc::clone(&mcp.state);
-    let service = mcp
-        .serve(stdio())
-        .await
-        .inspect_err(|e| tracing::error!("serve: {e}"))?;
-    let wait_res = service.waiting().await;
-    let engine = {
-        let mut st = state.lock().await;
-        st.context_gen += 1;
-        st.tabs.clear();
-        st.context = None;
-        st.engine.take()
-    };
-    if let Some(engine) = engine {
-        if let Err(err) = engine.shutdown(Duration::from_secs(5)).await {
-            tracing::warn!(%err, "error shutting down browser engine");
-        }
+    match cli.http {
+        Some(addr) => run_http(addr, cli.allow_unauthenticated, headless).await,
+        None => run_stdio(headless).await,
     }
-    wait_res?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1355,5 +1621,384 @@ mod tests {
         let err = tool_err("selector timed out");
         assert_eq!(err.is_error, Some(true));
         assert_eq!(err.content.len(), 1);
+    }
+
+    #[test]
+    fn constant_time_token_comparison() {
+        assert!(constant_time_eq(b"secret-token-123", b"secret-token-123"));
+        assert!(!constant_time_eq(b"", b"secret-token-123"));
+        assert!(!constant_time_eq(b"secret-token-12", b"secret-token-123"));
+        assert!(!constant_time_eq(b"secret-token-1234", b"secret-token-123"));
+        assert!(!constant_time_eq(b"aecret-token-123", b"secret-token-123"));
+        assert!(!constant_time_eq(b"secret-xoken-123", b"secret-token-123"));
+        assert!(!constant_time_eq(b"secret-token-124", b"secret-token-123"));
+    }
+
+    #[test]
+    fn http_security_enforces_non_loopback_fail_closed() {
+        let non_loopback: SocketAddr = "0.0.0.0:8088".parse().unwrap();
+        let lan_ip: SocketAddr = "10.0.0.5:8088".parse().unwrap();
+        let v6_any: SocketAddr = "[::]:8088".parse().unwrap();
+        let loopback_v4: SocketAddr = "127.0.0.1:8088".parse().unwrap();
+        let loopback_v6: SocketAddr = "[::1]:8088".parse().unwrap();
+
+        assert!(validate_http_security(non_loopback, None, false).is_err());
+        assert!(validate_http_security(lan_ip, Some("short"), false).is_err());
+        assert!(validate_http_security(v6_any, Some(&"a".repeat(31)), false).is_err());
+
+        assert!(validate_http_security(non_loopback, Some(&"a".repeat(32)), false)
+            .unwrap()
+            .is_some());
+        assert!(validate_http_security(non_loopback, None, true)
+            .unwrap()
+            .is_none());
+
+        assert!(validate_http_security(loopback_v4, None, false)
+            .unwrap()
+            .is_none());
+        assert!(validate_http_security(loopback_v6, None, false)
+            .unwrap()
+            .is_none());
+        assert!(validate_http_security(loopback_v4, Some("local-test-token"), false)
+            .unwrap()
+            .is_some());
+        assert!(validate_http_security(loopback_v4, Some("bad token with space"), false).is_err());
+    }
+
+    fn parse_first_sse_json(raw: &[u8]) -> serde_json::Value {
+        let text = std::str::from_utf8(raw).expect("valid utf-8 sse response");
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                let trimmed = rest.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                return serde_json::from_str(trimmed).expect("valid json-rpc sse payload");
+            }
+        }
+        panic!("expected non-empty SSE data payload, got:\n{text}");
+    }
+
+    fn test_http_app(
+        token: Option<&str>,
+    ) -> (
+        Router,
+        Arc<LocalSessionManager>,
+        StreamableHttpServerConfig,
+    ) {
+        let addr: SocketAddr = "127.0.0.1:8088".parse().unwrap();
+        let cfg = build_http_server_config(addr);
+        let ct = cfg.cancellation_token.clone();
+        let sessions = Arc::new(LocalSessionManager::default());
+        let app = build_http_router(
+            Arc::new(OnceCell::new()),
+            true,
+            Arc::clone(&sessions),
+            cfg,
+            token.map(|t| ExpectedToken::new(t.to_owned())),
+        );
+        let mut shutdown_cfg = StreamableHttpServerConfig::default();
+        shutdown_cfg.cancellation_token = ct;
+        (app, sessions, shutdown_cfg)
+    }
+
+    fn init_body() -> axum::body::Body {
+        axum::body::Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": { "name": "mcp-http-test", "version": "0.1.0" }
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_auth_middleware_enforces_bearer_and_allows_healthz() {
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let token = "0123456789abcdef0123456789abcdef";
+        let (app, sessions, shutdown_cfg) = test_http_app(Some(token));
+
+        let health_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), StatusCode::OK);
+        let health_bytes = axum::body::to_bytes(health_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let health_json: serde_json::Value = serde_json::from_slice(&health_bytes).unwrap();
+        assert_eq!(
+            health_json,
+            serde_json::json!({"status": "ok", "transport": "streamable-http"})
+        );
+
+        let no_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(init_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            no_auth.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer"
+        );
+
+        let wrong_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token-0123456789abcdef")
+                    .body(init_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_auth.status(), StatusCode::UNAUTHORIZED);
+
+        let basic_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Basic {token}"))
+                    .body(init_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(basic_auth.status(), StatusCode::UNAUTHORIZED);
+
+        let dup_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(init_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup_auth.status(), StatusCode::UNAUTHORIZED);
+
+        let get_no_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_no_auth.status(), StatusCode::UNAUTHORIZED);
+
+        let ok_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("bearer {token}"))
+                    .body(init_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        assert!(ok_resp.headers().contains_key("mcp-session-id"));
+
+        shutdown_cfg.cancellation_token.cancel();
+        close_all_sessions(&sessions).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_mcp_initialize_tools_list_and_session_teardown() {
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let (app, sessions, shutdown_cfg) = test_http_app(None);
+
+        let init_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(init_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_resp.status(), StatusCode::OK);
+        let session_id = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .expect("mcp-session-id header")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let init_bytes = axum::body::to_bytes(init_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let init_json = parse_first_sse_json(&init_bytes);
+        assert_eq!(init_json["result"]["serverInfo"]["name"], "fluxwright-mcp");
+
+        let notif_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", &session_id)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/initialized"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notif_resp.status(), StatusCode::ACCEPTED);
+
+        let list_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", &session_id)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/list"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_bytes = axum::body::to_bytes(list_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let list_json = parse_first_sse_json(&list_bytes);
+        let tools = list_json["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 21);
+
+        let sid: Arc<str> = Arc::from(session_id.as_str());
+        assert!(sessions.has_session(&sid).await.unwrap());
+
+        let del_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header("mcp-session-id", &session_id)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_resp.status(), StatusCode::ACCEPTED);
+        assert!(!sessions.has_session(&sid).await.unwrap());
+
+        let stale_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", &session_id)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 3,
+                            "method": "tools/list"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_resp.status(), StatusCode::NOT_FOUND);
+
+        shutdown_cfg.cancellation_token.cancel();
+    }
+
+    #[test]
+    fn http_sessions_isolate_state_and_share_engine_cell() {
+        let engine = Arc::new(OnceCell::new());
+        let a = FluxwrightMcp::with_engine(Arc::clone(&engine), true);
+        let b = FluxwrightMcp::with_engine(Arc::clone(&engine), true);
+        assert!(!Arc::ptr_eq(&a.state, &b.state));
+        assert!(Arc::ptr_eq(&a.engine, &b.engine));
+
+        let weak_a = Arc::downgrade(&a.state);
+        drop(a);
+        assert!(weak_a.upgrade().is_none());
     }
 }
