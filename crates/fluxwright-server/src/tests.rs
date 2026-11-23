@@ -3236,11 +3236,14 @@ async fn embed_live_endpoints_validate_auth_ttl_clamping_capacity_csp_and_html_i
     )
     .unwrap();
     assert!(ro_html.contains("data-mode=\"read_only\""));
+    assert!(ro_html.contains("pill-readonly"));
     assert!(!ro_html.contains("fluxwright_token"));
     assert!(!ro_html.contains("/dashboard"));
-    assert!(!ro_html.contains("live-url-form"));
-    assert!(!ro_html.contains("btn-live-pause"));
-    assert!(!ro_html.contains("btn-live-esc"));
+    assert!(!ro_html.contains("<form"));
+    assert!(!ro_html.contains("id=\"live-url-form\""));
+    assert!(!ro_html.contains("id=\"btn-live-pause\""));
+    assert!(!ro_html.contains("id=\"btn-live-esc\""));
+    assert!(!ro_html.contains("id=\"btn-live-banner-resume\""));
 
     let int_html_resp = srv
         .router()
@@ -3256,8 +3259,10 @@ async fn embed_live_endpoints_validate_auth_ttl_clamping_capacity_csp_and_html_i
     )
     .unwrap();
     assert!(int_html.contains("data-mode=\"interactive\""));
-    assert!(int_html.contains("live-url-form"));
-    assert!(int_html.contains("btn-live-esc"));
+    assert!(!int_html.contains("pill-readonly"));
+    assert!(int_html.contains("id=\"live-url-form\""));
+    assert!(int_html.contains("id=\"btn-live-esc\""));
+    assert!(int_html.contains("id=\"btn-live-banner-resume\""));
     assert!(!int_html.contains("fluxwright_token"));
     assert!(!int_html.contains("/dashboard"));
 
