@@ -2108,7 +2108,8 @@ async fn executes_snapshot_diff_and_screenshot_annotate_mask_steps() {
     assert_eq!(s3["changed"], true, "{s3}");
     assert!(s3["tree"].as_str().unwrap_or("").contains("button \"Added\""), "{s3}");
 
-    let shot_b64 = results[5].as_str().expect("screenshot base64");
+    assert_eq!(results[5]["mime_type"], "image/png");
+    let shot_b64 = results[5]["base64"].as_str().expect("screenshot base64");
     let shot_bytes = base64::engine::general_purpose::STANDARD
         .decode(shot_b64)
         .unwrap();
