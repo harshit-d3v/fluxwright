@@ -3385,10 +3385,10 @@ async fn snapshot_diff_and_som_mask_screenshots() {
         })
         .await
         .unwrap();
-    let px = |img: &fluxwright::RgbaImage, x: u32, y: u32| -> &[u8] {
+    fn px(img: &fluxwright::RgbaImage, x: u32, y: u32) -> &[u8] {
         let off = ((y * img.width + x) * 4) as usize;
         &img.data[off..off + 4]
-    };
+    }
     let decoded = decode_png(&masked_png).unwrap();
     assert_eq!(px(&decoded, 40, 40), &[0, 255, 0, 255]);
     assert_eq!(px(&decoded, 130, 40), &[0, 255, 0, 255]);
