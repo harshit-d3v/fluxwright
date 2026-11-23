@@ -3200,6 +3200,18 @@ async fn embed_live_endpoints_validate_auth_ttl_clamping_capacity_csp_and_html_i
         .status(),
         StatusCode::UNPROCESSABLE_ENTITY
     );
+    // Oversized embed request bodies (> 4096 bytes) rejected.
+    assert_eq!(
+        call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            vec![b'a'; 5000],
+        )
+        .await
+        .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
 
     // Unauthenticated GET /embed/live/{token} serves minimal isolated HTML with strict CSP.
     let ro_html_resp = srv

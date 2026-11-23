@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::to_bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -725,22 +725,28 @@ pub(crate) async fn create_ticket(
     })))
 }
 
+const MAX_EMBED_REQUEST_BYTES: usize = 4096;
+
 pub(crate) async fn create_embed(
     State(inner): State<Arc<Inner>>,
     Path(id): Path<String>,
-    body: Bytes,
+    request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let req: EmbedRequest = if body.iter().all(u8::is_ascii_whitespace) {
+    let bytes = to_bytes(request.into_body(), MAX_EMBED_REQUEST_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "embed request body exceeds 4096 bytes",
+            )
+        })?;
+    let req: EmbedRequest = if bytes.iter().all(u8::is_ascii_whitespace) {
         EmbedRequest::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            let status = if e.is_syntax() || e.is_eof() {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::UNPROCESSABLE_ENTITY
-            };
-            ApiError::new(status, "invalid_request", e.to_string())
-        })?
+        let Json(parsed) = Json::<EmbedRequest>::from_bytes(&bytes)
+            .map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
+        parsed
     };
     let (token, ttl, expires_at) = inner.live.issue_embed(&id, req.mode, req.ttl_secs)?;
     Ok(Json(json!({

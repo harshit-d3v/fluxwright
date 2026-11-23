@@ -1065,11 +1065,12 @@ fn finish_job(
                 );
             }
         }
-        match record.job.status {
+        let term = record.to_terminal(telemetry::now_unix_nano());
+        match term.job.status {
             JobStatus::Succeeded => registry.succeeded_jobs += 1,
             _ => registry.failed_jobs += 1,
         }
-        Some(record.to_terminal(telemetry::now_unix_nano()))
+        Some(term)
     });
     if let Some(term) = terminal {
         let status = term.job.status;
