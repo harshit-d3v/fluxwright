@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-crates-${{ github.ref }}
+  group: release-crates
   cancel-in-progress: false
 
 jobs:
