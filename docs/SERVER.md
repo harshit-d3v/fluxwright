@@ -79,6 +79,13 @@ session affinity (`"proxy_session"`) and exponential cooldown backoff on failure
 pressure or failed jobs and grows smoothly back toward configured capacity while queue demand exists.
 
 Without `--max-browsers` or `--memory-ceiling-mb`, the engine sizes itself to the machine.
+
+Additional server operations flags on `fluxwright serve` (also available on `fluxwright coordinate` except `--embed-frame-ancestors`):
+
+- `--webhook-secret <secret>` / `FLUXWRIGHT_WEBHOOK_SECRET`: HMAC-SHA256 signing key for terminal job webhook deliveries (`X-Fluxwright-Signature`).
+- `--otlp-endpoint <url>` / `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP/HTTP JSON trace collector base URL (`POST <base>/v1/traces`).
+- `--otlp-service-name <name>` / `OTEL_SERVICE_NAME`: `service.name` resource attribute on exported OTLP spans (default `fluxwright-server`).
+- `--embed-frame-ancestors <policy>`: `Content-Security-Policy` `frame-ancestors` directive served on `GET /embed/live/{token}` (`fluxwright serve` only; default `*`).
 `--max-contexts` defaults to 8 per browser. Ctrl+C (and SIGTERM on Unix) stops admission,
 cancels outstanding jobs, and shuts down Chrome, allowing up to 10 seconds for lease cleanup.
 The existing local `start` / `stats` / `browsers` commands are unchanged: the HTTP server is a
@@ -179,6 +186,10 @@ failed job returns **409**.
   "profile": "acct-prod",
   "persist_profile": true,
   "proxy_session": "user-42",
+  "webhook_url": "https://hooks.example.com/fluxwright",
+  "webhook_headers": {
+    "Authorization": "Bearer hook-token"
+  },
   "steps": [
     { "action": "goto", "url": "https://example.com", "wait_until": "load" },
     { "action": "text_content", "selector": "h1" },
@@ -186,6 +197,8 @@ failed job returns **409**.
   ]
 }
 ```
+
+Optional `webhook_url` (`http://` or `https://`, validated against SSRF rules unless `FLUXWRIGHT_SERVER_ANY_URL=1` and DNS-pinned on delivery) triggers an asynchronous completion callback when the job reaches a terminal state (`succeeded`, `failed`, or `cancelled`). Optional `webhook_headers` supports up to 16 custom headers (CR/LF/control characters and reserved `host`, `content-length`, `connection`, `transfer-encoding`, and `x-fluxwright-*` names are rejected) and is omitted from public `Job` responses so secrets do not leak.
 
 | Action | Fields | Result |
 |---|---|---|
@@ -273,7 +286,9 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | GET | `/v1/events` | Bearer token | Server-Sent Events (SSE) stream of fleet and job snapshots |
 | GET | `/v1/live` | Bearer token | List active live browser sessions (jobs and `/cdp` gateway sessions) (standalone only) |
 | POST | `/v1/live/{id}/ticket` | Bearer token | Mint a single-use 30-second WebSocket ticket bound to `{id}` (standalone only) |
-| GET (WS) | `/v1/live/{id}/ws` | Bearer token or single-use `?ticket=` | Live JPEG screencast stream + HITL mouse/keyboard/navigate/pause forwarding (standalone only) |
+| POST | `/v1/live/{id}/embed` | Bearer token | Mint an embeddable signed live viewer URL & WebSocket token (`read_only` or `interactive`, `10..=3600`s TTL) (standalone only) |
+| GET | `/embed/live/{token}` | Signed `{token}` | Minimal standalone HTML live viewer (`Referrer-Policy: no-referrer`, SHA-256 CSP, configurable `frame-ancestors`) |
+| GET (WS) | `/v1/live/{id}/ws` | Bearer token, `?ticket=`, or `?embed=` | Live JPEG screencast stream + HITL mouse/keyboard/navigate/pause forwarding (`?embed=` enforces token mode) (standalone only) |
 | POST | `/v1/jobs/{id}/pause` | Bearer token | Pause a running live job before its next step (standalone only) |
 | POST | `/v1/jobs/{id}/resume` | Bearer token | Resume a paused live job (standalone only) |
 | GET | `/v1/profiles` | Bearer token | List saved named profiles (metadata only; requires `--profiles-dir`) |
@@ -282,7 +297,7 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | GET | `/json/version` | Bearer (or `?token=` with `--allow-query-token`) | Standard DevTools discovery JSON pointing at `ws(s)://<host>/cdp` (standalone only) |
 | GET (WS) | `/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Pooled, context-isolated Chrome DevTools Protocol WebSocket gateway (standalone only) |
 
-The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp` and `/json/version`, never `/v1/*` or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally. Browser `/dashboard` live streams authenticate WebSocket upgrades with single-use `?ticket=` tokens from `POST /v1/live/{id}/ticket`.
+The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp` and `/json/version`, never `/v1/*` or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally. Browser `/dashboard` live streams authenticate WebSocket upgrades with single-use `?ticket=` tokens from `POST /v1/live/{id}/ticket`, while iframe embeds authenticate `GET /embed/live/{token}` and `/v1/live/{id}/ws?embed={token}` with capability tokens minted by `POST /v1/live/{id}/embed`.
 
 ## Live screencast viewer & human-in-the-loop
 
@@ -291,6 +306,7 @@ In standalone mode (`fluxwright serve`), `/dashboard` displays active browser jo
 - **Screencast transport:** `GET /v1/live/{id}/ws` attaches an observer CDP session and streams `Page.startScreencast` JPEG frames (`quality` `20–95`, `max_width` `320–1920`, `max_height` `240–1200`), automatically acking each frame for backpressure and capturing an immediate fallback frame when viewing an idle/paused page.
 - **Human takeover:** With **Interactive** enabled in the dashboard modal, pointer clicks, movement, mouse wheel, keyboard input, `Send Esc`, and URL navigation forward directly to the remote tab (URL navigation enforces SSRF checks unless `FLUXWRIGHT_SERVER_ANY_URL=1`).
 - **Pause & resume:** Jobs can include a `{ "action": "pause_for_human", "message": "Solve CAPTCHA", "timeout_ms": 120000 }` step or be paused/resumed manually via `POST /v1/jobs/{id}/pause`, `POST /v1/jobs/{id}/resume`, or the dashboard viewer.
+- **Embeddable signed live views:** Mint a scoped shareable viewer URL via `POST /v1/live/{id}/embed` with optional `{ "mode": "read_only" | "interactive", "ttl_secs": 300 }` (default `"read_only"`, clamped `10..=3600` seconds), returning `{ "url", "ws_url", "mode", "expires_at" }`. `GET /embed/live/{token}` serves a minimal standalone viewer without admin tokens or dashboard navigation (hiding controls in `read_only` mode), guarded by `Referrer-Policy: no-referrer`, a SHA-256 inline script/style CSP, and `--embed-frame-ancestors` (default `*`). WebSocket connections using `?embed={token}` enforce `mode` server-side (rejecting interactive/control frames with a `403` error in `read_only` mode). Active tokens are bounded (`256` max), expire on TTL, and revoke immediately when the live session closes.
 
 ## Pooled CDP WebSocket gateway (`GET /cdp`, `GET /json/version`)
 
@@ -397,14 +413,22 @@ Every 1000 ms, the server emits an event named `snapshot` with a JSON payload co
 
 ### Distributed tracing (W3C TraceContext & OpenTelemetry)
 
-The server supports the W3C TraceContext `traceparent` header to propagate distributed traces across service boundaries (`tracestate` is ignored):
+The server supports the W3C TraceContext `traceparent` header to propagate distributed traces across service boundaries (`tracestate` is ignored) and includes an OTLP/HTTP JSON trace exporter:
 
 - **Incoming headers**: Clients can pass a standard W3C `traceparent` header (format `00-<trace_id>-<parent_id>-<flags>`) when submitting a job (`POST /v1/jobs`).
 - **Trace propagation**: If a valid `traceparent` is provided, the server preserves the 32-hex `trace_id` and records the parent span ID. If missing or invalid, a fresh high-entropy 16-byte hex trace ID and 8-byte hex root span ID are generated automatically.
 - **Response headers & payload**: The `POST /v1/jobs` response returns an outbound `traceparent` header (e.g. `00-<trace_id>-<root_span_id>-01`), and the `trace_id` is included in the `Job` JSON object (`trace_id`).
-- **Spans**: Jobs and steps are instrumented with OpenTelemetry-*named* spans emitted through the `tracing` crate (so any tracing subscriber, including `RUST_LOG` output, sees them; there is no OTLP/OpenTelemetry SDK exporter yet):
-  - `fluxwright.job`: Wraps the entire job lifecycle with fields `otel.name`, `trace_id`, `span_id`, `parent_span_id`, `job.id`, `job.priority`, `job.timeout_ms`, and `job.retries`.
-  - `fluxwright.step`: Wraps each step execution on the page with fields `otel.name`, `trace_id`, `job.id`, `step.index`, and `step.action`.
+- **Spans**: Jobs and steps emit OpenTelemetry-compatible spans through `tracing` subscribers (`fluxwright.job` and `fluxwright.step`), and when `--otlp-endpoint <url>` / `OTEL_EXPORTER_OTLP_ENDPOINT` is configured on `fluxwright serve` or `fluxwright coordinate`, terminal jobs export `resourceSpans` over `POST <base>/v1/traces` (`Content-Type: application/json`):
+  - **Resource & span fields**: Sets `service.name` from `--otlp-service-name` / `OTEL_SERVICE_NAME` (default `fluxwright-server`), `traceId`, `parentSpanId` (when supplied), root `spanId`, `startTimeUnixNano`, `endTimeUnixNano`, OTLP `status`, and attributes `job.id`, `job.status`, `job.steps`, and `job.attempts`.
+  - **Batching**: Uses a non-blocking bounded queue (`512` spans) flushed asynchronously every `2s` or `32` spans (supporting both `http://` and `https://` collector URLs).
+
+### Signed job webhooks
+
+When a job specifies `webhook_url` (`http://` or `https://`), both standalone `fluxwright serve` and cluster `fluxwright coordinate` dispatch an asynchronous `POST` callback when the job reaches a terminal state (`succeeded`, `failed`, or `cancelled`):
+
+- **Payload & headers**: Sends `{ "event": "job.completed", "job": { ... } }` with `Content-Type: application/json`, `X-Fluxwright-Event: job.completed`, `X-Fluxwright-Job-Id: <id>`, `X-Fluxwright-Timestamp: <unix_secs>`, plus any validated `webhook_headers` (up to `16` headers; CR/LF/control characters and reserved `host`, `content-length`, `connection`, `transfer-encoding`, and `x-fluxwright-*` names are rejected).
+- **HMAC-SHA256 signing**: When `--webhook-secret <secret>` or `FLUXWRIGHT_WEBHOOK_SECRET` is configured, includes `X-Fluxwright-Signature: sha256=<hex(HMAC-SHA256(secret, "{timestamp}.{body}"))>`.
+- **SSRF protection & delivery**: `webhook_url` is validated at submission unless `FLUXWRIGHT_SERVER_ANY_URL=1`, and delivery connects directly to the DNS-resolved allowed IP address with SNI/`Host` pinned to the URL hostname to prevent DNS rebinding. Retries up to `3` attempts (`500ms`, `1500ms` backoff), `10s` timeout per attempt, bounded by `32` concurrent in-flight deliveries.
 
 ## Failure evidence
 

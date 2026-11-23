@@ -83,6 +83,18 @@ enum Cmd {
         /// Enable AIMD adaptive concurrency limiting driven by browser RSS pressure and failures.
         #[arg(long, default_value_t = false)]
         adaptive_concurrency: bool,
+        /// HMAC-SHA256 signing secret for job completion webhooks (falls back to FLUXWRIGHT_WEBHOOK_SECRET).
+        #[arg(long)]
+        webhook_secret: Option<String>,
+        /// OTLP/HTTP JSON trace collector endpoint base URL (falls back to OTEL_EXPORTER_OTLP_ENDPOINT).
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
+        /// OpenTelemetry service.name attribute (falls back to OTEL_SERVICE_NAME, default "fluxwright-server").
+        #[arg(long)]
+        otlp_service_name: Option<String>,
+        /// CSP frame-ancestors policy for GET /embed/live/{token} (default "*").
+        #[arg(long, default_value = "*")]
+        embed_frame_ancestors: String,
     },
     /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
     Coordinate {
@@ -106,6 +118,15 @@ enum Cmd {
         /// How long finished job results remain valid in the SQLite store (seconds).
         #[arg(long, default_value_t = 3600)]
         result_ttl_secs: u64,
+        /// HMAC-SHA256 signing secret for job completion webhooks (falls back to FLUXWRIGHT_WEBHOOK_SECRET).
+        #[arg(long)]
+        webhook_secret: Option<String>,
+        /// OTLP/HTTP JSON trace collector endpoint base URL (falls back to OTEL_EXPORTER_OTLP_ENDPOINT).
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
+        /// OpenTelemetry service.name attribute (falls back to OTEL_SERVICE_NAME, default "fluxwright-server").
+        #[arg(long)]
+        otlp_service_name: Option<String>,
     },
     Start {
         #[arg(long, default_value_t = 4)]
@@ -189,6 +210,10 @@ async fn main() -> Result<()> {
             profiles_dir,
             proxies,
             adaptive_concurrency,
+            webhook_secret,
+            otlp_endpoint,
+            otlp_service_name,
+            embed_frame_ancestors,
         } => {
             let address = listen.unwrap_or_else(|| {
                 if join.is_some() {
@@ -218,6 +243,10 @@ async fn main() -> Result<()> {
                 profiles_dir,
                 proxies,
                 adaptive_concurrency,
+                webhook_secret,
+                otlp_endpoint,
+                otlp_service_name,
+                embed_frame_ancestors,
             )
             .await
         }
@@ -229,6 +258,9 @@ async fn main() -> Result<()> {
             journal,
             store,
             result_ttl_secs,
+            webhook_secret,
+            otlp_endpoint,
+            otlp_service_name,
         } => {
             coordinator_daemon(
                 listen,
@@ -238,6 +270,9 @@ async fn main() -> Result<()> {
                 journal,
                 store,
                 result_ttl_secs,
+                webhook_secret,
+                otlp_endpoint,
+                otlp_service_name,
             )
             .await
         }
@@ -331,12 +366,41 @@ fn resolve_serve_tokens(
     }
 }
 
-fn worker_token_from_env() -> Option<String> {
-    std::env::var("FLUXWRIGHT_WORKER_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty())
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+fn worker_token_from_env() -> Option<String> {
+    nonempty_env("FLUXWRIGHT_WORKER_TOKEN")
+}
+
+fn resolve_opt_with_env(cli: Option<String>, env_name: &str) -> Option<String> {
+    cli.filter(|v| !v.is_empty()).or_else(|| nonempty_env(env_name))
+}
+
+fn apply_server_ops_config(
+    mut config: ServerConfig,
+    webhook_secret: Option<String>,
+    otlp_endpoint: Option<String>,
+    otlp_service_name: Option<String>,
+    embed_frame_ancestors: Option<String>,
+) -> Result<ServerConfig> {
+    if let Some(secret) = resolve_opt_with_env(webhook_secret, "FLUXWRIGHT_WEBHOOK_SECRET") {
+        config = config.with_webhook_secret(secret)?;
+    }
+    if let Some(endpoint) = resolve_opt_with_env(otlp_endpoint, "OTEL_EXPORTER_OTLP_ENDPOINT") {
+        config = config.with_otlp_endpoint(endpoint)?;
+    }
+    if let Some(svc) = resolve_opt_with_env(otlp_service_name, "OTEL_SERVICE_NAME") {
+        config = config.with_otlp_service_name(svc);
+    }
+    if let Some(policy) = embed_frame_ancestors {
+        config = config.with_embed_frame_ancestors(policy)?;
+    }
+    Ok(config)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn coordinator_daemon(
     address: SocketAddr,
     max_jobs: usize,
@@ -345,6 +409,9 @@ async fn coordinator_daemon(
     journal: Option<std::path::PathBuf>,
     store: Option<std::path::PathBuf>,
     result_ttl_secs: u64,
+    webhook_secret: Option<String>,
+    otlp_endpoint: Option<String>,
+    otlp_service_name: Option<String>,
 ) -> Result<()> {
     let (_token, mut config) =
         server_config_for(false, max_jobs, journal, store, result_ttl_secs)?;
@@ -356,6 +423,13 @@ async fn coordinator_daemon(
     } else {
         false
     };
+    config = apply_server_ops_config(
+        config,
+        webhook_secret,
+        otlp_endpoint,
+        otlp_service_name,
+        None,
+    )?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let server = HttpServer::coordinator(config)?;
     eprintln!(
@@ -390,11 +464,22 @@ async fn http_daemon(
     profiles_dir: Option<PathBuf>,
     proxies: Vec<String>,
     adaptive_concurrency: bool,
+    webhook_secret: Option<String>,
+    otlp_endpoint: Option<String>,
+    otlp_service_name: Option<String>,
+    embed_frame_ancestors: String,
 ) -> Result<()> {
     let is_worker = join.is_some();
     let (join_token, mut config) =
         server_config_for(is_worker, max_jobs, journal, store, result_ttl_secs)?;
     config.allow_query_token = allow_query_token;
+    config = apply_server_ops_config(
+        config,
+        webhook_secret,
+        otlp_endpoint,
+        otlp_service_name,
+        Some(embed_frame_ancestors),
+    )?;
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
     let mut builder = BrowserEngine::builder();
@@ -740,6 +825,10 @@ mod tests {
                 profiles_dir,
                 proxies,
                 adaptive_concurrency,
+                webhook_secret,
+                otlp_endpoint,
+                otlp_service_name,
+                embed_frame_ancestors,
             } => {
                 assert!(
                     max_per_host.is_none()
@@ -752,7 +841,11 @@ mod tests {
                         && chromium_args.is_empty()
                         && profiles_dir.is_none()
                         && proxies.is_empty()
+                        && webhook_secret.is_none()
+                        && otlp_endpoint.is_none()
+                        && otlp_service_name.is_none()
                 );
+                assert_eq!(embed_frame_ancestors, "*");
                 assert_eq!(result_ttl_secs, 3600);
                 assert!(!allow_query_token);
                 assert!(!adaptive_concurrency);
@@ -787,8 +880,16 @@ mod tests {
             "/tmp/fw-jobs.sqlite",
             "--result-ttl-secs",
             "120",
+            "--webhook-secret",
+            "whsec-test",
+            "--otlp-endpoint",
+            "http://127.0.0.1:4318",
+            "--otlp-service-name",
+            "fw-custom",
+            "--embed-frame-ancestors",
+            "'self' https://app.example.com",
         ])
-        .expect("serve launch/prewarm/store flags should parse");
+        .expect("serve launch/prewarm/store/ops flags should parse");
         match custom.cmd {
             Cmd::Serve {
                 prewarm_contexts,
@@ -800,6 +901,10 @@ mod tests {
                 adaptive_concurrency,
                 store,
                 result_ttl_secs,
+                webhook_secret,
+                otlp_endpoint,
+                otlp_service_name,
+                embed_frame_ancestors,
                 ..
             } => {
                 assert_eq!(prewarm_contexts, 2);
@@ -814,6 +919,10 @@ mod tests {
                 assert!(adaptive_concurrency);
                 assert_eq!(store.as_deref(), Some(std::path::Path::new("/tmp/fw-jobs.sqlite")));
                 assert_eq!(result_ttl_secs, 120);
+                assert_eq!(webhook_secret.as_deref(), Some("whsec-test"));
+                assert_eq!(otlp_endpoint.as_deref(), Some("http://127.0.0.1:4318"));
+                assert_eq!(otlp_service_name.as_deref(), Some("fw-custom"));
+                assert_eq!(embed_frame_ancestors, "'self' https://app.example.com");
             }
             _ => panic!("expected Cmd::Serve"),
         }
@@ -830,6 +939,12 @@ mod tests {
             "2",
             "--min-host-delay-ms",
             "250",
+            "--webhook-secret",
+            "coord-secret",
+            "--otlp-endpoint",
+            "https://otlp.example.com/v1/traces",
+            "--otlp-service-name",
+            "fw-coord",
         ])
         .expect("coordinate store and host-limit flags should parse")
         .cmd
@@ -841,6 +956,9 @@ mod tests {
                 journal,
                 store,
                 result_ttl_secs,
+                webhook_secret,
+                otlp_endpoint,
+                otlp_service_name,
                 ..
             } => {
                 assert_eq!(max_jobs.get(), 256);
@@ -849,6 +967,12 @@ mod tests {
                 assert!(journal.is_none());
                 assert_eq!(store.as_deref(), Some(std::path::Path::new("/tmp/coord.sqlite")));
                 assert_eq!(result_ttl_secs, 600);
+                assert_eq!(webhook_secret.as_deref(), Some("coord-secret"));
+                assert_eq!(
+                    otlp_endpoint.as_deref(),
+                    Some("https://otlp.example.com/v1/traces")
+                );
+                assert_eq!(otlp_service_name.as_deref(), Some("fw-coord"));
             }
             _ => panic!("expected Cmd::Coordinate"),
         }

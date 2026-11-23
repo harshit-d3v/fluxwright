@@ -2,7 +2,7 @@
 //! Fluxwright across multiple machines.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
@@ -10,21 +10,18 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use fluxwright::BrowserEngine;
-use rustls::pki_types::ServerName;
-use rustls::ClientConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::AbortHandle;
-use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
+use crate::http_post::{post_bytes, HttpEndpoint, MAX_HTTP_RESPONSE_BYTES};
+use crate::telemetry::now_unix_nano;
 use crate::{
     bounded_error, execute_job, json_len, not_found, parse_id, ApiError, ConfigError,
     ExecutionProgress, FailureEvidence, Inner, Job, JobPriority, JobRequest, JobStatus,
-    JobTraceContext, Step, MAX_RESULT_BYTES,
+    JobTraceContext, Step, TerminalJob, MAX_RESULT_BYTES,
 };
 
 const MAX_TRACKED_HOSTS: usize = 4096;
@@ -84,7 +81,6 @@ const MAX_LEASE_BATCH: usize = 64;
 /// Coordinator stops adding queued jobs to one lease response past 2 MiB so batches stay fast and
 /// never hit the worker's 4 MiB read cap even with JSON escaping overhead.
 const MAX_LEASE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024 + 65_536;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for aborted job tasks to stop before deciding which jobs to release.
 const TASK_STOP_WAIT: Duration = Duration::from_secs(1);
@@ -335,9 +331,10 @@ pub(crate) fn workers_snapshot(
 
 /// Requeues or fails leased jobs whose deadline passed without a heartbeat, returning terminal
 /// job snapshots that must be persisted to the durable store once unlocked.
-pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Job> {
+pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<TerminalJob> {
     let mut done = Vec::new();
     let mut expired_workers = Vec::new();
+    let end_ns = now_unix_nano();
     for record in &mut registry.jobs {
         if record.job.status == JobStatus::Running
             && record.lease_until.is_some_and(|expiry| expiry <= now)
@@ -355,7 +352,7 @@ pub(crate) fn expire_leases(registry: &mut crate::Registry, now: u64) -> Vec<Job
                 record.job.finished_at = Some(now);
                 record.job.error = Some("worker lost".into());
                 registry.failed_jobs += 1;
-                done.push(record.job.clone());
+                done.push(record.to_terminal(end_ns));
             }
         }
     }
@@ -446,7 +443,7 @@ pub(crate) async fn lease(
 
                     let candidate = LeasedJob {
                         id: record.job.id,
-                        request: record.request.clone(),
+                        request: record.request.without_webhook(),
                         attempts: record.job.attempts + 1,
                         trace_id: record.job.trace_id.clone(),
                     };
@@ -474,6 +471,7 @@ pub(crate) async fn lease(
             let record = &mut registry.jobs[idx];
             record.job.status = JobStatus::Running;
             record.job.started_at.get_or_insert(now);
+            record.started_ns.get_or_insert_with(now_unix_nano);
             record.job.attempts = item.attempts;
             record.job.step_index = None;
             record.job.failure_evidence = None;
@@ -545,6 +543,7 @@ pub(crate) async fn release(
                     record.job.attempts = record.job.attempts.saturating_sub(1);
                     if record.job.attempts == 0 {
                         record.job.started_at = None;
+                        record.started_ns = None;
                     }
                     record.job.step_index = None;
                     record.job.failure_evidence = None;
@@ -586,11 +585,11 @@ pub(crate) async fn result(
         }
     }
 
-    let (job, finished) = inner.with_registry(|registry, now| -> Result<(Job, bool), ApiError> {
+    let (job, terminal) = inner.with_registry(|registry, now| -> Result<(Job, Option<TerminalJob>), ApiError> {
         touch_worker(registry, &req.worker, now, None, None);
         let record = registry.find_mut(id).ok_or_else(not_found)?;
         if record.job.status == JobStatus::Cancelled {
-            return Ok((record.job.clone(), false));
+            return Ok((record.job.clone(), None));
         }
         if record.job.status != JobStatus::Running
             || record.worker.as_deref() != Some(req.worker.as_str())
@@ -633,6 +632,7 @@ pub(crate) async fn result(
             _ => unreachable!(),
         }
         let snapshot = record.job.clone();
+        let terminal = record.to_terminal(now_unix_nano());
         match req.status {
             JobStatus::Succeeded => {
                 registry.succeeded_jobs += 1;
@@ -648,11 +648,11 @@ pub(crate) async fn result(
             }
             _ => unreachable!(),
         }
-        Ok((snapshot, true))
+        Ok((snapshot, Some(terminal)))
     })?;
 
-    if finished {
-        inner.store_finished(&job);
+    if let Some(term) = terminal {
+        inner.on_job_terminal(term);
         tracing::info!(job_id = %id, status = ?job.status, worker = %req.worker, "cluster job finished");
     }
     Ok(Json(job))
@@ -727,82 +727,23 @@ pub(crate) struct CoordinatorEndpoint {
     pub(crate) tls: bool,
     pub(crate) host: String,
     port: u16,
-    host_header: String,
     base_path: String,
+    inner: HttpEndpoint,
 }
 
 impl CoordinatorEndpoint {
     pub(crate) fn is_loopback(&self) -> bool {
-        self.host.eq_ignore_ascii_case("localhost")
-            || self
-                .host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+        self.inner.is_loopback()
     }
 
     pub(crate) fn parse(url: &str) -> Result<Self, ConfigError> {
-        let trimmed = url.trim();
-        if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err(ConfigError::InvalidCoordinator(
-                "URL must not contain whitespace".into(),
-            ));
-        }
-        let (tls, rest) = if let Some(rest) = trimmed.strip_prefix("http://") {
-            (false, rest)
-        } else if let Some(rest) = trimmed.strip_prefix("https://") {
-            (true, rest)
-        } else {
-            return Err(ConfigError::InvalidCoordinator(
-                "coordinator URL must start with http:// or https://".into(),
-            ));
-        };
-        let default_port = if tls { 443 } else { 80 };
-        let (authority, path_raw) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, ""),
-        };
-        if authority.contains('@') || authority.contains(['?', '#']) || path_raw.contains(['?', '#'])
-        {
-            return Err(ConfigError::InvalidCoordinator(
-                "userinfo, query, and fragment are not allowed".into(),
-            ));
-        }
-        let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
-            let Some(end) = after_bracket.find(']') else {
-                return Err(ConfigError::InvalidCoordinator("unclosed IPv6 host".into()));
-            };
-            let ip = &after_bracket[..end];
-            let tail = &after_bracket[end + 1..];
-            let port = match tail {
-                "" => default_port,
-                _ => tail
-                    .strip_prefix(':')
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .filter(|&p| p != 0)
-                    .ok_or_else(|| ConfigError::InvalidCoordinator("invalid port".into()))?,
-            };
-            (ip.to_string(), port)
-        } else if let Some((h, p)) = authority.rsplit_once(':') {
-            let port = p
-                .parse::<u16>()
-                .ok()
-                .filter(|&n| n != 0)
-                .ok_or_else(|| ConfigError::InvalidCoordinator("invalid port".into()))?;
-            (h.to_string(), port)
-        } else {
-            (authority.to_string(), default_port)
-        };
-        if host.is_empty() {
-            return Err(ConfigError::InvalidCoordinator(
-                "empty coordinator host".into(),
-            ));
-        }
+        let ep = HttpEndpoint::parse(url, false).map_err(ConfigError::InvalidCoordinator)?;
         Ok(Self {
-            tls,
-            host,
-            port,
-            host_header: authority.to_string(),
-            base_path: path_raw.trim_end_matches('/').to_string(),
+            tls: ep.tls,
+            host: ep.host.clone(),
+            port: ep.port,
+            base_path: ep.base_path().to_string(),
+            inner: ep,
         })
     }
 }
@@ -1433,43 +1374,6 @@ async fn post_result(
     }
 }
 
-fn worker_tls_config() -> &'static Arc<ClientConfig> {
-    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let cfg = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("ring supports default TLS versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        Arc::new(cfg)
-    })
-}
-
-async fn exchange_http<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    head: &[u8],
-    body: &[u8],
-) -> Result<Vec<u8>, String> {
-    stream.write_all(head).await.map_err(|e| e.to_string())?;
-    stream.write_all(body).await.map_err(|e| e.to_string())?;
-    stream.flush().await.map_err(|e| e.to_string())?;
-    let mut raw = Vec::new();
-    stream
-        .take((MAX_HTTP_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut raw)
-        .await
-        .map_err(|e| e.to_string())?;
-    if raw.len() > MAX_HTTP_RESPONSE_BYTES {
-        return Err("coordinator HTTP response exceeded maximum size".into());
-    }
-    Ok(raw)
-}
-
 async fn post_json_raw(
     ep: &CoordinatorEndpoint,
     token: &str,
@@ -1478,83 +1382,21 @@ async fn post_json_raw(
 ) -> Result<(u16, Vec<u8>), String> {
     let json_bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let full_path = format!("{}{}", ep.base_path, path);
-    let head = format!(
-        "POST {full_path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        ep.host_header,
-        json_bytes.len()
-    );
-    let io = async {
-        let stream = TcpStream::connect((ep.host.as_str(), ep.port))
-            .await
-            .map_err(|e| e.to_string())?;
-        if ep.tls {
-            let server_name = ServerName::try_from(ep.host.clone())
-                .map_err(|_| format!("invalid TLS server name: {}", ep.host))?;
-            let connector = TlsConnector::from(worker_tls_config().clone());
-            let mut tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .map_err(|e| e.to_string())?;
-            exchange_http(&mut tls_stream, head.as_bytes(), &json_bytes).await
-        } else {
-            let mut tcp = stream;
-            exchange_http(&mut tcp, head.as_bytes(), &json_bytes).await
-        }
-    };
-    let raw = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, io)
-        .await
-        .map_err(|_| "coordinator HTTP request timed out".to_string())??;
-    let sep = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "invalid HTTP response from coordinator".to_string())?;
-    let header_text = std::str::from_utf8(&raw[..sep])
-        .map_err(|_| "invalid HTTP headers from coordinator".to_string())?;
-    let mut lines = header_text.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| format!("invalid HTTP status line: {status_line}"))?;
-    let is_chunked = lines.any(|l| {
-        l.split_once(':').is_some_and(|(k, v)| {
-            k.trim().eq_ignore_ascii_case("transfer-encoding")
-                && v.to_ascii_lowercase().contains("chunked")
-        })
-    });
-    let body = &raw[sep + 4..];
-    let body = if is_chunked {
-        decode_chunked(body)?
-    } else {
-        body.to_vec()
-    };
-    Ok((status, body))
-}
-
-fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    loop {
-        let Some(line_end) = data.windows(2).position(|w| w == b"\r\n") else {
-            return Err("truncated chunked response".into());
-        };
-        let size_hex = std::str::from_utf8(&data[..line_end])
-            .map_err(|_| "invalid chunk size")?
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
-        let size = usize::from_str_radix(size_hex, 16).map_err(|_| "invalid chunk hex")?;
-        data = &data[line_end + 2..];
-        if size == 0 {
-            return Ok(out);
-        }
-        if data.len() < size + 2 {
-            return Err("truncated chunk payload".into());
-        }
-        out.extend_from_slice(&data[..size]);
-        data = &data[size + 2..];
-    }
+    let auth = format!("Bearer {token}");
+    let headers = [
+        ("Authorization", auth.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+    post_bytes(
+        &ep.inner,
+        Some(&full_path),
+        &headers,
+        &json_bytes,
+        HTTP_REQUEST_TIMEOUT,
+        MAX_HTTP_RESPONSE_BYTES,
+        false,
+    )
+    .await
 }
 
 #[cfg(test)]
