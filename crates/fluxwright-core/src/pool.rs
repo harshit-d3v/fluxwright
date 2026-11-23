@@ -2653,6 +2653,16 @@ impl PageLease {
             .await?)
     }
 
+    /// Alias for [`Self::aria_snapshot`].
+    pub async fn snapshot(&self) -> Result<AriaSnapshot> {
+        self.aria_snapshot().await
+    }
+
+    /// Alias for [`Self::aria_snapshot_with`].
+    pub async fn snapshot_with(&self, options: &SnapshotOptions) -> Result<AriaSnapshot> {
+        self.aria_snapshot_with(options).await
+    }
+
     /// Serializes the visible DOM (or a sub-tree matching `selector`) cleanly to Markdown.
     pub async fn markdown(&self) -> Result<String> {
         self.markdown_with(&MarkdownOptions::default()).await

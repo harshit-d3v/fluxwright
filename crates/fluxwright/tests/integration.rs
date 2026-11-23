@@ -3236,9 +3236,209 @@ async fn persistent_profile_reuses_cookies_and_localstorage_across_jobs() {
     let p3 = eng.acquire_job(&JobOptions::default().profile("acct_1")).await.unwrap();
     p3.goto(&format!("{base}/")).await.unwrap();
     assert_eq!(p3.evaluate("localStorage.getItem('fw_theme')").await.unwrap(), "dark");
-    p3.close().await.unwrap();
+    drop(p3);
 
     let _ = std::fs::remove_dir_all(&profiles_dir);
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_diff_and_som_mask_screenshots() {
+    use fluxwright::{
+        decode_png, ImageFormat, ScreenshotAnimations, ScreenshotCaret, ScreenshotOptions,
+        SnapshotOptions,
+    };
+
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            axum::response::Html(concat!(
+                "<!doctype html><style>",
+                "body{margin:0;background:#fff}",
+                "#go{position:fixed;left:10px;top:90px;width:90px;height:32px}",
+                "#in{position:fixed;left:110px;top:90px;width:120px;height:32px}",
+                "#wrap{position:fixed;left:0;top:0;width:200px;height:80px;background:#fff}",
+                "#secret{position:fixed;left:10px;top:10px;width:60px;height:60px;background:#fff}",
+                "#caret-box{position:fixed;left:240px;top:90px;width:120px;height:32px}",
+                "@keyframes pulse{0%{opacity:1}50%{opacity:.2}100%{opacity:1}}",
+                "#anim{position:fixed;left:240px;top:10px;width:40px;height:40px;background:#00f;animation:pulse 1s infinite}",
+                "</style>",
+                "<div id='wrap'><div id='secret'>Secret</div><div id='host'></div></div>",
+                "<button id='go' onclick=\"document.getElementById('out').innerHTML='<button id=added>Added</button>'\">Go</button>",
+                "<input id='in' aria-label='Name' type='text'>",
+                "<input id='caret-box' aria-label='Caret' type='text'>",
+                "<div id='anim'></div>",
+                "<div id='out'>idle</div>",
+                "<script>",
+                "const sh=document.getElementById('host').attachShadow({mode:'open'});",
+                "sh.innerHTML='<div id=shadow-secret style=\"position:fixed;left:100px;top:10px;width:60px;height:60px;background:#fff\">S</div>';",
+                "</script>"
+            ))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let srv_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = engine(1, 1).await;
+    let page = eng
+        .acquire_job(&JobOptions::default().viewport(600, 400))
+        .await
+        .unwrap();
+    page.goto(&format!("{base}/")).await.unwrap();
+
+    // 1. Diff-only snapshot lifecycle: initial -> unchanged -> mutated -> reset.
+    let diff_opts = SnapshotOptions {
+        diff: true,
+        ..Default::default()
+    };
+    let init_snap = page.snapshot_with(&diff_opts).await.unwrap();
+    assert!(!init_snap.is_diff, "{init_snap:?}");
+    assert!(init_snap.changed, "{init_snap:?}");
+    assert!(init_snap.tree.contains("button \"Go\""), "{}", init_snap.tree);
+
+    let same_snap = page.snapshot_with(&diff_opts).await.unwrap();
+    assert!(same_snap.is_diff, "{same_snap:?}");
+    assert!(!same_snap.changed, "{same_snap:?}");
+    assert_eq!(same_snap.tree, "(no changes)");
+    // Live refs stay valid even on unchanged diff responses.
+    let go_ref = same_snap
+        .refs
+        .iter()
+        .find(|r| r.role == "button" && r.name == "Go")
+        .expect("live button ref when unchanged")
+        .clone();
+
+    // 2. Set-of-Marks screenshot (PNG, JPEG, WebP) leaves last_snapshot intact and cleans overlay.
+    let som_png = page
+        .screenshot_with(&ScreenshotOptions {
+            annotate: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(decode_png(&som_png).is_ok());
+    assert_eq!(
+        page.evaluate("document.getElementById('__fluxwright_som_overlay') === null")
+            .await
+            .unwrap(),
+        true
+    );
+    let som_jpeg = page
+        .screenshot_with(&ScreenshotOptions {
+            annotate: true,
+            format: ImageFormat::Jpeg,
+            quality: Some(80),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(som_jpeg.starts_with(&[0xFF, 0xD8]));
+    let som_webp = page
+        .screenshot_with(&ScreenshotOptions {
+            annotate: true,
+            format: ImageFormat::Webp,
+            quality: Some(80),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(som_webp.starts_with(b"RIFF") && &som_webp[8..12] == b"WEBP");
+
+    // Verify annotate: true did NOT clobber cached baseline snapshot.
+    let still_same = page.snapshot_with(&diff_opts).await.unwrap();
+    assert!(still_same.is_diff);
+    assert!(!still_same.changed);
+    assert_eq!(still_same.tree, "(no changes)");
+
+    // Clicking live ref mutates DOM, producing a compact diff on next diff: true snapshot.
+    page.click(format!("@{}", go_ref.id)).await.unwrap();
+    let changed_snap = page.aria_snapshot_with(&diff_opts).await.unwrap();
+    assert!(changed_snap.is_diff, "{changed_snap:?}");
+    assert!(changed_snap.changed, "{changed_snap:?}");
+    assert!(changed_snap.tree.contains("+ "), "{}", changed_snap.tree);
+    assert!(
+        changed_snap.tree.contains("button \"Added\""),
+        "{}",
+        changed_snap.tree
+    );
+
+    // Explicit diff: false resets baseline.
+    let full_snap = page.snapshot().await.unwrap();
+    assert!(!full_snap.is_diff);
+    assert!(full_snap.changed);
+    let after_reset = page.snapshot_with(&diff_opts).await.unwrap();
+    assert!(after_reset.is_diff);
+    assert!(!after_reset.changed);
+    assert_eq!(after_reset.tree, "(no changes)");
+
+    // 3. Screenshot masking (including open Shadow DOM), animations: disabled, caret: hide.
+    page.click("#caret-box").await.unwrap();
+    let masked_png = page
+        .screenshot_with(&ScreenshotOptions {
+            mask: vec!["#secret".into(), "#shadow-secret".into()],
+            mask_color: Some("#00FF00".into()),
+            animations: Some(ScreenshotAnimations::Disabled),
+            caret: Some(ScreenshotCaret::Hide),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let decoded = decode_png(&masked_png).unwrap();
+    assert_eq!(decoded.get_pixel(40, 40).0, [0, 255, 0, 255]);
+    assert_eq!(decoded.get_pixel(130, 40).0, [0, 255, 0, 255]);
+    assert_eq!(
+        page.evaluate(
+            "!document.getElementById('__fluxwright_mask_overlay') && !document.getElementById('__fluxwright_screenshot_style')"
+        )
+        .await
+        .unwrap(),
+        true
+    );
+
+    // Locator element screenshot with mask also colors masked element and cleans up overlay.
+    let elem_masked = page
+        .locator("#wrap")
+        .screenshot_with(&ScreenshotOptions {
+            mask: vec!["#secret".into()],
+            mask_color: Some("#FF0000".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let elem_img = decode_png(&elem_masked).unwrap();
+    assert_eq!(elem_img.get_pixel(40, 40).0, [255, 0, 0, 255]);
+    assert_eq!(
+        page.evaluate("document.getElementById('__fluxwright_mask_overlay') === null")
+            .await
+            .unwrap(),
+        true
+    );
+
+    // Reject invalid mask_color upfront.
+    let bad_color = page
+        .screenshot_with(&ScreenshotOptions {
+            mask: vec!["#secret".into()],
+            mask_color: Some("red; background:url(x)".into()),
+            ..Default::default()
+        })
+        .await
+        .expect_err("invalid mask_color must error");
+    assert!(bad_color.to_string().contains("mask_color"), "{bad_color}");
+
+    // Empty about:blank handles annotate: true cleanly without crashing.
+    page.goto("about:blank").await.unwrap();
+    let blank_som = page
+        .screenshot_with(&ScreenshotOptions {
+            annotate: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(decode_png(&blank_som).is_ok());
+
+    page.close().await.unwrap();
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
     srv_task.abort();
 }

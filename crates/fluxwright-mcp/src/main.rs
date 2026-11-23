@@ -127,6 +127,8 @@ struct SnapshotArgs {
     max_depth: Option<usize>,
     #[schemars(description = "Maximum nodes to emit between 1 and 5000 (default 1500)")]
     max_nodes: Option<usize>,
+    #[schemars(description = "Return a compact line-level diff against the previous snapshot on this tab (default false)")]
+    diff: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
@@ -237,6 +239,8 @@ struct EvalArgs {
 struct ScreenshotArgs {
     #[schemars(description = "Capture the full scrollable page instead of just the viewport (default false)")]
     full_page: Option<bool>,
+    #[schemars(description = "Overlay Set-of-Marks @eN labels on interactive elements before capture (default false)")]
+    annotate: Option<bool>,
 }
 
 impl FluxwrightMcp {
@@ -665,7 +669,7 @@ impl FluxwrightMcp {
         }
     }
 
-    #[tool(description = "Capture a compact ARIA accessibility tree with short @eN element refs for click/fill/hover/select.")]
+    #[tool(description = "Capture a compact ARIA accessibility tree with short @eN element refs for click/fill/hover/select (set diff=true for incremental changes).")]
     async fn snapshot(
         &self,
         Parameters(args): Parameters<SnapshotArgs>,
@@ -680,6 +684,7 @@ impl FluxwrightMcp {
             interactive_only: args.interactive_only.unwrap_or(false),
             compact: args.compact.unwrap_or(true),
             max_depth: args.max_depth,
+            diff: args.diff.unwrap_or(false),
             ..Default::default()
         };
         if let Some(limit) = args.max_nodes {
@@ -696,8 +701,10 @@ impl FluxwrightMcp {
         let url = tab.page.url();
         let title = tab.page.title().await.unwrap_or_default();
         let mut out = format!(
-            "url: {url}\ntitle: {title}\nrefs: {}\n\n{}",
+            "url: {url}\ntitle: {title}\nrefs: {}\ndiff: {}\nchanged: {}\n\n{}",
             snap.refs.len(),
+            snap.is_diff,
+            snap.changed,
             snap.tree
         );
         if snap.truncated {
@@ -1044,13 +1051,14 @@ impl FluxwrightMcp {
         }
     }
 
-    #[tool(description = "Take a PNG screenshot of the active tab (viewport by default, or full_page=true).")]
+    #[tool(description = "Take a PNG screenshot of the active tab (viewport by default, or full_page=true; annotate=true overlays @eN labels).")]
     async fn screenshot(
         &self,
-        Parameters(ScreenshotArgs { full_page }): Parameters<ScreenshotArgs>,
+        Parameters(ScreenshotArgs { full_page, annotate }): Parameters<ScreenshotArgs>,
     ) -> Result<CallToolResult, McpError> {
         let opts = ScreenshotOptions {
             full_page: full_page.unwrap_or(false),
+            annotate: annotate.unwrap_or(false),
             ..Default::default()
         };
         let tab = match self.active_tab().await {
@@ -1610,6 +1618,14 @@ mod tests {
         assert!(serde_json::from_str::<ConsoleArgs>("{}").is_ok());
         assert!(serde_json::from_str::<NetworkArgs>("{}").is_ok());
         assert!(serde_json::from_str::<ScreenshotArgs>("{}").is_ok());
+
+        let snap: SnapshotArgs = serde_json::from_str(r#"{"diff":true,"interactive_only":true}"#).unwrap();
+        assert_eq!(snap.diff, Some(true));
+        assert_eq!(snap.interactive_only, Some(true));
+
+        let shot: ScreenshotArgs = serde_json::from_str(r#"{"full_page":true,"annotate":true}"#).unwrap();
+        assert_eq!(shot.full_page, Some(true));
+        assert_eq!(shot.annotate, Some(true));
     }
 
     #[test]

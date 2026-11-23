@@ -5,7 +5,7 @@
 //   label=... and placeholder=... (matched like text=)   testid="id" (data-testid, exact)
 // Parts joined by >> narrow the match: each part is searched inside the previous matches, or is
 // nth=N (0-based, negative from the end) or has-text="Foo"i (keeps matches containing the text).
-// Modes: attached | visible | click | point | box | rect | element | clear | changed | focus | blur | scroll | check_state | select_options | check_file_input | set_files.
+// Modes: attached | visible | click | point | box | rect | rects | element | clear | changed | focus | blur | scroll | check_state | select_options | check_file_input | set_files.
 ((sel, mode, arg, refEl) => {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const box = (el) => el.getBoundingClientRect();
@@ -652,7 +652,11 @@
 
   let matches;
   const strict = !!(arg && arg.strict);
-  const bulk = mode === 'count' || mode === 'all_text_contents' || mode === 'all_inner_texts';
+  const bulk =
+    mode === 'count' ||
+    mode === 'all_text_contents' ||
+    mode === 'all_inner_texts' ||
+    mode === 'rects';
   try {
     matches = [...new Set(findAll(sel, document, !strict && !bulk))];
   } catch (e) {
@@ -662,6 +666,17 @@
   if (mode === 'all_text_contents') return { ok: true, texts: matches.map((e) => e.textContent ?? '') };
   if (mode === 'all_inner_texts') {
     return { ok: true, texts: matches.map((e) => (e instanceof HTMLElement ? e.innerText : e.textContent) ?? '') };
+  }
+  if (mode === 'rects') {
+    const rects = [];
+    for (const el of matches) {
+      if (!el || !el.isConnected || !visible(el)) continue;
+      const r = box(el);
+      if (r.width > 0 && r.height > 0) {
+        rects.push({ x: r.x, y: r.y, width: r.width, height: r.height });
+      }
+    }
+    return { ok: true, rects };
   }
   if (strict && matches.length > 1) {
     return { ok: false, fatal: true, reason: strictViolation(sel, matches) };

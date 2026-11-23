@@ -3,7 +3,9 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use fluxwright_cdp::Clip;
+use fluxwright_cdp::{
+    validate_mask_color, Clip, ScreenshotCaret, FREEZE_ANIMATIONS_CSS, HIDE_CARET_CSS,
+};
 
 use crate::error::{Error, Result};
 
@@ -38,6 +40,12 @@ pub struct ToHaveScreenshotOptions {
     pub omit_background: bool,
     /// Optional clip rectangle (page screenshots only).
     pub clip: Option<Clip>,
+    /// Selectors for elements to cover with solid colored mask boxes.
+    pub mask: Vec<String>,
+    /// CSS color for mask overlays (default `#FF00FF`).
+    pub mask_color: Option<String>,
+    /// Text caret mode during capture (`Hide` or `Initial`).
+    pub caret: Option<ScreenshotCaret>,
 }
 
 impl Default for ToHaveScreenshotOptions {
@@ -51,6 +59,9 @@ impl Default for ToHaveScreenshotOptions {
             full_page: false,
             omit_background: false,
             clip: None,
+            mask: Vec::new(),
+            mask_color: None,
+            caret: None,
         }
     }
 }
@@ -96,6 +107,25 @@ impl ToHaveScreenshotOptions {
         self
     }
 
+    pub fn mask<I, S>(mut self, selectors: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.mask = selectors.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn mask_color(mut self, color: impl Into<String>) -> Self {
+        self.mask_color = Some(color.into());
+        self
+    }
+
+    pub fn caret(mut self, caret: ScreenshotCaret) -> Self {
+        self.caret = Some(caret);
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.threshold.is_finite() || !(0.0..=1.0).contains(&self.threshold) {
             return Err(Error::Other(format!(
@@ -109,6 +139,16 @@ impl ToHaveScreenshotOptions {
                     "to_have_screenshot: max_diff_pixel_ratio must be in 0.0..=1.0, got {ratio}"
                 )));
             }
+        }
+        for sel in &self.mask {
+            if sel.trim().is_empty() {
+                return Err(Error::Other(
+                    "to_have_screenshot: mask selector must not be empty".into(),
+                ));
+            }
+        }
+        if let Some(ref color) = self.mask_color {
+            validate_mask_color(color)?;
         }
         Ok(())
     }
@@ -149,29 +189,47 @@ impl VisualDiff {
     }
 }
 
-pub(crate) const DISABLE_ANIMATIONS_PAGE_JS: &str = r#"(() => {
-    if (!document.getElementById('__fw_disable_animations')) {
+fn animation_freeze_css(hide_caret: bool) -> String {
+    if hide_caret {
+        format!("{FREEZE_ANIMATIONS_CSS} {HIDE_CARET_CSS}")
+    } else {
+        FREEZE_ANIMATIONS_CSS.to_string()
+    }
+}
+
+pub(crate) fn disable_animations_page_js(hide_caret: bool) -> String {
+    let css = serde_json::to_string(&animation_freeze_css(hide_caret)).unwrap();
+    format!(
+        r#"(() => {{
+    if (!document.getElementById('__fw_disable_animations')) {{
         const style = document.createElement('style');
         style.id = '__fw_disable_animations';
-        style.textContent = '*, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; animation-play-state: paused !important; transition-duration: 0s !important; transition-delay: 0s !important; scroll-behavior: auto !important; caret-color: transparent !important; }';
+        style.textContent = {css};
         (document.head || document.documentElement).appendChild(style);
-    }
-})()"#;
+    }}
+}})()"#
+    )
+}
 
 pub(crate) const RESTORE_ANIMATIONS_PAGE_JS: &str = r#"(() => {
     const el = document.getElementById('__fw_disable_animations');
     if (el) el.remove();
 })()"#;
 
-pub(crate) const DISABLE_ANIMATIONS_LOCATOR_JS: &str = r#"(el) => {
+pub(crate) fn disable_animations_locator_js(hide_caret: bool) -> String {
+    let css = serde_json::to_string(&animation_freeze_css(hide_caret)).unwrap();
+    format!(
+        r#"(el) => {{
     const doc = (el && el.ownerDocument) || document;
-    if (!doc.getElementById('__fw_disable_animations')) {
+    if (!doc.getElementById('__fw_disable_animations')) {{
         const style = doc.createElement('style');
         style.id = '__fw_disable_animations';
-        style.textContent = '*, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; animation-play-state: paused !important; transition-duration: 0s !important; transition-delay: 0s !important; scroll-behavior: auto !important; caret-color: transparent !important; }';
+        style.textContent = {css};
         (doc.head || doc.documentElement).appendChild(style);
-    }
-}"#;
+    }}
+}}"#
+    )
+}
 
 pub(crate) const RESTORE_ANIMATIONS_LOCATOR_JS: &str = r#"(el) => {
     const doc = (el && el.ownerDocument) || document;

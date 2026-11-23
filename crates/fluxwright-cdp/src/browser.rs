@@ -1010,6 +1010,7 @@ impl CdpBrowser {
                                             url: url_tx,
                                             net,
                                             ax_refs: Default::default(),
+                                            last_snapshot: Default::default(),
                                             early_log_events: Arc::new(std::sync::Mutex::new(
                                                 early_log_events,
                                             )),
@@ -1735,6 +1736,7 @@ impl CdpBrowser {
             url,
             net,
             ax_refs: Default::default(),
+            last_snapshot: Default::default(),
             early_log_events: Default::default(),
         })
     }

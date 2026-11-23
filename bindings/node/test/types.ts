@@ -33,20 +33,39 @@ export async function typed(): Promise<void> {
   const jpeg: Buffer = await page.screenshot({ type: 'jpeg', quality: 80, clip: { x: 0, y: 0, width: 10, height: 10 } })
   const pdf: Buffer = await page.pdf({ format: 'A4', margin: { top: '1cm', left: 20 }, printBackground: true, path: 'p.pdf' })
   const snap = await page.ariaSnapshot()
-  const snapInteractive = await page.ariaSnapshot({ interactiveOnly: true, compact: true, maxDepth: 4, maxNodes: 500 })
-  const snapCheck: [string, string, string, string, boolean] = [
+  const snapInteractive = await page.ariaSnapshot({ interactiveOnly: true, compact: true, maxDepth: 4, maxNodes: 500, diff: true })
+  const snapCheck: [string, string, string, string, boolean, boolean, boolean] = [
     snap.tree,
     snapInteractive.refs[0].id,
     snapInteractive.refs[0].role,
     snapInteractive.refs[0].name,
     snap.truncated,
+    snap.isDiff,
+    snap.changed,
   ]
+  const somShot: Buffer = await page.screenshot({
+    annotate: true,
+    animations: 'disabled',
+    caret: 'hide',
+    mask: [page.locator('#secret'), '.ad'],
+    maskColor: '#00FF00',
+  })
+  const locMaskedShot: Buffer = await page.locator('#card').screenshot({
+    mask: [page.locator('#inner'), '.badge'],
+    maskColor: 'rgb(0, 0, 0)',
+    animations: 'allow',
+    caret: 'initial',
+  })
+  // @ts-expect-error invalid caret mode
+  await page.screenshot({ caret: 'visible' })
+  // @ts-expect-error invalid mask element
+  await page.screenshot({ mask: [123] })
   const md1: string = await page.markdown()
   const md2: string = await page.markdown({ selector: 'main', mainContentOnly: true, includeLinks: false, includeImages: true })
   // @ts-expect-error webp is not a screenshot type
   await page.screenshot({ type: 'webp' })
   await fluxwright.chromium.launch()
-  void [title, sum, upper, expression, wrong, png, jpeg, pdf, snapCheck, md1, md2]
+  void [title, sum, upper, expression, wrong, png, jpeg, somShot, locMaskedShot, pdf, snapCheck, md1, md2]
 
   const state: StorageState = await page.storageState({ path: 'state.json' })
   await browser.newPage({ storageState: state, locale: 'de-DE', colorScheme: 'dark', permissions: ['geolocation'] })
@@ -308,6 +327,9 @@ export async function typed(): Promise<void> {
     maxDiffPixels: 5,
     maxDiffPixelRatio: 0.01,
     animations: 'disabled',
+    caret: 'hide',
+    mask: [page.locator('#dot'), '.ad'],
+    maskColor: '#ff00ff',
     timeout: 2000,
     update: true,
     omitBackground: false,
@@ -318,6 +340,10 @@ export async function typed(): Promise<void> {
   await locAssert.toHaveScreenshot('item.png', { fullPage: true })
   // @ts-expect-error invalid animations mode
   await pageAssert.toHaveScreenshot('page.png', { animations: 'paused' })
+  // @ts-expect-error invalid caret mode
+  await pageAssert.toHaveScreenshot('page.png', { caret: 'visible' })
+  // @ts-expect-error invalid mask item
+  await pageAssert.toHaveScreenshot('page.png', { mask: [123] })
   await vidCtx.close()
 
   await context.close()

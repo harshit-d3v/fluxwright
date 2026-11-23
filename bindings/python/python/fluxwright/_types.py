@@ -78,3 +78,5 @@ class AriaSnapshot(TypedDict):
     tree: str
     refs: list[AriaRef]
     truncated: bool
+    is_diff: bool
+    changed: bool

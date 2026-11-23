@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::pool::{with_timeout, Locator, PageLease};
 use crate::visual::{
-    artifact_paths, compare_images, decode_png, should_update_snapshots, Animations, RgbaImage,
-    ToHaveScreenshotOptions, DISABLE_ANIMATIONS_LOCATOR_JS, DISABLE_ANIMATIONS_PAGE_JS,
-    RESTORE_ANIMATIONS_LOCATOR_JS, RESTORE_ANIMATIONS_PAGE_JS,
+    artifact_paths, compare_images, decode_png, disable_animations_locator_js,
+    disable_animations_page_js, should_update_snapshots, Animations, RgbaImage,
+    ToHaveScreenshotOptions, RESTORE_ANIMATIONS_LOCATOR_JS, RESTORE_ANIMATIONS_PAGE_JS,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -849,19 +849,18 @@ async fn apply_animation_guard(
     page: &PageLease,
     locator: Option<&Locator<'_>>,
     disable: bool,
+    hide_caret: bool,
 ) {
     if !disable || page.is_closed() {
         return;
     }
-    let _ = with_timeout(
-        Some(Duration::from_millis(500)),
-        page.evaluate(DISABLE_ANIMATIONS_PAGE_JS),
-    )
-    .await;
+    let page_js = disable_animations_page_js(hide_caret);
+    let _ = with_timeout(Some(Duration::from_millis(500)), page.evaluate(&page_js)).await;
     if let Some(loc) = locator.filter(|l| !l.selector().frames.is_empty()) {
+        let loc_js = disable_animations_locator_js(hide_caret);
         let _ = with_timeout(
             Some(Duration::from_millis(500)),
-            loc.evaluate(DISABLE_ANIMATIONS_LOCATOR_JS, None),
+            loc.evaluate(&loc_js, None),
         )
         .await;
     }
@@ -898,9 +897,19 @@ async fn capture_png_shot(
     if page.is_closed() {
         return Err(Error::Other("page is closed".into()));
     }
+    let caret = if options.animations == Animations::Allow
+        && options.caret == Some(fluxwright_cdp::ScreenshotCaret::Hide)
+    {
+        Some(fluxwright_cdp::ScreenshotCaret::Hide)
+    } else {
+        None
+    };
     if let Some(loc) = locator {
         let shot_opts = fluxwright_cdp::ScreenshotOptions {
             omit_background: options.omit_background,
+            mask: options.mask.clone(),
+            mask_color: options.mask_color.clone(),
+            caret,
             ..Default::default()
         };
         with_timeout(Some(limit), loc.screenshot_with(&shot_opts)).await
@@ -909,6 +918,9 @@ async fn capture_png_shot(
             full_page: options.full_page,
             clip: options.clip,
             omit_background: options.omit_background,
+            mask: options.mask.clone(),
+            mask_color: options.mask_color.clone(),
+            caret,
             ..Default::default()
         };
         with_timeout(Some(limit), page.screenshot_with(&shot_opts)).await
@@ -952,6 +964,7 @@ async fn run_to_have_screenshot(
     }
 
     let disable_animations = options.animations == Animations::Disabled;
+    let hide_caret = options.caret != Some(fluxwright_cdp::ScreenshotCaret::Initial);
     let res = Box::pin(run_to_have_screenshot_inner(
         target,
         path,
@@ -961,6 +974,7 @@ async fn run_to_have_screenshot(
         page,
         locator,
         disable_animations,
+        hide_caret,
     ))
     .await;
     Box::pin(clear_animation_guard(page, locator, disable_animations)).await;
@@ -977,6 +991,7 @@ async fn run_to_have_screenshot_inner(
     page: &PageLease,
     locator: Option<&Locator<'_>>,
     disable_animations: bool,
+    hide_caret: bool,
 ) -> Result<()> {
     let (baseline_path, actual_path, diff_path) = artifact_paths(path)?;
     if page.is_closed() {
@@ -992,7 +1007,7 @@ async fn run_to_have_screenshot_inner(
         let mut last_err: Option<String>;
         let mut attempts = 0usize;
         loop {
-            Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
+            Box::pin(apply_animation_guard(page, locator, disable_animations, hide_caret)).await;
             let remaining = timeout.saturating_sub(start.elapsed());
             match Box::pin(capture_png_shot(page, locator, options, shot_limit(remaining))).await {
                 Ok(bytes) => {
@@ -1064,7 +1079,7 @@ async fn run_to_have_screenshot_inner(
     let baseline_bytes = match baseline_read {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
+            Box::pin(apply_animation_guard(page, locator, disable_animations, hide_caret)).await;
             if let Ok(actual) = Box::pin(capture_png_shot(page, locator, options, Duration::from_secs(2))).await {
                 let _ = write_file_mkdir(actual_path.clone(), actual).await;
             }
@@ -1088,7 +1103,7 @@ async fn run_to_have_screenshot_inner(
     let mut last_err: Option<String>;
 
     loop {
-        Box::pin(apply_animation_guard(page, locator, disable_animations)).await;
+        Box::pin(apply_animation_guard(page, locator, disable_animations, hide_caret)).await;
         let remaining = timeout.saturating_sub(start.elapsed());
         match Box::pin(capture_png_shot(page, locator, options, shot_limit(remaining))).await {
             Ok(bytes) => {

@@ -563,6 +563,94 @@ const RESTORE_ANIMATIONS_LOCATOR_FN = (el) => {
   if (s) s.remove()
 }
 
+function validateMaskColor(method, color) {
+  if (typeof color !== 'string') {
+    throw new TypeError(`${method}: maskColor must be a CSS color string`)
+  }
+  if (/[\x00-\x1f\x7f]/.test(color)) {
+    throw new TypeError(`${method}: maskColor must not contain control characters`)
+  }
+  const trimmed = color.trim()
+  if (!trimmed || trimmed.length > 128) {
+    throw new TypeError(`${method}: maskColor must be a 1-128 character CSS color`)
+  }
+  if (/[;:{}"'<>\\]|\/\*|\*\/|\/\//.test(trimmed)) {
+    throw new TypeError(`${method}: invalid maskColor ${JSON.stringify(color)}`)
+  }
+  if (trimmed.startsWith('#')) {
+    if (/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(trimmed)) {
+      return trimmed
+    }
+    throw new TypeError(`${method}: invalid hex maskColor ${JSON.stringify(color)}`)
+  }
+  const fnMatch = /^([a-zA-Z-]+)\(([\s\S]*)\)$/.exec(trimmed)
+  if (fnMatch) {
+    const fname = fnMatch[1].toLowerCase()
+    const inner = fnMatch[2]
+    const allowedFns = new Set([
+      'rgb',
+      'rgba',
+      'hsl',
+      'hsla',
+      'hwb',
+      'lab',
+      'lch',
+      'oklab',
+      'oklch',
+      'color',
+      'color-mix',
+    ])
+    if (!allowedFns.has(fname) || !inner.trim() || /(?:url|expression|var)\s*\(/i.test(inner)) {
+      throw new TypeError(`${method}: invalid maskColor ${JSON.stringify(color)}`)
+    }
+    let depth = 1
+    for (const ch of inner) {
+      if (ch === '(') {
+        if (fname !== 'color-mix') throw new TypeError(`${method}: invalid maskColor ${JSON.stringify(color)}`)
+        depth++
+      } else if (ch === ')') {
+        depth--
+        if (depth < 1) throw new TypeError(`${method}: invalid maskColor ${JSON.stringify(color)}`)
+      } else if (!/[a-zA-Z0-9 ,.%+\-/#]/.test(ch)) {
+        throw new TypeError(`${method}: invalid maskColor ${JSON.stringify(color)}`)
+      }
+    }
+    if (depth !== 1) throw new TypeError(`${method}: invalid maskColor ${JSON.stringify(color)}`)
+    return trimmed
+  }
+  if (/^[a-zA-Z]+$/.test(trimmed)) return trimmed
+  throw new TypeError(`${method}: invalid maskColor ${JSON.stringify(color)}`)
+}
+
+function resolveMaskSelectors(method, mask, page, ownerPageFn) {
+  if (!Array.isArray(mask)) {
+    throw new TypeError(`${method}: mask must be an array of Locator objects or selector strings`)
+  }
+  const resolved = []
+  for (const entry of mask) {
+    if (typeof entry === 'string') {
+      if (!entry.trim()) {
+        throw new TypeError(`${method}: mask selector must not be empty`)
+      }
+      resolved.push(entry)
+    } else if (entry && typeof entry._frames === 'function' && typeof entry._query === 'function') {
+      if (typeof ownerPageFn === 'function') {
+        const locPage = ownerPageFn(entry)
+        if (page && locPage && locPage !== page) {
+          throw new TypeError(`${method}: mask locator must belong to the same page`)
+        }
+      }
+      if (entry._frames().length > 0) {
+        throw new TypeError(`${method}: mask locators inside frameLocator are not supported`)
+      }
+      resolved.push(entry._query())
+    } else {
+      throw new TypeError(`${method}: mask entries must be Locator objects or selector strings`)
+    }
+  }
+  return resolved
+}
+
 module.exports = {
   decodePng,
   encodePng,
@@ -570,6 +658,8 @@ module.exports = {
   isWithinTolerance,
   artifactPaths,
   shouldUpdateSnapshots,
+  validateMaskColor,
+  resolveMaskSelectors,
   DISABLE_ANIMATIONS_PAGE_FN,
   RESTORE_ANIMATIONS_PAGE_FN,
   DISABLE_ANIMATIONS_LOCATOR_FN,

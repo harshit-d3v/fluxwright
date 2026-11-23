@@ -42,7 +42,10 @@ pub use page::{
     url_glob_matches, BoundingBox, CdpPage, DownloadQueue, ResourceType, RoleOptions,
     ScriptTagOptions, Selector, StyleTagOptions, WaitPolling, WaitState, WaitUntil, FRAME_ID_PREFIX,
 };
-pub use render::{MAX_PDF_BYTES, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotOptions};
+pub use render::{
+    validate_mask_color, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotAnimations,
+    ScreenshotCaret, ScreenshotOptions, FREEZE_ANIMATIONS_CSS, HIDE_CARET_CSS, MAX_PDF_BYTES,
+};
 pub use route::{Fulfill, InterceptedRequest, Overrides, RouteFetchHandle};
 pub use snapshot::{AriaRef, AriaSnapshot, MarkdownOptions, SnapshotOptions};
 pub use worker::{Worker, WorkerEvent};

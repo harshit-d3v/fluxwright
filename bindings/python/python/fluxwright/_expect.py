@@ -30,6 +30,7 @@ from ._visual import (
     compare_images,
     decode_png,
     should_update_snapshots,
+    validate_mask_color,
 )
 
 if TYPE_CHECKING:
@@ -701,6 +702,9 @@ class LocatorAssertions:
         max_diff_pixels: int | None = None,
         max_diff_pixel_ratio: float | None = None,
         animations: Literal["disabled", "allow"] | None = None,
+        caret: Literal["hide", "initial"] | None = None,
+        mask: Sequence[Any] | None = None,
+        mask_color: str | None = None,
         timeout: float | None = None,
         omit_background: bool | None = None,
         update: bool | None = None,
@@ -711,6 +715,9 @@ class LocatorAssertions:
             max_diff_pixels=max_diff_pixels,
             max_diff_pixel_ratio=max_diff_pixel_ratio,
             animations=animations,
+            caret=caret,
+            mask=mask,
+            mask_color=mask_color,
             timeout=timeout,
             default_timeout=self._default_timeout,
             omit_background=omit_background,
@@ -740,6 +747,20 @@ class LocatorAssertions:
                 with suppress(Exception):
                     await self._raw_locator.evaluate(RESTORE_ANIMATIONS_LOCATOR_JS, None, timeout=250.0)
 
+        def _capture_loc(limit_ms: float) -> Awaitable[bytes]:
+            extra: dict[str, Any] = {}
+            if opts["mask"] is not None:
+                extra["mask"] = opts["mask"]
+            if opts["mask_color"] is not None:
+                extra["mask_color"] = opts["mask_color"]
+            if opts["animations"] == "allow" and opts["caret"] is not None:
+                extra["caret"] = opts["caret"]
+            return self._raw_locator.screenshot(
+                omit_background=opts["omit_background"],
+                timeout=limit_ms,
+                **extra,
+            )
+
         await self._run_checked(
             _run_to_have_screenshot(
                 target_label=self._target(),
@@ -748,10 +769,7 @@ class LocatorAssertions:
                 is_closed=_is_closed,
                 disable_animations=_disable,
                 restore_animations=_restore,
-                capture_shot=lambda limit_ms: self._raw_locator.screenshot(
-                    omit_background=opts["omit_background"],
-                    timeout=limit_ms,
-                ),
+                capture_shot=_capture_loc,
             )
         )
 
@@ -861,6 +879,9 @@ class PageAssertions:
         max_diff_pixels: int | None = None,
         max_diff_pixel_ratio: float | None = None,
         animations: Literal["disabled", "allow"] | None = None,
+        caret: Literal["hide", "initial"] | None = None,
+        mask: Sequence[Any] | None = None,
+        mask_color: str | None = None,
         timeout: float | None = None,
         full_page: bool | None = None,
         omit_background: bool | None = None,
@@ -873,6 +894,9 @@ class PageAssertions:
             max_diff_pixels=max_diff_pixels,
             max_diff_pixel_ratio=max_diff_pixel_ratio,
             animations=animations,
+            caret=caret,
+            mask=mask,
+            mask_color=mask_color,
             timeout=timeout,
             default_timeout=self._default_timeout,
             omit_background=omit_background,
@@ -898,6 +922,13 @@ class PageAssertions:
                     await self._page.evaluate(RESTORE_ANIMATIONS_PAGE_JS)
 
         def _capture(limit_ms: float) -> Awaitable[bytes]:
+            extra: dict[str, Any] = {}
+            if opts["mask"] is not None:
+                extra["mask"] = opts["mask"]
+            if opts["mask_color"] is not None:
+                extra["mask_color"] = opts["mask_color"]
+            if opts["animations"] == "allow" and opts["caret"] is not None:
+                extra["caret"] = opts["caret"]
             if is_native_page:
                 return _native.Page.screenshot(
                     self._page,
@@ -905,12 +936,14 @@ class PageAssertions:
                     clip=opts["clip"],
                     omit_background=opts["omit_background"],
                     timeout=limit_ms,
+                    **extra,
                 )
             return self._page.screenshot(
                 full_page=opts["full_page"],
                 clip=opts["clip"],
                 omit_background=opts["omit_background"],
                 timeout=limit_ms,
+                **extra,
             )
 
         await self._run_checked(
@@ -969,6 +1002,9 @@ def _validate_screenshot_options(
     full_page: bool | None,
     clip: FloatRect | None,
     update: bool | None,
+    mask: Sequence[Any] | None = None,
+    mask_color: str | None = None,
+    caret: str | None = None,
 ) -> dict[str, Any]:
     timeout_ms = _validate_timeout(timeout, default_timeout)
     if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float))):
@@ -992,6 +1028,23 @@ def _validate_screenshot_options(
     anim = "disabled" if animations is None else animations
     if anim not in ("disabled", "allow"):
         raise ValueError(f"{method}: animations must be 'disabled' or 'allow', not {animations!r}")
+    if caret is not None and caret not in ("hide", "initial"):
+        raise ValueError(f"{method}: caret must be 'hide' or 'initial', not {caret!r}")
+    validated_mask: list[Any] | None = None
+    if mask is not None:
+        if isinstance(mask, (str, bytes)) or not isinstance(mask, Sequence):
+            raise TypeError(f"{method}: mask must be a sequence of Locator or str")
+        validated_mask = []
+        for entry in mask:
+            if isinstance(entry, str):
+                if not entry.strip():
+                    raise ValueError(f"{method}: mask selector must not be empty")
+                validated_mask.append(entry)
+            elif hasattr(entry, "_impl") or (_native is not None and isinstance(entry, _native.Locator)):
+                validated_mask.append(entry)
+            else:
+                raise TypeError(f"{method}: mask entries must be Locator or str, got {type(entry).__name__}")
+    validated_mask_color = validate_mask_color(method, mask_color) if mask_color is not None else None
     for opt_name, opt_val in (
         ("omit_background", omit_background),
         ("full_page", full_page),
@@ -1006,6 +1059,9 @@ def _validate_screenshot_options(
         "max_diff_pixels": max_diff_pixels,
         "max_diff_pixel_ratio": float(max_diff_pixel_ratio) if max_diff_pixel_ratio is not None else None,
         "animations": anim,
+        "caret": caret,
+        "mask": validated_mask,
+        "mask_color": validated_mask_color,
         "omit_background": False if omit_background is None else omit_background,
         "full_page": False if full_page is None else full_page,
         "clip": validated_clip,
@@ -1350,6 +1406,9 @@ class SyncLocatorAssertions:
         max_diff_pixels: int | None = None,
         max_diff_pixel_ratio: float | None = None,
         animations: Literal["disabled", "allow"] | None = None,
+        caret: Literal["hide", "initial"] | None = None,
+        mask: Sequence[Any] | None = None,
+        mask_color: str | None = None,
         timeout: float | None = None,
         omit_background: bool | None = None,
         update: bool | None = None,
@@ -1361,6 +1420,9 @@ class SyncLocatorAssertions:
             max_diff_pixels=max_diff_pixels,
             max_diff_pixel_ratio=max_diff_pixel_ratio,
             animations=animations,
+            caret=caret,
+            mask=mask,
+            mask_color=mask_color,
             timeout=timeout,
             omit_background=omit_background,
             update=update,
@@ -1414,6 +1476,9 @@ class SyncPageAssertions:
         max_diff_pixels: int | None = None,
         max_diff_pixel_ratio: float | None = None,
         animations: Literal["disabled", "allow"] | None = None,
+        caret: Literal["hide", "initial"] | None = None,
+        mask: Sequence[Any] | None = None,
+        mask_color: str | None = None,
         timeout: float | None = None,
         full_page: bool | None = None,
         omit_background: bool | None = None,
@@ -1427,6 +1492,9 @@ class SyncPageAssertions:
             max_diff_pixels=max_diff_pixels,
             max_diff_pixel_ratio=max_diff_pixel_ratio,
             animations=animations,
+            caret=caret,
+            mask=mask,
+            mask_color=mask_color,
             timeout=timeout,
             full_page=full_page,
             omit_background=omit_background,

@@ -192,6 +192,7 @@ class Page:
         compact: bool | None = None,
         max_depth: int | None = None,
         max_nodes: int | None = None,
+        diff: bool | None = None,
     ) -> Awaitable[AriaSnapshot]: ...
     def markdown(
         self,
@@ -386,6 +387,11 @@ class Page:
         quality: int | None = None,
         clip: FloatRect | None = None,
         omit_background: bool | None = None,
+        annotate: bool | None = None,
+        mask: Sequence[Any] | None = None,
+        mask_color: str | None = None,
+        animations: Literal["allow", "disabled"] | None = None,
+        caret: Literal["hide", "initial"] | None = None,
         timeout: float | None = None,
     ) -> Awaitable[bytes]:
         """PNG or JPEG; with ``path``, also written there (extension picks type if omitted)."""
@@ -672,6 +678,11 @@ class Locator:
         type: Literal["png", "jpeg"] | None = None,
         quality: int | None = None,
         omit_background: bool | None = None,
+        annotate: bool | None = None,
+        mask: Sequence[Any] | None = None,
+        mask_color: str | None = None,
+        animations: Literal["allow", "disabled"] | None = None,
+        caret: Literal["hide", "initial"] | None = None,
         timeout: float | None = None,
     ) -> Awaitable[bytes]:
         """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""

@@ -336,6 +336,8 @@ export interface AriaSnapshot {
   tree: string
   refs: Array<AriaRef>
   truncated: boolean
+  isDiff: boolean
+  changed: boolean
 }
 
 export interface AriaSnapshotOptions {
@@ -343,6 +345,7 @@ export interface AriaSnapshotOptions {
   compact?: boolean
   maxDepth?: number
   maxNodes?: number
+  diff?: boolean
 }
 
 export interface BindingCallEvent {
@@ -685,6 +688,16 @@ export interface ScreenshotOptions {
   clip?: BoundingBox
   /** A transparent background instead of the default white one (PNG). */
   omitBackground?: boolean
+  /** Overlay Set-of-Marks `@eN` labels on interactive controls before capture. */
+  annotate?: boolean
+  /** Selectors to cover with colored mask boxes during capture. */
+  mask?: Array<string>
+  /** CSS color for `mask` overlays (default "#FF00FF"). */
+  maskColor?: string
+  /** Whether CSS animations and transitions are allowed or disabled during capture. */
+  animations?: 'allow' | 'disabled'
+  /** Whether the text caret is hidden or left at its initial appearance during capture. */
+  caret?: 'hide' | 'initial'
   /** Milliseconds; 0 for no timeout. Default: the page's or the engine's action timeout. */
   timeout?: number
 }

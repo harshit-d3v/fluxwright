@@ -1628,6 +1628,11 @@ class Locator(_AsyncFinders):
         type: Literal["png", "jpeg"] | None = None,
         quality: int | None = None,
         omit_background: bool | None = None,
+        annotate: bool | None = None,
+        mask: Sequence[Locator | str] | None = None,
+        mask_color: str | None = None,
+        animations: Literal["allow", "disabled"] | None = None,
+        caret: Literal["hide", "initial"] | None = None,
         timeout: float | None = None,
     ) -> bytes:
         """PNG or JPEG of the element, once it is visible and still; with ``path``, also written there."""
@@ -1638,6 +1643,11 @@ class Locator(_AsyncFinders):
                 type=type,
                 quality=quality,
                 omit_background=omit_background,
+                annotate=annotate,
+                mask=mask,
+                mask_color=mask_color,
+                animations=animations,
+                caret=caret,
                 timeout=timeout,
             ),
         )

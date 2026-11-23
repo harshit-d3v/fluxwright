@@ -5,8 +5,8 @@ use base64::Engine;
 use fluxwright::{
     netguard, parse_modifiers, validate_profile_name, CheckOptions, ClickOptions, Clip,
     HoverOptions, ImageFormat, JobOptions, MarkdownOptions, MouseButton, PageLease, PdfMargin,
-    PdfOptions, Priority, ResourcePreset, ResourceType, ScreenshotOptions, SelectEntry,
-    SnapshotOptions, WaitUntil,
+    PdfOptions, Priority, ResourcePreset, ResourceType, ScreenshotAnimations, ScreenshotCaret,
+    ScreenshotOptions, SelectEntry, SnapshotOptions, WaitUntil,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -645,6 +645,8 @@ pub enum Step {
         max_depth: Option<usize>,
         #[serde(default)]
         max_nodes: Option<usize>,
+        #[serde(default)]
+        diff: bool,
     },
     Markdown {
         #[serde(default)]
@@ -671,6 +673,16 @@ pub enum Step {
         clip: Option<ServerClip>,
         #[serde(default)]
         omit_background: bool,
+        #[serde(default)]
+        annotate: bool,
+        #[serde(default)]
+        mask: Vec<String>,
+        #[serde(default)]
+        mask_color: Option<String>,
+        #[serde(default)]
+        animations: Option<ServerScreenshotAnimations>,
+        #[serde(default)]
+        caret: Option<ServerScreenshotCaret>,
     },
     Pdf {
         format: Option<String>,
@@ -826,6 +838,38 @@ fn validate_modifiers(modifiers: &[String]) -> Result<u8, String> {
     parse_modifiers(modifiers).map_err(|e| e.to_string())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerScreenshotAnimations {
+    Allow,
+    Disabled,
+}
+
+impl ServerScreenshotAnimations {
+    fn into_core(self) -> ScreenshotAnimations {
+        match self {
+            Self::Allow => ScreenshotAnimations::Allow,
+            Self::Disabled => ScreenshotAnimations::Disabled,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerScreenshotCaret {
+    Hide,
+    Initial,
+}
+
+impl ServerScreenshotCaret {
+    fn into_core(self) -> ScreenshotCaret {
+        match self {
+            Self::Hide => ScreenshotCaret::Hide,
+            Self::Initial => ScreenshotCaret::Initial,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerImageFormat {
@@ -936,10 +980,21 @@ impl Step {
             quality,
             clip,
             omit_background,
+            annotate,
+            mask,
+            mask_color,
+            animations,
+            caret,
         } = self
         else {
             unreachable!();
         };
+        if mask.len() > 32 {
+            return Err("screenshot: mask must contain at most 32 selectors".into());
+        }
+        for sel in mask {
+            validate_selector(sel)?;
+        }
         Ok(ScreenshotOptions {
             full_page: *full_page,
             format: kind.into_core(),
@@ -951,6 +1006,11 @@ impl Step {
                 height: c.height,
             }),
             omit_background: *omit_background,
+            annotate: *annotate,
+            mask: mask.clone(),
+            mask_color: mask_color.clone(),
+            animations: animations.map(ServerScreenshotAnimations::into_core),
+            caret: caret.map(ServerScreenshotCaret::into_core),
         })
     }
 
@@ -1286,11 +1346,13 @@ impl Step {
                 compact,
                 max_depth,
                 max_nodes,
+                diff,
             } => {
                 let mut opts = SnapshotOptions {
                     interactive_only: *interactive_only,
                     compact: *compact,
                     max_depth: *max_depth,
+                    diff: *diff,
                     ..Default::default()
                 };
                 if let Some(limit) = max_nodes {
@@ -1704,5 +1766,34 @@ mod tests {
         assert_eq!(opts.profile.as_deref(), Some("acct_1-prod"));
         assert!(!opts.persist_profile);
         assert_eq!(opts.proxy_session.as_deref(), Some("sticky-user-42"));
+
+        assert!(serde_json::from_value::<JobRequest>(json!({
+            "steps": [
+                { "action": "snapshot", "diff": true },
+                {
+                    "action": "screenshot",
+                    "annotate": true,
+                    "mask": [".secret", "#token"],
+                    "mask_color": "#00FFAA",
+                    "animations": "disabled",
+                    "caret": "hide"
+                }
+            ]
+        }))
+        .unwrap()
+        .validate()
+        .is_ok());
+
+        for bad_shot in [
+            json!({ "steps": [{ "action": "screenshot", "mask": vec![".a"; 33] }] }),
+            json!({ "steps": [{ "action": "screenshot", "mask": ["  "] }] }),
+            json!({ "steps": [{ "action": "screenshot", "mask_color": "red; background:url(x)" }] }),
+            json!({ "steps": [{ "action": "screenshot", "mask_color": "red\nblue" }] }),
+        ] {
+            let job: JobRequest = serde_json::from_value(bad_shot).unwrap();
+            assert!(job.validate().is_err());
+        }
+        assert!(serde_json::from_value::<Step>(json!({ "action": "screenshot", "animations": "bogus" })).is_err());
+        assert!(serde_json::from_value::<Step>(json!({ "action": "screenshot", "caret": "bogus" })).is_err());
     }
 }

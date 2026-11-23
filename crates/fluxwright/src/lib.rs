@@ -28,7 +28,7 @@ pub use fluxwright_cdp::{
     IndexedDbStore, InterceptedRequest, LaunchOptions, LogEntry, MarkdownOptions, MouseButton,
     NetEvent, NetRequest, NetResponse, OriginStorage, Overrides, PageError, PdfMargin, PdfOptions,
     Proxy, RecordHarOptions, ResourceType, RoleOptions, RouteFetchHandle, RouteFetchOptions,
-    ScreenshotOptions, ScriptTagOptions, SelectEntry, Selector, SnapshotOptions, StorageItem,
-    StorageState, StyleTagOptions, WaitPolling, WaitState, WaitUntil, WebSocketEvent, Worker,
-    WorkerEvent, FRAME_ID_PREFIX,
+    ScreenshotAnimations, ScreenshotCaret, ScreenshotOptions, ScriptTagOptions, SelectEntry,
+    Selector, SnapshotOptions, StorageItem, StorageState, StyleTagOptions, WaitPolling, WaitState,
+    WaitUntil, WebSocketEvent, Worker, WorkerEvent, FRAME_ID_PREFIX,
 };

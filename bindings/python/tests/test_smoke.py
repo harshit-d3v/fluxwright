@@ -320,8 +320,18 @@ async def async_smoke(base: str, tmp: Path) -> None:
             await ui.screenshot(path=tmp / "out.webp")
         with pytest.raises(ValueError, match="JPEG only"):
             await ui.screenshot(type="png", quality=50)
+        with pytest.raises(ValueError, match="animations"):
+            await ui.screenshot(animations="bogus")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="caret"):
+            await ui.screenshot(caret="bogus")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="mask_color"):
+            await ui.screenshot(mask_color="red;bad")
         with pytest.raises(TypeError):
-            await ui.screenshot(animations="disabled")  # type: ignore[call-arg]
+            await ui.screenshot(mask="#secret")  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            await ui.screenshot(mask=[123])  # type: ignore[list-item]
+        with pytest.raises(TypeError):
+            await ui.screenshot(bogus_option=True)  # type: ignore[call-arg]
         with pytest.raises(Error, match="unknown format"):
             await ui.pdf(format="A9")
         with pytest.raises(ValueError):
@@ -2216,4 +2226,137 @@ def test_aria_snapshot_and_markdown():
                 browser.close()
     finally:
         srv.shutdown()
+
+
+def test_snapshot_diff_and_som_mask():
+    from fluxwright._visual import decode_png
+
+    html = (
+        "<!doctype html><style>"
+        "body{margin:0;background:#fff}"
+        "#wrap{position:fixed;left:0;top:0;width:200px;height:80px;background:#fff}"
+        "#secret{position:fixed;left:10px;top:10px;width:60px;height:60px;background:#fff}"
+        "#go{position:fixed;left:10px;top:90px;width:90px;height:32px}"
+        "#caret-box{position:fixed;left:110px;top:90px;width:120px;height:32px}"
+        "@keyframes pulse{0%{opacity:1}50%{opacity:.2}100%{opacity:1}}"
+        "#anim{position:fixed;left:220px;top:10px;width:40px;height:40px;background:#00f;animation:pulse 1s infinite}"
+        "</style>"
+        '<div id="wrap"><div id="secret">Secret</div><div id="host"></div></div>'
+        '<button id="go" onclick="document.getElementById(\'out\').innerHTML=\'<button id=added>Added</button>\'">Go</button>'
+        '<input id="caret-box" aria-label="Caret" type="text">'
+        '<div id="anim"></div>'
+        '<div id="out">idle</div>'
+        "<script>"
+        'const sh=document.getElementById("host").attachShadow({mode:"open"});'
+        "sh.innerHTML='<div id=shadow-secret style=\"position:fixed;left:100px;top:10px;width:60px;height:60px;background:#fff\">S</div>';"
+        "</script>"
+    )
+
+    def px(img, x: int, y: int) -> tuple[int, int, int, int]:
+        off = (y * img.width + x) * 4
+        return tuple(img.data[off : off + 4])  # type: ignore[return-value]
+
+    async def _async_case() -> None:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(max_browsers=1)
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+
+                with pytest.raises(TypeError):
+                    await page.aria_snapshot(diff="yes")  # type: ignore[arg-type]
+
+                d0 = await page.aria_snapshot(diff=True)
+                assert d0["is_diff"] is False
+                assert d0["changed"] is True
+                assert 'button "Go"' in d0["tree"]
+
+                d1 = await page.aria_snapshot(diff=True)
+                assert d1["is_diff"] is True
+                assert d1["changed"] is False
+                assert d1["tree"] == "(no changes)"
+                go_ref = next(r for r in d1["refs"] if r["role"] == "button" and r["name"] == "Go")
+
+                som_png = await page.screenshot(annotate=True)
+                assert som_png[:4] == b"\x89PNG"
+                assert await page.evaluate("() => document.getElementById('__fluxwright_som_overlay') === null") is True
+                som_jpeg = await page.screenshot(annotate=True, type="jpeg", quality=80)
+                assert som_jpeg[:2] == b"\xff\xd8"
+
+                # annotate=True preserves cached snapshot baseline.
+                still_same = await page.aria_snapshot(diff=True)
+                assert still_same["is_diff"] is True
+                assert still_same["changed"] is False
+                assert still_same["tree"] == "(no changes)"
+
+                await page.click(f"@{go_ref['id']}")
+                d2 = await page.aria_snapshot(diff=True)
+                assert d2["is_diff"] is True
+                assert d2["changed"] is True
+                assert "+ " in d2["tree"]
+                assert 'button "Added"' in d2["tree"]
+
+                reset_snap = await page.aria_snapshot()
+                assert reset_snap["is_diff"] is False
+                assert reset_snap["changed"] is True
+
+                await page.click("#caret-box")
+                masked = await page.screenshot(
+                    mask=[page.locator("#secret"), "#shadow-secret"],
+                    mask_color="#00FF00",
+                    animations="disabled",
+                    caret="hide",
+                )
+                img = decode_png(masked)
+                assert px(img, 40, 40) == (0, 255, 0, 255)
+                assert px(img, 130, 40) == (0, 255, 0, 255)
+                assert await page.evaluate(
+                    "() => !document.getElementById('__fluxwright_mask_overlay') && !document.getElementById('__fluxwright_screenshot_style')"
+                ) is True
+
+                elem_masked = await page.locator("#wrap").screenshot(mask=["#secret"], mask_color="#FF0000")
+                elem_img = decode_png(elem_masked)
+                assert px(elem_img, 40, 40) == (255, 0, 0, 255)
+                assert await page.evaluate("() => document.getElementById('__fluxwright_mask_overlay') === null") is True
+
+                other = await browser.new_page()
+                try:
+                    with pytest.raises((TypeError, ValueError, Error)):
+                        await page.screenshot(mask=[other.locator("#secret")])
+                finally:
+                    await other.close()
+
+                await page.goto("about:blank")
+                blank_som = await page.screenshot(annotate=True)
+                assert blank_som[:4] == b"\x89PNG"
+                await page.close()
+            finally:
+                await browser.close()
+
+    asyncio.run(_async_case())
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(max_browsers=1)
+        try:
+            page = browser.new_page()
+            page.set_content(html)
+            s0 = page.aria_snapshot(diff=True)
+            assert s0["is_diff"] is False
+            assert s0["changed"] is True
+            s1 = page.aria_snapshot(diff=True)
+            assert s1["is_diff"] is True
+            assert s1["changed"] is False
+            assert s1["tree"] == "(no changes)"
+            shot = page.screenshot(
+                annotate=True,
+                mask=[page.locator("#secret")],
+                mask_color="#00FF00",
+                animations="disabled",
+                caret="hide",
+            )
+            assert shot[:4] == b"\x89PNG"
+            assert px(decode_png(shot), 40, 40) == (0, 255, 0, 255)
+            page.close()
+        finally:
+            browser.close()
 

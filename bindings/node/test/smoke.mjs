@@ -9,6 +9,7 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import fluxwright from '../addon.js'
+import { decodePng } from '../visual.js'
 
 // Echoes the user agent and languages; /login sets a cookie; /report is a download; /hdr echoes
 // x-test; /api is the real API that routes stand in for.
@@ -193,8 +194,13 @@ try {
   await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.gif') }), TypeError)
   await assert.rejects(page.screenshot({ path: join(tmpdir(), 'fluxwright.webp') }), TypeError)
   await assert.rejects(page.screenshot({ type: 'webp' }), TypeError)
-  await assert.rejects(page.screenshot({ animations: 'disabled' }), TypeError)
-  await assert.rejects(page.screenshot({ mask: [] }), TypeError)
+  await assert.rejects(page.screenshot({ animations: 'bogus' }), TypeError)
+  await assert.rejects(page.screenshot({ caret: 'bogus' }), TypeError)
+  await assert.rejects(page.screenshot({ maskColor: 'red; background:url(x)' }), TypeError)
+  await assert.rejects(page.screenshot({ mask: '#secret' }), TypeError)
+  await assert.rejects(page.screenshot({ mask: [123] }), TypeError)
+  await assert.rejects(page.screenshot({ annotate: 'yes' }), TypeError)
+  await assert.rejects(page.screenshot({ bogusOption: true }), TypeError)
   await assert.rejects(page.screenshot({ clip: { x: 0, y: 0, width: 10, height: 10, extra: 1 } }), TypeError)
   await assert.rejects(page.screenshot({ type: 'png', quality: 50 }), /JPEG only/)
   await assert.rejects(page.pdf({ format: 'A9' }), /unknown format/)
@@ -1554,6 +1560,100 @@ try {
 
       await aiPage.goto(`${aiBase}/next`)
       await assert.rejects(() => aiPage.click(`@${btnRef.id}`), /unknown element ref|stale/)
+
+      // Diff-only ariaSnapshot, Set-of-Marks annotate, and screenshot masking (incl. Shadow DOM).
+      await assert.rejects(() => aiPage.ariaSnapshot({ diff: 'yes' }), TypeError)
+      await aiPage.setContent(
+        '<!doctype html><style>' +
+          'body{margin:0;background:#fff}' +
+          '#wrap{position:fixed;left:0;top:0;width:200px;height:80px;background:#fff}' +
+          '#secret{position:fixed;left:10px;top:10px;width:60px;height:60px;background:#fff}' +
+          '#go{position:fixed;left:10px;top:90px;width:90px;height:32px}' +
+          '#caret-box{position:fixed;left:110px;top:90px;width:120px;height:32px}' +
+          '@keyframes pulse{0%{opacity:1}50%{opacity:.2}100%{opacity:1}}' +
+          '#anim{position:fixed;left:220px;top:10px;width:40px;height:40px;background:#00f;animation:pulse 1s infinite}' +
+          '</style>' +
+          '<div id="wrap"><div id="secret">Secret</div><div id="host"></div></div>' +
+          '<button id="go" onclick="document.getElementById(\'out\').innerHTML=\'<button id=added>Added</button>\'">Go</button>' +
+          '<input id="caret-box" aria-label="Caret" type="text">' +
+          '<div id="anim"></div>' +
+          '<div id="out">idle</div>' +
+          '<script>' +
+          'const sh=document.getElementById("host").attachShadow({mode:"open"});' +
+          'sh.innerHTML="<div id=shadow-secret style=\'position:fixed;left:100px;top:10px;width:60px;height:60px;background:#fff\'>S</div>";' +
+          '</script>',
+      )
+      const d0 = await aiPage.ariaSnapshot({ diff: true })
+      assert.equal(d0.isDiff, false)
+      assert.equal(d0.changed, true)
+      assert.match(d0.tree, /button "Go"/)
+
+      const d1 = await aiPage.ariaSnapshot({ diff: true })
+      assert.equal(d1.isDiff, true)
+      assert.equal(d1.changed, false)
+      assert.equal(d1.tree, '(no changes)')
+      const goRef = d1.refs.find((r) => r.role === 'button' && r.name === 'Go')
+      assert.ok(goRef)
+
+      const somPng = await aiPage.screenshot({ annotate: true })
+      assert.equal(somPng.subarray(0, 4).toString('latin1'), '\x89PNG')
+      assert.equal(await aiPage.evaluate(() => document.getElementById('__fluxwright_som_overlay') === null), true)
+      const somJpeg = await aiPage.screenshot({ annotate: true, type: 'jpeg', quality: 80 })
+      assert.equal(somJpeg[0], 0xff)
+      assert.equal(somJpeg[1], 0xd8)
+
+      // annotate: true must not overwrite diff baseline cache.
+      const stillUnchanged = await aiPage.ariaSnapshot({ diff: true })
+      assert.equal(stillUnchanged.isDiff, true)
+      assert.equal(stillUnchanged.changed, false)
+      assert.equal(stillUnchanged.tree, '(no changes)')
+
+      await aiPage.click(`@${goRef.id}`)
+      const d2 = await aiPage.ariaSnapshot({ diff: true })
+      assert.equal(d2.isDiff, true)
+      assert.equal(d2.changed, true)
+      assert.ok(d2.tree.includes('+ '))
+      assert.match(d2.tree, /button "Added"/)
+
+      const resetSnap = await aiPage.ariaSnapshot()
+      assert.equal(resetSnap.isDiff, false)
+      assert.equal(resetSnap.changed, true)
+
+      await aiPage.click('#caret-box')
+      const maskedPng = await aiPage.screenshot({
+        mask: [aiPage.locator('#secret'), '#shadow-secret'],
+        maskColor: '#00FF00',
+        animations: 'disabled',
+        caret: 'hide',
+      })
+      const dec = decodePng(maskedPng)
+      const px = (x, y) => {
+        const off = (y * dec.width + x) * 4
+        return Array.from(dec.data.subarray(off, off + 4))
+      }
+      assert.deepEqual(px(40, 40), [0, 255, 0, 255])
+      assert.deepEqual(px(130, 40), [0, 255, 0, 255])
+      assert.equal(
+        await aiPage.evaluate(() => !document.getElementById('__fluxwright_mask_overlay') && !document.getElementById('__fluxwright_screenshot_style')),
+        true,
+      )
+
+      const elemMasked = await aiPage.locator('#wrap').screenshot({ mask: ['#secret'], maskColor: '#FF0000' })
+      const elemDec = decodePng(elemMasked)
+      const elemOff = (40 * elemDec.width + 40) * 4
+      assert.deepEqual(Array.from(elemDec.data.subarray(elemOff, elemOff + 4)), [255, 0, 0, 255])
+      assert.equal(await aiPage.evaluate(() => document.getElementById('__fluxwright_mask_overlay') === null), true)
+
+      const otherPage = await browser.newPage()
+      try {
+        await assert.rejects(() => aiPage.screenshot({ mask: [otherPage.locator('#secret')] }), TypeError)
+      } finally {
+        await otherPage.close()
+      }
+
+      await aiPage.goto('about:blank')
+      const blankSom = await aiPage.screenshot({ annotate: true })
+      assert.equal(blankSom.subarray(0, 4).toString('latin1'), '\x89PNG')
     } finally {
       await aiPage.close()
       aiSrv.close()

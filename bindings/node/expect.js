@@ -8,6 +8,8 @@ const {
   isWithinTolerance,
   artifactPaths,
   shouldUpdateSnapshots,
+  validateMaskColor,
+  resolveMaskSelectors,
   DISABLE_ANIMATIONS_PAGE_FN,
   RESTORE_ANIMATIONS_PAGE_FN,
   DISABLE_ANIMATIONS_LOCATOR_FN,
@@ -503,9 +505,16 @@ class LocatorAssertions {
     if (this.#negated) {
       throw new Error('expect(locator).toHaveScreenshot: .not is not supported')
     }
-    const opts = validateScreenshotCall(`${formatLocator(this.#locator)}.toHaveScreenshot`, nameOrPath, options, false)
-    const timeoutMs = opts.timeout ?? this.#defaultTimeout
     const ownerPage = typeof this.#getOwnerPage === 'function' ? this.#getOwnerPage(this.#locator) : null
+    const opts = validateScreenshotCall(
+      `${formatLocator(this.#locator)}.toHaveScreenshot`,
+      nameOrPath,
+      options,
+      false,
+      ownerPage,
+      this.#getOwnerPage,
+    )
+    const timeoutMs = opts.timeout ?? this.#defaultTimeout
     const inFrame = typeof this.#locator._frames === 'function' && this.#locator._frames().length > 0
     return this.#run(() =>
       runToHaveScreenshot({
@@ -539,6 +548,9 @@ class LocatorAssertions {
         captureShot: (limitMs) =>
           this.#locator.screenshot({
             omitBackground: opts.omitBackground,
+            ...(opts.mask !== undefined ? { mask: opts.mask } : {}),
+            ...(opts.maskColor !== undefined ? { maskColor: opts.maskColor } : {}),
+            ...(opts.animations === 'allow' && opts.caret ? { caret: opts.caret } : {}),
             timeout: limitMs,
           }),
       }),
@@ -551,16 +563,18 @@ class PageAssertions {
   #defaultTimeout
   #negated
   #onSoftError
+  #getOwnerPage
 
-  constructor(page, defaultTimeout, negated = false, onSoftError = null) {
+  constructor(page, defaultTimeout, negated = false, onSoftError = null, getOwnerPage = null) {
     this.#page = page
     this.#defaultTimeout = defaultTimeout
     this.#negated = negated
     this.#onSoftError = onSoftError
+    this.#getOwnerPage = getOwnerPage
   }
 
   get not() {
-    return new PageAssertions(this.#page, this.#defaultTimeout, !this.#negated, this.#onSoftError)
+    return new PageAssertions(this.#page, this.#defaultTimeout, !this.#negated, this.#onSoftError, this.#getOwnerPage)
   }
 
   #timeout(options) {
@@ -631,7 +645,14 @@ class PageAssertions {
     if (this.#negated) {
       throw new Error('expect(page).toHaveScreenshot: .not is not supported')
     }
-    const opts = validateScreenshotCall('expect(page).toHaveScreenshot', nameOrPath, options, true)
+    const opts = validateScreenshotCall(
+      'expect(page).toHaveScreenshot',
+      nameOrPath,
+      options,
+      true,
+      this.#page,
+      this.#getOwnerPage,
+    )
     const timeoutMs = opts.timeout ?? this.#defaultTimeout
     return this.#run(() =>
       runToHaveScreenshot({
@@ -647,6 +668,9 @@ class PageAssertions {
             fullPage: opts.fullPage,
             clip: opts.clip,
             omitBackground: opts.omitBackground,
+            ...(opts.mask !== undefined ? { mask: opts.mask } : {}),
+            ...(opts.maskColor !== undefined ? { maskColor: opts.maskColor } : {}),
+            ...(opts.animations === 'allow' && opts.caret ? { caret: opts.caret } : {}),
             timeout: limitMs,
           }),
       }),
@@ -654,7 +678,7 @@ class PageAssertions {
   }
 }
 
-function validateScreenshotCall(method, nameOrPath, options, isPage) {
+function validateScreenshotCall(method, nameOrPath, options, isPage, page = null, getOwnerPage = null) {
   if (typeof nameOrPath === 'string') {
     if (!nameOrPath) throw new TypeError(`${method}: path must be a non-empty string`)
   } else if (Array.isArray(nameOrPath)) {
@@ -671,6 +695,9 @@ function validateScreenshotCall(method, nameOrPath, options, isPage) {
     maxDiffPixels: true,
     maxDiffPixelRatio: true,
     animations: true,
+    caret: true,
+    mask: true,
+    maskColor: true,
     update: true,
     omitBackground: true,
     ...(isPage ? { fullPage: true, clip: true } : {}),
@@ -699,6 +726,16 @@ function validateScreenshotCall(method, nameOrPath, options, isPage) {
   if (animations !== 'disabled' && animations !== 'allow') {
     throw new TypeError(`${method}: animations must be 'disabled' or 'allow'`)
   }
+  if (opts.caret != null && opts.caret !== 'hide' && opts.caret !== 'initial') {
+    throw new TypeError(`${method}: caret must be 'hide' or 'initial'`)
+  }
+  let resolvedMask
+  if (opts.mask != null) {
+    resolvedMask = resolveMaskSelectors(method, opts.mask, page, getOwnerPage)
+  }
+  if (opts.maskColor != null) {
+    validateMaskColor(method, opts.maskColor)
+  }
   for (const bKey of ['update', 'omitBackground', 'fullPage']) {
     if (opts[bKey] != null && typeof opts[bKey] !== 'boolean') {
       throw new TypeError(`${method}: ${bKey} must be a boolean`)
@@ -722,6 +759,9 @@ function validateScreenshotCall(method, nameOrPath, options, isPage) {
     maxDiffPixels: opts.maxDiffPixels,
     maxDiffPixelRatio: opts.maxDiffPixelRatio,
     animations,
+    caret: opts.caret,
+    mask: resolvedMask,
+    maskColor: opts.maskColor,
     update: opts.update,
     omitBackground: opts.omitBackground ?? false,
     fullPage: opts.fullPage ?? false,
@@ -892,7 +932,7 @@ function createExpect(PageClass, LocatorClass, defaultTimeout = DEFAULT_TIMEOUT_
 
   function expect(target) {
     if (PageClass && target instanceof PageClass) {
-      return new PageAssertions(target, defaultTimeout, false, null)
+      return new PageAssertions(target, defaultTimeout, false, null, getOwnerPage)
     }
     if (LocatorClass && target instanceof LocatorClass) {
       return new LocatorAssertions(target, defaultTimeout, false, getOwnerPage, null)
@@ -902,7 +942,7 @@ function createExpect(PageClass, LocatorClass, defaultTimeout = DEFAULT_TIMEOUT_
 
   expect.soft = (target) => {
     if (PageClass && target instanceof PageClass) {
-      return new PageAssertions(target, defaultTimeout, false, recordSoftError)
+      return new PageAssertions(target, defaultTimeout, false, recordSoftError, getOwnerPage)
     }
     if (LocatorClass && target instanceof LocatorClass) {
       return new LocatorAssertions(target, defaultTimeout, false, getOwnerPage, recordSoftError)
