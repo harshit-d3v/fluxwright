@@ -1829,7 +1829,7 @@ try {
       )
       const rp = await rCtx.newPage()
       await assert.rejects(() => rp.route('**/echo/*', () => {}, { times: 1.5 }), TypeError)
-      await rp.goto('/echo/init')
+      await rp.goto('/route-home')
 
       // Older page route inspects overrides from newer route and adds x-mid + new url before falling back to context route.
       await rp.route('**/echo/*', async (route, request) => {
@@ -1840,6 +1840,10 @@ try {
             url: `${routeBase}/echo/final?step=2`,
             headers: { ...request.headers(), 'X-Mid': 'from-mid' },
           })
+          return
+        }
+        if (request.url().includes('/echo/after')) {
+          await route.fallback()
           return
         }
         await route.fulfill({ json: { directToOlder: true } })
@@ -1886,9 +1890,10 @@ try {
       // 3rd request: outer times:2 handler is gone, so /echo/start hits older page handler directly.
       const third = await rp.evaluate(() => fetch('/echo/start').then((r) => r.json()))
       assert.deepEqual(third, { directToOlder: true })
-      // Context times:2 handler is also exhausted.
-      const fourth = await rp.evaluate(() => fetch('/echo/other').then((r) => r.json()))
-      assert.deepEqual(fourth, { directToOlder: true })
+      // Context times:2 handler is also exhausted (mid falls back on /echo/after and reaches server directly).
+      const fourth = await rp.evaluate(() => fetch('/echo/after').then((r) => r.json()))
+      assert.equal(fourth.url, '/echo/after')
+      assert.equal(fourth.method, 'GET')
       assert.equal(ctxLog.length, 2)
       await rp.close()
     } finally {

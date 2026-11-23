@@ -156,7 +156,7 @@ def _settled(result: Any = None, error: BaseException | None = None) -> asyncio.
     return future
 
 
-_UNSET = object()
+_UNSET: Any = object()
 
 
 class Request:
@@ -1442,7 +1442,6 @@ async def _apply_route_from_har(
 
 
 Listener = Callable[[Any], Any]
-_UNSET: Any = object()
 _pages_by_target: weakref.WeakValueDictionary[str, Page] = weakref.WeakValueDictionary()
 
 

@@ -2550,7 +2550,7 @@ def test_clock_and_route_times_fallback_parity() -> None:
 
                         await ctx.route("**/echo/*", ctx_handler, times=2)
                         rp = await ctx.new_page()
-                        await rp.goto("/echo/init")
+                        await rp.goto("/route-home")
 
                         async def mid_handler(route: Route, request: Request) -> None:
                             if request.headers.get("x-outer"):
@@ -2560,6 +2560,9 @@ def test_clock_and_route_times_fallback_parity() -> None:
                                     url=f"{base}/echo/final?step=2",
                                     headers={**request.headers, "X-Mid": "from-mid"},
                                 )
+                                return
+                            if "/echo/after" in request.url:
+                                await route.fallback()
                                 return
                             await route.fulfill(json={"directToOlder": True})
 
@@ -2605,8 +2608,9 @@ def test_clock_and_route_times_fallback_parity() -> None:
 
                         third = await rp.evaluate("() => fetch('/echo/start').then(r => r.json())")
                         assert third == {"directToOlder": True}
-                        fourth = await rp.evaluate("() => fetch('/echo/other').then(r => r.json())")
-                        assert fourth == {"directToOlder": True}
+                        fourth = await rp.evaluate("() => fetch('/echo/after').then(r => r.json())")
+                        assert fourth["path"] == "/echo/after"
+                        assert fourth["method"] == "GET"
                         assert len(ctx_log) == 2
                         await rp.close()
                     finally:
@@ -2640,7 +2644,7 @@ def test_clock_and_route_times_fallback_parity() -> None:
                 ctx = browser.new_context(base_url=base)
                 try:
                     rp = ctx.new_page()
-                    rp.goto("/echo/init")
+                    rp.goto("/route-home")
                     rp.route(
                         "**/echo/*",
                         lambda route, req: route.fulfill(
