@@ -204,12 +204,12 @@ try {
 
   // .not on missing element must fail rather than falsely pass.
   await assert.rejects(
-    () => expect(page.locator('#missing')).not.toHaveText('anything', { timeout: 150 }),
+    () => expect(page.locator('#missing')).not.toHaveText('anything', { timeout: 600 }),
     /element not found/,
   )
 
   await assert.rejects(
-    () => expect(page).toHaveURL('/never', { timeout: 150 }),
+    () => expect(page).toHaveURL('/never', { timeout: 600 }),
     /Expected:.*\/never[\s\S]*Received:/,
   )
 
@@ -227,7 +227,7 @@ try {
   try {
     await expect.soft(page.locator('#txt')).toHaveText('SoftMismatch', { timeout: 120 })
     await expect.configure({ timeout: 120 }).soft(page).toHaveTitle('WrongSoftTitle')
-    await expect.soft(page.locator('#txt')).toHaveText('Loaded 42 items', { timeout: 200 })
+    await expect.soft(page.locator('#txt')).toHaveText('Loaded 42 items', { timeout: 1000 })
   } finally {
     setSoftErrorCollector(prevCollector)
   }

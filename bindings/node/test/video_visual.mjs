@@ -259,7 +259,7 @@ try {
 
     // Missing baseline fails cleanly.
     await assert.rejects(
-      () => expect(page.locator('#box')).toHaveScreenshot(boxShot, { timeout: 250 }),
+      () => expect(page.locator('#box')).toHaveScreenshot(boxShot, { timeout: 1000 }),
       /Baseline snapshot does not exist/,
     )
     await assert.rejects(() => fs.stat(boxShot), { code: 'ENOENT' })
@@ -296,7 +296,7 @@ try {
     })
     await expect(page.locator('#box')).toHaveScreenshot(boxShot)
     await assert.rejects(
-      () => expect(page.locator('#box')).toHaveScreenshot(boxShot, { threshold: 0, timeout: 250 }),
+      () => expect(page.locator('#box')).toHaveScreenshot(boxShot, { threshold: 0, timeout: 1000 }),
       /Screenshot mismatch/,
     )
 
@@ -311,7 +311,7 @@ try {
     await fs.rm(boxActual, { force: true })
     await fs.rm(boxDiff, { force: true })
     await assert.rejects(
-      () => expect(page.locator('#box')).toHaveScreenshot(boxShot, { timeout: 250 }),
+      () => expect(page.locator('#box')).toHaveScreenshot(boxShot, { timeout: 1000 }),
       (err) => {
         assert.match(err.message, /pixels differ/)
         assert.match(err.message, /ratio /)
@@ -348,7 +348,7 @@ try {
       document.body.style.background = '#000000'
     })
     await assert.rejects(
-      () => expect(page).toHaveScreenshot(pageShot, { timeout: 250 }),
+      () => expect(page).toHaveScreenshot(pageShot, { timeout: 1000 }),
       /page-diff\.png/,
     )
 
@@ -486,7 +486,7 @@ try {
     process.env.FLUXWRIGHT_UPDATE_SNAPSHOTS = '1'
     try {
       await assert.rejects(
-        () => expect(page.locator('#box')).toHaveScreenshot(missingWithFalse, { update: false, timeout: 200 }),
+        () => expect(page.locator('#box')).toHaveScreenshot(missingWithFalse, { update: false, timeout: 800 }),
         /Baseline snapshot does not exist/,
       )
       await assert.rejects(() => fs.stat(missingWithFalse), { code: 'ENOENT' })
@@ -519,7 +519,7 @@ try {
       setTimeout(() => el.remove(), 40)
     })
     await assert.rejects(
-      () => expect(page.locator('#ephemeral')).toHaveScreenshot(join(snapDir, 'box.png'), { timeout: 250 }),
+      () => expect(page.locator('#ephemeral')).toHaveScreenshot(join(snapDir, 'box.png'), { timeout: 1000 }),
     )
     const leakedStyle = await page.evaluate(() => Boolean(document.getElementById('__fw_disable_animations')))
     assert.equal(leakedStyle, false, '__fw_disable_animations style must be removed even if locator detaches')

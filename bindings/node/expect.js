@@ -19,7 +19,7 @@ const {
 const DEFAULT_TIMEOUT_MS = 5000
 const POLL_INTERVAL_MS = 50
 const MIN_PROBE_TIMEOUT_MS = 50
-const MAX_PROBE_TIMEOUT_MS = 250
+const MAX_PROBE_TIMEOUT_MS = 500
 
 function normalizeWhitespace(s) {
   return String(s).replace(/\s+/g, ' ').trim()
