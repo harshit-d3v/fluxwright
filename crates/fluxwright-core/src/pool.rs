@@ -5356,7 +5356,7 @@ async fn dispatch_intercepted_request(
     let ctx_snapshot = ctx_routes.lock().unwrap().clone();
     groups.push((ctx_snapshot, ctx_routes));
 
-    for (entries, owner_list) in groups {
+    'dispatch: for (entries, owner_list) in groups {
         for entry in entries.into_iter().rev() {
             if entry.removed.load(Ordering::SeqCst) {
                 continue;
@@ -5396,7 +5396,7 @@ async fn dispatch_intercepted_request(
             route.inner.returned.store(true, Ordering::SeqCst);
             if let Err(err) = res {
                 warn!(error = %err, "route handler failed; continuing request");
-                break;
+                break 'dispatch;
             }
 
             let outcome = std::mem::replace(
@@ -5421,12 +5421,13 @@ async fn dispatch_intercepted_request(
                     accumulated.merge(overrides);
                     continue;
                 }
-                RouteOutcome::Pending => break,
+                RouteOutcome::Pending => break 'dispatch,
             }
         }
     }
 
-    if let Some(req) = raw.lock().await.take() {
+    let maybe_req = raw.lock().await.take();
+    if let Some(req) = maybe_req {
         let _ = req.continue_with(accumulated).await;
     }
 }
