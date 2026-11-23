@@ -1,31 +1,39 @@
 //! Live browser viewport screencast streaming (`Page.startScreencast`), single-use
-//! WebSocket ticket auth, and Human-in-the-Loop (HITL) mouse/keyboard forwarding.
+//! WebSocket ticket auth, embeddable signed live viewer URLs, and Human-in-the-Loop (HITL)
+//! mouse/keyboard forwarding.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use axum::body::to_bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
+use base64::Engine;
 use fluxwright::{netguard, Connection};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use ring::digest;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::cdp_gateway::percent_decode_str;
-use crate::{parse_id, same_token, ApiError, Inner};
+use crate::{now_ms, parse_id, same_token, ApiError, Inner};
 
 const MAX_LIVE_VIEWERS: usize = 16;
 const MAX_TICKETS: usize = 256;
+const MAX_EMBED_TOKENS: usize = 256;
 const TICKET_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_EMBED_TTL_SECS: u64 = 300;
+const MIN_EMBED_TTL_SECS: u64 = 10;
+const MAX_EMBED_TTL_SECS: u64 = 3600;
 const MAX_WS_PAYLOAD_BYTES: usize = 16 * 1024;
 const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_CALL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -63,6 +71,7 @@ pub(crate) struct LiveEntry {
     pub(crate) started_at: u64,
     pub(crate) pause_tx: Option<watch::Sender<bool>>,
     pub(crate) pause_reason: Arc<StdMutex<Option<String>>>,
+    pub(crate) revoked_tx: watch::Sender<bool>,
 }
 
 impl LiveEntry {
@@ -86,15 +95,84 @@ impl LiveEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EmbedMode {
+    #[default]
+    ReadOnly,
+    Interactive,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbedRequest {
+    #[serde(default)]
+    mode: EmbedMode,
+    #[serde(default = "default_embed_ttl_secs")]
+    ttl_secs: u64,
+}
+
+impl Default for EmbedRequest {
+    fn default() -> Self {
+        Self {
+            mode: EmbedMode::ReadOnly,
+            ttl_secs: DEFAULT_EMBED_TTL_SECS,
+        }
+    }
+}
+
+fn default_embed_ttl_secs() -> u64 {
+    DEFAULT_EMBED_TTL_SECS
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiveAccess {
+    pub(crate) read_only: bool,
+    pub(crate) expires_at: Option<Instant>,
+}
+
 struct LiveTicket {
     session_id: String,
     expires_at: Instant,
 }
 
+struct EmbedToken {
+    session_id: String,
+    mode: EmbedMode,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedEmbed {
+    pub(crate) session_id: String,
+    pub(crate) mode: EmbedMode,
+    pub(crate) expires_at: Instant,
+}
+
+fn sha256_token(token: &str) -> [u8; 32] {
+    let d = digest::digest(&digest::SHA256, token.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
+fn is_well_formed_embed_token(token: &str) -> bool {
+    (32..=128).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 #[derive(Default)]
 pub(crate) struct LiveRegistry {
     targets: Arc<StdMutex<HashMap<String, LiveEntry>>>,
-    tickets: StdMutex<HashMap<String, LiveTicket>>,
+    tickets: Arc<StdMutex<HashMap<String, LiveTicket>>>,
+    embeds: Arc<StdMutex<HashMap<[u8; 32], EmbedToken>>>,
     active_viewers: Arc<AtomicUsize>,
 }
 
@@ -103,6 +181,9 @@ pub(crate) struct LiveGuard {
     url: Arc<StdMutex<String>>,
     pause_reason: Arc<StdMutex<Option<String>>>,
     targets: Arc<StdMutex<HashMap<String, LiveEntry>>>,
+    tickets: Arc<StdMutex<HashMap<String, LiveTicket>>>,
+    embeds: Arc<StdMutex<HashMap<[u8; 32], EmbedToken>>>,
+    revoked_tx: watch::Sender<bool>,
 }
 
 impl LiveGuard {
@@ -117,7 +198,16 @@ impl LiveGuard {
 
 impl Drop for LiveGuard {
     fn drop(&mut self) {
+        let _ = self.revoked_tx.send(true);
         self.targets.lock().unwrap().remove(&self.id);
+        self.tickets
+            .lock()
+            .unwrap()
+            .retain(|_, t| t.session_id != self.id);
+        self.embeds
+            .lock()
+            .unwrap()
+            .retain(|_, t| t.session_id != self.id);
     }
 }
 
@@ -143,6 +233,7 @@ impl LiveRegistry {
         pause_reason: Arc<StdMutex<Option<String>>>,
     ) -> LiveGuard {
         let url = Arc::new(StdMutex::new(initial_url));
+        let (revoked_tx, _) = watch::channel(false);
         let entry = LiveEntry {
             id: id.clone(),
             kind: LiveKind::Job,
@@ -152,6 +243,7 @@ impl LiveRegistry {
             started_at,
             pause_tx: Some(pause_tx),
             pause_reason: pause_reason.clone(),
+            revoked_tx: revoked_tx.clone(),
         };
         self.targets.lock().unwrap().insert(id.clone(), entry);
         LiveGuard {
@@ -159,6 +251,9 @@ impl LiveRegistry {
             url,
             pause_reason,
             targets: self.targets.clone(),
+            tickets: self.tickets.clone(),
+            embeds: self.embeds.clone(),
+            revoked_tx,
         }
     }
 
@@ -171,6 +266,7 @@ impl LiveRegistry {
         started_at: u64,
     ) -> LiveGuard {
         let pause_reason = Arc::new(StdMutex::new(None));
+        let (revoked_tx, _) = watch::channel(false);
         let entry = LiveEntry {
             id: id.clone(),
             kind: LiveKind::Cdp,
@@ -180,6 +276,7 @@ impl LiveRegistry {
             started_at,
             pause_tx: None,
             pause_reason: pause_reason.clone(),
+            revoked_tx: revoked_tx.clone(),
         };
         self.targets.lock().unwrap().insert(id.clone(), entry);
         LiveGuard {
@@ -187,6 +284,9 @@ impl LiveRegistry {
             url,
             pause_reason,
             targets: self.targets.clone(),
+            tickets: self.tickets.clone(),
+            embeds: self.embeds.clone(),
+            revoked_tx,
         }
     }
 
@@ -277,6 +377,97 @@ impl LiveRegistry {
         ticket.session_id == session_id && now <= ticket.expires_at
     }
 
+    pub(crate) fn issue_embed(
+        &self,
+        session_id: &str,
+        mode: EmbedMode,
+        ttl_secs: u64,
+    ) -> Result<(String, u64, u64), ApiError> {
+        self.issue_embed_at(session_id, mode, ttl_secs, Instant::now(), now_ms())
+    }
+
+    pub(crate) fn issue_embed_at(
+        &self,
+        session_id: &str,
+        mode: EmbedMode,
+        ttl_secs: u64,
+        now: Instant,
+        now_epoch_ms: u64,
+    ) -> Result<(String, u64, u64), ApiError> {
+        if self.get(session_id).is_none() {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "live session not found",
+            ));
+        }
+        let clamped_ttl = ttl_secs.clamp(MIN_EMBED_TTL_SECS, MAX_EMBED_TTL_SECS);
+        let mut embeds = self.embeds.lock().unwrap();
+        embeds.retain(|_, tok| tok.expires_at > now);
+        if embeds.len() >= MAX_EMBED_TOKENS {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "capacity_exceeded",
+                "too many active embed tokens",
+            ));
+        }
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let digest = sha256_token(&token);
+        let expires_at = now + Duration::from_secs(clamped_ttl);
+        let expires_at_ms = now_epoch_ms.saturating_add(clamped_ttl.saturating_mul(1000));
+        embeds.insert(
+            digest,
+            EmbedToken {
+                session_id: session_id.to_string(),
+                mode,
+                expires_at,
+            },
+        );
+        Ok((token, clamped_ttl, expires_at_ms))
+    }
+
+    pub(crate) fn verify_embed(
+        &self,
+        token: &str,
+        expected_session: Option<&str>,
+    ) -> Option<VerifiedEmbed> {
+        self.verify_embed_at(token, expected_session, Instant::now())
+    }
+
+    pub(crate) fn verify_embed_at(
+        &self,
+        token: &str,
+        expected_session: Option<&str>,
+        now: Instant,
+    ) -> Option<VerifiedEmbed> {
+        if !is_well_formed_embed_token(token) {
+            return None;
+        }
+        let digest = sha256_token(token);
+        let verified = {
+            let mut embeds = self.embeds.lock().unwrap();
+            embeds.retain(|_, tok| tok.expires_at > now);
+            let tok = embeds.get(&digest)?;
+            if tok.expires_at <= now {
+                return None;
+            }
+            if let Some(expected) = expected_session {
+                if tok.session_id != expected {
+                    return None;
+                }
+            }
+            VerifiedEmbed {
+                session_id: tok.session_id.clone(),
+                mode: tok.mode,
+                expires_at: tok.expires_at,
+            }
+        };
+        if self.get(&verified.session_id).is_none() {
+            return None;
+        }
+        Some(verified)
+    }
+
     fn acquire_viewer(&self) -> Result<ViewerGuard, ApiError> {
         let res = self.active_viewers.try_update(
             Ordering::SeqCst,
@@ -345,17 +536,24 @@ fn extract_single_query_param(query: &str, key: &str) -> Option<String> {
     found
 }
 
+fn query_contains_key(query: &str, key: &str) -> bool {
+    query.split('&').any(|pair| {
+        pair.split_once('=')
+            .is_some_and(|(k, _)| k == key)
+    })
+}
+
 fn extract_live_ws_id(path: &str) -> Option<&str> {
     let id = path.strip_prefix("/v1/live/")?.strip_suffix("/ws")?;
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 /// Auth middleware exclusively for `GET /v1/live/{id}/ws`.
-/// Accepts `Authorization: Bearer <token>` OR a single-use `?ticket=<val>` bound to `{id}`.
-/// Never accepts `?token=`.
+/// Accepts `Authorization: Bearer <token>`, a single-use `?ticket=<val>`, or a scoped
+/// `?embed=<token>` bound to `{id}`. Never accepts `?token=`.
 pub(crate) async fn authorize_ws(
     State(inner): State<Arc<Inner>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let header_valid = request
@@ -365,31 +563,55 @@ pub(crate) async fn authorize_ws(
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(b"Bearer "))
         .is_some_and(|(_, supplied)| same_token(supplied, &inner.token));
 
-    let ticket_valid = if header_valid {
-        true
+    let access = if header_valid {
+        Some(LiveAccess {
+            read_only: false,
+            expires_at: None,
+        })
     } else if let Some(id) = extract_live_ws_id(request.uri().path()) {
-        request
-            .uri()
-            .query()
-            .and_then(|q| extract_single_query_param(q, "ticket"))
-            .is_some_and(|ticket| inner.live.consume_ticket(&ticket, id))
+        if let Some(q) = request.uri().query() {
+            let has_ticket = query_contains_key(q, "ticket");
+            let has_embed = query_contains_key(q, "embed");
+            if has_ticket && has_embed {
+                None
+            } else if has_ticket {
+                extract_single_query_param(q, "ticket")
+                    .filter(|ticket| inner.live.consume_ticket(ticket, id))
+                    .map(|_| LiveAccess {
+                        read_only: false,
+                        expires_at: None,
+                    })
+            } else if has_embed {
+                extract_single_query_param(q, "embed")
+                    .and_then(|token| inner.live.verify_embed(&token, Some(id)))
+                    .map(|verified| LiveAccess {
+                        read_only: verified.mode == EmbedMode::ReadOnly,
+                        expires_at: Some(verified.expires_at),
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
-        false
+        None
     };
 
-    if !ticket_valid {
+    let Some(access) = access else {
         let mut response = ApiError::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "a bearer token or single-use live ticket is required",
+            "a bearer token, single-use live ticket, or valid embed token is required",
         )
         .into_response();
         response
             .headers_mut()
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         return response;
-    }
+    };
 
+    request.extensions_mut().insert(access);
     next.run(request).await
 }
 
@@ -443,7 +665,7 @@ impl LiveStreamQuery {
                 )
             })?;
             match k {
-                "ticket" => {}
+                "ticket" | "embed" => {}
                 "quality" => {
                     let q = val.parse::<u8>().ok().filter(|q| (20..=95).contains(q));
                     out.quality = q.ok_or_else(|| {
@@ -503,6 +725,73 @@ pub(crate) async fn create_ticket(
     })))
 }
 
+const MAX_EMBED_REQUEST_BYTES: usize = 4096;
+
+pub(crate) async fn create_embed(
+    State(inner): State<Arc<Inner>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let bytes = to_bytes(request.into_body(), MAX_EMBED_REQUEST_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "embed request body exceeds 4096 bytes",
+            )
+        })?;
+    let req: EmbedRequest = if bytes.iter().all(u8::is_ascii_whitespace) {
+        EmbedRequest::default()
+    } else {
+        let Json(parsed) = Json::<EmbedRequest>::from_bytes(&bytes)
+            .map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
+        parsed
+    };
+    let (token, ttl, expires_at) = inner.live.issue_embed(&id, req.mode, req.ttl_secs)?;
+    Ok(Json(json!({
+        "url": format!("/embed/live/{token}"),
+        "ws_url": format!("/v1/live/{id}/ws?embed={token}"),
+        "mode": req.mode,
+        "expires_at": expires_at,
+        "expires_in_secs": ttl,
+    })))
+}
+
+pub(crate) async fn embed_html(
+    State(inner): State<Arc<Inner>>,
+    Path(token): Path<String>,
+) -> Result<Response, ApiError> {
+    let Some(verified) = inner.live.verify_embed(&token, None) else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid or expired embed token",
+        ));
+    };
+    if !is_safe_session_id(&verified.session_id) {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_session",
+            "live session id is not embeddable",
+        ));
+    }
+
+    let html = render_embed_html(&verified.session_id, verified.mode);
+    let csp = embed_csp_header(&inner.embed_frame_ancestors);
+    let mut response = (StatusCode::OK, axum::response::Html(html)).into_response();
+    if let Ok(val) = HeaderValue::from_str(&csp) {
+        response
+            .headers_mut()
+            .insert(header::HeaderName::from_static("content-security-policy"), val);
+    }
+    response.headers_mut().insert(
+        header::HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    Ok(response)
+}
+
 pub(crate) async fn pause_job(
     State(inner): State<Arc<Inner>>,
     Path(id): Path<String>,
@@ -525,6 +814,7 @@ pub(crate) async fn ws_handler(
     State(inner): State<Arc<Inner>>,
     Path(id): Path<String>,
     RawQuery(raw_query): RawQuery,
+    Extension(access): Extension<LiveAccess>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let query = LiveStreamQuery::parse(raw_query.as_deref())?;
@@ -535,7 +825,9 @@ pub(crate) async fn ws_handler(
     Ok(ws
         .max_frame_size(MAX_WS_PAYLOAD_BYTES)
         .max_message_size(MAX_WS_PAYLOAD_BYTES)
-        .on_upgrade(move |socket| run_live_stream(socket, inner, entry, query, viewer_guard)))
+        .on_upgrade(move |socket| {
+            run_live_stream(socket, inner, entry, query, access, viewer_guard)
+        }))
 }
 
 #[derive(Debug, PartialEq)]
@@ -656,7 +948,7 @@ async fn send_json(ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Messag
         .is_ok()
 }
 
-fn status_payload(entry: &LiveEntry) -> Value {
+fn status_payload(entry: &LiveEntry, read_only: bool) -> Value {
     let info = entry.info();
     json!({
         "type": "status",
@@ -665,7 +957,8 @@ fn status_payload(entry: &LiveEntry) -> Value {
         "url": info.url,
         "paused": info.paused,
         "pause_reason": info.pause_reason,
-        "can_pause": info.can_pause,
+        "can_pause": info.can_pause && !read_only,
+        "mode": if read_only { "read_only" } else { "interactive" },
     })
 }
 
@@ -687,6 +980,7 @@ async fn run_live_stream(
     inner: Arc<Inner>,
     entry: LiveEntry,
     query: LiveStreamQuery,
+    access: LiveAccess,
     _viewer_guard: ViewerGuard,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -791,7 +1085,7 @@ async fn run_live_stream(
         return;
     }
 
-    if !send_json(&mut ws_tx, &status_payload(&entry)).await {
+    if !send_json(&mut ws_tx, &status_payload(&entry, access.read_only)).await {
         let _ = entry
             .conn
             .call("Page.stopScreencast", json!({}), Some(&obs_sid), CLEANUP_TIMEOUT)
@@ -817,6 +1111,7 @@ async fn run_live_stream(
 
     let any_url = inner.allow_any_url();
     let mut shutdown_rx = inner.shutdown_tx.subscribe();
+    let mut revoked_rx = entry.revoked_tx.subscribe();
     let mut pause_rx = entry.pause_tx.as_ref().map(|tx| tx.subscribe());
     let mut got_frame = false;
     let fallback_sleep = tokio::time::sleep(STATIC_FALLBACK_DELAY);
@@ -838,6 +1133,7 @@ async fn run_live_stream(
         let entry = entry.clone();
         let out_tx = out_tx.clone();
         let pause_seq = pause_seq.clone();
+        let read_only = access.read_only;
         tokio::spawn(async move {
             while let Some(op) = input_rx.recv().await {
                 match op {
@@ -875,7 +1171,7 @@ async fn run_live_stream(
                         if pause_seq.load(Ordering::SeqCst) == seq {
                             if let Some(tx) = &entry.pause_tx {
                                 apply_pause_state(tx, &entry.pause_reason, false, None);
-                                let _ = out_tx.send(status_payload(&entry));
+                                let _ = out_tx.send(status_payload(&entry, read_only));
                             }
                         }
                     }
@@ -893,6 +1189,14 @@ async fn run_live_stream(
             .await;
             break;
         }
+        if *revoked_rx.borrow() {
+            let _ = send_json(
+                &mut ws_tx,
+                &json!({ "type": "ended", "reason": "session closed" }),
+            )
+            .await;
+            break;
+        }
 
         tokio::select! {
             res = shutdown_rx.changed() => {
@@ -903,6 +1207,27 @@ async fn run_live_stream(
                     ).await;
                     break;
                 }
+            }
+            res = revoked_rx.changed() => {
+                if res.is_err() || *revoked_rx.borrow() {
+                    let _ = send_json(
+                        &mut ws_tx,
+                        &json!({ "type": "ended", "reason": "session closed" }),
+                    ).await;
+                    break;
+                }
+            }
+            _ = async {
+                match access.expires_at {
+                    Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let _ = send_json(
+                    &mut ws_tx,
+                    &json!({ "type": "ended", "reason": "embed token expired" }),
+                ).await;
+                break;
             }
             Some(_) = bg_tasks.join_next(), if !bg_tasks.is_empty() => {}
             Some(msg) = out_rx.recv() => {
@@ -916,7 +1241,7 @@ async fn run_live_stream(
                     None => std::future::pending().await,
                 }
             } => {
-                if !send_json(&mut ws_tx, &status_payload(&entry)).await {
+                if !send_json(&mut ws_tx, &status_payload(&entry, access.read_only)).await {
                     break;
                 }
             }
@@ -995,7 +1320,7 @@ async fn run_live_stream(
                     "Page.frameNavigated" if !ev.params["frame"]["parentId"].is_string() => {
                         if let Some(u) = ev.params["frame"]["url"].as_str() {
                             entry.set_url_if_nonempty(u);
-                            if !send_json(&mut ws_tx, &status_payload(&entry)).await {
+                            if !send_json(&mut ws_tx, &status_payload(&entry, access.read_only)).await {
                                 break;
                             }
                         }
@@ -1006,6 +1331,22 @@ async fn run_live_stream(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        if access.read_only {
+                            if !send_json(
+                                &mut ws_tx,
+                                &json!({
+                                    "type": "error",
+                                    "code": "forbidden",
+                                    "status": 403,
+                                    "message": "read-only embed session does not permit control commands",
+                                }),
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
                         match parse_client_command(text.as_str(), any_url) {
                             Ok(ClientCommand::Mouse(params)) => {
                                 let _ = input_tx.try_send(InputOp::Mouse(params));
@@ -1035,7 +1376,7 @@ async fn run_live_stream(
                                 if let Some(tx) = &entry.pause_tx {
                                     pause_seq.fetch_add(1, Ordering::SeqCst);
                                     apply_pause_state(tx, &entry.pause_reason, true, None);
-                                    if !send_json(&mut ws_tx, &status_payload(&entry)).await {
+                                    if !send_json(&mut ws_tx, &status_payload(&entry, access.read_only)).await {
                                         break;
                                     }
                                 } else {
@@ -1047,7 +1388,7 @@ async fn run_live_stream(
                                     let seq = pause_seq.fetch_add(1, Ordering::SeqCst) + 1;
                                     if input_tx.try_send(InputOp::Resume(seq)).is_err() {
                                         apply_pause_state(tx, &entry.pause_reason, false, None);
-                                        if !send_json(&mut ws_tx, &status_payload(&entry)).await {
+                                        if !send_json(&mut ws_tx, &status_payload(&entry, access.read_only)).await {
                                             break;
                                         }
                                     }
@@ -1136,6 +1477,421 @@ async fn capture_fallback_frame(conn: &Connection, sid: &str, quality: u8) -> Op
         "timestamp": 0.0,
     }))
 }
+
+fn sha256_b64(text: &str) -> String {
+    let d = digest::digest(&digest::SHA256, text.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(d.as_ref())
+}
+
+fn embed_csp_header(frame_ancestors: &str) -> String {
+    static HASHES: OnceLock<(String, String)> = OnceLock::new();
+    let (style_hash, script_hash) =
+        HASHES.get_or_init(|| (sha256_b64(EMBED_STYLE), sha256_b64(EMBED_SCRIPT)));
+    format!(
+        "default-src 'none'; script-src 'self' 'sha256-{script_hash}'; style-src 'sha256-{style_hash}'; img-src data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors {frame_ancestors}"
+    )
+}
+
+fn render_embed_html(session_id: &str, mode: EmbedMode) -> String {
+    let mode_str = match mode {
+        EmbedMode::ReadOnly => "read_only",
+        EmbedMode::Interactive => "interactive",
+    };
+    let toolbar_controls = match mode {
+        EmbedMode::ReadOnly => "<span class=\"pill pill-readonly\">Read-only</span>",
+        EmbedMode::Interactive => {
+            "<button type=\"button\" id=\"btn-live-pause\" class=\"btn-sm\" hidden>Pause</button>\
+             <button type=\"button\" id=\"btn-live-esc\" class=\"btn-sm\">Send Esc</button>"
+        }
+    };
+    let url_bar = match mode {
+        EmbedMode::ReadOnly => "",
+        EmbedMode::Interactive => {
+            "<form id=\"live-url-form\" class=\"live-urlbar\">\
+             <label for=\"live-url-input\" class=\"visually-hidden\">Target URL</label>\
+             <input id=\"live-url-input\" type=\"url\" placeholder=\"https://example.com\">\
+             <button type=\"submit\" class=\"btn-sm\">Go</button>\
+             </form>"
+        }
+    };
+    let banner_resume = match mode {
+        EmbedMode::ReadOnly => "",
+        EmbedMode::Interactive => {
+            "<button type=\"button\" id=\"btn-live-banner-resume\" class=\"btn-sm\">Resume</button>"
+        }
+    };
+    let stage_class = match mode {
+        EmbedMode::ReadOnly => "live-stage readonly",
+        EmbedMode::Interactive => "live-stage interactive",
+    };
+    format!(
+        "<!DOCTYPE html>\n\
+<html lang=\"en\">\n\
+<head>\n\
+  <meta charset=\"utf-8\">\n\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+  <title>Fluxwright Live View</title>\n\
+  <style>{EMBED_STYLE}</style>\n\
+</head>\n\
+<body data-session=\"{session_id}\" data-mode=\"{mode_str}\">\n\
+  <div class=\"embed-shell\">\n\
+    <div class=\"live-toolbar\">\n\
+      <div class=\"live-meta-group\">\n\
+        <span class=\"title\">Live View</span>\n\
+        <span class=\"pill\"><span id=\"conn-dot\" class=\"status-dot\"></span><span id=\"conn-label\">Connecting...</span></span>\n\
+        <span id=\"live-meta\" class=\"mono meta-text\"></span>\n\
+        <span id=\"live-fps\" class=\"mono meta-text\">0 fps</span>\n\
+      </div>\n\
+      <div class=\"live-actions\">{toolbar_controls}</div>\n\
+    </div>\n\
+    {url_bar}\n\
+    <div id=\"live-pause-banner\" class=\"live-pause-banner\" hidden>\n\
+      <span id=\"live-pause-text\">Paused for human action</span>\n\
+      {banner_resume}\n\
+    </div>\n\
+    <div id=\"{stage_id}\" class=\"{stage_class}\" tabindex=\"0\" aria-label=\"Live browser viewport\">\n\
+      <img id=\"live-frame\" alt=\"Live browser viewport\" draggable=\"false\" hidden>\n\
+      <div id=\"live-empty\" class=\"live-empty\">Connecting live stream...</div>\n\
+    </div>\n\
+  </div>\n\
+  <script>{EMBED_SCRIPT}</script>\n\
+</body>\n\
+</html>\n",
+        stage_id = "live-stage",
+    )
+}
+
+const EMBED_STYLE: &str = r##"
+:root {
+  color-scheme: light dark;
+  --bg: #0f172a;
+  --card-bg: #1e293b;
+  --border: #334155;
+  --text: #f8fafc;
+  --text-muted: #94a3b8;
+  --primary: #38bdf8;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; font-family: var(--font); background: var(--bg); color: var(--text); }
+.embed-shell { display: flex; flex-direction: column; height: 100vh; }
+.live-toolbar {
+  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+  gap: 0.5rem; padding: 0.5rem 0.75rem; background: var(--card-bg); border-bottom: 1px solid var(--border);
+}
+.live-meta-group { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.live-actions { display: flex; align-items: center; gap: 0.5rem; }
+.title { font-size: 0.9375rem; font-weight: 600; }
+.mono { font-family: var(--mono); font-size: 0.75rem; }
+.meta-text { color: var(--text-muted); }
+.pill {
+  display: inline-flex; align-items: center; gap: 0.375rem; font-size: 0.75rem;
+  padding: 0.15rem 0.5rem; border-radius: 9999px; background: var(--bg); border: 1px solid var(--border);
+}
+.pill-readonly { color: var(--text-muted); }
+.status-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--warning); }
+.status-dot.connected { background: var(--success); }
+.status-dot.disconnected { background: var(--danger); }
+button, input {
+  font-family: inherit; font-size: 0.8125rem; padding: 0.35rem 0.65rem;
+  border-radius: 6px; border: 1px solid var(--border); background: var(--card-bg); color: var(--text);
+}
+button { cursor: pointer; font-weight: 500; }
+button:hover { border-color: var(--primary); }
+.btn-sm { padding: 0.25rem 0.625rem; font-size: 0.75rem; }
+.live-urlbar {
+  display: flex; gap: 0.5rem; padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border); background: var(--bg);
+}
+.live-urlbar input { flex: 1; }
+.live-pause-banner {
+  display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+  padding: 0.4rem 0.75rem; background: #f59e0b22; border-bottom: 1px solid #f59e0b55;
+  color: var(--warning); font-size: 0.8125rem; font-weight: 500;
+}
+.live-stage {
+  flex: 1; overflow: auto; display: flex; justify-content: center; align-items: flex-start;
+  padding: 0.5rem; background: #020617; outline: none;
+}
+#live-frame {
+  max-width: 100%; height: auto; display: block; background: #000;
+  user-select: none; -webkit-user-drag: none; border-radius: 4px;
+}
+.live-stage.interactive #live-frame { cursor: crosshair; }
+.live-empty { color: var(--text-muted); padding: 2rem; font-size: 0.875rem; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+"##;
+
+const EMBED_SCRIPT: &str = r##"(function () {
+  const body = document.body;
+  const sessionId = (body && body.dataset && body.dataset.session) || '';
+  const mode = (body && body.dataset && body.dataset.mode) === 'interactive' ? 'interactive' : 'read_only';
+  const parts = location.pathname.split('/').filter(Boolean);
+  const embedToken = parts.length ? parts[parts.length - 1] : '';
+  const connDot = document.getElementById('conn-dot');
+  const connLabel = document.getElementById('conn-label');
+  const liveMeta = document.getElementById('live-meta');
+  const liveFps = document.getElementById('live-fps');
+  const livePauseBanner = document.getElementById('live-pause-banner');
+  const livePauseText = document.getElementById('live-pause-text');
+  const liveStage = document.getElementById('live-stage');
+  const liveFrame = document.getElementById('live-frame');
+  const liveEmpty = document.getElementById('live-empty');
+  const livePauseBtn = document.getElementById('btn-live-pause');
+  const liveEscBtn = document.getElementById('btn-live-esc');
+  const liveBannerResumeBtn = document.getElementById('btn-live-banner-resume');
+  const liveUrlForm = document.getElementById('live-url-form');
+  const liveUrlInput = document.getElementById('live-url-input');
+
+  let liveWs = null;
+  let liveSessionState = null;
+  let mouseDragging = false;
+  let frameWidth = 1280;
+  let frameHeight = 800;
+  let fpsWindow = [];
+  let lastMoveAt = 0;
+
+  function setStatus(state, text) {
+    if (connDot) connDot.className = 'status-dot ' + state;
+    if (connLabel) connLabel.textContent = text;
+  }
+
+  function sendLive(payload) {
+    if (mode !== 'interactive') return;
+    if (liveWs && liveWs.readyState === WebSocket.OPEN) {
+      liveWs.send(JSON.stringify(payload));
+    }
+  }
+
+  function applyStatus(msg) {
+    liveSessionState = msg;
+    if (liveMeta) liveMeta.textContent = frameWidth + 'x' + frameHeight;
+    if (liveUrlInput && msg.url && document.activeElement !== liveUrlInput) {
+      liveUrlInput.value = String(msg.url);
+    }
+    if (livePauseBtn) {
+      livePauseBtn.hidden = mode !== 'interactive' || !msg.can_pause;
+      livePauseBtn.textContent = msg.paused ? 'Resume' : 'Pause';
+    }
+    if (livePauseBanner) livePauseBanner.hidden = !msg.paused;
+    if (livePauseText) livePauseText.textContent = msg.pause_reason || 'Paused for human action';
+  }
+
+  function connect() {
+    if (!sessionId || !embedToken) {
+      setStatus('disconnected', 'Invalid embed link');
+      if (liveEmpty) liveEmpty.textContent = 'Invalid embed session.';
+      return;
+    }
+    setStatus('connecting', 'Connecting...');
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const wsUrl = proto + location.host + '/v1/live/' + encodeURIComponent(sessionId) + '/ws?embed=' + encodeURIComponent(embedToken);
+    const ws = new WebSocket(wsUrl);
+    liveWs = ws;
+    ws.addEventListener('open', function () {
+      setStatus('connected', mode === 'interactive' ? 'Live (Interactive)' : 'Live (Read-only)');
+    });
+    ws.addEventListener('message', function (ev) {
+      if (liveWs !== ws) return;
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (_) {
+        return;
+      }
+      if (msg.type === 'frame' && typeof msg.data === 'string' && /^[A-Za-z0-9+/=]+$/.test(msg.data)) {
+        frameWidth = Number(msg.width) || frameWidth;
+        frameHeight = Number(msg.height) || frameHeight;
+        if (liveMeta) liveMeta.textContent = frameWidth + 'x' + frameHeight;
+        liveFrame.src = 'data:image/jpeg;base64,' + msg.data;
+        liveFrame.hidden = false;
+        if (liveEmpty) liveEmpty.hidden = true;
+        const now = performance.now();
+        fpsWindow.push(now);
+        while (fpsWindow.length && fpsWindow[0] < now - 1000) fpsWindow.shift();
+        if (liveFps) liveFps.textContent = fpsWindow.length + ' fps';
+      } else if (msg.type === 'status') {
+        applyStatus(msg);
+      } else if (msg.type === 'ended') {
+        setStatus('disconnected', 'Ended');
+        if (liveEmpty) {
+          liveEmpty.textContent = 'Session ended: ' + (msg.reason || 'closed');
+          liveEmpty.hidden = false;
+        }
+      } else if (msg.type === 'error') {
+        if (liveEmpty) {
+          liveEmpty.textContent = msg.message || 'Live stream error';
+          liveEmpty.hidden = false;
+        }
+      }
+    });
+    ws.addEventListener('close', function () {
+      if (liveWs === ws) {
+        liveWs = null;
+        mouseDragging = false;
+        setStatus('disconnected', 'Disconnected');
+        if (liveFrame.hidden && liveEmpty) {
+          liveEmpty.hidden = false;
+        }
+      }
+    });
+  }
+
+  if (mode === 'interactive') {
+    function mapCoords(e) {
+      const rect = liveFrame.getBoundingClientRect();
+      if (!rect.width || !rect.height) return { x: 0, y: 0 };
+      const rawX = ((e.clientX - rect.left) / rect.width) * frameWidth;
+      const rawY = ((e.clientY - rect.top) / rect.height) * frameHeight;
+      return {
+        x: Math.round(Math.min(frameWidth, Math.max(0, rawX)) * 100) / 100,
+        y: Math.round(Math.min(frameHeight, Math.max(0, rawY)) * 100) / 100,
+      };
+    }
+    function mouseButton(b) {
+      if (b === 0) return 'left';
+      if (b === 1) return 'middle';
+      if (b === 2) return 'right';
+      return 'none';
+    }
+    function mouseButtonFromMask(mask) {
+      if (mask & 1) return 'left';
+      if (mask & 2) return 'right';
+      if (mask & 4) return 'middle';
+      return 'none';
+    }
+    function modBits(e) {
+      return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+    }
+    liveFrame.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    liveFrame.addEventListener('mousedown', function (e) {
+      e.preventDefault();
+      mouseDragging = true;
+      if (liveStage) liveStage.focus();
+      const pt = mapCoords(e);
+      sendLive({
+        type: 'mouse',
+        event: 'mousePressed',
+        x: pt.x,
+        y: pt.y,
+        button: mouseButton(e.button),
+        buttons: e.buttons || 0,
+        clickCount: e.detail || 1,
+        modifiers: modBits(e),
+      });
+    });
+    window.addEventListener('mouseup', function (e) {
+      if (!mouseDragging && e.target !== liveFrame) return;
+      mouseDragging = false;
+      if (e.target === liveFrame) e.preventDefault();
+      const pt = mapCoords(e);
+      sendLive({
+        type: 'mouse',
+        event: 'mouseReleased',
+        x: pt.x,
+        y: pt.y,
+        button: mouseButton(e.button),
+        buttons: e.buttons || 0,
+        clickCount: e.detail || 1,
+        modifiers: modBits(e),
+      });
+    });
+    window.addEventListener('mousemove', function (e) {
+      if (!mouseDragging && e.target !== liveFrame) return;
+      const now = performance.now();
+      if (now - lastMoveAt < 33) return;
+      lastMoveAt = now;
+      const pt = mapCoords(e);
+      const mask = e.buttons || 0;
+      sendLive({
+        type: 'mouse',
+        event: 'mouseMoved',
+        x: pt.x,
+        y: pt.y,
+        button: mouseButtonFromMask(mask),
+        buttons: mask,
+        modifiers: modBits(e),
+      });
+    });
+    liveFrame.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      const pt = mapCoords(e);
+      sendLive({
+        type: 'mouse',
+        event: 'mouseWheel',
+        x: pt.x,
+        y: pt.y,
+        button: 'none',
+        modifiers: modBits(e),
+        deltaX: e.deltaX,
+        deltaY: e.deltaY,
+      });
+    }, { passive: false });
+    function buildKeyPayload(e, kind) {
+      const text = (kind === 'keyDown' && e.key === 'Enter')
+        ? '\r'
+        : (kind === 'keyDown' && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey ? e.key : '');
+      return {
+        type: 'key',
+        event: kind,
+        key: e.key,
+        code: e.code,
+        text: text,
+        modifiers: modBits(e),
+        windowsVirtualKeyCode: e.keyCode || 0,
+      };
+    }
+    if (liveStage) {
+      liveStage.addEventListener('keydown', function (e) {
+        if (e.isComposing) return;
+        e.preventDefault();
+        sendLive(buildKeyPayload(e, 'keyDown'));
+      });
+      liveStage.addEventListener('keyup', function (e) {
+        if (e.isComposing) return;
+        e.preventDefault();
+        sendLive(buildKeyPayload(e, 'keyUp'));
+      });
+    }
+    if (liveUrlForm) {
+      liveUrlForm.addEventListener('submit', function (e) {
+        e.preventDefault();
+        const nextUrl = liveUrlInput ? liveUrlInput.value.trim() : '';
+        if (nextUrl) {
+          sendLive({ type: 'navigate', url: nextUrl });
+          if (liveStage) liveStage.focus();
+        }
+      });
+    }
+    if (livePauseBtn) {
+      livePauseBtn.addEventListener('click', function () {
+        if (!liveSessionState) return;
+        sendLive({ type: liveSessionState.paused ? 'resume' : 'pause' });
+      });
+    }
+    if (liveBannerResumeBtn) {
+      liveBannerResumeBtn.addEventListener('click', function () {
+        sendLive({ type: 'resume' });
+      });
+    }
+    if (liveEscBtn) {
+      liveEscBtn.addEventListener('click', function () {
+        sendLive({ type: 'key', event: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+        sendLive({ type: 'key', event: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+        if (liveStage) liveStage.focus();
+      });
+    }
+  }
+
+  connect();
+})();"##;
 
 #[cfg(test)]
 mod tests {

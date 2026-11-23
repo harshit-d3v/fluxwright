@@ -6,12 +6,15 @@
 mod cdp_gateway;
 mod cluster;
 pub mod dashboard;
+mod http_post;
 mod job;
 mod journal;
 mod live;
+mod otlp;
 pub mod prometheus;
 mod store;
 pub mod telemetry;
+mod webhook;
 
 #[cfg(test)]
 mod tests;
@@ -79,10 +82,16 @@ pub struct ServerConfig {
     /// Disable the server-side SSRF URL guard (same effect as `FLUXWRIGHT_SERVER_ANY_URL=1`).
     /// Disabled by default.
     pub allow_any_url: bool,
+    webhook_secret: Option<Vec<u8>>,
+    otlp_endpoint: Option<String>,
+    otlp_service_name: String,
+    embed_frame_ancestors: String,
 }
 
 const DEFAULT_LEASE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_RESULT_TTL_SECS: u64 = 3_600;
+const DEFAULT_OTLP_SERVICE_NAME: &str = "fluxwright-server";
+const DEFAULT_EMBED_FRAME_ANCESTORS: &str = "*";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -98,6 +107,12 @@ pub enum ConfigError {
     ConflictingStore,
     #[error("invalid coordinator configuration: {0}")]
     InvalidCoordinator(String),
+    #[error("invalid webhook secret: {0}")]
+    InvalidWebhookSecret(String),
+    #[error("invalid OTLP endpoint: {0}")]
+    InvalidOtlpEndpoint(String),
+    #[error("invalid embed frame-ancestors policy: {0}")]
+    InvalidFrameAncestors(String),
 }
 
 fn validate_token(token: &str) -> Result<(), ConfigError> {
@@ -105,6 +120,21 @@ fn validate_token(token: &str) -> Result<(), ConfigError> {
         return Err(ConfigError::InvalidToken);
     }
     Ok(())
+}
+
+fn validate_frame_ancestors(policy: &str) -> Result<String, ConfigError> {
+    let trimmed = policy.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 1024
+        || trimmed.contains([';', ','])
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(ConfigError::InvalidFrameAncestors(
+            "policy must be 1-1024 characters without semicolons, commas, or control characters"
+                .into(),
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 impl ServerConfig {
@@ -121,6 +151,10 @@ impl ServerConfig {
             min_delay_per_host: None,
             allow_query_token: false,
             allow_any_url: false,
+            webhook_secret: None,
+            otlp_endpoint: None,
+            otlp_service_name: DEFAULT_OTLP_SERVICE_NAME.to_string(),
+            embed_frame_ancestors: DEFAULT_EMBED_FRAME_ANCESTORS.to_string(),
         })
     }
 
@@ -129,6 +163,40 @@ impl ServerConfig {
     pub fn with_worker_token(mut self, token: String) -> Result<Self, ConfigError> {
         validate_token(&token)?;
         self.worker_token = Some(token);
+        Ok(self)
+    }
+
+    /// Configures the HMAC-SHA256 secret used to sign job completion webhooks via
+    /// `X-Fluxwright-Signature: sha256=<hex>`.
+    pub fn with_webhook_secret(mut self, secret: String) -> Result<Self, ConfigError> {
+        if secret.is_empty() || secret.len() > 1024 || secret.chars().any(char::is_control) {
+            return Err(ConfigError::InvalidWebhookSecret(
+                "secret must be 1-1024 bytes without control characters".into(),
+            ));
+        }
+        self.webhook_secret = Some(secret.into_bytes());
+        Ok(self)
+    }
+
+    /// Configures an OTLP/HTTP JSON trace exporter base URL (e.g. `http://127.0.0.1:4318`).
+    pub fn with_otlp_endpoint(mut self, endpoint: String) -> Result<Self, ConfigError> {
+        let _ = otlp::parse_otlp_endpoint(&endpoint).map_err(ConfigError::InvalidOtlpEndpoint)?;
+        self.otlp_endpoint = Some(endpoint);
+        Ok(self)
+    }
+
+    /// Sets the `service.name` resource attribute reported to OTLP (defaults to `"fluxwright-server"`).
+    pub fn with_otlp_service_name(mut self, service_name: String) -> Self {
+        let trimmed = service_name.trim();
+        if !trimmed.is_empty() && trimmed.len() <= 256 && !trimmed.chars().any(char::is_control) {
+            self.otlp_service_name = trimmed.to_string();
+        }
+        self
+    }
+
+    /// Configures the CSP `frame-ancestors` policy emitted on `GET /embed/live/{token}` (default `*`).
+    pub fn with_embed_frame_ancestors(mut self, policy: String) -> Result<Self, ConfigError> {
+        self.embed_frame_ancestors = validate_frame_ancestors(&policy)?;
         Ok(self)
     }
 }
@@ -147,12 +215,15 @@ pub(crate) struct Inner {
     min_delay_per_host_ms: Option<u64>,
     allow_query_token: bool,
     allow_any_url: bool,
+    embed_frame_ancestors: String,
     lease_ms: AtomicU64,
     lease_notify: tokio::sync::Notify,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     active_cdp_sessions: AtomicUsize,
     total_cdp_sessions: AtomicU64,
     live: live::LiveRegistry,
+    webhooks: webhook::WebhookDispatcher,
+    otlp: Option<otlp::OtlpExporter>,
     registry: Mutex<Registry>,
     store: Option<Box<dyn store::JobStore>>,
 }
@@ -171,9 +242,38 @@ struct Registry {
 struct Record {
     job: Job,
     request: JobRequest,
+    trace_ctx: JobTraceContext,
+    submitted_ns: u128,
+    started_ns: Option<u128>,
     abort: Option<AbortHandle>,
     worker: Option<String>,
     lease_until: Option<u64>,
+}
+
+pub(crate) struct TerminalJob {
+    pub(crate) job: Job,
+    pub(crate) webhook: Option<webhook::WebhookTarget>,
+    pub(crate) span: otlp::OtlpSpanData,
+}
+
+impl Record {
+    pub(crate) fn to_terminal(&self, end_ns: u128) -> TerminalJob {
+        let start_ns = self.started_ns.unwrap_or(self.submitted_ns);
+        TerminalJob {
+            job: self.job.clone(),
+            webhook: webhook::WebhookTarget::from_request(&self.request),
+            span: otlp::OtlpSpanData {
+                trace_ctx: self.trace_ctx.clone(),
+                job_id: self.job.id,
+                status: self.job.status,
+                steps: self.request.steps.len(),
+                attempts: self.job.attempts,
+                start_time_unix_nano: start_ns,
+                end_time_unix_nano: end_ns.max(start_ns),
+                error: self.job.error.clone(),
+            },
+        }
+    }
 }
 
 impl Registry {
@@ -206,7 +306,7 @@ impl Inner {
     }
 
     /// Expires overdue worker leases under the registry lock, runs `f`, and flushes newly
-    /// terminal job snapshots to the durable store once the lock is dropped.
+    /// terminal job snapshots (plus webhooks and OTLP spans) once the lock is dropped.
     pub(crate) fn with_registry<T>(&self, f: impl FnOnce(&mut Registry, u64) -> T) -> T {
         let now = now_ms();
         let (out, expired) = {
@@ -214,8 +314,8 @@ impl Inner {
             let expired = cluster::expire_leases(&mut registry, now);
             (f(&mut registry, now), expired)
         };
-        for job in expired {
-            self.store_finished(&job);
+        for term in expired {
+            self.on_job_terminal(term);
         }
         out
     }
@@ -347,6 +447,17 @@ impl Inner {
             store.invalid_pending(id);
         }
     }
+
+    pub(crate) fn on_job_terminal(&self, term: TerminalJob) {
+        self.store_finished(&term.job);
+        if let Some(target) = term.webhook {
+            self.webhooks
+                .dispatch(target, term.job, self.allow_any_url());
+        }
+        if let Some(otlp) = &self.otlp {
+            otlp.try_record(term.span);
+        }
+    }
 }
 
 impl Drop for Inner {
@@ -395,6 +506,13 @@ impl HttpServer {
             .filter(|d| !d.is_zero())
             .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
             .filter(|ms| *ms > 0);
+        let otlp = match &config.otlp_endpoint {
+            Some(ep) => Some(
+                otlp::OtlpExporter::new(ep, config.otlp_service_name.clone())
+                    .map_err(ConfigError::InvalidOtlpEndpoint)?,
+            ),
+            None => None,
+        };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let inner = Arc::new(Inner {
             engine,
@@ -405,12 +523,15 @@ impl HttpServer {
             min_delay_per_host_ms,
             allow_query_token: config.allow_query_token,
             allow_any_url: config.allow_any_url,
+            embed_frame_ancestors: config.embed_frame_ancestors,
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
             lease_notify: tokio::sync::Notify::new(),
             shutdown_tx,
             active_cdp_sessions: AtomicUsize::new(0),
             total_cdp_sessions: AtomicU64::new(0),
             live: live::LiveRegistry::default(),
+            webhooks: webhook::WebhookDispatcher::new(config.webhook_secret),
+            otlp,
             registry: Mutex::new(Registry {
                 accepting: true,
                 jobs: VecDeque::new(),
@@ -425,12 +546,13 @@ impl HttpServer {
         });
 
         if let Some(loaded) = loaded {
+            let allow_any_url = inner.allow_any_url();
             let mut valid_pending = Vec::new();
             let mut invalid_ids = Vec::new();
             for item in loaded.pending {
                 match serde_json::from_value::<JobRequest>(item.request) {
                     Ok(request)
-                        if request.validate().is_ok()
+                        if request.validate_with(allow_any_url).is_ok()
                             && (inner.engine.is_some()
                                 || !request
                                     .steps
@@ -492,9 +614,18 @@ impl HttpServer {
             for item in kept_finished {
                 let request = serde_json::from_str::<JobRequest>(&item.request_json)
                     .unwrap_or_else(|_| fallback_finished_request());
+                let mut trace_ctx = JobTraceContext::new();
+                if let Some(tid) = item.job.trace_id.clone() {
+                    trace_ctx.trace_id = tid;
+                }
+                let submitted_ns = telemetry::ms_to_unix_nano(item.job.submitted_at);
+                let started_ns = item.job.started_at.map(telemetry::ms_to_unix_nano);
                 registry.jobs.push_back(Record {
                     job: item.job,
                     request,
+                    trace_ctx,
+                    submitted_ns,
+                    started_ns,
                     abort: None,
                     worker: None,
                     lease_until: None,
@@ -566,6 +697,7 @@ impl HttpServer {
         let mut protected = small
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
         let mut live_ws = Router::new();
+        let mut embed_routes = Router::new();
         if self.inner.engine.is_some() {
             protected = protected
                 .route("/cdp", get(cdp_gateway::ws_handler))
@@ -575,6 +707,7 @@ impl HttpServer {
                 .route("/v1/proxies", get(list_proxies))
                 .route("/v1/live", get(live::list_sessions))
                 .route("/v1/live/{id}/ticket", post(live::create_ticket))
+                .route("/v1/live/{id}/embed", post(live::create_embed))
                 .route("/v1/jobs/{id}/pause", post(live::pause_job))
                 .route("/v1/jobs/{id}/resume", post(live::resume_job));
             live_ws = Router::new()
@@ -583,6 +716,7 @@ impl HttpServer {
                     self.inner.clone(),
                     live::authorize_ws,
                 ));
+            embed_routes = Router::new().route("/embed/live/{token}", get(live::embed_html));
         }
         let protected = protected.route_layer(middleware::from_fn_with_state(
             self.inner.clone(),
@@ -600,6 +734,7 @@ impl HttpServer {
             .merge(protected)
             .merge(worker_routes)
             .merge(live_ws)
+            .merge(embed_routes)
             .fallback(|| async {
                 ApiError::new(StatusCode::NOT_FOUND, "not_found", "endpoint not found")
             })
@@ -631,10 +766,14 @@ impl HttpServer {
         }
         self.inner.lease_notify.notify_one();
         let _ = self.inner.shutdown_tx.send(true);
-        match &self.inner.engine {
+        let res = match &self.inner.engine {
             Some(engine) => engine.shutdown(grace).await,
             None => Ok(()),
+        };
+        if let Some(otlp) = &self.inner.otlp {
+            otlp.flush(grace.min(Duration::from_secs(2))).await;
         }
+        res
     }
 }
 
@@ -731,7 +870,7 @@ async fn submit(
         ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_request", e.to_string())
     })?;
     request
-        .validate()
+        .validate_with(inner.allow_any_url())
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
     if inner.engine.is_none()
         && request
@@ -825,6 +964,8 @@ fn fallback_finished_request() -> JobRequest {
         profile: None,
         persist_profile: true,
         proxy_session: None,
+        webhook_url: None,
+        webhook_headers: HashMap::new(),
     }
 }
 
@@ -838,17 +979,31 @@ fn enqueue_job(
     trace_ctx: JobTraceContext,
 ) {
     let id = job.id;
+    let submitted_ns = telemetry::now_unix_nano();
     if let Some(engine) = inner.engine.clone() {
         let weak = Arc::downgrade(inner);
         let worker_state = weak.clone();
         let req_clone = request.clone();
+        let task_trace_ctx = trace_ctx.clone();
         let task = tokio::spawn(async move {
             let progress = Arc::new(Mutex::new(ExecutionProgress::default()));
-            execute_job(engine, req_clone, Some(worker_state), id, trace_ctx, 0, progress).await
+            execute_job(
+                engine,
+                req_clone,
+                Some(worker_state),
+                id,
+                task_trace_ctx,
+                0,
+                progress,
+            )
+            .await
         });
         registry.jobs.push_back(Record {
             job,
             request,
+            trace_ctx,
+            submitted_ns,
+            started_ns: None,
             abort: Some(task.abort_handle()),
             worker: None,
             lease_until: None,
@@ -866,6 +1021,9 @@ fn enqueue_job(
         registry.jobs.push_back(Record {
             job,
             request,
+            trace_ctx,
+            submitted_ns,
+            started_ns: None,
             abort: None,
             worker: None,
             lease_until: None,
@@ -879,7 +1037,7 @@ fn finish_job(
     id: Uuid,
     outcome: Result<fluxwright::Result<Vec<Value>>, tokio::task::JoinError>,
 ) {
-    let finished_job = inner.with_registry(|registry, now| {
+    let terminal = inner.with_registry(|registry, now| {
         let record = registry.find_mut(id)?;
         record.abort = None;
         if record.job.status.terminal() {
@@ -907,16 +1065,17 @@ fn finish_job(
                 );
             }
         }
-        let snapshot = record.job.clone();
-        match snapshot.status {
+        let term = record.to_terminal(telemetry::now_unix_nano());
+        match term.job.status {
             JobStatus::Succeeded => registry.succeeded_jobs += 1,
             _ => registry.failed_jobs += 1,
         }
-        Some(snapshot)
+        Some(term)
     });
-    if let Some(job) = finished_job {
-        inner.store_finished(&job);
-        tracing::info!(job_id = %id, status = ?job.status, "HTTP job finished");
+    if let Some(term) = terminal {
+        let status = term.job.status;
+        inner.on_job_terminal(term);
+        tracing::info!(job_id = %id, ?status, "HTTP job finished");
     }
 }
 
@@ -987,12 +1146,13 @@ pub(crate) async fn execute_job(
                         p.failure_evidence = None;
                     }
                     if let Some(weak) = &inner {
-                        update(weak, id, |job| {
-                            job.status = JobStatus::Running;
-                            job.started_at.get_or_insert_with(now_ms);
-                            job.attempts = total_attempts;
-                            job.step_index = None;
-                            job.failure_evidence = None;
+                        update_record(weak, id, |record| {
+                            record.started_ns.get_or_insert_with(telemetry::now_unix_nano);
+                            record.job.status = JobStatus::Running;
+                            record.job.started_at.get_or_insert_with(now_ms);
+                            record.job.attempts = total_attempts;
+                            record.job.step_index = None;
+                            record.job.failure_evidence = None;
                         });
                     }
 
@@ -1441,11 +1601,15 @@ fn format_page_error(err: &fluxwright::PageError) -> String {
 }
 
 fn update(inner: &Weak<Inner>, id: Uuid, f: impl FnOnce(&mut Job)) {
+    update_record(inner, id, |record| f(&mut record.job));
+}
+
+fn update_record(inner: &Weak<Inner>, id: Uuid, f: impl FnOnce(&mut Record)) {
     if let Some(inner) = inner.upgrade() {
         let mut registry = inner.registry.lock().unwrap();
         if let Some(record) = registry.find_mut(id) {
             if !record.job.status.terminal() {
-                f(&mut record.job);
+                f(record);
             }
         }
     }
@@ -1473,10 +1637,10 @@ async fn cancel(
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
-    let (job_clone, abort, finished) = inner.with_registry(|registry, now| -> Result<_, ApiError> {
+    let (job_clone, abort, terminal) = inner.with_registry(|registry, now| -> Result<_, ApiError> {
         let record = registry.find_mut(id).ok_or_else(not_found)?;
         if record.job.status == JobStatus::Cancelled {
-            return Ok((record.job.clone(), None, false));
+            return Ok((record.job.clone(), None, None));
         }
         if record.job.status.terminal() {
             return Err(ApiError::new(
@@ -1491,15 +1655,16 @@ async fn cancel(
         record.lease_until = None;
         let job = record.job.clone();
         let abort = record.abort.clone();
+        let terminal = record.to_terminal(telemetry::now_unix_nano());
         registry.cancelled_jobs += 1;
-        Ok((job, abort, true))
+        Ok((job, abort, Some(terminal)))
     })?;
     if let Some(abort) = abort {
         abort.abort();
     }
-    if finished {
+    if let Some(term) = terminal {
         // A job the client cancelled is over. One the shutdown cancels is not: it runs again.
-        inner.store_finished(&job_clone);
+        inner.on_job_terminal(term);
     }
     Ok(Json(job_clone))
 }

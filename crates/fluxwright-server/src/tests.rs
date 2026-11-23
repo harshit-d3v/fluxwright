@@ -778,7 +778,12 @@ fn eviction_keeps_active_jobs() {
                 profile: None,
                 persist_profile: true,
                 proxy_session: None,
+                webhook_url: None,
+                webhook_headers: HashMap::new(),
             },
+            trace_ctx: JobTraceContext::new(),
+            submitted_ns: 0,
+            started_ns: None,
             abort: active.then(|| tokio::spawn(std::future::pending::<()>()).abort_handle()),
             worker: None,
             lease_until: None,
@@ -2319,4 +2324,1205 @@ async fn coordinator_enforces_global_per_host_delay_across_workers_without_hol_b
     assert_eq!(l_after["jobs"][0]["id"], a2.id.to_string());
 
     coord.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[test]
+fn http_post_parses_urls_validates_headers_and_blocks_ssrf_ips() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let ep = http_post::HttpEndpoint::parse("https://Hooks.Example.COM:8443/v1/hook?token=abc#frag", true)
+        .unwrap();
+    assert!(ep.tls);
+    assert_eq!(ep.host, "hooks.example.com");
+    assert_eq!(ep.port, 8443);
+    assert_eq!(ep.host_header, "Hooks.Example.COM:8443");
+    assert_eq!(ep.path_and_query, "/v1/hook?token=abc");
+
+    let q_root = http_post::HttpEndpoint::parse("http://127.0.0.1:9000?a=1", true).unwrap();
+    assert_eq!(q_root.path_and_query, "/?a=1");
+    assert!(q_root.is_loopback());
+
+    let v6 = http_post::HttpEndpoint::parse("https://[::1]:443/otel/", false).unwrap();
+    assert_eq!(v6.host, "::1");
+    assert!(v6.is_loopback());
+    assert_eq!(v6.base_path(), "/otel");
+
+    for bad in [
+        "",
+        "ftp://example.com/hook",
+        "https://user:pass@example.com/hook",
+        "https://example.com\\@169.254.169.254/",
+        "https://example.com:0/hook",
+        "https://exa\nmple.com/hook",
+        "https://[::1/hook",
+    ] {
+        assert!(http_post::HttpEndpoint::parse(bad, true).is_err(), "{bad}");
+    }
+
+    // Header hygiene checks
+    assert!(http_post::validate_header_name("X-Api-Key").is_ok());
+    assert!(http_post::validate_header_name("Bad Header").is_err());
+    assert!(http_post::validate_header_name("Bad:Name").is_err());
+    assert!(http_post::validate_header_value("ok-value").is_ok());
+    assert!(http_post::validate_header_value("bad\r\nInjected: 1").is_err());
+    assert!(http_post::validate_header_value("bad\nline").is_err());
+    for reserved in [
+        "Host",
+        "content-length",
+        "Connection",
+        "Transfer-Encoding",
+        "X-Fluxwright-Signature",
+        "x-fluxwright-event",
+    ] {
+        assert!(http_post::is_reserved_header(reserved), "{reserved}");
+    }
+    assert!(!http_post::is_reserved_header("X-Custom-Token"));
+
+    // SSRF IP and mixed DNS resolution checks
+    for blocked in [
+        IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+        IpAddr::V6("fe80::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("fd00:ec2::254".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("::ffff:169.254.169.254".parse::<Ipv6Addr>().unwrap()),
+    ] {
+        assert!(http_post::ip_allowed(blocked).is_err(), "{blocked}");
+        // Mixed DNS resolution containing even one blocked IP must be rejected entirely.
+        let mixed = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443),
+            SocketAddr::new(blocked, 443),
+        ];
+        assert!(http_post::validate_resolved_addrs(mixed.clone(), true).is_err());
+        assert!(http_post::validate_resolved_addrs(mixed, false).is_ok());
+    }
+    for allowed in [
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::V6("::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    ] {
+        assert!(http_post::ip_allowed(allowed).is_ok(), "{allowed}");
+    }
+}
+
+#[tokio::test]
+async fn webhook_validation_rejects_ssrf_and_reserved_headers_and_verifies_hmac() {
+    let srv = server(4).await;
+
+    // SSRF and malformed webhook URLs rejected with 400.
+    for bad_url in [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "http://169.254.169.254/latest/meta-data",
+        "http://2852039166/hook",
+        "http://metadata.google.internal/hook",
+        "http://[::ffff:169.254.169.254]/hook",
+        "http://[fe80::1]/hook",
+        "http://user:pass@example.com/hook",
+    ] {
+        let payload = json!({
+            "steps": [{ "action": "title" }],
+            "webhook_url": bad_url,
+        });
+        let resp = call(&srv, "POST", "/v1/jobs", payload.to_string()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad_url}");
+    }
+
+    // Reserved, CR/LF, duplicate-case, and >16 webhook_headers rejected.
+    let mut too_many = serde_json::Map::new();
+    for i in 0..17 {
+        too_many.insert(format!("X-H-{i}"), json!("v"));
+    }
+    for bad_headers in [
+        json!({ "Host": "evil.example" }),
+        json!({ "Content-Length": "999" }),
+        json!({ "Connection": "keep-alive" }),
+        json!({ "Transfer-Encoding": "chunked" }),
+        json!({ "X-Fluxwright-Signature": "sha256=deadbeef" }),
+        json!({ "x-fluxwright-event": "fake" }),
+        json!({ "X-Test": "line1\r\nX-Evil: 1" }),
+        json!({ "X-Test": "val", "x-test": "dup" }),
+        Value::Object(too_many),
+    ] {
+        let payload = json!({
+            "steps": [{ "action": "title" }],
+            "webhook_url": "http://127.0.0.1:9999/hook",
+            "webhook_headers": bad_headers,
+        });
+        let resp = call(&srv, "POST", "/v1/jobs", payload.to_string()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad_headers}");
+    }
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+
+    // allow_any_url permits 169.254.x.x webhook URLs (while still rejecting non-http schemes).
+    let engine = idle_engine().await;
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.allow_any_url = true;
+    let any_srv = HttpServer::new(engine, cfg).unwrap();
+    let ok_any = call(
+        &any_srv,
+        "POST",
+        "/v1/jobs",
+        json!({
+            "steps": [{ "action": "title" }],
+            "webhook_url": "http://169.254.169.254/hook",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(ok_any.status(), StatusCode::ACCEPTED);
+    let still_bad = call(
+        &any_srv,
+        "POST",
+        "/v1/jobs",
+        json!({
+            "steps": [{ "action": "title" }],
+            "webhook_url": "file:///etc/passwd",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(still_bad.status(), StatusCode::BAD_REQUEST);
+    any_srv.shutdown(Duration::ZERO).await.unwrap();
+
+    // HMAC-SHA256 verification against ring::hmac::verify
+    let secret = b"whsec_super_secret";
+    let body = br#"{"event":"job.completed","job":{"id":"123"}}"#;
+    let ts = 1_793_664_000u64;
+    let sig_header = webhook::sign_payload(secret, ts, body);
+    let hex_sig = sig_header.strip_prefix("sha256=").expect("sha256= prefix");
+    assert_eq!(hex_sig.len(), 64);
+    let sig_bytes: Vec<u8> = (0..hex_sig.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex_sig[i..i + 2], 16).unwrap())
+        .collect();
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let signed_msg = format!("{ts}.{}", std::str::from_utf8(body).unwrap());
+    assert!(ring::hmac::verify(&key, signed_msg.as_bytes(), &sig_bytes).is_ok());
+    assert!(ring::hmac::verify(&key, b"tampered", &sig_bytes).is_err());
+
+    // Config validation rejects empty webhook secrets.
+    assert!(matches!(
+        ServerConfig::new(TOKEN.into()).unwrap().with_webhook_secret(String::new()),
+        Err(ConfigError::InvalidWebhookSecret(_))
+    ));
+}
+
+#[derive(Clone)]
+struct CapturedWebhook {
+    uri: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+async fn spawn_webhook_receiver(fail_first_n: usize) -> (String, Arc<Mutex<Vec<CapturedWebhook>>>, tokio::task::JoinHandle<()>) {
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, Uri};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post({
+            let captured = captured.clone();
+            let attempts = attempts.clone();
+            move |uri: Uri, headers: HeaderMap, body: Bytes| async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                let mut hdrs = HashMap::new();
+                for (k, v) in &headers {
+                    if let Ok(val) = v.to_str() {
+                        hdrs.insert(k.as_str().to_ascii_lowercase(), val.to_string());
+                    }
+                }
+                captured.lock().unwrap().push(CapturedWebhook {
+                    uri: uri.to_string(),
+                    headers: hdrs,
+                    body: body.to_vec(),
+                });
+                if n < fail_first_n {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/hook?src=fw"), captured, handle)
+}
+
+fn verify_webhook_signature(secret: &[u8], cap: &CapturedWebhook) {
+    let ts = cap
+        .headers
+        .get("x-fluxwright-timestamp")
+        .expect("missing X-Fluxwright-Timestamp");
+    let sig = cap
+        .headers
+        .get("x-fluxwright-signature")
+        .expect("missing X-Fluxwright-Signature");
+    let hex_sig = sig.strip_prefix("sha256=").expect("sha256= prefix");
+    let sig_bytes: Vec<u8> = (0..hex_sig.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex_sig[i..i + 2], 16).unwrap())
+        .collect();
+    let mut msg = format!("{ts}.").into_bytes();
+    msg.extend_from_slice(&cap.body);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    ring::hmac::verify(&key, &msg, &sig_bytes).expect("HMAC signature mismatch");
+}
+
+#[tokio::test]
+async fn webhook_delivers_signed_payload_retries_500_to_200_and_hides_secrets() {
+    let secret = "whsec_standalone_secret";
+    let (hook_url, captured, hook_task) = spawn_webhook_receiver(1).await;
+
+    let engine = idle_engine().await;
+    let config = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_webhook_secret(secret.into())
+        .unwrap();
+    let srv = HttpServer::new(engine, config).unwrap();
+
+    // 1. Submit job with secret webhook header + query string on webhook_url.
+    let sub_resp = call(
+        &srv,
+        "POST",
+        "/v1/jobs",
+        json!({
+            "steps": [{ "action": "title" }],
+            "webhook_url": hook_url,
+            "webhook_headers": { "Authorization": "Bearer hook-secret-xyz", "X-Env": "ci" },
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(sub_resp.status(), StatusCode::ACCEPTED);
+    let sub_bytes = to_bytes(sub_resp.into_body(), MAX_RESULT_BYTES).await.unwrap();
+    let sub_text = String::from_utf8(sub_bytes.to_vec()).unwrap();
+    assert!(!sub_text.contains("hook-secret-xyz"));
+    assert!(!sub_text.contains(&hook_url));
+    let job1: Job = serde_json::from_str(&sub_text).unwrap();
+
+    let get_resp = call(&srv, "GET", &format!("/v1/jobs/{}", job1.id), Body::empty()).await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_text = String::from_utf8(
+        to_bytes(get_resp.into_body(), MAX_RESULT_BYTES)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!get_text.contains("hook-secret-xyz"));
+
+    // Finish job1: first attempt hits 500, second attempt after 500ms backoff succeeds 200.
+    finish_job(&srv.inner, job1.id, Ok(Ok(vec![json!("Example Title")])));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while captured.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("webhook retried from 500 -> 200");
+
+    {
+        let caps = captured.lock().unwrap();
+        assert_eq!(caps.len(), 2);
+        let ok_cap = &caps[1];
+        assert_eq!(ok_cap.uri, "/hook?src=fw");
+        assert_eq!(ok_cap.headers.get("content-type").map(String::as_str), Some("application/json"));
+        assert_eq!(ok_cap.headers.get("x-fluxwright-event").map(String::as_str), Some("job.completed"));
+        assert_eq!(
+            ok_cap.headers.get("x-fluxwright-job-id").map(String::as_str),
+            Some(job1.id.to_string().as_str())
+        );
+        assert_eq!(ok_cap.headers.get("authorization").map(String::as_str), Some("Bearer hook-secret-xyz"));
+        assert_eq!(ok_cap.headers.get("x-env").map(String::as_str), Some("ci"));
+        verify_webhook_signature(secret.as_bytes(), ok_cap);
+        let payload: Value = serde_json::from_slice(&ok_cap.body).unwrap();
+        assert_eq!(payload["event"], "job.completed");
+        assert_eq!(payload["job"]["id"], job1.id.to_string());
+        assert_eq!(payload["job"]["status"], "succeeded");
+        assert_eq!(payload["job"]["results"], json!(["Example Title"]));
+    }
+
+    // 2. Cancelled job also dispatches webhook.
+    captured.lock().unwrap().clear();
+    let sub2 = call(
+        &srv,
+        "POST",
+        "/v1/jobs",
+        json!({
+            "steps": [{ "action": "title" }],
+            "webhook_url": hook_url,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(sub2.status(), StatusCode::ACCEPTED);
+    let job2: Job = serde_json::from_value(body(sub2).await).unwrap();
+    assert_eq!(
+        call(&srv, "DELETE", &format!("/v1/jobs/{}", job2.id), Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while captured.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled job webhook delivered");
+    let cancel_cap = &captured.lock().unwrap()[0];
+    verify_webhook_signature(secret.as_bytes(), cancel_cap);
+    let cancel_payload: Value = serde_json::from_slice(&cancel_cap.body).unwrap();
+    assert_eq!(cancel_payload["event"], "job.completed");
+    assert_eq!(cancel_payload["job"]["id"], job2.id.to_string());
+    assert_eq!(cancel_payload["job"]["status"], "cancelled");
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+    hook_task.abort();
+}
+
+#[tokio::test]
+async fn coordinator_dispatches_signed_webhooks_on_result_cancel_and_lease_expiry_and_strips_worker_secrets() {
+    let secret = "whsec_coord_secret";
+    let (hook_url, captured, hook_task) = spawn_webhook_receiver(0).await;
+
+    let mut config = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_webhook_secret(secret.into())
+        .unwrap();
+    config.max_jobs = 8;
+    let coord = HttpServer::coordinator(config).unwrap();
+    coord.set_lease_timeout(Duration::from_millis(50));
+
+    let submit_with_hook = || async {
+        let resp = call(
+            &coord,
+            "POST",
+            "/v1/jobs",
+            json!({
+                "steps": [{ "action": "title" }],
+                "webhook_url": hook_url,
+                "webhook_headers": { "X-Secret": "top-secret" },
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        serde_json::from_value::<Job>(body(resp).await).unwrap()
+    };
+
+    let j_ok = submit_with_hook().await;
+    let j_lost = submit_with_hook().await;
+    let j_cancel = submit_with_hook().await;
+
+    // Leasing to workers must strip webhook_url and webhook_headers secrets.
+    let leased = body(
+        call(&coord, "POST", "/v1/workers/w1/lease", r#"{"max_jobs":2}"#).await,
+    )
+    .await;
+    let leased_text = leased.to_string();
+    assert!(!leased_text.contains("top-secret"));
+    assert!(!leased_text.contains(&hook_url));
+    assert!(leased["jobs"][0]["request"]["webhook_url"].is_null());
+
+    // 1. Worker posts succeeded result -> webhook delivered.
+    assert_eq!(
+        call(
+            &coord,
+            "POST",
+            &format!("/v1/jobs/{}/result", j_ok.id),
+            json!({
+                "worker": "w1",
+                "status": "succeeded",
+                "attempts": 1,
+                "step_index": 0,
+                "results": ["Cluster OK"],
+            })
+            .to_string(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    // 2. Cancel j_cancel -> webhook delivered.
+    assert_eq!(
+        call(&coord, "DELETE", &format!("/v1/jobs/{}", j_cancel.id), Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 3. Lease on j_lost expires -> "worker lost" failure -> webhook delivered.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let _ = call(&coord, "GET", &format!("/v1/jobs/{}", j_lost.id), Body::empty()).await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while captured.lock().unwrap().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all 3 coordinator terminal webhooks delivered");
+
+    let caps = captured.lock().unwrap();
+    let mut statuses_by_id = HashMap::new();
+    for cap in caps.iter() {
+        verify_webhook_signature(secret.as_bytes(), cap);
+        assert_eq!(cap.headers.get("x-secret").map(String::as_str), Some("top-secret"));
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["event"], "job.completed");
+        statuses_by_id.insert(
+            v["job"]["id"].as_str().unwrap().to_string(),
+            v["job"]["status"].as_str().unwrap().to_string(),
+        );
+    }
+    assert_eq!(statuses_by_id.get(&j_ok.id.to_string()).map(String::as_str), Some("succeeded"));
+    assert_eq!(statuses_by_id.get(&j_cancel.id.to_string()).map(String::as_str), Some("cancelled"));
+    assert_eq!(statuses_by_id.get(&j_lost.id.to_string()).map(String::as_str), Some("failed"));
+
+    coord.shutdown(Duration::ZERO).await.unwrap();
+    hook_task.abort();
+}
+
+#[tokio::test]
+async fn otlp_exporter_emits_resource_spans_with_traceparent_and_attributes() {
+    use axum::body::Bytes;
+
+    let batches: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        "/collector/v1/traces",
+        axum::routing::post({
+            let batches = batches.clone();
+            move |headers: axum::http::HeaderMap, body: Bytes| async move {
+                let ct = headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let val: Value = serde_json::from_slice(&body).unwrap();
+                batches.lock().unwrap().push((ct, val));
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let collector_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    assert!(matches!(
+        ServerConfig::new(TOKEN.into())
+            .unwrap()
+            .with_otlp_endpoint("ftp://bad".into()),
+        Err(ConfigError::InvalidOtlpEndpoint(_))
+    ));
+    assert_eq!(
+        otlp::parse_otlp_endpoint("http://127.0.0.1:4318")
+            .unwrap()
+            .1,
+        "/v1/traces"
+    );
+    assert_eq!(
+        otlp::parse_otlp_endpoint("http://127.0.0.1:4318/collector/v1/traces")
+            .unwrap()
+            .1,
+        "/collector/v1/traces"
+    );
+
+    let config = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_otlp_endpoint(format!("http://{addr}/collector"))
+        .unwrap()
+        .with_otlp_service_name("fluxwright-test-svc".into());
+    let coord = HttpServer::coordinator(config).unwrap();
+
+    let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let sub_resp = coord
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jobs")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("traceparent", tp)
+                .body(Body::from(
+                    r#"{"steps":[{"action":"title"},{"action":"url"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub_resp.status(), StatusCode::ACCEPTED);
+    let job: Job = serde_json::from_value(body(sub_resp).await).unwrap();
+
+    let _ = call(&coord, "POST", "/v1/workers/w1/lease", r#"{"max_jobs":1}"#).await;
+    assert_eq!(
+        call(
+            &coord,
+            "POST",
+            &format!("/v1/jobs/{}/result", job.id),
+            json!({
+                "worker": "w1",
+                "status": "succeeded",
+                "attempts": 2,
+                "step_index": 1,
+                "results": ["t", "u"],
+            })
+            .to_string(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    // Graceful shutdown flushes buffered OTLP spans without waiting the full 2s timer.
+    coord.shutdown(Duration::from_secs(2)).await.unwrap();
+
+    let recorded = batches.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, "application/json");
+    let rs = &recorded[0].1["resourceSpans"][0];
+    assert_eq!(rs["resource"]["attributes"][0]["key"], "service.name");
+    assert_eq!(
+        rs["resource"]["attributes"][0]["value"]["stringValue"],
+        "fluxwright-test-svc"
+    );
+    let span = &rs["scopeSpans"][0]["spans"][0];
+    assert_eq!(span["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(span["parentSpanId"], "00f067aa0ba902b7");
+    assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
+    assert_eq!(span["status"]["code"], 1);
+    let start_ns: u128 = span["startTimeUnixNano"].as_str().unwrap().parse().unwrap();
+    let end_ns: u128 = span["endTimeUnixNano"].as_str().unwrap().parse().unwrap();
+    assert!(start_ns > 0 && end_ns >= start_ns);
+
+    let attrs = span["attributes"].as_array().unwrap();
+    let find_attr = |k: &str| {
+        attrs
+            .iter()
+            .find(|a| a["key"] == k)
+            .unwrap()["value"]
+            .clone()
+    };
+    assert_eq!(find_attr("job.id")["stringValue"], job.id.to_string());
+    assert_eq!(find_attr("job.status")["stringValue"], "succeeded");
+    assert_eq!(find_attr("job.steps")["intValue"], "2");
+    assert_eq!(find_attr("job.attempts")["intValue"], "2");
+
+    collector_task.abort();
+}
+
+#[tokio::test]
+async fn otlp_exporter_batches_at_32_and_drops_cleanly_when_bounded_channel_full() {
+    use axum::body::Bytes;
+
+    let total_spans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/v1/traces",
+        axum::routing::post({
+            let total_spans = total_spans.clone();
+            move |body: Bytes| async move {
+                let val: Value = serde_json::from_slice(&body).unwrap();
+                let count = val["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                    .as_array()
+                    .map_or(0, Vec::len);
+                total_spans.fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let collector_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let exporter =
+        otlp::OtlpExporter::new(&format!("http://{addr}"), "batch-svc".into()).unwrap();
+    for _ in 0..32 {
+        exporter.try_record(otlp::OtlpSpanData {
+            trace_ctx: JobTraceContext::new(),
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Succeeded,
+            steps: 1,
+            attempts: 1,
+            start_time_unix_nano: 1_000,
+            end_time_unix_nano: 2_000,
+            error: None,
+        });
+    }
+
+    // 32 spans must flush immediately without waiting for the 2s periodic flush.
+    tokio::time::timeout(Duration::from_millis(800), async {
+        while total_spans.load(std::sync::atomic::Ordering::SeqCst) < 32 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("32-span OTLP batch flushed promptly");
+
+    // Verify bounded channel (512) never blocks even when hammered synchronously without draining.
+    let (tx, _rx) = tokio::sync::mpsc::channel::<u32>(512);
+    for i in 0..600 {
+        let _ = tx.try_send(i);
+    }
+
+    collector_task.abort();
+}
+
+async fn spawn_mock_cdp_server() -> (
+    std::net::SocketAddr,
+    Arc<Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::extract::ws::{Message as AxumMsg, WebSocketUpgrade};
+    use futures_util::{SinkExt, StreamExt};
+
+    let recorded_cmds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get({
+            let recorded_cmds = recorded_cmds.clone();
+            move |ws: WebSocketUpgrade| {
+                let recorded_cmds = recorded_cmds.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        while let Some(Ok(AxumMsg::Text(txt))) = socket.next().await {
+                            let Ok(v) = serde_json::from_str::<Value>(txt.as_str()) else {
+                                continue;
+                            };
+                            let Some(id) = v.get("id").and_then(Value::as_u64) else {
+                                continue;
+                            };
+                            let method = v["method"].as_str().unwrap_or("");
+                            recorded_cmds.lock().unwrap().push(method.to_string());
+                            let result = match method {
+                                "Target.getTargetInfo" => {
+                                    json!({ "targetInfo": { "url": "https://example.com" } })
+                                }
+                                "Target.attachToTarget" => json!({ "sessionId": "obs-1" }),
+                                "Page.getLayoutMetrics" => json!({
+                                    "cssLayoutViewport": { "clientWidth": 1280.0, "clientHeight": 800.0 }
+                                }),
+                                "Page.captureScreenshot" => json!({ "data": "AA==" }),
+                                _ => json!({}),
+                            };
+                            let reply = json!({ "id": id, "result": result });
+                            if socket
+                                .send(AxumMsg::Text(reply.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if method == "Page.startScreencast" {
+                                let frame = json!({
+                                    "method": "Page.screencastFrame",
+                                    "sessionId": "obs-1",
+                                    "params": {
+                                        "data": "/9j/4AAQ",
+                                        "sessionId": 1,
+                                        "metadata": {
+                                            "deviceWidth": 1280,
+                                            "deviceHeight": 800,
+                                            "timestamp": 1.0
+                                        }
+                                    }
+                                });
+                                let _ = socket.send(AxumMsg::Text(frame.to_string().into())).await;
+                            }
+                        }
+                    })
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, recorded_cmds, handle)
+}
+
+#[tokio::test]
+async fn embed_live_endpoints_validate_auth_ttl_clamping_capacity_csp_and_html_isolation() {
+    assert!(matches!(
+        ServerConfig::new(TOKEN.into())
+            .unwrap()
+            .with_embed_frame_ancestors("https://ok.test; script-src 'unsafe-inline'".into()),
+        Err(ConfigError::InvalidFrameAncestors(_))
+    ));
+    assert!(matches!(
+        ServerConfig::new(TOKEN.into())
+            .unwrap()
+            .with_embed_frame_ancestors("   ".into()),
+        Err(ConfigError::InvalidFrameAncestors(_))
+    ));
+
+    let engine = idle_engine().await;
+    let config = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_embed_frame_ancestors("'self' https://app.example.com".into())
+        .unwrap();
+    let srv = HttpServer::new(engine, config).unwrap();
+
+    // POST /v1/live/{id}/embed requires Bearer auth (never ?token=).
+    let unauth = srv
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/live/job-1/embed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let query_tok = srv
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/live/job-1/embed?token={TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query_tok.status(), StatusCode::UNAUTHORIZED);
+
+    assert_eq!(
+        call(&srv, "POST", "/v1/live/missing/embed", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        srv.router()
+            .oneshot(
+                Request::builder()
+                    .uri("/embed/live/nonexistent-token-0123456789abcdef0123456789abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Register a live session against a mock CDP connection.
+    let (cdp_addr, _cmds, cdp_task) = spawn_mock_cdp_server().await;
+    let conn = fluxwright_cdp::Connection::connect(&format!("ws://{cdp_addr}"))
+        .await
+        .unwrap();
+    let (pause_tx, _pause_rx) = tokio::sync::watch::channel(false);
+    let session_id = Uuid::new_v4().to_string();
+    let guard = srv.inner.live.register_job(
+        session_id.clone(),
+        conn,
+        "target-1".into(),
+        "https://example.com".into(),
+        now_ms(),
+        pause_tx,
+        Arc::new(Mutex::new(None)),
+    );
+
+    // Default body (empty) -> mode=read_only, ttl=300; ttl clamping 10..=3600.
+    let def_resp = call(
+        &srv,
+        "POST",
+        &format!("/v1/live/{session_id}/embed"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(def_resp.status(), StatusCode::OK);
+    let def_json = body(def_resp).await;
+    assert_eq!(def_json["mode"], "read_only");
+    assert_eq!(def_json["expires_in_secs"], 300);
+    let ro_url = def_json["url"].as_str().unwrap().to_string();
+    let ro_ws = def_json["ws_url"].as_str().unwrap().to_string();
+    assert!(ro_url.starts_with("/embed/live/"));
+    assert!(ro_ws.starts_with(&format!("/v1/live/{session_id}/ws?embed=")));
+
+    let low_ttl = body(
+        call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            r#"{"ttl_secs":1}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(low_ttl["expires_in_secs"], 10);
+
+    let high_ttl = body(
+        call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            r#"{"mode":"interactive","ttl_secs":99999}"#,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(high_ttl["mode"], "interactive");
+    assert_eq!(high_ttl["expires_in_secs"], 3600);
+    let int_url = high_ttl["url"].as_str().unwrap().to_string();
+
+    // Invalid mode or unknown fields rejected.
+    assert_eq!(
+        call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            r#"{"mode":"admin"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    // Oversized embed request bodies (> 4096 bytes) rejected.
+    assert_eq!(
+        call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            vec![b'a'; 5000],
+        )
+        .await
+        .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    // Unauthenticated GET /embed/live/{token} serves minimal isolated HTML with strict CSP.
+    let ro_html_resp = srv
+        .router()
+        .oneshot(Request::builder().uri(&ro_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ro_html_resp.status(), StatusCode::OK);
+    let csp = ro_html_resp.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("frame-ancestors 'self' https://app.example.com"), "{csp}");
+    assert!(csp.contains("script-src 'self' 'sha256-"), "{csp}");
+    assert_eq!(ro_html_resp.headers()["referrer-policy"], "no-referrer");
+    assert_eq!(ro_html_resp.headers()[header::CACHE_CONTROL], "no-store");
+    let ro_html = String::from_utf8(
+        to_bytes(ro_html_resp.into_body(), MAX_RESULT_BYTES)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(ro_html.contains("data-mode=\"read_only\""));
+    assert!(ro_html.contains("<span class=\"pill pill-readonly\">"));
+    assert!(!ro_html.contains("fluxwright_token"));
+    assert!(!ro_html.contains("/dashboard"));
+    assert!(!ro_html.contains("<form"));
+    assert!(!ro_html.contains("id=\"live-url-form\""));
+    assert!(!ro_html.contains("id=\"btn-live-pause\""));
+    assert!(!ro_html.contains("id=\"btn-live-esc\""));
+    assert!(!ro_html.contains("id=\"btn-live-banner-resume\""));
+
+    let int_html_resp = srv
+        .router()
+        .oneshot(Request::builder().uri(&int_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(int_html_resp.status(), StatusCode::OK);
+    let int_html = String::from_utf8(
+        to_bytes(int_html_resp.into_body(), MAX_RESULT_BYTES)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(int_html.contains("data-mode=\"interactive\""));
+    assert!(!int_html.contains("<span class=\"pill pill-readonly\">"));
+    assert!(int_html.contains("id=\"live-url-form\""));
+    assert!(int_html.contains("id=\"btn-live-esc\""));
+    assert!(int_html.contains("id=\"btn-live-banner-resume\""));
+    assert!(!int_html.contains("fluxwright_token"));
+    assert!(!int_html.contains("/dashboard"));
+
+    // Capacity bound: 256 embed tokens max (3 already created, 253 more succeed, 257th returns 429).
+    for _ in 0..253 {
+        let r = call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let overflow = call(
+        &srv,
+        "POST",
+        &format!("/v1/live/{session_id}/embed"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    drop(guard);
+    // Closing the live session immediately revokes embed tokens.
+    let after_close = srv
+        .router()
+        .oneshot(Request::builder().uri(&ro_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(after_close.status(), StatusCode::UNAUTHORIZED);
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+    cdp_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn embed_live_ws_enforces_read_only_vs_interactive_ttl_expiry_and_session_revocation() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let engine = idle_engine().await;
+    let srv = HttpServer::new(engine, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn({
+        let router = srv.router();
+        async move {
+            let _ = axum::serve(listener, router).await;
+        }
+    });
+
+    let (cdp_addr, recorded_cmds, cdp_task) = spawn_mock_cdp_server().await;
+    let conn = fluxwright_cdp::Connection::connect(&format!("ws://{cdp_addr}"))
+        .await
+        .unwrap();
+    let (pause_tx, _pause_rx) = tokio::sync::watch::channel(false);
+    let session_id = Uuid::new_v4().to_string();
+    let guard = srv.inner.live.register_job(
+        session_id.clone(),
+        conn,
+        "target-1".into(),
+        "https://example.com".into(),
+        now_ms(),
+        pause_tx.clone(),
+        Arc::new(Mutex::new(None)),
+    );
+
+    // 1. Read-only embed token rejects ALL mouse/key/wheel/text/navigate/pause/resume frames.
+    let ro_resp = body(
+        call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            r#"{"mode":"read_only","ttl_secs":300}"#,
+        )
+        .await,
+    )
+    .await;
+    let ro_ws_path = ro_resp["ws_url"].as_str().unwrap();
+    let ro_token = ro_resp["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("/embed/live/")
+        .unwrap()
+        .to_string();
+
+    // Binding check: embed token cannot be used on a different live session ID.
+    let wrong_session_err = tokio_tungstenite::connect_async(&format!(
+        "ws://{addr}/v1/live/other-session/ws?embed={ro_token}"
+    ))
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        wrong_session_err,
+        tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == StatusCode::UNAUTHORIZED
+    ));
+
+    let (mut ro_ws, _) =
+        tokio_tungstenite::connect_async(&format!("ws://{addr}{ro_ws_path}"))
+            .await
+            .unwrap();
+
+    // Wait for status + frame.
+    let mut got_status = false;
+    let mut got_frame = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !(got_status && got_frame) {
+            if let Some(Ok(WsMsg::Text(txt))) = ro_ws.next().await {
+                let v: Value = serde_json::from_str(&txt).unwrap();
+                match v["type"].as_str() {
+                    Some("status") => {
+                        assert_eq!(v["mode"], "read_only");
+                        assert_eq!(v["can_pause"], false);
+                        got_status = true;
+                    }
+                    Some("frame") => got_frame = true,
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("read_only WS received status and frame");
+
+    for blocked_cmd in [
+        json!({ "type": "mouse", "event": "mousePressed", "x": 10, "y": 10, "button": "left" }),
+        json!({ "type": "mouse", "event": "mouseWheel", "x": 10, "y": 10, "deltaX": 0, "deltaY": 50 }),
+        json!({ "type": "key", "event": "keyDown", "key": "a", "code": "KeyA" }),
+        json!({ "type": "text", "text": "secret" }),
+        json!({ "type": "navigate", "url": "https://example.org" }),
+        json!({ "type": "pause" }),
+        json!({ "type": "resume" }),
+    ] {
+        ro_ws
+            .send(WsMsg::Text(blocked_cmd.to_string().into()))
+            .await
+            .unwrap();
+        let err_msg = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Ok(WsMsg::Text(txt))) = ro_ws.next().await {
+                    let v: Value = serde_json::from_str(&txt).unwrap();
+                    if v["type"] == "error" {
+                        return v;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("read_only error reply");
+        assert_eq!(err_msg["status"], 403);
+        assert_eq!(err_msg["code"], "forbidden");
+    }
+    assert!(!*pause_tx.borrow());
+    assert!(
+        !recorded_cmds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.starts_with("Input.") || m == "Page.navigate"),
+        "read_only embed must never forward input or navigation to CDP"
+    );
+
+    // 2. Interactive embed token forwards input & pause/resume commands cleanly.
+    let int_resp = body(
+        call(
+            &srv,
+            "POST",
+            &format!("/v1/live/{session_id}/embed"),
+            r#"{"mode":"interactive","ttl_secs":300}"#,
+        )
+        .await,
+    )
+    .await;
+    let int_ws_path = int_resp["ws_url"].as_str().unwrap();
+    let (mut int_ws, _) =
+        tokio_tungstenite::connect_async(&format!("ws://{addr}{int_ws_path}"))
+            .await
+            .unwrap();
+
+    // Wait for status.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(WsMsg::Text(txt))) = int_ws.next().await {
+            let v: Value = serde_json::from_str(&txt).unwrap();
+            if v["type"] == "status" {
+                assert_eq!(v["mode"], "interactive");
+                assert_eq!(v["can_pause"], true);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("interactive status");
+
+    int_ws
+        .send(WsMsg::Text(r#"{"type":"pause"}"#.into()))
+        .await
+        .unwrap();
+    int_ws
+        .send(WsMsg::Text(r#"{"type":"text","text":"ok"}"#.into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !*pause_tx.borrow()
+            || !recorded_cmds
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m == "Input.insertText")
+        {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("interactive embed forwarded pause and Input.insertText");
+
+    // 3. TTL expiry check (unit + active WS closure).
+    let now = std::time::Instant::now();
+    let (ttl_tok, ttl_clamped, _) = srv
+        .inner
+        .live
+        .issue_embed_at(&session_id, live::EmbedMode::ReadOnly, 10, now, 1_000)
+        .unwrap();
+    assert_eq!(ttl_clamped, 10);
+    assert!(srv
+        .inner
+        .live
+        .verify_embed_at(&ttl_tok, Some(&session_id), now + Duration::from_secs(9))
+        .is_some());
+    assert!(srv
+        .inner
+        .live
+        .verify_embed_at(&ttl_tok, Some(&session_id), now + Duration::from_secs(10))
+        .is_none());
+
+    // 4. LiveGuard drop immediately ends active embed WS streams and revokes embed tokens.
+    drop(guard);
+    let ended_reason = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(Ok(WsMsg::Text(txt))) = ro_ws.next().await {
+            let v: Value = serde_json::from_str(&txt).unwrap();
+            if v["type"] == "ended" {
+                return v["reason"].as_str().unwrap().to_string();
+            }
+        }
+        String::new()
+    })
+    .await
+    .expect("ro_ws ended on LiveGuard::drop");
+    assert_eq!(ended_reason, "session closed");
+
+    let revoked_ws = tokio_tungstenite::connect_async(&format!("ws://{addr}{int_ws_path}"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        revoked_ws,
+        tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == StatusCode::UNAUTHORIZED
+    ));
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+    srv_handle.abort();
+    cdp_task.abort();
 }

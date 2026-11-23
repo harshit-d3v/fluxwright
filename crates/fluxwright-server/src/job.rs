@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use base64::Engine;
@@ -47,6 +48,10 @@ pub struct JobRequest {
     pub persist_profile: bool,
     #[serde(default)]
     pub proxy_session: Option<String>,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub webhook_headers: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +113,12 @@ pub enum JobPriority {
 }
 
 impl JobRequest {
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), String> {
+        self.validate_with(false)
+    }
+
+    pub(crate) fn validate_with(&self, allow_any_url: bool) -> Result<(), String> {
         if self.steps.is_empty() || self.steps.len() > MAX_STEPS {
             return Err(format!(
                 "steps must contain between 1 and {MAX_STEPS} entries"
@@ -133,6 +143,11 @@ impl JobRequest {
                 );
             }
         }
+        crate::webhook::validate_webhook_config(
+            self.webhook_url.as_deref(),
+            &self.webhook_headers,
+            allow_any_url,
+        )?;
         if self.block_url_patterns.len() > 64 {
             return Err("block_url_patterns must contain at most 64 patterns".into());
         }
@@ -342,6 +357,13 @@ impl JobRequest {
             opts = opts.proxy_session(session.clone());
         }
         opts
+    }
+
+    pub(crate) fn without_webhook(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.webhook_url = None;
+        cloned.webhook_headers.clear();
+        cloned
     }
 }
 

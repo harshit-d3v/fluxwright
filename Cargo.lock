@@ -627,6 +627,7 @@ dependencies = [
  "fluxwright",
  "fluxwright-cdp",
  "futures-util",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

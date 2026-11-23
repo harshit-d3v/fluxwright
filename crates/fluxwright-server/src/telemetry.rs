@@ -4,6 +4,8 @@
 //! `traceparent = version "-" trace_id "-" parent_id "-" trace_flags`
 //! Example: `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use uuid::Uuid;
 
 /// Parsed or generated W3C TraceContext for a job execution.
@@ -128,6 +130,19 @@ pub fn generate_span_id() -> String {
         id = 1;
     }
     format!("{id:016x}")
+}
+
+/// Returns the current Unix timestamp in nanoseconds.
+pub(crate) fn now_unix_nano() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+/// Converts a Unix epoch millisecond timestamp to nanoseconds.
+pub(crate) fn ms_to_unix_nano(ms: u64) -> u128 {
+    u128::from(ms) * 1_000_000
 }
 
 #[cfg(test)]
