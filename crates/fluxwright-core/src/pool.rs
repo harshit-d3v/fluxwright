@@ -1139,8 +1139,9 @@ impl Inner {
                 let Ok(permit) = self.grants.clone().try_acquire_owned() else {
                     break;
                 };
+                let state = &mut *st;
                 let (waiter, picked_abandoned) =
-                    pick_waiter(&mut st.queue, &mut st.mixed_priorities);
+                    pick_waiter(&mut state.queue, &mut state.mixed_priorities);
                 abandoned_total += picked_abandoned;
                 let Some(waiter) = waiter else {
                     break;

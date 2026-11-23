@@ -824,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_subscription_routes_own_child_and_browser_wide_events_only() {
-        use futures_util::{SinkExt, StreamExt};
+        use futures_util::SinkExt;
         use serde_json::json;
         use tokio_tungstenite::tungstenite::Message;
 

@@ -217,6 +217,7 @@ pub(crate) struct Watch {
 /// Runs until aborted: records console calls, uncaught exceptions and finished downloads from
 /// the page and every child target session (iframes in other processes, workers) that attaches
 /// under it. Separate top-level popup page targets get their own `CdpPage` and `PageLog`.
+#[cfg(test)]
 pub(crate) async fn collect(
     events: UnboundedReceiver<Arc<CdpEvent>>,
     watch: Watch,
