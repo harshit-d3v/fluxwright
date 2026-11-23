@@ -746,13 +746,15 @@ mod tests {
         let diff = diff_snapshot_trees(base, changed);
         assert_eq!(
             diff,
-            "\
-  - RootWebArea \"App\"
-    - heading \"Title\" [ref=e1] [level=1]
--   - button \"Save\" [ref=e2]
-+   - button \"Saved\" [ref=e2]
-+   - status \"Done\"
-    - link \"Docs\" [ref=e3]"
+            [
+                "  - RootWebArea \"App\"",
+                "    - heading \"Title\" [ref=e1] [level=1]",
+                "-   - button \"Save\" [ref=e2]",
+                "+   - button \"Saved\" [ref=e2]",
+                "+   - status \"Done\"",
+                "    - link \"Docs\" [ref=e3]",
+            ]
+            .join("\n")
         );
 
         let many_old: Vec<String> = (1..=30).map(|i| format!("  - item {i}")).collect();
