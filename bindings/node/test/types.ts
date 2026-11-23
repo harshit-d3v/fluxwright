@@ -123,9 +123,24 @@ export async function typed(): Promise<void> {
   void [box, length, shot, errors, logs, page.getByPlaceholder('city').first().last(), await page.screenshot({ path: 'p.png' })]
 
   await page.route('**/api/*', (route, request) => route.fulfill({ json: { ok: request.method() === 'GET' } }))
+  await page.route('**/once/*', (route) => route.fallback({ method: 'POST', headers: { 'x-a': '1' }, postData: 'hi' }), { times: 1 })
+  // @ts-expect-error times must be a number
+  await page.route('**/bad', (route) => route.abort(), { times: '2' })
+  // @ts-expect-error fallback rejects unknown override keys
+  await page.route('**/bad2', (route) => route.fallback({ bogus: 1 }))
   await page.route(/\.png$/, (route) => route.abort('blockedbyclient'))
   await page.route((url) => url.hostname === 'example.com', (route) => route.continue({ headers: { 'x-a': '1' } }))
   await page.unroute('**/api/*')
+
+  await page.clock.install({ time: new Date('2024-02-02T08:00:00Z') })
+  await page.clock.pauseAt('2024-02-02T08:00:00Z')
+  await page.clock.setFixedTime(1_706_860_800_000)
+  await page.clock.setSystemTime(new Date())
+  await page.clock.fastForward('05:00')
+  await page.clock.runFor(1000)
+  await page.clock.resume()
+  // @ts-expect-error fastForward expects number or string
+  await page.clock.fastForward(true)
   page.on('console', (m) => void m.text.length).on('pageerror', (e: Error) => void e.message)
   const download = await page.waitForDownload({ timeout: 5000 })
   const name: string = download.suggestedFilename()
@@ -180,7 +195,7 @@ export async function typed(): Promise<void> {
   const context = await browser.newContext({ userAgent: 'Ctx', storageState: 'state.json', baseURL: 'https://example.com', bypassCSP: true, httpCredentials: { username: 'u', password: 'p' } })
   await context.addCookies([{ name: 'c', value: 'v', url: 'https://example.com' }])
   await context.clearCookies()
-  await context.route('**/api', (route) => route.abort())
+  await context.route('**/api', (route) => route.abort(), { times: 2 })
   const only = await context.newPage()
   await only.emulateMedia({ media: 'print', colorScheme: 'dark' })
   void [only.getByAltText('Logo', { exact: true }), only.getByTitle('Tooltip')]

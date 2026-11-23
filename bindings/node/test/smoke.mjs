@@ -1667,6 +1667,241 @@ try {
     }
   }
 
+  // page.clock: install, pauseAt, runFor, fastForward, setFixedTime, setSystemTime, resume, navigation persistence.
+  {
+    const clockSrv = http.createServer((req, res) => {
+      if (req.url === '/clock-a') {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(`<!doctype html><script>
+          window.__bootNow = Date.now()
+          window.__bootIso = new Date().toISOString()
+          window.__events = []
+          window.__ivCount = 0
+          window.__rafCount = 0
+          setTimeout(() => {
+            window.__events.push('t1500:' + Date.now())
+            Promise.resolve().then(() => {
+              setTimeout(() => window.__events.push('micro:' + Date.now()), 100)
+            })
+          }, 1500)
+          const iv = setInterval(() => {
+            window.__ivCount++
+            window.__events.push('iv:' + window.__ivCount + ':' + Date.now())
+          }, 1000)
+          window.__stopIv = () => clearInterval(iv)
+          requestAnimationFrame(() => { window.__rafCount++ })
+        </script>`)
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/html' })
+      res.end(`<!doctype html><script>
+        window.__step2Now = Date.now()
+        window.__step2Instance = new Date() instanceof Date
+        window.__step2DateFn = typeof Date()
+        window.__step2Utc = Date.UTC(2024, 1, 2, 8, 0, 0)
+        window.__step2Parse = Date.parse('2024-02-02T08:00:00Z')
+      </script>`)
+    })
+    await new Promise((r) => clockSrv.listen(0, '127.0.0.1', r))
+    const clockBase = `http://127.0.0.1:${clockSrv.address().port}`
+    const cp = await browser.newPage()
+    try {
+      const t0 = Date.parse('2024-02-02T08:00:00Z')
+      await cp.clock.install({ time: new Date(t0) })
+      await cp.clock.pauseAt(t0)
+      await cp.goto(`${clockBase}/clock-a`)
+      assert.equal(await cp.evaluate(() => window.__bootNow), t0)
+      assert.equal(await cp.evaluate(() => window.__bootIso), '2024-02-02T08:00:00.000Z')
+
+      const perf0 = await cp.evaluate(() => performance.now())
+      await new Promise((r) => setTimeout(r, 80))
+      assert.equal(await cp.evaluate(() => Date.now()), t0)
+      assert.equal(await cp.evaluate(() => performance.now()), perf0)
+      assert.equal(await cp.evaluate(() => window.__ivCount), 0)
+
+      await cp.clock.runFor(2500)
+      const perf1 = await cp.evaluate(() => performance.now())
+      assert.ok(Math.abs(perf1 - perf0 - 2500) < 1e-6)
+      assert.equal(await cp.evaluate(() => Date.now()), t0 + 2500)
+      assert.equal(await cp.evaluate(() => window.__ivCount), 2)
+      assert.equal(await cp.evaluate(() => window.__rafCount), 1)
+      assert.deepEqual(await cp.evaluate(() => window.__events), [
+        `iv:1:${t0 + 1000}`,
+        `t1500:${t0 + 1500}`,
+        `micro:${t0 + 1600}`,
+        `iv:2:${t0 + 2000}`,
+      ])
+
+      await cp.clock.fastForward('05:00')
+      assert.equal(await cp.evaluate(() => window.__ivCount), 3)
+      assert.equal(await cp.evaluate(() => Date.now()), t0 + 2500 + 300_000)
+      await cp.clock.fastForward('00:00:10')
+      assert.equal(await cp.evaluate(() => window.__ivCount), 4)
+      assert.equal(await cp.evaluate(() => Date.now()), t0 + 2500 + 310_000)
+      await cp.evaluate(() => window.__stopIv())
+
+      await cp.goto(`${clockBase}/clock-b`)
+      assert.equal(await cp.evaluate(() => window.__step2Now), t0 + 2500 + 310_000)
+      assert.equal(await cp.evaluate(() => window.__step2Instance), true)
+      assert.equal(await cp.evaluate(() => window.__step2DateFn), 'string')
+      assert.equal(await cp.evaluate(() => window.__step2Utc), t0)
+      assert.equal(await cp.evaluate(() => window.__step2Parse), t0)
+
+      const fixedTs = Date.parse('2025-01-01T00:00:00Z')
+      await cp.clock.setFixedTime('2025-01-01T00:00:00Z')
+      await cp.evaluate(() => {
+        window.__fixedFired = 0
+        setTimeout(() => {
+          window.__fixedFired = Date.now()
+        }, 200)
+      })
+      const pBeforeFixed = await cp.evaluate(() => performance.now())
+      await cp.clock.runFor(500)
+      const pAfterFixed = await cp.evaluate(() => performance.now())
+      assert.ok(Math.abs(pAfterFixed - pBeforeFixed - 500) < 1e-6)
+      assert.equal(await cp.evaluate(() => Date.now()), fixedTs)
+      assert.equal(await cp.evaluate(() => window.__fixedFired), fixedTs)
+
+      await cp.clock.setSystemTime(t0)
+      assert.equal(await cp.evaluate(() => Date.now()), t0)
+
+      await cp.evaluate(() => {
+        window.__resumedFired = false
+        setTimeout(() => {
+          window.__resumedFired = true
+        }, 40)
+      })
+      await cp.clock.resume()
+      for (let i = 0; i < 40 && !(await cp.evaluate(() => window.__resumedFired)); i++) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      assert.equal(await cp.evaluate(() => window.__resumedFired), true)
+      assert.ok((await cp.evaluate(() => Date.now())) > t0)
+
+      await assert.rejects(() => cp.clock.fastForward(-1), TypeError)
+      await assert.rejects(() => cp.clock.runFor(Number.NaN), TypeError)
+      await assert.rejects(() => cp.clock.fastForward('01:60'), /ClockTicks/)
+      await assert.rejects(() => cp.clock.install({ time: new Date('bad') }), TypeError)
+      await assert.rejects(() => cp.clock.pauseAt(''), TypeError)
+      await assert.rejects(() => cp.clock.setFixedTime('2024-02-30T00:00:00Z'), /ClockTime/)
+    } finally {
+      await cp.close()
+      clockSrv.close()
+    }
+  }
+
+  // page.route / context.route { times } and multi-handler route.fallback(overrides).
+  {
+    const routeSrv = http.createServer((req, res) => {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        )
+      })
+    })
+    await new Promise((r) => routeSrv.listen(0, '127.0.0.1', r))
+    const routeBase = `http://127.0.0.1:${routeSrv.address().port}`
+    const rCtx = await browser.newContext({ baseURL: routeBase })
+    try {
+      await assert.rejects(() => rCtx.route('**/echo/*', () => {}, { times: -1 }), TypeError)
+      const ctxLog = []
+      await rCtx.route(
+        '**/echo/*',
+        async (route, request) => {
+          ctxLog.push({
+            url: request.url(),
+            method: request.method(),
+            xOuter: request.headers()['x-outer'],
+            xMid: request.headers()['x-mid'],
+            postData: request.postData(),
+          })
+          await route.fallback()
+        },
+        { times: 2 },
+      )
+      const rp = await rCtx.newPage()
+      await assert.rejects(() => rp.route('**/echo/*', () => {}, { times: 1.5 }), TypeError)
+      await rp.goto('/route-home')
+
+      // Older page route inspects overrides from newer route and adds x-mid + new url before falling back to context route.
+      await rp.route('**/echo/*', async (route, request) => {
+        if (request.headers()['x-outer']) {
+          assert.equal(request.method(), 'POST')
+          assert.equal(request.postData(), 'from-outer')
+          await route.fallback({
+            url: `${routeBase}/echo/final?step=2`,
+            headers: { ...request.headers(), 'X-Mid': 'from-mid' },
+          })
+          return
+        }
+        if (request.url().includes('/echo/after')) {
+          await route.fallback()
+          return
+        }
+        await route.fulfill({ json: { directToOlder: true } })
+      })
+
+      let doubleFallbackErr = null
+      let zeroHits = 0
+      await rp.route(
+        '**/echo/start',
+        async (route, request) => {
+          await route.fallback({
+            method: 'POST',
+            headers: { ...request.headers(), 'X-Outer': 'from-outer' },
+            postData: Buffer.from('from-outer'),
+          })
+          await route.fallback().catch((e) => (doubleFallbackErr = e.message))
+        },
+        { times: 2 },
+      )
+      await rp.route(
+        '**/echo/start',
+        (route) => {
+          zeroHits++
+          return route.fulfill({ body: 'never' })
+        },
+        { times: 0 },
+      )
+
+      for (let i = 0; i < 2; i++) {
+        const res = await rp.evaluate(() => fetch('/echo/start').then((r) => r.json()))
+        assert.equal(res.method, 'POST')
+        assert.equal(res.url, '/echo/final?step=2')
+        assert.equal(res.headers['x-outer'], 'from-outer')
+        assert.equal(res.headers['x-mid'], 'from-mid')
+        assert.equal(res.body, 'from-outer')
+      }
+      assert.match(doubleFallbackErr, /already handled/)
+      assert.equal(zeroHits, 0)
+      assert.equal(ctxLog.length, 2)
+      assert.equal(ctxLog[0].xOuter, 'from-outer')
+      assert.equal(ctxLog[0].xMid, 'from-mid')
+      assert.equal(ctxLog[0].postData, 'from-outer')
+
+      // 3rd request: outer times:2 handler is gone, so /echo/start hits older page handler directly.
+      const third = await rp.evaluate(() => fetch('/echo/start').then((r) => r.json()))
+      assert.deepEqual(third, { directToOlder: true })
+      // Context times:2 handler is also exhausted (mid falls back on /echo/after and reaches server directly).
+      const fourth = await rp.evaluate(() => fetch('/echo/after').then((r) => r.json()))
+      assert.equal(fourth.url, '/echo/after')
+      assert.equal(fourth.method, 'GET')
+      assert.equal(ctxLog.length, 2)
+      await rp.close()
+    } finally {
+      await rCtx.close()
+      routeSrv.close()
+    }
+  }
+
   // Left open on purpose: Node drops it at exit, outside the engine's runtime (0.2.1 crashed there).
   await browser.newPage()
 } finally {

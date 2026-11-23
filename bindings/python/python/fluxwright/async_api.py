@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
 import inspect
 import json as _json
 import logging
@@ -155,27 +156,45 @@ def _settled(result: Any = None, error: BaseException | None = None) -> asyncio.
     return future
 
 
+_UNSET: Any = object()
+
+
 class Request:
     """A request, as route handlers and network events see it."""
 
-    def __init__(self, native: _native.Route | _native.NetworkRequest, failure: str | None = None) -> None:
+    def __init__(
+        self,
+        native: _native.Route | _native.NetworkRequest,
+        failure: str | None = None,
+        *,
+        url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        post_data: Any = _UNSET,
+    ) -> None:
         self._native = native
         self._failure = failure
+        self._url = url
+        self._method = method
+        self._headers = headers
+        self._post_data = post_data
 
     @property
     def url(self) -> str:
-        return self._native.url
+        return self._url if self._url is not None else self._native.url
 
     @property
     def method(self) -> str:
-        return self._native.method
+        return self._method if self._method is not None else self._native.method
 
     @property
     def headers(self) -> dict[str, str]:
-        return self._native.headers
+        return dict(self._headers) if self._headers is not None else self._native.headers
 
     @property
     def post_data(self) -> str | None:
+        if self._post_data is not _UNSET:
+            return self._post_data
         return self._native.post_data
 
     @property
@@ -438,6 +457,117 @@ class Touchscreen:
         )
 
 
+def _normalize_clock_time(label: str, time_val: int | float | str | datetime.datetime) -> tuple[float | None, str | None]:
+    if isinstance(time_val, bool):
+        raise TypeError(f"{label}: time must be int, float, str, or datetime, not bool")
+    if isinstance(time_val, datetime.datetime):
+        ms = time_val.timestamp() * 1000.0
+        if not math.isfinite(ms):
+            raise ValueError(f"{label}: datetime timestamp must be finite")
+        return ms, None
+    if isinstance(time_val, (int, float)):
+        ms = float(time_val)
+        if not math.isfinite(ms):
+            raise ValueError(f"{label}: time must be finite, got {time_val!r}")
+        return ms, None
+    if isinstance(time_val, str):
+        if not time_val.strip():
+            raise ValueError(f"{label}: time string must not be empty")
+        return None, time_val
+    raise TypeError(f"{label}: time must be int, float, str, or datetime, not {type(time_val).__name__}")
+
+
+def _normalize_clock_ticks(label: str, ticks: int | float | str) -> tuple[float | None, str | None]:
+    if isinstance(ticks, bool):
+        raise TypeError(f"{label}: ticks must be int, float, or str, not bool")
+    if isinstance(ticks, (int, float)):
+        ms = float(ticks)
+        if not math.isfinite(ms) or ms < 0:
+            raise ValueError(f"{label}: ticks must be a non-negative finite number, got {ticks!r}")
+        return ms, None
+    if isinstance(ticks, str):
+        if not ticks.strip():
+            raise ValueError(f"{label}: ticks string must not be empty")
+        return None, ticks
+    raise TypeError(f"{label}: ticks must be int, float, or str, not {type(ticks).__name__}")
+
+
+class Clock:
+    """Fake clock controls for ``Date``, ``performance.now``, ``setTimeout``, ``setInterval``, and ``requestAnimationFrame``."""
+
+    def __init__(self, page: Page) -> None:
+        self._page = page
+
+    async def install(self, *, time: int | float | str | datetime.datetime | None = None) -> None:
+        time_ms, time_iso = (None, None) if time is None else _normalize_clock_time("clock.install", time)
+        await self._page._trace_action(
+            "install",
+            "clock.install",
+            {},
+            lambda: self._page._clock_install(time_ms=time_ms, time_iso=time_iso),
+            class_name="Clock",
+        )
+
+    async def pause_at(self, time: int | float | str | datetime.datetime) -> None:
+        time_ms, time_iso = _normalize_clock_time("clock.pause_at", time)
+        await self._page._trace_action(
+            "pauseAt",
+            "clock.pause_at",
+            {},
+            lambda: self._page._clock_pause_at(time_ms=time_ms, time_iso=time_iso),
+            class_name="Clock",
+        )
+
+    async def set_fixed_time(self, time: int | float | str | datetime.datetime) -> None:
+        time_ms, time_iso = _normalize_clock_time("clock.set_fixed_time", time)
+        await self._page._trace_action(
+            "setFixedTime",
+            "clock.set_fixed_time",
+            {},
+            lambda: self._page._clock_set_fixed_time(time_ms=time_ms, time_iso=time_iso),
+            class_name="Clock",
+        )
+
+    async def set_system_time(self, time: int | float | str | datetime.datetime) -> None:
+        time_ms, time_iso = _normalize_clock_time("clock.set_system_time", time)
+        await self._page._trace_action(
+            "setSystemTime",
+            "clock.set_system_time",
+            {},
+            lambda: self._page._clock_set_system_time(time_ms=time_ms, time_iso=time_iso),
+            class_name="Clock",
+        )
+
+    async def fast_forward(self, ticks: int | float | str) -> None:
+        ticks_ms, ticks_text = _normalize_clock_ticks("clock.fast_forward", ticks)
+        await self._page._trace_action(
+            "fastForward",
+            "clock.fast_forward",
+            {},
+            lambda: self._page._clock_fast_forward(ticks_ms=ticks_ms, ticks_text=ticks_text),
+            class_name="Clock",
+        )
+
+    async def run_for(self, ticks: int | float | str) -> None:
+        ticks_ms, ticks_text = _normalize_clock_ticks("clock.run_for", ticks)
+        await self._page._trace_action(
+            "runFor",
+            "clock.run_for",
+            {},
+            lambda: self._page._clock_run_for(ticks_ms=ticks_ms, ticks_text=ticks_text),
+            class_name="Clock",
+        )
+
+    async def resume(self) -> None:
+        await self._page._trace_action(
+            "resume",
+            "clock.resume",
+            {},
+            lambda: self._page._clock_resume(),
+            class_name="Clock",
+        )
+
+
 def _save_storage_json_private(path: str | PathLike[str], data: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -673,13 +803,36 @@ class APIRequestContext:
         self._disposed = True
 
 
+def _normalize_route_headers(headers: Mapping[str, Any]) -> dict[str, str]:
+    if not isinstance(headers, Mapping):
+        raise TypeError("route: headers must be a mapping")
+    return {str(k).lower(): str(v) for k, v in headers.items()}
+
+
+def _validate_route_times(label: str, times: int | None) -> int | None:
+    if times is None:
+        return None
+    if isinstance(times, bool) or not isinstance(times, int):
+        raise TypeError(f"{label}: times must be an int")
+    if times < 0:
+        raise ValueError(f"{label}: times must be a non-negative integer")
+    return times
+
+
 class Route:
     """How a route handler answers a request, as Playwright's ``Route``. Each request takes one
     answer; the methods return awaitables."""
 
-    def __init__(self, native: _native.Route, request: Request) -> None:
+    def __init__(
+        self,
+        native: _native.Route,
+        request: Request,
+        accumulated: dict[str, Any] | None = None,
+    ) -> None:
         self._native = native
         self._request = request
+        self._accumulated: dict[str, Any] = accumulated or {}
+        self._fallback_overrides: dict[str, Any] | None = None
         self._answer: asyncio.Future[None] | None = None
         self._fell_back = False
         # Set once the handler returned: the request went on, and a later answer is too late.
@@ -703,18 +856,19 @@ class Route:
             raise Error("route: handler already returned")
         if self._answer is not None or self._fell_back:
             raise Error("route is already handled")
+        effective_post = post_data if post_data is not None else self._accumulated.get("post_data")
         encoded_post: str | bytes | None = None
-        if post_data is not None:
-            if isinstance(post_data, (bytes, bytearray)):
-                encoded_post = bytes(post_data)
-            elif isinstance(post_data, str):
-                encoded_post = post_data
+        if effective_post is not None:
+            if isinstance(effective_post, (bytes, bytearray)):
+                encoded_post = bytes(effective_post)
+            elif isinstance(effective_post, str):
+                encoded_post = effective_post
             else:
-                encoded_post = _json.dumps(post_data)
+                encoded_post = _json.dumps(effective_post)
         raw = await self._native.fetch(
-            url=url,
-            method=method,
-            headers=headers,
+            url=url if url is not None else self._accumulated.get("url"),
+            method=method if method is not None else self._accumulated.get("method"),
+            headers=headers if headers is not None else self._accumulated.get("headers"),
             post_data=encoded_post,
             max_redirects=max_redirects,
             timeout=timeout,
@@ -786,8 +940,19 @@ class Route:
         post_data: str | bytes | None = None,
     ) -> Awaitable[None]:
         """Sends the request on, changed if asked; ``headers`` replaces all of them."""
+        merged_url = url if url is not None else self._accumulated.get("url")
+        merged_method = method if method is not None else self._accumulated.get("method")
+        merged_headers = (
+            _normalize_route_headers(headers) if headers is not None else self._accumulated.get("headers")
+        )
+        merged_post = post_data if post_data is not None else self._accumulated.get("post_data")
         return self._answer_with(
-            lambda: self._native.continue_(url=url, method=method, headers=headers, post_data=post_data)
+            lambda: self._native.continue_(
+                url=merged_url,
+                method=merged_method,
+                headers=merged_headers,
+                post_data=merged_post,
+            )
         )
 
     def abort(self, error_code: str | None = None) -> Awaitable[None]:
@@ -795,12 +960,41 @@ class Route:
         ``aborted``, ``blockedbyclient``, ``timedout``, ..."""
         return self._answer_with(lambda: self._native.abort(error_code))
 
-    def fallback(self) -> Awaitable[None]:
+    def fallback(
+        self,
+        *,
+        url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
+        post_data: str | bytes | None = None,
+    ) -> Awaitable[None]:
         """Leaves the request to the next matching handler: the one added before this one."""
         if self._returned:
             return _late("route")
-        if self._answer is not None:
+        if self._answer is not None or self._fell_back:
             return _settled(error=Error("route is already handled"))
+        overrides: dict[str, Any] = {}
+        if url is not None:
+            if not isinstance(url, str):
+                return _settled(error=TypeError("route.fallback: url must be a str"))
+            overrides["url"] = url
+        if method is not None:
+            if not isinstance(method, str):
+                return _settled(error=TypeError("route.fallback: method must be a str"))
+            overrides["method"] = method
+        if headers is not None:
+            try:
+                overrides["headers"] = _normalize_route_headers(headers)
+            except TypeError as exc:
+                return _settled(error=exc)
+        if post_data is not None:
+            if isinstance(post_data, bytearray):
+                overrides["post_data"] = bytes(post_data)
+            elif isinstance(post_data, (str, bytes)):
+                overrides["post_data"] = post_data
+            else:
+                return _settled(error=TypeError("route.fallback: post_data must be a str or bytes"))
+        self._fallback_overrides = overrides or None
         self._fell_back = True
         return _settled()
 
@@ -831,13 +1025,23 @@ def _late(what: str) -> asyncio.Future[None]:
 
 
 class _RouteEntry:
-    __slots__ = ("url", "handler", "matches", "with_request")
+    __slots__ = ("url", "handler", "matches", "with_request", "remaining", "removed", "owner")
 
-    def __init__(self, url: URLMatch, handler: Callable[..., Any]) -> None:
+    def __init__(
+        self,
+        url: URLMatch,
+        handler: Callable[..., Any],
+        *,
+        times: int | None = None,
+        owner: list[_RouteEntry] | None = None,
+    ) -> None:
         self.url = url
         self.handler = handler
         self.matches = _url_matcher(url)
         self.with_request = _takes_request(handler)
+        self.remaining = times
+        self.removed = False
+        self.owner = owner
 
 
 class EventInfo(Generic[T]):
@@ -1238,7 +1442,6 @@ async def _apply_route_from_har(
 
 
 Listener = Callable[[Any], Any]
-_UNSET: Any = object()
 _pages_by_target: weakref.WeakValueDictionary[str, Page] = weakref.WeakValueDictionary()
 
 
@@ -2140,6 +2343,10 @@ class Page(_native.Page):
     def touchscreen(self) -> Touchscreen:
         return Touchscreen(self)
 
+    @property
+    def clock(self) -> Clock:
+        return Clock(self)
+
     def _active_tracer(self) -> Tracing | None:
         ctx = self._context_ref() if self._context_ref is not None else None
         return ctx._active_tracer() if ctx is not None else None
@@ -2223,10 +2430,11 @@ class Page(_native.Page):
                 rem = None
             await self._wait_for_url_change(current, timeout=rem)
 
-    async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
+    async def route(self, url: URLMatch, handler: Callable[..., Any], *, times: int | None = None) -> None:
         """Hands matching requests of this page, its popups and iframes to ``handler(route)``
         or ``handler(route, request)``, as Playwright's ``page.route``. The handler added last
         runs first; an unanswered request continues. Call it before navigating."""
+        validated_times = _validate_route_times("page.route", times)
         # A call made while another is turning interception on waits for it, so no call returns
         # before requests are handed over.
         async with self._route_lock:
@@ -2235,11 +2443,18 @@ class Page(_native.Page):
                 ref = weakref.ref(self)
                 _keep(self._tasks, asyncio.ensure_future(_serve_routes(stream, lambda: _routes_of(ref), self._tasks)))
                 self._routing = True
-            self._routes.append(_RouteEntry(url, handler))
+            if validated_times != 0:
+                self._routes.append(_RouteEntry(url, handler, times=validated_times, owner=self._routes))
 
     async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
         """Removes the handlers added for ``url`` (only ``handler``, when given)."""
-        self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
+        kept: list[_RouteEntry] = []
+        for r in self._routes:
+            if r.url == url and (handler is None or r.handler == handler):
+                r.removed = True
+            else:
+                kept.append(r)
+        self._routes[:] = kept
 
     async def route_from_har(
         self,
@@ -3076,17 +3291,39 @@ async def _serve_routes(
 
 
 async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
-    request = Request(native)
+    acc: dict[str, Any] = {}
+    cur_url = native.url
+    cur_method = native.method
+    cur_headers = dict(native.headers)
+    cur_post_data: str | None = native.post_data
     answered = False
     try:
         for entry in reversed(list(routes)):
+            if entry.removed:
+                continue
             try:
-                if not entry.matches(native.url):
+                if not entry.matches(cur_url):
                     continue
             except Exception:
                 _log.exception("a page.route URL matcher failed")
                 continue
-            route = Route(native, request)
+            if entry.remaining is not None:
+                if entry.remaining <= 0:
+                    continue
+                entry.remaining -= 1
+                if entry.remaining == 0:
+                    entry.removed = True
+                    if entry.owner is not None:
+                        with suppress(ValueError):
+                            entry.owner.remove(entry)
+            request = Request(
+                native,
+                url=cur_url,
+                method=cur_method,
+                headers=dict(cur_headers),
+                post_data=cur_post_data,
+            )
+            route = Route(native, request, dict(acc))
             try:
                 try:
                     result = entry.handler(route, request) if entry.with_request else entry.handler(route)
@@ -3095,6 +3332,21 @@ async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
                 finally:
                     route._returned = True
                 if route._fell_back and route._answer is None:
+                    overrides = route._fallback_overrides
+                    if overrides:
+                        if "url" in overrides:
+                            acc["url"] = overrides["url"]
+                            cur_url = overrides["url"]
+                        if "method" in overrides:
+                            acc["method"] = overrides["method"]
+                            cur_method = overrides["method"]
+                        if "headers" in overrides:
+                            acc["headers"] = overrides["headers"]
+                            cur_headers = dict(overrides["headers"])
+                        if "post_data" in overrides:
+                            pd = overrides["post_data"]
+                            acc["post_data"] = pd
+                            cur_post_data = pd.decode("utf-8", errors="replace") if isinstance(pd, bytes) else pd
                     continue
                 if route._answer is not None:
                     await route._answer
@@ -3108,7 +3360,7 @@ async def _dispatch(native: _native.Route, routes: list[_RouteEntry]) -> None:
         # it).
         if not answered:
             with suppress(Error):
-                await native.continue_()
+                await native.continue_(**acc)
 
 
 class Browser:
@@ -3403,11 +3655,12 @@ class BrowserContext:
             raise
         return page
 
-    async def route(self, url: URLMatch, handler: Callable[..., Any]) -> None:
+    async def route(self, url: URLMatch, handler: Callable[..., Any], *, times: int | None = None) -> None:
         """``page.route`` for all pages and popups in this context; added before ``new_page()``, it
         applies from the first request."""
         if self._closed:
             raise Error("browser_context.route: the context is closed")
+        validated_times = _validate_route_times("browser_context.route", times)
         async with self._route_lock:
             if not self._routing:
                 stream = await self._ctx.intercept()
@@ -3417,10 +3670,17 @@ class BrowserContext:
                     asyncio.ensure_future(_serve_routes(stream, lambda: _ctx_routes_of(ref), self._tasks)),
                 )
                 self._routing = True
-            self._routes.append(_RouteEntry(url, handler))
+            if validated_times != 0:
+                self._routes.append(_RouteEntry(url, handler, times=validated_times, owner=self._routes))
 
     async def unroute(self, url: URLMatch, handler: Callable[..., Any] | None = None) -> None:
-        self._routes[:] = [r for r in self._routes if not (r.url == url and (handler is None or r.handler == handler))]
+        kept: list[_RouteEntry] = []
+        for r in self._routes:
+            if r.url == url and (handler is None or r.handler == handler):
+                r.removed = True
+            else:
+                kept.append(r)
+        self._routes[:] = kept
 
     async def route_from_har(
         self,

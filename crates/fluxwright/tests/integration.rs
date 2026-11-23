@@ -3446,3 +3446,337 @@ async fn snapshot_diff_and_som_mask_screenshots() {
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
     srv_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn page_clock_controls_time_timers_and_navigations() {
+    use axum::{response::Html, routing::get, Router};
+    use fluxwright::{ClockInstallOptions, ClockTicks, ClockTime};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            "/step1",
+            get(|| async {
+                Html(
+                    r#"<!doctype html><script>
+                    window.__bootNow = Date.now();
+                    window.__bootIso = new Date().toISOString();
+                    window.__events = [];
+                    window.__rafCount = 0;
+                    window.__intervalCount = 0;
+                    setTimeout(() => {
+                        window.__events.push('t1500:' + Date.now());
+                        Promise.resolve().then(() => {
+                            setTimeout(() => window.__events.push('micro:' + Date.now()), 100);
+                        });
+                    }, 1500);
+                    const iv = setInterval(() => {
+                        window.__intervalCount++;
+                        window.__events.push('iv:' + window.__intervalCount + ':' + Date.now());
+                    }, 1000);
+                    window.__stopIv = () => clearInterval(iv);
+                    requestAnimationFrame((ts) => {
+                        window.__rafCount++;
+                        window.__rafTs = ts;
+                    });
+                    </script>"#,
+                )
+            }),
+        )
+        .route(
+            "/step2",
+            get(|| async {
+                Html(
+                    r#"<!doctype html><script>
+                    window.__step2Now = Date.now();
+                    window.__step2Iso = new Date().toISOString();
+                    window.__step2Instance = new Date() instanceof Date;
+                    window.__step2DateFn = typeof Date();
+                    window.__step2Utc = Date.UTC(2024, 1, 2, 8, 0, 0);
+                    window.__step2Parse = Date.parse('2024-02-02T08:00:00Z');
+                    </script>"#,
+                )
+            }),
+        );
+    let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let eng = engine(1, 1).await;
+    let page = eng.acquire().await.unwrap();
+
+    // Install fake clock at 2024-02-02T08:00:00Z and pause at the same instant before goto.
+    let t0 = 1_706_860_800_000_i64;
+    page.clock()
+        .install_with(&ClockInstallOptions {
+            time: Some(ClockTime::from("2024-02-02T08:00:00Z")),
+        })
+        .await
+        .unwrap();
+    page.clock().pause_at(t0).await.unwrap();
+
+    page.goto(&format!("{base}/step1")).await.unwrap();
+    assert_eq!(page.evaluate("window.__bootNow").await.unwrap(), json!(t0));
+    assert_eq!(
+        page.evaluate("window.__bootIso").await.unwrap(),
+        json!("2024-02-02T08:00:00.000Z")
+    );
+
+    // Paused clock keeps Date.now() and performance.now() steady across real time.
+    let perf0 = page.evaluate("performance.now()").await.unwrap().as_f64().unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(page.evaluate("Date.now()").await.unwrap(), json!(t0));
+    assert_eq!(page.evaluate("performance.now()").await.unwrap().as_f64().unwrap(), perf0);
+    assert_eq!(page.evaluate("window.__intervalCount").await.unwrap(), json!(0));
+
+    // run_for advances chronologically: interval fires at 1000 and 2000; timeout at 1500 + microtask at 1600; rAF fires.
+    page.clock().run_for(2500).await.unwrap();
+    let perf1 = page.evaluate("performance.now()").await.unwrap().as_f64().unwrap();
+    assert!((perf1 - perf0 - 2500.0).abs() < 1e-6, "perf0={perf0} perf1={perf1}");
+    assert_eq!(page.evaluate("Date.now()").await.unwrap(), json!(t0 + 2500));
+    assert_eq!(page.evaluate("window.__intervalCount").await.unwrap(), json!(2));
+    assert_eq!(page.evaluate("window.__rafCount").await.unwrap(), json!(1));
+    assert_eq!(
+        page.evaluate("window.__events").await.unwrap(),
+        json!([
+            format!("iv:1:{}", t0 + 1000),
+            format!("t1500:{}", t0 + 1500),
+            format!("micro:{}", t0 + 1600),
+            format!("iv:2:{}", t0 + 2000),
+        ])
+    );
+
+    // fast_forward jumps by "05:00" (300_000 ms), firing the 1s interval AT MOST ONCE.
+    page.clock().fast_forward("05:00").await.unwrap();
+    assert_eq!(page.evaluate("window.__intervalCount").await.unwrap(), json!(3));
+    assert_eq!(
+        page.evaluate("Date.now()").await.unwrap(),
+        json!(t0 + 2500 + 300_000)
+    );
+    page.evaluate("window.__stopIv()").await.unwrap();
+
+    // Persistence across goto while paused.
+    page.goto(&format!("{base}/step2")).await.unwrap();
+    assert_eq!(
+        page.evaluate("window.__step2Now").await.unwrap(),
+        json!(t0 + 2500 + 300_000)
+    );
+    assert_eq!(page.evaluate("window.__step2Instance").await.unwrap(), json!(true));
+    assert_eq!(page.evaluate("window.__step2DateFn").await.unwrap(), json!("string"));
+    assert_eq!(page.evaluate("window.__step2Utc").await.unwrap(), json!(t0));
+    assert_eq!(page.evaluate("window.__step2Parse").await.unwrap(), json!(t0));
+
+    // set_fixed_time freezes Date.now() / new Date() while timers & performance.now() still advance.
+    let fixed_ts = 1_735_689_600_000_i64; // 2025-01-01T00:00:00Z
+    page.clock().set_fixed_time("2025-01-01T00:00:00Z").await.unwrap();
+    page.evaluate("window.__fixedTimerFired = 0; setTimeout(() => { window.__fixedTimerFired = Date.now(); }, 200);")
+        .await
+        .unwrap();
+    let perf_before_fixed = page.evaluate("performance.now()").await.unwrap().as_f64().unwrap();
+    page.clock().run_for(500).await.unwrap();
+    let perf_after_fixed = page.evaluate("performance.now()").await.unwrap().as_f64().unwrap();
+    assert!((perf_after_fixed - perf_before_fixed - 500.0).abs() < 1e-6);
+    assert_eq!(page.evaluate("Date.now()").await.unwrap(), json!(fixed_ts));
+    assert_eq!(page.evaluate("window.__fixedTimerFired").await.unwrap(), json!(fixed_ts));
+
+    // set_system_time updates Date.now() without freezing and without firing timers.
+    page.clock().set_system_time(t0).await.unwrap();
+    assert_eq!(page.evaluate("Date.now()").await.unwrap(), json!(t0));
+
+    // resume allows real wall-clock ticking and fires scheduled timers naturally.
+    page.evaluate("window.__resumedFired = false; setTimeout(() => { window.__resumedFired = true; }, 40);")
+        .await
+        .unwrap();
+    page.clock().resume().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(page.evaluate("window.__resumedFired").await.unwrap(), json!(true));
+    assert!(page.evaluate("Date.now()").await.unwrap().as_i64().unwrap() > t0);
+
+    // Input validation rejects negative/NaN/malformed values cleanly.
+    assert!(page.clock().fast_forward(-1).await.is_err());
+    assert!(page.clock().run_for(f64::NAN).await.is_err());
+    assert!(page.clock().fast_forward("01:60").await.is_err());
+    assert!(page.clock().fast_forward("bad").await.is_err());
+    assert!(page.clock().install_with(&ClockInstallOptions { time: Some(ClockTime::from(f64::NAN)) }).await.is_err());
+    assert!(page.clock().pause_at("").await.is_err());
+    assert!(page.clock().set_fixed_time("2024-02-30T00:00:00Z").await.is_err());
+    let _ = ClockTicks::from("00:01:05");
+
+    page.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn page_and_context_route_times_and_fallback_overrides() {
+    use axum::{body::Bytes, extract::Request, routing::any, Json, Router};
+    use fluxwright::{Fulfill, Overrides, RouteOptions, UrlPattern};
+
+    let app = Router::new()
+        .route("/home", axum::routing::get(|| async { "home" }))
+        .route(
+            "/echo/{*rest}",
+        any(|req: Request| async move {
+            let method = req.method().to_string();
+            let uri = req.uri().to_string();
+            let headers: serde_json::Map<String, serde_json::Value> = req
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), json!(v.to_str().unwrap_or(""))))
+                .collect();
+            let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 64)
+                .await
+                .unwrap_or_else(|_| Bytes::new());
+            let body = String::from_utf8_lossy(&body_bytes).into_owned();
+            Json(json!({
+                "method": method,
+                "uri": uri,
+                "headers": headers,
+                "body": body,
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://127.0.0.1:{port}");
+
+    let eng = engine(1, 1).await;
+    let ctx = eng.acquire_context().await.unwrap();
+
+    // Context route acts as the outer fallback below page routes.
+    let ctx_seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let ctx_seen_c = ctx_seen.clone();
+    ctx.route("**/echo/*", move |route| {
+        let log = ctx_seen_c.clone();
+        async move {
+            let hdr = route.request().header("x-outer").unwrap_or("none").to_string();
+            let mid = route.request().header("x-mid").unwrap_or("none").to_string();
+            log.lock().unwrap().push(format!(
+                "{} {} outer={hdr} mid={mid} body={:?}",
+                route.request().method(),
+                route.request().url(),
+                route.request().post_data()
+            ));
+            route.fallback(Overrides::default()).await
+        }
+    })
+    .await
+    .unwrap();
+
+    let page = ctx.new_page().await.unwrap();
+    page.goto(&format!("{base}/home")).await.unwrap();
+
+    // Older page route inspects accumulated overrides when coming from outer route, adds X-Mid, and falls back to context route.
+    page.route("**/echo/*", |route| async move {
+        let mut headers = route.request().headers().to_vec();
+        if route.request().header("x-outer").is_some() {
+            assert_eq!(route.request().header("x-outer"), Some("from-outer"));
+            assert_eq!(route.request().method(), "POST");
+            assert_eq!(route.request().post_data(), Some("outer-payload"));
+            headers.push(("X-Mid".into(), "from-mid".into()));
+            let origin = route.request().url().split("/echo/").next().unwrap();
+            route
+                .fallback(Overrides {
+                    url: Some(format!("{origin}/echo/rewritten?ok=1")),
+                    headers: Some(headers),
+                    ..Default::default()
+                })
+                .await
+        } else {
+            assert_eq!(route.request().method(), "GET");
+            assert_eq!(route.request().post_data(), None);
+            headers.push(("X-Mid".into(), "direct-only".into()));
+            route
+                .fallback(Overrides {
+                    headers: Some(headers),
+                    ..Default::default()
+                })
+                .await
+        }
+    })
+    .await
+    .unwrap();
+
+    // Newer page route with times: 2 falls back with overrides (decrementing even on fallback!).
+    let double_err = Arc::new(std::sync::Mutex::new(false));
+    let double_err_c = double_err.clone();
+    page.route_with(
+        UrlPattern::from("**/echo/start"),
+        move |route| {
+            let double_err_c = double_err_c.clone();
+            async move {
+                let mut headers = route.request().headers().to_vec();
+                headers.push(("X-Outer".into(), "from-outer".into()));
+                route
+                    .fallback(Overrides {
+                        method: Some("POST".into()),
+                        headers: Some(headers),
+                        post_data: Some(b"outer-payload".to_vec()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                // Second answer on same route fails.
+                if route.fulfill(Fulfill::default()).await.is_err() {
+                    *double_err_c.lock().unwrap() = true;
+                }
+                Ok(())
+            }
+        },
+        RouteOptions { times: Some(2) },
+    )
+    .await
+    .unwrap();
+
+    // Route with times: 0 never runs.
+    let zero_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let zero_hits_c = zero_hits.clone();
+    page.route_with(
+        "**/echo/start",
+        move |route| {
+            zero_hits_c.fetch_add(1, Ordering::SeqCst);
+            async move { route.fulfill(Fulfill { body: b"never".to_vec(), ..Default::default() }).await }
+        },
+        RouteOptions { times: Some(0) },
+    )
+    .await
+    .unwrap();
+
+    // Requests 1 and 2 hit the outer times:2 handler -> mid page handler -> context handler -> server.
+    for _ in 0..2 {
+        let res = page
+            .evaluate("fetch('/echo/start').then(r => r.json())")
+            .await
+            .unwrap();
+        assert_eq!(res["method"], json!("POST"));
+        assert_eq!(res["uri"], json!("/echo/rewritten?ok=1"));
+        assert_eq!(res["headers"]["x-outer"], json!("from-outer"));
+        assert_eq!(res["headers"]["x-mid"], json!("from-mid"));
+        assert_eq!(res["body"], json!("outer-payload"));
+    }
+    assert!(*double_err.lock().unwrap());
+    assert_eq!(zero_hits.load(Ordering::SeqCst), 0);
+
+    // Request 3: times:2 handler is gone, so /echo/start hits the older **/echo/* route directly (without x-outer).
+    let third = page
+        .evaluate("fetch('/echo/start').then(r => r.json())")
+        .await
+        .unwrap();
+    assert_eq!(third["method"], json!("GET"));
+    assert_eq!(third["uri"], json!("/echo/start"));
+    assert_eq!(third["headers"]["x-mid"], json!("direct-only"));
+    assert!(third["headers"].get("x-outer").is_none());
+
+    let seen = ctx_seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].contains("outer=from-outer mid=from-mid"));
+    assert!(seen[1].contains("outer=from-outer mid=from-mid"));
+    assert!(seen[2].contains("outer=none mid=direct-only"));
+    drop(seen);
+
+    page.close().await.unwrap();
+    ctx.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv.abort();
+}

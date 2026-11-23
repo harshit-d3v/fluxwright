@@ -342,6 +342,8 @@ pub(crate) struct PageSetup {
     pub(crate) bindings_enabled: bool,
     pub(crate) exposed_bindings: HashSet<String>,
     pub(crate) init_scripts: Vec<String>,
+    pub(crate) clock_init_script: Option<String>,
+    pub(crate) clock_script_ids: HashMap<String, String>,
     pub(crate) popups: Option<tokio::sync::mpsc::UnboundedSender<CdpPage>>,
 }
 
@@ -2459,9 +2461,10 @@ async fn prepare_session(
         if bindings_enabled {
             calls.push(("Runtime.addBinding", json!({ "name": "__fluxwright_binding" })));
         }
-        for source in setup
+        for source in page_setup
             .iter()
-            .flat_map(|s| s.init_scripts.iter())
+            .flat_map(|p| p.clock_init_script.iter())
+            .chain(setup.iter().flat_map(|s| s.init_scripts.iter()))
             .chain(page_setup.iter().flat_map(|p| p.init_scripts.iter()))
         {
             calls.push((

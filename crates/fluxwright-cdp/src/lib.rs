@@ -1,5 +1,6 @@
 mod browser;
 mod cdp_session;
+mod clock;
 mod connection;
 mod context;
 mod error;
@@ -17,6 +18,9 @@ mod worker;
 
 pub use browser::{BrowserId, CdpBrowser, ContextId, FrameInfo, Proxy, SessionId, TargetId};
 pub use cdp_session::{CdpSession, CdpSessionEvent};
+pub use clock::{
+    parse_clock_ticks, parse_clock_time, ClockInstallOptions, ClockTicks, ClockTime, CLOCK_JS,
+};
 pub use connection::{CdpEvent, Connection};
 pub use context::{
     filter_cookies, ColorScheme, Cookie, CookieFilter, Emulation, Geolocation, IndexedDbDatabase,
@@ -46,6 +50,6 @@ pub use render::{
     validate_mask_color, Clip, ImageFormat, PdfMargin, PdfOptions, ScreenshotAnimations,
     ScreenshotCaret, ScreenshotOptions, FREEZE_ANIMATIONS_CSS, HIDE_CARET_CSS, MAX_PDF_BYTES,
 };
-pub use route::{Fulfill, InterceptedRequest, Overrides, RouteFetchHandle};
+pub use route::{normalize_headers, Fulfill, InterceptedRequest, Overrides, RouteFetchHandle, RouteOptions};
 pub use snapshot::{AriaRef, AriaSnapshot, MarkdownOptions, SnapshotOptions};
 pub use worker::{Worker, WorkerEvent};

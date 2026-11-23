@@ -1827,6 +1827,29 @@ fn parse_load_state(state: Option<&str>) -> PyResult<fluxwright::WaitUntil> {
     }
 }
 
+fn to_clock_time(time_ms: Option<f64>, time_iso: Option<String>) -> PyResult<fluxwright::ClockTime> {
+    match (time_ms, time_iso) {
+        (Some(ms), None) => Ok(fluxwright::ClockTime::Ms(ms)),
+        (None, Some(iso)) => Ok(fluxwright::ClockTime::Iso(iso)),
+        _ => Err(PyValueError::new_err(
+            "clock time must specify either time_ms or time_iso",
+        )),
+    }
+}
+
+fn to_clock_ticks(
+    ticks_ms: Option<f64>,
+    ticks_text: Option<String>,
+) -> PyResult<fluxwright::ClockTicks> {
+    match (ticks_ms, ticks_text) {
+        (Some(ms), None) => Ok(fluxwright::ClockTicks::Ms(ms)),
+        (None, Some(text)) => Ok(fluxwright::ClockTicks::Text(text)),
+        _ => Err(PyValueError::new_err(
+            "clock ticks must specify either ticks_ms or ticks_text",
+        )),
+    }
+}
+
 #[pymethods]
 impl Page {
     #[new]
@@ -3074,6 +3097,96 @@ impl Page {
     fn add_init_script<'py>(&self, py: Python<'py>, source: String) -> PyResult<Bound<'py, PyAny>> {
         run(py, &self.lease, move |p| {
             Box::pin(async move { p.add_init_script(&source).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clock_install", signature = (*, time_ms=None, time_iso=None))]
+    fn clock_install<'py>(
+        &self,
+        py: Python<'py>,
+        time_ms: Option<f64>,
+        time_iso: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let time = if time_ms.is_none() && time_iso.is_none() {
+            None
+        } else {
+            Some(to_clock_time(time_ms, time_iso)?)
+        };
+        let opts = fluxwright::ClockInstallOptions { time };
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.clock().install_with(&opts).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clock_pause_at", signature = (*, time_ms=None, time_iso=None))]
+    fn clock_pause_at<'py>(
+        &self,
+        py: Python<'py>,
+        time_ms: Option<f64>,
+        time_iso: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let time = to_clock_time(time_ms, time_iso)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.clock().pause_at(time).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clock_set_fixed_time", signature = (*, time_ms=None, time_iso=None))]
+    fn clock_set_fixed_time<'py>(
+        &self,
+        py: Python<'py>,
+        time_ms: Option<f64>,
+        time_iso: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let time = to_clock_time(time_ms, time_iso)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.clock().set_fixed_time(time).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clock_set_system_time", signature = (*, time_ms=None, time_iso=None))]
+    fn clock_set_system_time<'py>(
+        &self,
+        py: Python<'py>,
+        time_ms: Option<f64>,
+        time_iso: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let time = to_clock_time(time_ms, time_iso)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.clock().set_system_time(time).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clock_fast_forward", signature = (*, ticks_ms=None, ticks_text=None))]
+    fn clock_fast_forward<'py>(
+        &self,
+        py: Python<'py>,
+        ticks_ms: Option<f64>,
+        ticks_text: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ticks = to_clock_ticks(ticks_ms, ticks_text)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.clock().fast_forward(ticks).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clock_run_for", signature = (*, ticks_ms=None, ticks_text=None))]
+    fn clock_run_for<'py>(
+        &self,
+        py: Python<'py>,
+        ticks_ms: Option<f64>,
+        ticks_text: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ticks = to_clock_ticks(ticks_ms, ticks_text)?;
+        run(py, &self.lease, move |p| {
+            Box::pin(async move { p.clock().run_for(ticks).await.map(none) })
+        })
+    }
+
+    #[pyo3(name = "_clock_resume")]
+    fn clock_resume<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        run(py, &self.lease, |p| {
+            Box::pin(async move { p.clock().resume().await.map(none) })
         })
     }
 

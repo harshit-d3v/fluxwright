@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fluxwright_cdp::{
-    http_client::HttpContextDefaults, ApiRequestOptions, ApiResponse, AriaSnapshot, BoundingBox,
-    CdpBrowser, CdpPage, CdpSession, ConsoleMessage, ContextId, CookieFilter, Download,
-    DownloadQueue, FrameInfo, HarNotFound, HarRecorder, HarRouteOptions, HarRouter,
-    InterceptedRequest, LogEntry, MarkdownOptions, PageError, PageLog, PdfOptions, Proxy,
-    RecordHarOptions, ResourceType, ScreenshotOptions, Selector, SnapshotOptions, WebSocketEvent,
-    Worker, WorkerEvent,
+    http_client::HttpContextDefaults, normalize_headers, ApiRequestOptions, ApiResponse,
+    AriaSnapshot, BoundingBox, CdpBrowser, CdpPage, CdpSession, ClockInstallOptions, ClockTicks,
+    ClockTime, ConsoleMessage, ContextId, CookieFilter, Download, DownloadQueue, FrameInfo, Fulfill,
+    HarNotFound, HarRecorder, HarRouteOptions, HarRouter, InterceptedRequest, LogEntry,
+    MarkdownOptions, Overrides, PageError, PageLog, PdfOptions, Proxy, RecordHarOptions,
+    ResourceType, RouteFetchHandle, RouteFetchOptions, RouteOptions, ScreenshotOptions, Selector,
+    SnapshotOptions, WebSocketEvent, Worker, WorkerEvent,
 };
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -133,6 +134,9 @@ struct ContextGuard {
     http_defaults: std::sync::Mutex<HttpContextDefaults>,
     har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
     har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    route_entries: Arc<std::sync::Mutex<Vec<Arc<RouteEntry>>>>,
+    route_start: tokio::sync::Mutex<bool>,
+    route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     record_video: std::sync::Mutex<Option<RecordVideoOptions>>,
     video_recorders: std::sync::Mutex<Vec<VideoRecorder>>,
     proxy_lease: std::sync::Mutex<Option<ProxyLease>>,
@@ -171,6 +175,9 @@ impl ContextGuard {
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
+        for handle in self.route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
         for rec in recorders {
             let _ = rec.finish().await;
@@ -196,6 +203,9 @@ impl ContextGuard {
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        for handle in self.route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
@@ -225,6 +235,9 @@ impl Drop for ContextGuard {
         self.release_proxy(completed);
         let _ = self.warm_page.lock().unwrap().take();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        for handle in self.route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
         let recorders = std::mem::take(&mut *self.har_recorders.lock().unwrap());
@@ -365,6 +378,9 @@ pub struct PageLease {
     base_url: std::sync::Mutex<Option<String>>,
     har_recorders: std::sync::Mutex<Vec<HarRecorder>>,
     har_route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    route_entries: Arc<std::sync::Mutex<Vec<Arc<RouteEntry>>>>,
+    route_start: tokio::sync::Mutex<bool>,
+    route_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     video_recorder: std::sync::Mutex<Option<VideoRecorder>>,
     video: Option<Video>,
 }
@@ -1473,6 +1489,9 @@ impl Inner {
             http_defaults: std::sync::Mutex::new(HttpContextDefaults::default()),
             har_recorders: Default::default(),
             har_route_tasks: Default::default(),
+            route_entries: Default::default(),
+            route_start: tokio::sync::Mutex::new(false),
+            route_tasks: Default::default(),
             record_video: Default::default(),
             video_recorders: Default::default(),
             proxy_lease: Default::default(),
@@ -1828,6 +1847,9 @@ fn build_page_lease(
             base_url: std::sync::Mutex::new(base_url),
             har_recorders: Default::default(),
             har_route_tasks: Default::default(),
+            route_entries: Default::default(),
+            route_start: tokio::sync::Mutex::new(false),
+            route_tasks: Default::default(),
             video_recorder: std::sync::Mutex::new(video_recorder),
             video,
         }
@@ -2128,6 +2150,51 @@ impl ContextLease {
             .browser
             .context_intercept(&self.guard.context, self.timeout())
             .await?)
+    }
+
+    /// Registers a context-wide route handler (`url` glob or predicate), running newest-first.
+    pub async fn route<F, Fut>(&self, pattern: impl Into<UrlPattern>, handler: F) -> Result<()>
+    where
+        F: Fn(Route) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        self.route_with(pattern, handler, RouteOptions::default()).await
+    }
+
+    /// Registers a context-wide route handler with [`RouteOptions`] (such as `times`).
+    pub async fn route_with<F, Fut>(
+        &self,
+        pattern: impl Into<UrlPattern>,
+        handler: F,
+        options: RouteOptions,
+    ) -> Result<()>
+    where
+        F: Fn(Route) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        if self.is_closed() {
+            return Err(Error::Other("browser context is closed".into()));
+        }
+        {
+            let mut started = self.guard.route_start.lock().await;
+            if !*started {
+                let rx = self.intercept().await?;
+                let task = spawn_route_dispatcher(
+                    None,
+                    self.guard.route_entries.clone(),
+                    rx,
+                );
+                self.guard.route_tasks.lock().unwrap().push(task);
+                *started = true;
+            }
+        }
+        push_route_entry(&self.guard.route_entries, pattern.into(), handler, options);
+        Ok(())
+    }
+
+    /// Removes context-wide handlers registered for the matching glob `pattern`.
+    pub async fn unroute(&self, pattern: &str) {
+        remove_route_entries(&self.guard.route_entries, pattern);
     }
 
     pub async fn new_cdp_session(&self, page: &PageLease) -> Result<CdpSession> {
@@ -3472,11 +3539,61 @@ impl PageLease {
         self.locator(Selector::test_id(id))
     }
 
+    /// Fake clock controls for this page (`Date`, `performance.now`, `setTimeout`, `setInterval`, `requestAnimationFrame`).
+    pub fn clock(&self) -> Clock<'_> {
+        Clock { lease: self }
+    }
+
     /// Hands every request of this page, its popups and iframes to the returned channel to
     /// fulfill, change or abort (Playwright's `page.route`). Call it before navigating. A request
     /// dropped unanswered continues; blocked resource types stay blocked.
     pub async fn intercept(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>> {
         Ok(self.page.intercept(self.action_timeout()).await?)
+    }
+
+    /// Registers a Playwright-style route handler on this page (`page.route`). Newest handler runs first.
+    pub async fn route<F, Fut>(&self, pattern: impl Into<UrlPattern>, handler: F) -> Result<()>
+    where
+        F: Fn(Route) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        self.route_with(pattern, handler, RouteOptions::default()).await
+    }
+
+    /// Registers a route handler with [`RouteOptions`] (such as `times`).
+    pub async fn route_with<F, Fut>(
+        &self,
+        pattern: impl Into<UrlPattern>,
+        handler: F,
+        options: RouteOptions,
+    ) -> Result<()>
+    where
+        F: Fn(Route) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        if self.is_closed() {
+            return Err(Error::Other("page is closed".into()));
+        }
+        {
+            let mut started = self.route_start.lock().await;
+            if !*started {
+                let rx = self.intercept().await?;
+                let task = spawn_route_dispatcher(
+                    Some(self.route_entries.clone()),
+                    self.context.route_entries.clone(),
+                    rx,
+                );
+                self.route_tasks.lock().unwrap().push(task);
+                *started = true;
+            }
+        }
+        push_route_entry(&self.route_entries, pattern.into(), handler, options);
+        Ok(())
+    }
+
+    /// Removes page-level handlers registered for the matching glob `pattern`.
+    pub async fn unroute(&self, pattern: &str) {
+        remove_route_entries(&self.route_entries, pattern);
     }
 
     /// The next download this page, its popups or iframes finished, oldest first, waiting up to
@@ -3789,6 +3906,9 @@ impl PageLease {
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
+        for handle in self.route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
         if self.released {
             return;
         }
@@ -3831,6 +3951,9 @@ impl Drop for PageLease {
         self.log_task.abort();
         self.popup_task.abort();
         for handle in self.har_route_tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        for handle in self.route_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
         if self.released {
@@ -4866,6 +4989,446 @@ impl EngineBuilder {
         }
         engine.inner.maybe_prewarm().await;
         Ok(engine)
+    }
+}
+
+/// Playwright-style `page.clock` controller for deterministic time and timer testing.
+pub struct Clock<'a> {
+    lease: &'a PageLease,
+}
+
+impl<'a> Clock<'a> {
+    /// Installs fake clocks at the current real wall-clock time.
+    pub async fn install(&self) -> Result<()> {
+        self.install_with(&ClockInstallOptions::default()).await
+    }
+
+    /// Installs fake clocks with explicit [`ClockInstallOptions`].
+    pub async fn install_with(&self, options: &ClockInstallOptions) -> Result<()> {
+        let timeout = self.lease.action_timeout();
+        self.lease
+            .traced("Clock", "install", "clock.install", || serde_json::json!({}), async {
+                Ok(self.lease.page.clock_install(options, timeout).await?)
+            })
+            .await
+    }
+
+    /// Jumps to `time` (if ahead) and pauses time progression.
+    pub async fn pause_at(&self, time: impl Into<ClockTime>) -> Result<()> {
+        let time = time.into();
+        let timeout = self.lease.action_timeout();
+        self.lease
+            .traced("Clock", "pauseAt", "clock.pause_at", || serde_json::json!({}), async {
+                Ok(self.lease.page.clock_pause_at(&time, timeout).await?)
+            })
+            .await
+    }
+
+    /// Freezes `Date.now()` / `new Date()` to `time` while timers continue running.
+    pub async fn set_fixed_time(&self, time: impl Into<ClockTime>) -> Result<()> {
+        let time = time.into();
+        let timeout = self.lease.action_timeout();
+        self.lease
+            .traced(
+                "Clock",
+                "setFixedTime",
+                "clock.set_fixed_time",
+                || serde_json::json!({}),
+                async { Ok(self.lease.page.clock_set_fixed_time(&time, timeout).await?) },
+            )
+            .await
+    }
+
+    /// Sets the system clock to `time` without freezing `Date` or firing timers.
+    pub async fn set_system_time(&self, time: impl Into<ClockTime>) -> Result<()> {
+        let time = time.into();
+        let timeout = self.lease.action_timeout();
+        self.lease
+            .traced(
+                "Clock",
+                "setSystemTime",
+                "clock.set_system_time",
+                || serde_json::json!({}),
+                async { Ok(self.lease.page.clock_set_system_time(&time, timeout).await?) },
+            )
+            .await
+    }
+
+    /// Jumps simulated time forward by `ticks`, firing due timers at most once.
+    pub async fn fast_forward(&self, ticks: impl Into<ClockTicks>) -> Result<()> {
+        let ticks = ticks.into();
+        let timeout = self.lease.action_timeout();
+        self.lease
+            .traced(
+                "Clock",
+                "fastForward",
+                "clock.fast_forward",
+                || serde_json::json!({}),
+                async { Ok(self.lease.page.clock_fast_forward(&ticks, timeout).await?) },
+            )
+            .await
+    }
+
+    /// Advances simulated time by `ticks`, executing due timers and intervals in order.
+    pub async fn run_for(&self, ticks: impl Into<ClockTicks>) -> Result<()> {
+        let ticks = ticks.into();
+        let timeout = self.lease.action_timeout();
+        self.lease
+            .traced("Clock", "runFor", "clock.run_for", || serde_json::json!({}), async {
+                Ok(self.lease.page.clock_run_for(&ticks, timeout).await?)
+            })
+            .await
+    }
+
+    /// Resumes natural wall-clock progression from the current clock state.
+    pub async fn resume(&self) -> Result<()> {
+        let timeout = self.lease.action_timeout();
+        self.lease
+            .traced("Clock", "resume", "clock.resume", || serde_json::json!({}), async {
+                Ok(self.lease.page.clock_resume(timeout).await?)
+            })
+            .await
+    }
+}
+
+/// URL matcher for `page.route` and `context.route`.
+#[derive(Clone)]
+pub enum UrlPattern {
+    Glob(String),
+    Predicate(Arc<dyn Fn(&str) -> bool + Send + Sync>),
+}
+
+impl UrlPattern {
+    pub fn matches(&self, url: &str) -> bool {
+        match self {
+            Self::Glob(pat) => fluxwright_cdp::url_glob_matches(pat, url),
+            Self::Predicate(pred) => pred(url),
+        }
+    }
+
+    fn glob_key(&self) -> Option<&str> {
+        match self {
+            Self::Glob(pat) => Some(pat.as_str()),
+            Self::Predicate(_) => None,
+        }
+    }
+}
+
+impl From<&str> for UrlPattern {
+    fn from(s: &str) -> Self {
+        Self::Glob(s.to_owned())
+    }
+}
+
+impl From<String> for UrlPattern {
+    fn from(s: String) -> Self {
+        Self::Glob(s)
+    }
+}
+
+/// Request snapshot visible to a Rust `page.route` / `context.route` handler, reflecting any
+/// prior `route.fallback(overrides)`.
+#[derive(Debug, Clone)]
+pub struct RouteRequest {
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub post_data: Option<String>,
+    pub resource_type: String,
+}
+
+impl RouteRequest {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let lower = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .rev()
+            .find(|(k, _)| k.to_ascii_lowercase() == lower)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn post_data(&self) -> Option<&str> {
+        self.post_data.as_deref()
+    }
+
+    pub fn resource_type(&self) -> &str {
+        &self.resource_type
+    }
+}
+
+enum RouteOutcome {
+    Pending,
+    Answered,
+    FellBack(Overrides),
+}
+
+struct RouteInner {
+    raw: Arc<Mutex<Option<InterceptedRequest>>>,
+    fetch_handle: RouteFetchHandle,
+    accumulated: Overrides,
+    request: RouteRequest,
+    outcome: Mutex<RouteOutcome>,
+    returned: AtomicBool,
+}
+
+/// A Playwright-style route handle passed to `page.route` / `context.route` handlers.
+#[derive(Clone)]
+pub struct Route {
+    inner: Arc<RouteInner>,
+}
+
+impl Route {
+    pub fn request(&self) -> &RouteRequest {
+        &self.inner.request
+    }
+
+    /// Performs the HTTP request without fulfilling it, inheriting accumulated fallback overrides.
+    pub async fn fetch(&self, opts: &RouteFetchOptions) -> Result<ApiResponse> {
+        if self.inner.returned.load(Ordering::SeqCst) {
+            return Err(Error::Other("route: handler already returned".into()));
+        }
+        {
+            let outcome = self.inner.outcome.lock().await;
+            if !matches!(*outcome, RouteOutcome::Pending) {
+                return Err(Error::Other("route is already handled".into()));
+            }
+        }
+        if self.inner.raw.lock().await.is_none() {
+            return Err(Error::Other("route is already handled".into()));
+        }
+        Ok(self.inner.fetch_handle.fetch(opts).await?)
+    }
+
+    /// Fulfills the intercepted request with a synthetic response.
+    pub async fn fulfill(&self, fulfill: Fulfill) -> Result<()> {
+        let req = self.take_for_answer().await?;
+        Ok(req.fulfill(fulfill).await?)
+    }
+
+    /// Continues the intercepted request with optional overrides merged onto fallback overrides.
+    pub async fn continue_with(&self, overrides: Overrides) -> Result<()> {
+        let req = self.take_for_answer().await?;
+        let mut merged = self.inner.accumulated.clone();
+        merged.merge(overrides);
+        Ok(req.continue_with(merged).await?)
+    }
+
+    /// Fails the intercepted request with a Playwright error code (`failed`, `aborted`, ...).
+    pub async fn abort(&self, error_code: &str) -> Result<()> {
+        let req = self.take_for_answer().await?;
+        Ok(req.abort(error_code).await?)
+    }
+
+    /// Hands the request to the next matching route handler, applying optional `overrides`.
+    pub async fn fallback(&self, overrides: Overrides) -> Result<()> {
+        if self.inner.returned.load(Ordering::SeqCst) {
+            return Err(Error::Other("route: handler already returned".into()));
+        }
+        let mut outcome = self.inner.outcome.lock().await;
+        if !matches!(*outcome, RouteOutcome::Pending) {
+            return Err(Error::Other("route is already handled".into()));
+        }
+        *outcome = RouteOutcome::FellBack(overrides);
+        Ok(())
+    }
+
+    async fn take_for_answer(&self) -> Result<InterceptedRequest> {
+        if self.inner.returned.load(Ordering::SeqCst) {
+            return Err(Error::Other("route: handler already returned".into()));
+        }
+        let mut outcome = self.inner.outcome.lock().await;
+        if !matches!(*outcome, RouteOutcome::Pending) {
+            return Err(Error::Other("route is already handled".into()));
+        }
+        let req = self
+            .inner
+            .raw
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| Error::Other("route is already handled".into()))?;
+        *outcome = RouteOutcome::Answered;
+        Ok(req)
+    }
+}
+
+type RouteHandlerFn = Arc<
+    dyn Fn(Route) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+struct RouteEntry {
+    id: u64,
+    pattern: UrlPattern,
+    handler: RouteHandlerFn,
+    remaining: std::sync::Mutex<Option<usize>>,
+    removed: AtomicBool,
+}
+
+static NEXT_ROUTE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn push_route_entry<F, Fut>(
+    list: &std::sync::Mutex<Vec<Arc<RouteEntry>>>,
+    pattern: UrlPattern,
+    handler: F,
+    options: RouteOptions,
+) where
+    F: Fn(Route) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    if options.times == Some(0) {
+        return;
+    }
+    let id = NEXT_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
+    let entry = Arc::new(RouteEntry {
+        id,
+        pattern,
+        handler: Arc::new(move |r| Box::pin(handler(r))),
+        remaining: std::sync::Mutex::new(options.times),
+        removed: AtomicBool::new(false),
+    });
+    list.lock().unwrap().push(entry);
+}
+
+fn remove_route_entries(list: &std::sync::Mutex<Vec<Arc<RouteEntry>>>, pattern: &str) {
+    let mut guard = list.lock().unwrap();
+    guard.retain(|entry| {
+        if entry.pattern.glob_key() == Some(pattern) {
+            entry.removed.store(true, Ordering::SeqCst);
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn spawn_route_dispatcher(
+    page_routes: Option<Arc<std::sync::Mutex<Vec<Arc<RouteEntry>>>>>,
+    ctx_routes: Arc<std::sync::Mutex<Vec<Arc<RouteEntry>>>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<InterceptedRequest>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let page_ref = page_routes.clone();
+            let ctx_ref = ctx_routes.clone();
+            tokio::spawn(async move {
+                dispatch_intercepted_request(page_ref, ctx_ref, req).await;
+            });
+        }
+    })
+}
+
+async fn dispatch_intercepted_request(
+    page_routes: Option<Arc<std::sync::Mutex<Vec<Arc<RouteEntry>>>>>,
+    ctx_routes: Arc<std::sync::Mutex<Vec<Arc<RouteEntry>>>>,
+    req: InterceptedRequest,
+) {
+    let mut accumulated = Overrides::default();
+    let mut current = RouteRequest {
+        url: req.url.clone(),
+        method: req.method.clone(),
+        headers: req.headers.clone(),
+        post_data: req.post_data.clone(),
+        resource_type: req.resource_type.clone(),
+    };
+    let base_fetch = req.fetch_handle();
+    let raw = Arc::new(Mutex::new(Some(req)));
+
+    let mut groups: Vec<(Vec<Arc<RouteEntry>>, Arc<std::sync::Mutex<Vec<Arc<RouteEntry>>>>)> =
+        Vec::with_capacity(2);
+    if let Some(pr) = page_routes {
+        let snapshot = pr.lock().unwrap().clone();
+        groups.push((snapshot, pr));
+    }
+    let ctx_snapshot = ctx_routes.lock().unwrap().clone();
+    groups.push((ctx_snapshot, ctx_routes));
+
+    'dispatch: for (entries, owner_list) in groups {
+        for entry in entries.into_iter().rev() {
+            if entry.removed.load(Ordering::SeqCst) {
+                continue;
+            }
+            if !entry.pattern.matches(&current.url) {
+                continue;
+            }
+            let exhausted_now = {
+                let mut rem = entry.remaining.lock().unwrap();
+                match *rem {
+                    Some(0) => continue,
+                    Some(n) => {
+                        let next = n - 1;
+                        *rem = Some(next);
+                        next == 0
+                    }
+                    None => false,
+                }
+            };
+            if exhausted_now {
+                entry.removed.store(true, Ordering::SeqCst);
+                owner_list.lock().unwrap().retain(|e| e.id != entry.id);
+            }
+
+            let route = Route {
+                inner: Arc::new(RouteInner {
+                    raw: raw.clone(),
+                    fetch_handle: base_fetch.with_overrides(&accumulated),
+                    accumulated: accumulated.clone(),
+                    request: current.clone(),
+                    outcome: Mutex::new(RouteOutcome::Pending),
+                    returned: AtomicBool::new(false),
+                }),
+            };
+
+            let res = (entry.handler)(route.clone()).await;
+            route.inner.returned.store(true, Ordering::SeqCst);
+            if let Err(err) = res {
+                warn!(error = %err, "route handler failed; continuing request");
+                break 'dispatch;
+            }
+
+            let outcome = std::mem::replace(
+                &mut *route.inner.outcome.lock().await,
+                RouteOutcome::Pending,
+            );
+            match outcome {
+                RouteOutcome::Answered => return,
+                RouteOutcome::FellBack(overrides) => {
+                    if let Some(ref url) = overrides.url {
+                        current.url = url.clone();
+                    }
+                    if let Some(ref method) = overrides.method {
+                        current.method = method.clone();
+                    }
+                    if let Some(ref headers) = overrides.headers {
+                        current.headers = normalize_headers(headers.clone());
+                    }
+                    if let Some(ref post_data) = overrides.post_data {
+                        current.post_data = Some(String::from_utf8_lossy(post_data).into_owned());
+                    }
+                    accumulated.merge(overrides);
+                    continue;
+                }
+                RouteOutcome::Pending => break 'dispatch,
+            }
+        }
+    }
+
+    let maybe_req = raw.lock().await.take();
+    if let Some(req) = maybe_req {
+        let _ = req.continue_with(accumulated).await;
     }
 }
 

@@ -230,8 +230,23 @@ export interface Route {
   continue(options?: { url?: string; method?: string; headers?: Record<string, string>; postData?: string | Buffer }): Promise<void>
   /** Fails it with one of Playwright's codes: `failed` (default), `aborted`, `blockedbyclient`, `timedout`, ... */
   abort(errorCode?: string): Promise<void>
-  /** Leaves it to the next matching handler, the one added before this one. */
-  fallback(): Promise<void>
+  /** Leaves it to the next matching handler, the one added before this one, optionally overriding the request. */
+  fallback(options?: { url?: string; method?: string; headers?: Record<string, string>; postData?: string | Buffer }): Promise<void>
+}
+
+export interface RouteOptions {
+  /** How often a route should be used. By default it will be used every time. */
+  times?: number
+}
+
+export interface Clock {
+  install(options?: { time?: number | string | Date }): Promise<void>
+  fastForward(ticks: number | string): Promise<void>
+  pauseAt(time: number | string | Date): Promise<void>
+  resume(): Promise<void>
+  runFor(ticks: number | string): Promise<void>
+  setFixedTime(time: number | string | Date): Promise<void>
+  setSystemTime(time: number | string | Date): Promise<void>
 }
 
 /** A glob (`**` any characters, `*` any but `/`, `{a,b}` either), a RegExp, or a function of the URL. */
@@ -398,7 +413,7 @@ export interface BrowserContext {
   pages(): Page[]
   newPage(): Promise<Page>
   /** `page.route` for all pages and popups in this context; added before `newPage()`, it applies from the first request. */
-  route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
+  route(url: URLMatch, handler: (route: Route, request: Request) => unknown, options?: RouteOptions): Promise<void>
   unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
   routeFromHAR(har: string, options?: RouteFromHarOptions): Promise<void>
   addInitScript<Arg>(script: (arg: Arg) => unknown, arg: Arg): Promise<void>
@@ -540,7 +555,7 @@ declare module './index' {
      * the handler returns (await or return the answer): an unanswered request continues, and a
      * later answer is ignored with a warning.
      */
-    route(url: URLMatch, handler: (route: Route, request: Request) => unknown): Promise<void>
+    route(url: URLMatch, handler: (route: Route, request: Request) => unknown, options?: RouteOptions): Promise<void>
     /** Removes the handlers added for `url` (only `handler`, when given). */
     unroute(url: URLMatch, handler?: (route: Route, request: Request) => unknown): Promise<void>
     routeFromHAR(har: string, options?: RouteFromHarOptions): Promise<void>
@@ -644,6 +659,7 @@ declare module './index' {
     readonly mouse: Mouse
     readonly keyboard: Keyboard
     readonly touchscreen: Touchscreen
+    readonly clock: Clock
     /** `timeout` is in milliseconds, for this call only; 0 waits as long as it takes. */
     click(selector: string, options?: ClickOptions & { strict?: boolean }): Promise<void>
     dblclick(selector: string, options?: DblclickOptions & { strict?: boolean }): Promise<void>

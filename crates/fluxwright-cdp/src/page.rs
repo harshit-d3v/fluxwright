@@ -14,6 +14,9 @@ use crate::browser::{
     NetActivity, PageSetup, Proxy, SessionId, TargetId, TargetState,
 };
 use crate::cdp_session::CdpSession;
+use crate::clock::{
+    parse_clock_ticks, parse_clock_time, ClockInstallOptions, ClockTicks, ClockTime, CLOCK_JS,
+};
 use crate::connection::Connection;
 use crate::context::{
     filter_cookies, permission_types, Cookie, CookieFilter, Emulation, OriginStorage,
@@ -2509,6 +2512,108 @@ impl CdpPage {
             if s == self.sid() {
                 res?;
             }
+        }
+        Ok(())
+    }
+
+    /// Installs or resets the deterministic fake clock on this page and across subsequent navigations.
+    pub async fn clock_install(&self, opts: &ClockInstallOptions, timeout: Duration) -> Result<()> {
+        let mut cmd = json!({ "op": "install" });
+        if let Some(ref t) = opts.time {
+            cmd["time"] = parse_clock_time(t)?;
+        }
+        self.run_clock_command(cmd, timeout).await
+    }
+
+    /// Jumps to `time` (if ahead of the current clock) and pauses the fake clock.
+    pub async fn clock_pause_at(&self, time: &ClockTime, timeout: Duration) -> Result<()> {
+        let cmd = json!({ "op": "pauseAt", "time": parse_clock_time(time)? });
+        self.run_clock_command(cmd, timeout).await
+    }
+
+    /// Freezes `Date.now()` / `new Date()` to `time` while allowing timers to continue running.
+    pub async fn clock_set_fixed_time(&self, time: &ClockTime, timeout: Duration) -> Result<()> {
+        let cmd = json!({ "op": "setFixedTime", "time": parse_clock_time(time)? });
+        self.run_clock_command(cmd, timeout).await
+    }
+
+    /// Sets the fake system clock to `time` without freezing `Date` or firing timers.
+    pub async fn clock_set_system_time(&self, time: &ClockTime, timeout: Duration) -> Result<()> {
+        let cmd = json!({ "op": "setSystemTime", "time": parse_clock_time(time)? });
+        self.run_clock_command(cmd, timeout).await
+    }
+
+    /// Jumps simulated time forward by `ticks`, firing due timers at most once.
+    pub async fn clock_fast_forward(&self, ticks: &ClockTicks, timeout: Duration) -> Result<()> {
+        let cmd = json!({ "op": "fastForward", "ticks": parse_clock_ticks(ticks)? });
+        self.run_clock_command(cmd, timeout).await
+    }
+
+    /// Advances simulated time by `ticks`, executing due timers and intervals in chronological order.
+    pub async fn clock_run_for(&self, ticks: &ClockTicks, timeout: Duration) -> Result<()> {
+        let cmd = json!({ "op": "runFor", "ticks": parse_clock_ticks(ticks)? });
+        self.run_clock_command(cmd, timeout).await
+    }
+
+    /// Resumes natural wall-clock progression from the current fake clock state.
+    pub async fn clock_resume(&self, timeout: Duration) -> Result<()> {
+        self.run_clock_command(json!({ "op": "resume" }), timeout).await
+    }
+
+    async fn run_clock_command(&self, cmd: Value, timeout: Duration) -> Result<()> {
+        let cmd_json = serde_json::to_string(&cmd).unwrap();
+        let expr = format!("({CLOCK_JS}).command({cmd_json})");
+        let state = self.evaluate(&expr, timeout).await?;
+        let state_json = serde_json::to_string(&state).unwrap();
+        let init_script = format!("({CLOCK_JS}).restore({state_json});");
+        self.sync_clock_init_script(init_script, timeout).await
+    }
+
+    async fn sync_clock_init_script(&self, source: String, timeout: Duration) -> Result<()> {
+        let old_ids = {
+            let mut ps = self.page_setups.lock().await;
+            let setup = ps.entry(self.target_id.0.clone()).or_default();
+            setup.clock_init_script = Some(source.clone());
+            std::mem::take(&mut setup.clock_script_ids)
+        };
+        let mut sessions = CdpBrowser::sessions_for_page(&self.targets, &self.target_id.0).await;
+        if !sessions.iter().any(|s| s == self.sid()) {
+            sessions.push(self.sid().to_string());
+        }
+        let mut new_ids = HashMap::new();
+        for s in sessions {
+            if let Some(old_id) = old_ids.get(&s) {
+                let _ = self
+                    .session_call(
+                        &s,
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        json!({ "identifier": old_id }),
+                        timeout,
+                    )
+                    .await;
+            }
+            let res = self
+                .session_call(
+                    &s,
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": &source }),
+                    timeout,
+                )
+                .await;
+            match res {
+                Ok(val) => {
+                    if let Some(id) = val["identifier"].as_str() {
+                        new_ids.insert(s, id.to_string());
+                    }
+                }
+                Err(e) if s == self.sid() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        if !new_ids.is_empty() {
+            let mut ps = self.page_setups.lock().await;
+            let setup = ps.entry(self.target_id.0.clone()).or_default();
+            setup.clock_script_ids = new_ids;
         }
         Ok(())
     }
