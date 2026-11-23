@@ -1560,10 +1560,18 @@ try {
 
       await aiPage.goto(`${aiBase}/next`)
       await assert.rejects(() => aiPage.click(`@${btnRef.id}`), /unknown element ref|stale/)
+    } finally {
+      await aiPage.close()
+      aiSrv.close()
+    }
+  }
 
-      // Diff-only ariaSnapshot, Set-of-Marks annotate, and screenshot masking (incl. Shadow DOM).
-      await assert.rejects(() => aiPage.ariaSnapshot({ diff: 'yes' }), TypeError)
-      await aiPage.setContent(
+  // Diff-only ariaSnapshot, Set-of-Marks annotate, and screenshot masking (incl. Shadow DOM) on a fresh page.
+  {
+    const diffPage = await browser.newPage()
+    try {
+      await assert.rejects(() => diffPage.ariaSnapshot({ diff: 'yes' }), TypeError)
+      await diffPage.setContent(
         '<!doctype html><style>' +
           'body{margin:0;background:#fff}' +
           '#wrap{position:fixed;left:0;top:0;width:200px;height:80px;background:#fff}' +
@@ -1583,45 +1591,45 @@ try {
           'sh.innerHTML="<div id=shadow-secret style=\'position:fixed;left:100px;top:10px;width:60px;height:60px;background:#fff\'>S</div>";' +
           '</script>',
       )
-      const d0 = await aiPage.ariaSnapshot({ diff: true })
+      const d0 = await diffPage.ariaSnapshot({ diff: true })
       assert.equal(d0.isDiff, false)
       assert.equal(d0.changed, true)
       assert.match(d0.tree, /button "Go"/)
 
-      const d1 = await aiPage.ariaSnapshot({ diff: true })
+      const d1 = await diffPage.ariaSnapshot({ diff: true })
       assert.equal(d1.isDiff, true)
       assert.equal(d1.changed, false)
       assert.equal(d1.tree, '(no changes)')
       const goRef = d1.refs.find((r) => r.role === 'button' && r.name === 'Go')
       assert.ok(goRef)
 
-      const somPng = await aiPage.screenshot({ annotate: true })
+      const somPng = await diffPage.screenshot({ annotate: true })
       assert.equal(somPng.subarray(0, 4).toString('latin1'), '\x89PNG')
-      assert.equal(await aiPage.evaluate(() => document.getElementById('__fluxwright_som_overlay') === null), true)
-      const somJpeg = await aiPage.screenshot({ annotate: true, type: 'jpeg', quality: 80 })
+      assert.equal(await diffPage.evaluate(() => document.getElementById('__fluxwright_som_overlay') === null), true)
+      const somJpeg = await diffPage.screenshot({ annotate: true, type: 'jpeg', quality: 80 })
       assert.equal(somJpeg[0], 0xff)
       assert.equal(somJpeg[1], 0xd8)
 
       // annotate: true must not overwrite diff baseline cache.
-      const stillUnchanged = await aiPage.ariaSnapshot({ diff: true })
+      const stillUnchanged = await diffPage.ariaSnapshot({ diff: true })
       assert.equal(stillUnchanged.isDiff, true)
       assert.equal(stillUnchanged.changed, false)
       assert.equal(stillUnchanged.tree, '(no changes)')
 
-      await aiPage.click(`@${goRef.id}`)
-      const d2 = await aiPage.ariaSnapshot({ diff: true })
+      await diffPage.click(`@${goRef.id}`)
+      const d2 = await diffPage.ariaSnapshot({ diff: true })
       assert.equal(d2.isDiff, true)
       assert.equal(d2.changed, true)
       assert.ok(d2.tree.includes('+ '))
       assert.match(d2.tree, /button "Added"/)
 
-      const resetSnap = await aiPage.ariaSnapshot()
+      const resetSnap = await diffPage.ariaSnapshot()
       assert.equal(resetSnap.isDiff, false)
       assert.equal(resetSnap.changed, true)
 
-      await aiPage.click('#caret-box')
-      const maskedPng = await aiPage.screenshot({
-        mask: [aiPage.locator('#secret'), '#shadow-secret'],
+      await diffPage.click('#caret-box')
+      const maskedPng = await diffPage.screenshot({
+        mask: [diffPage.locator('#secret'), '#shadow-secret'],
         maskColor: '#00FF00',
         animations: 'disabled',
         caret: 'hide',
@@ -1634,29 +1642,28 @@ try {
       assert.deepEqual(px(40, 40), [0, 255, 0, 255])
       assert.deepEqual(px(130, 40), [0, 255, 0, 255])
       assert.equal(
-        await aiPage.evaluate(() => !document.getElementById('__fluxwright_mask_overlay') && !document.getElementById('__fluxwright_screenshot_style')),
+        await diffPage.evaluate(() => !document.getElementById('__fluxwright_mask_overlay') && !document.getElementById('__fluxwright_screenshot_style')),
         true,
       )
 
-      const elemMasked = await aiPage.locator('#wrap').screenshot({ mask: ['#secret'], maskColor: '#FF0000' })
+      const elemMasked = await diffPage.locator('#wrap').screenshot({ mask: ['#secret'], maskColor: '#FF0000' })
       const elemDec = decodePng(elemMasked)
       const elemOff = (40 * elemDec.width + 40) * 4
       assert.deepEqual(Array.from(elemDec.data.subarray(elemOff, elemOff + 4)), [255, 0, 0, 255])
-      assert.equal(await aiPage.evaluate(() => document.getElementById('__fluxwright_mask_overlay') === null), true)
+      assert.equal(await diffPage.evaluate(() => document.getElementById('__fluxwright_mask_overlay') === null), true)
 
       const otherPage = await browser.newPage()
       try {
-        await assert.rejects(() => aiPage.screenshot({ mask: [otherPage.locator('#secret')] }), TypeError)
+        await assert.rejects(() => diffPage.screenshot({ mask: [otherPage.locator('#secret')] }), TypeError)
       } finally {
         await otherPage.close()
       }
 
-      await aiPage.goto('about:blank')
-      const blankSom = await aiPage.screenshot({ annotate: true })
+      await diffPage.goto('about:blank')
+      const blankSom = await diffPage.screenshot({ annotate: true })
       assert.equal(blankSom.subarray(0, 4).toString('latin1'), '\x89PNG')
     } finally {
-      await aiPage.close()
-      aiSrv.close()
+      await diffPage.close()
     }
   }
 

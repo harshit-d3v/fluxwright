@@ -3064,7 +3064,7 @@ impl CdpPage {
         Ok(boxes)
     }
 
-    pub(crate) async fn element_screenshot_with_scope_styles(
+    async fn element_screenshot_with_scope_styles(
         &self,
         scope: &Scope,
         params: Value,

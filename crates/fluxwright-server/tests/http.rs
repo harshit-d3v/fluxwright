@@ -2113,7 +2113,8 @@ async fn executes_snapshot_diff_and_screenshot_annotate_mask_steps() {
         .decode(shot_b64)
         .unwrap();
     let img = fluxwright::decode_png(&shot_bytes).unwrap();
-    assert_eq!(img.get_pixel(40, 40).0, [0, 255, 0, 255]);
+    let off = ((40 * img.width + 40) * 4) as usize;
+    assert_eq!(&img.data[off..off + 4], &[0, 255, 0, 255]);
     assert_eq!(results[6], true);
 
     server.shutdown(Duration::from_secs(5)).await.unwrap();

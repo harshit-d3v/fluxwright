@@ -3385,9 +3385,13 @@ async fn snapshot_diff_and_som_mask_screenshots() {
         })
         .await
         .unwrap();
+    let px = |img: &fluxwright::RgbaImage, x: u32, y: u32| -> &[u8] {
+        let off = ((y * img.width + x) * 4) as usize;
+        &img.data[off..off + 4]
+    };
     let decoded = decode_png(&masked_png).unwrap();
-    assert_eq!(decoded.get_pixel(40, 40).0, [0, 255, 0, 255]);
-    assert_eq!(decoded.get_pixel(130, 40).0, [0, 255, 0, 255]);
+    assert_eq!(px(&decoded, 40, 40), &[0, 255, 0, 255]);
+    assert_eq!(px(&decoded, 130, 40), &[0, 255, 0, 255]);
     assert_eq!(
         page.evaluate(
             "!document.getElementById('__fluxwright_mask_overlay') && !document.getElementById('__fluxwright_screenshot_style')"
@@ -3408,7 +3412,7 @@ async fn snapshot_diff_and_som_mask_screenshots() {
         .await
         .unwrap();
     let elem_img = decode_png(&elem_masked).unwrap();
-    assert_eq!(elem_img.get_pixel(40, 40).0, [255, 0, 0, 255]);
+    assert_eq!(px(&elem_img, 40, 40), &[255, 0, 0, 255]);
     assert_eq!(
         page.evaluate("document.getElementById('__fluxwright_mask_overlay') === null")
             .await
