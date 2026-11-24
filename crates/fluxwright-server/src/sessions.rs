@@ -15,16 +15,17 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use fluxwright::{validate_profile_name, ContextLease, JobOptions, Priority, StorageState};
+use fluxwright::{validate_profile_name, CdpEvent, ContextLease, JobOptions, Priority, StorageState};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::cdp_gateway::{
     compute_enforce_server_proxy, create_initial_page, detach_client_sessions, host_base,
-    run_gateway_loop, teardown_gateway_state, GatewayPolicy, GatewayState,
+    run_gateway_loop, spawn_fail_blocked_request, teardown_gateway_state, GatewayPolicy,
+    GatewayState,
 };
 use crate::job::{JobPriority, ServerResourcePreset};
 use crate::live::{EmbedMode, LiveGuard};
@@ -129,31 +130,19 @@ impl CreateSessionRequest {
     }
 
     fn job_options(&self) -> JobOptions {
-        let mut req = crate::job::JobRequest {
-            steps: Vec::new(),
-            timeout_ms: 60_000,
-            retries: 0,
-            priority: self.priority,
-            resource_preset: self.resource_preset,
-            block_resources: Vec::new(),
-            block_url_patterns: Vec::new(),
-            profile: self.profile.clone(),
-            persist_profile: self.persist_profile,
-            proxy_session: self.proxy_session.clone(),
-            webhook_url: None,
-            webhook_headers: HashMap::new(),
-        };
-        // Session resource blocking runs inside GatewayState via GatewayPolicy so child contexts
-        // created over CDP behave identically to GET /cdp; keep ContextSetup fetch-free here.
-        req.resource_preset = None;
-        let mut opts = req.options();
-        opts.priority = match self.priority {
+        let priority = match self.priority {
             JobPriority::Low => Priority::Low,
             JobPriority::Normal => Priority::Normal,
             JobPriority::High => Priority::High,
         };
-        if let Some(vp) = self.viewport {
-            opts = opts.viewport(vp.width, vp.height);
+        let mut opts = JobOptions::default()
+            .priority(priority)
+            .persist_profile(self.persist_profile);
+        if let Some(ref profile) = self.profile {
+            opts = opts.profile(profile.clone());
+        }
+        if let Some(ref session) = self.proxy_session {
+            opts = opts.proxy_session(session.clone());
         }
         opts
     }
@@ -219,6 +208,7 @@ pub(crate) struct ManagedSession {
     created_at: u64,
     lease: Arc<ContextLease>,
     state: Arc<Mutex<GatewayState>>,
+    live_url: Arc<StdMutex<String>>,
     policy: GatewayPolicy,
     connected: AtomicBool,
     expires_tx: watch::Sender<(Instant, u64)>,
@@ -229,8 +219,14 @@ pub(crate) struct ManagedSession {
 impl ManagedSession {
     fn summary(&self) -> Value {
         let (_, expires_at) = *self.expires_tx.borrow();
-        let live_url = self.state.try_lock().ok().map(|g| g.live_url.lock().unwrap().clone());
-        let url = live_url.unwrap_or_else(|| String::from("about:blank"));
+        let url = {
+            let u = self.live_url.lock().unwrap();
+            if u.is_empty() {
+                String::from("about:blank")
+            } else {
+                u.clone()
+            }
+        };
         json!({
             "id": self.id,
             "status": if *self.close_tx.borrow() { "closing" } else { "active" },
@@ -300,9 +296,9 @@ impl SessionStoreState {
                 g.sessions
                     .values()
                     .next()
-                    .map(|s| (s.close_tx.clone(), s.closed_notify.clone()))
+                    .map(|s| (s.id.clone(), s.close_tx.clone(), s.closed_notify.clone()))
             };
-            let Some((close_tx, notify)) = next_notify else {
+            let Some((id, close_tx, notify)) = next_notify else {
                 break;
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -311,8 +307,11 @@ impl SessionStoreState {
             }
             let fut = notify.notified();
             tokio::pin!(fut);
+            fut.as_mut().enable();
             let _ = close_tx.send(true);
-            let _ = tokio::time::timeout(remaining.min(Duration::from_millis(100)), fut).await;
+            if self.get(&id).is_some() {
+                let _ = tokio::time::timeout(remaining.min(Duration::from_millis(100)), fut).await;
+            }
         }
     }
 }
@@ -419,10 +418,23 @@ pub(crate) async fn create_session(
     let state = Arc::new(Mutex::new(GatewayState::new(
         primary_context,
         live_target,
-        live_url,
+        live_url.clone(),
     )));
+    // Subscribe before installing the page/blocker so no disconnect or Fetch.requestPaused is missed.
+    let cdp_events = conn.subscribe_unbounded();
     let viewport = req.viewport.map(|v| (v.width, v.height));
-    create_initial_page(&conn, &state, &lease, &policy, viewport).await;
+    if create_initial_page(&conn, &state, &lease, &policy, viewport)
+        .await
+        .is_none()
+    {
+        teardown_gateway_state(&conn, &state, &lease, &policy).await;
+        drop(live_guard);
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "browser_error",
+            "failed to create initial page for managed session",
+        ));
+    }
 
     let (embed_token, effective_ttl, expires_at) = match inner
         .live
@@ -450,6 +462,7 @@ pub(crate) async fn create_session(
         created_at,
         lease,
         state,
+        live_url,
         policy,
         connected: AtomicBool::new(false),
         expires_tx,
@@ -458,7 +471,15 @@ pub(crate) async fn create_session(
     });
 
     inner.sessions.insert(reservation, session.clone());
-    spawn_session_reaper(inner.clone(), engine, session.clone(), expires_rx, close_rx, live_guard);
+    spawn_session_reaper(
+        inner.clone(),
+        engine,
+        session.clone(),
+        expires_rx,
+        close_rx,
+        cdp_events,
+        live_guard,
+    );
 
     let (ws_scheme, host) = host_base(&headers);
     let cdp_path = format!("/v1/sessions/{id}/cdp");
@@ -522,11 +543,14 @@ pub(crate) async fn extend_session(
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
     let sess = inner.sessions.get(&id).ok_or_else(session_not_found)?;
-    if *sess.close_tx.borrow() {
+    if *sess.close_tx.borrow() || sess.lease.is_closed() {
+        let _ = sess.close_tx.send(true);
         return Err(session_not_found());
     }
-    let next_instant = Instant::now() + Duration::from_secs(req.ttl_secs);
+    let next_std = std::time::Instant::now() + Duration::from_secs(req.ttl_secs);
+    let next_instant = Instant::from_std(next_std);
     let next_ms = now_ms().saturating_add(req.ttl_secs.saturating_mul(1000));
+    inner.live.extend_embeds(&id, next_std);
     let _ = sess.expires_tx.send((next_instant, next_ms));
     Ok(Json(sess.summary()))
 }
@@ -539,6 +563,7 @@ pub(crate) async fn delete_session(
     let sess = inner.sessions.get(&id).ok_or_else(session_not_found)?;
     let notified = sess.closed_notify.notified();
     tokio::pin!(notified);
+    notified.as_mut().enable();
     let _ = sess.close_tx.send(true);
     if inner.sessions.get(&id).is_some() {
         let _ = tokio::time::timeout(DELETE_WAIT_TIMEOUT, notified).await;
@@ -570,7 +595,8 @@ pub(crate) async fn cdp_ws_handler(
         ));
     };
     let sess = inner.sessions.get(&id).ok_or_else(session_not_found)?;
-    if *sess.close_tx.borrow() {
+    if *sess.close_tx.borrow() || sess.lease.is_closed() {
+        let _ = sess.close_tx.send(true);
         return Err(session_not_found());
     }
     if sess
@@ -601,11 +627,12 @@ pub(crate) async fn cdp_ws_handler(
                 sess.state.clone(),
                 sess.policy.clone(),
                 close_rx,
+                false,
             )
             .await;
             detach_client_sessions(&conn, &sess.state, &sess.lease).await;
             drop(_conn_guard);
-            if !sess.keep_alive {
+            if !sess.keep_alive || sess.lease.is_closed() {
                 let _ = sess.close_tx.send(true);
             }
         }))
@@ -617,24 +644,27 @@ fn spawn_session_reaper(
     session: Arc<ManagedSession>,
     mut expires_rx: watch::Receiver<(Instant, u64)>,
     mut close_rx: watch::Receiver<bool>,
+    mut cdp_events: mpsc::UnboundedReceiver<Arc<CdpEvent>>,
     live_guard: LiveGuard,
 ) {
     tokio::spawn(async move {
         let _live_guard = live_guard;
         let mut shutdown_rx = inner.shutdown_tx.subscribe();
+        let conn = session.lease.cdp_connection();
+        let has_preset = session.policy.resource_preset.is_some();
+        let sleep = tokio::time::sleep_until(expires_rx.borrow().0);
+        tokio::pin!(sleep);
         loop {
-            if *close_rx.borrow() || *shutdown_rx.borrow() {
+            if *close_rx.borrow() || *shutdown_rx.borrow() || session.lease.is_closed() {
                 break;
             }
-            let deadline = expires_rx.borrow().0;
-            let sleep = tokio::time::sleep_until(deadline);
-            tokio::pin!(sleep);
             tokio::select! {
                 () = &mut sleep => break,
                 res = expires_rx.changed() => {
                     if res.is_err() {
                         break;
                     }
+                    sleep.as_mut().reset(expires_rx.borrow().0);
                 }
                 res = close_rx.changed() => {
                     if res.is_err() || *close_rx.borrow() {
@@ -646,6 +676,25 @@ fn spawn_session_reaper(
                         break;
                     }
                 }
+                ev = cdp_events.recv() => {
+                    let Some(ev) = ev else {
+                        break;
+                    };
+                    if ev.method == "Fluxwright.disconnected" {
+                        break;
+                    }
+                    if has_preset && ev.method == "Fetch.requestPaused" {
+                        if let Some(sid) = ev.session_id.as_deref() {
+                            if session.state.lock().await.is_blocker_session(sid) {
+                                if let Some(req_id) =
+                                    ev.params["requestId"].as_str().map(str::to_owned)
+                                {
+                                    spawn_fail_blocked_request(&conn, sid, req_id);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -655,7 +704,6 @@ fn spawn_session_reaper(
                 persist_session_profile(&engine, &session.lease, profile_name).await;
             }
         }
-        let conn = session.lease.cdp_connection();
         teardown_gateway_state(&conn, &session.state, &session.lease, &session.policy).await;
         inner.sessions.remove(&session.id);
         drop(_live_guard);

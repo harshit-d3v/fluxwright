@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::job::{
-    execute_job, validate_selector, ExecutionProgress, JobPriority, JobRequest, NavigationWait,
-    ServerImageFormat, ServerResourcePreset, ServerResourceType, Step,
+    execute_job, ExecutionProgress, JobPriority, JobRequest, NavigationWait, ServerImageFormat,
+    ServerResourcePreset, ServerResourceType, Step,
 };
 use crate::{ApiError, Inner, JobTraceContext};
 
@@ -123,10 +123,6 @@ pub(crate) async fn scrape_handler(
     }
     let formats = dedup_formats(&req.formats)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
-    if let Some(ref sel) = req.wait_for_selector {
-        validate_selector(sel)
-            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
-    }
 
     let mut steps = vec![Step::Goto {
         url: req.url,

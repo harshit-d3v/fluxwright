@@ -354,11 +354,15 @@ pub(crate) struct GatewayState {
     auto_attach_waiters: HashMap<String, watch::Receiver<bool>>,
     discover_targets: bool,
     auto_attach: bool,
-    pub(crate) live_target: Arc<std::sync::Mutex<Option<String>>>,
-    pub(crate) live_url: Arc<std::sync::Mutex<String>>,
+    live_target: Arc<std::sync::Mutex<Option<String>>>,
+    live_url: Arc<std::sync::Mutex<String>>,
 }
 
 impl GatewayState {
+    pub(crate) fn is_blocker_session(&self, sid: &str) -> bool {
+        self.blocker_sessions.contains_key(sid)
+    }
+
     pub(crate) fn new(
         primary_context: String,
         live_target: Arc<std::sync::Mutex<Option<String>>>,
@@ -466,9 +470,28 @@ async fn run_gateway(
         state.clone(),
         policy.clone(),
         close_rx,
+        true,
     )
     .await;
     teardown_gateway_state(&conn, &state, &lease, &policy).await;
+}
+
+pub(crate) fn spawn_fail_blocked_request(conn: &Arc<Connection>, sid: &str, req_id: String) {
+    let conn = conn.clone();
+    let sid = sid.to_string();
+    tokio::spawn(async move {
+        let _ = conn
+            .call_raw(
+                "Fetch.failRequest",
+                json!({
+                    "requestId": req_id,
+                    "errorReason": "BlockedByClient",
+                }),
+                Some(&sid),
+                Duration::from_secs(5),
+            )
+            .await;
+    });
 }
 
 pub(crate) async fn run_gateway_loop(
@@ -478,6 +501,7 @@ pub(crate) async fn run_gateway_loop(
     state: Arc<Mutex<GatewayState>>,
     policy: GatewayPolicy,
     mut close_rx: watch::Receiver<bool>,
+    handle_blockers: bool,
 ) {
     let _active_guard = ActiveCdpSessionGuard::enter(inner.clone());
     let conn = lease.cdp_connection();
@@ -557,24 +581,10 @@ pub(crate) async fn run_gateway_loop(
                         }
                     };
                     if is_blocker {
-                        if ev.method == "Fetch.requestPaused" {
+                        if handle_blockers && ev.method == "Fetch.requestPaused" {
                             if let Some(req_id) = ev.params["requestId"].as_str().map(str::to_owned)
                             {
-                                let conn = conn.clone();
-                                let sid = sid.to_string();
-                                tokio::spawn(async move {
-                                    let _ = conn
-                                        .call_raw(
-                                            "Fetch.failRequest",
-                                            json!({
-                                                "requestId": req_id,
-                                                "errorReason": "BlockedByClient",
-                                            }),
-                                            Some(&sid),
-                                            Duration::from_secs(5),
-                                        )
-                                        .await;
-                                });
+                                spawn_fail_blocked_request(&conn, sid, req_id);
                             }
                         }
                         continue;

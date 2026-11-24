@@ -3480,7 +3480,7 @@ async fn embed_live_ws_enforces_read_only_vs_interactive_ttl_expiry_and_session_
     .await
     .expect("interactive embed forwarded pause and Input.insertText");
 
-    // 3. TTL expiry check (unit + active WS closure).
+    // 3. TTL expiry + extend_embeds check.
     let now = std::time::Instant::now();
     let (ttl_tok, ttl_clamped, _) = srv
         .inner
@@ -3493,10 +3493,18 @@ async fn embed_live_ws_enforces_read_only_vs_interactive_ttl_expiry_and_session_
         .live
         .verify_embed_at(&ttl_tok, Some(&session_id), now + Duration::from_secs(9))
         .is_some());
+    srv.inner
+        .live
+        .extend_embeds(&session_id, now + Duration::from_secs(60));
     assert!(srv
         .inner
         .live
-        .verify_embed_at(&ttl_tok, Some(&session_id), now + Duration::from_secs(10))
+        .verify_embed_at(&ttl_tok, Some(&session_id), now + Duration::from_secs(59))
+        .is_some());
+    assert!(srv
+        .inner
+        .live
+        .verify_embed_at(&ttl_tok, Some(&session_id), now + Duration::from_secs(60))
         .is_none());
 
     // 4. LiveGuard drop immediately ends active embed WS streams and revokes embed tokens.
@@ -3630,6 +3638,17 @@ async fn managed_sessions_and_scrape_validate_auth_and_bounds() {
             .await
             .status(),
         StatusCode::BAD_REQUEST
+    );
+    // POST /v1/scrape enforces the 64 KiB MAX_REQUEST_BYTES body cap.
+    let oversized_scrape = format!(
+        r#"{{"url":"https://example.com/{}"}}"#,
+        "a".repeat(MAX_REQUEST_BYTES + 128)
+    );
+    assert_eq!(
+        call(&srv, "POST", "/v1/scrape", oversized_scrape)
+            .await
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
     );
 
     srv.shutdown(Duration::ZERO).await.unwrap();

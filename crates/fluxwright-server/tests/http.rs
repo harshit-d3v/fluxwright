@@ -2147,7 +2147,7 @@ async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
         async move { axum::serve(listener, router).await }
     });
 
-    // 1. Create a persistent managed session with profile + initial viewport + live view embed.
+    // 1. Create a persistent managed session with profile + viewport + resource_preset + live view embed.
     let (st_create, created) = request(
         &server,
         "POST",
@@ -2155,10 +2155,11 @@ async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
         json!({
             "ttl_secs": 120,
             "keep_alive": true,
+            "resource_preset": "scraping",
             "profile": "cloud_user",
             "persist_profile": true,
             "viewport": { "width": 800, "height": 600 },
-            "live_view_mode": "read_only"
+            "live_view_mode": "interactive"
         }),
     )
     .await;
@@ -2183,7 +2184,42 @@ async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
         .unwrap();
     assert_eq!(embed_resp.status(), StatusCode::OK);
 
-    // 2. Connect WS client 1 over ?token=, set a cookie and navigate, then disconnect.
+    // Navigate via interactive Live View BEFORE any CDP client connects: resource_preset must
+    // still answer Fetch.requestPaused without hanging.
+    {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let embed_token = live_view_url.strip_prefix("/embed/live/").unwrap();
+        let (mut live_ws, _) = tokio_tungstenite::connect_async(&format!(
+            "ws://{addr}/v1/live/{sess_id}/ws?embed={embed_token}"
+        ))
+        .await
+        .unwrap();
+        live_ws
+            .send(WsMsg::Text(
+                json!({ "type": "navigate", "url": format!("{}/heavy", fixture.base_url) })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(WsMsg::Text(txt))) = live_ws.next().await {
+                let v: Value = serde_json::from_str(&txt).unwrap();
+                if v["type"] == "status"
+                    && v["url"].as_str().is_some_and(|u| u.ends_with("/heavy"))
+                {
+                    return;
+                }
+            }
+            panic!("live WS ended before /heavy status");
+        })
+        .await
+        .expect("interactive live navigation on resource_preset session completed without hanging");
+    }
+
+    // 2. Connect WS client 1 over ?token=, verify viewport & resource_preset blocking, then
+    // navigate to /forms, set a cookie, and disconnect.
     let cdp_ws_url = format!("ws://{addr}{cdp_path}?token={TOKEN}");
     let mut ws1 = connect_cdp_ws(&cdp_ws_url, None).await;
     let _ = cdp_rpc(
@@ -2211,6 +2247,28 @@ async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
     )
     .await;
     let sid1 = attached["result"]["sessionId"].as_str().unwrap().to_string();
+    // Wait for /heavy load and confirm viewport (800x600) + blocked image (naturalWidth === 0).
+    let mut heavy_ok = false;
+    for _ in 0..40 {
+        let ev = cdp_rpc(
+            &mut ws1,
+            30,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.readyState === 'complete' && location.pathname === '/heavy' && window.innerWidth === 800 && window.innerHeight === 600 && document.querySelector('img') && document.querySelector('img').naturalWidth === 0",
+                "returnByValue": true
+            }),
+            Some(&sid1),
+        )
+        .await;
+        if ev["result"]["result"]["value"] == json!(true) {
+            heavy_ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(heavy_ok, "expected 800x600 viewport and resource_preset to block /pixel.png on /heavy");
+
     let _ = cdp_rpc(
         &mut ws1,
         4,
@@ -2234,6 +2292,21 @@ async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let mut saw_forms_url = false;
+    for _ in 0..40 {
+        let (st_busy, busy_info) =
+            request(&server, "GET", &format!("/v1/sessions/{sess_id}"), Value::Null).await;
+        assert_eq!(st_busy, StatusCode::OK);
+        if busy_info["url"].as_str().unwrap_or("").ends_with("/forms") {
+            saw_forms_url = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        saw_forms_url,
+        "GET /v1/sessions/{{id}} should reflect /forms while CDP client is connected"
+    );
     let _ = cdp_rpc(
         &mut ws1,
         6,
@@ -2344,6 +2417,53 @@ async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
     let _ = std::fs::remove_dir_all(&profiles_dir);
     server.shutdown(Duration::from_secs(5)).await.unwrap();
     srv_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_session_ttl_expires_and_frees_slot() {
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+    let server = HttpServer::new(engine, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+
+    let (st, created) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        json!({ "ttl_secs": 10 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{created}");
+    let sess_id = created["id"].as_str().unwrap().to_string();
+
+    let expired = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (st, _) =
+                request(&server, "GET", &format!("/v1/sessions/{sess_id}"), Value::Null).await;
+            if st == StatusCode::NOT_FOUND {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(expired, "managed session should expire automatically after ttl_secs");
+
+    // Slot is freed immediately after TTL teardown so another session succeeds on the 1-slot engine.
+    let (st2, created2) = request(&server, "POST", "/v1/sessions", json!({})).await;
+    assert_eq!(st2, StatusCode::CREATED, "{created2}");
+    let sess2 = created2["id"].as_str().unwrap();
+    let (st_del, _) =
+        request(&server, "DELETE", &format!("/v1/sessions/{sess2}"), Value::Null).await;
+    assert_eq!(st_del, StatusCode::OK);
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

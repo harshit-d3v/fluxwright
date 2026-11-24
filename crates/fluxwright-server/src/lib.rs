@@ -698,8 +698,7 @@ impl HttpServer {
             );
         }
 
-        let mut protected = small
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
+        let mut protected = small;
         let mut live_ws = Router::new();
         let mut embed_routes = Router::new();
         if self.inner.engine.is_some() {
@@ -733,10 +732,12 @@ impl HttpServer {
                 ));
             embed_routes = Router::new().route("/embed/live/{token}", get(live::embed_html));
         }
-        let protected = protected.route_layer(middleware::from_fn_with_state(
-            self.inner.clone(),
-            authorize,
-        ));
+        let protected = protected
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .route_layer(middleware::from_fn_with_state(
+                self.inner.clone(),
+                authorize,
+            ));
 
         Router::new()
             // Liveness only: does not expose fleet state or launch Chrome.

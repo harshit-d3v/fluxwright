@@ -810,7 +810,7 @@ impl ServerSelectValues {
     }
 }
 
-pub(crate) fn validate_selector(selector: &str) -> Result<(), String> {
+fn validate_selector(selector: &str) -> Result<(), String> {
     if selector.trim().is_empty() {
         Err("selectors must not be empty".into())
     } else {
