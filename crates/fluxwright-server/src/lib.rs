@@ -12,6 +12,8 @@ mod journal;
 mod live;
 mod otlp;
 pub mod prometheus;
+mod scrape;
+mod sessions;
 mod store;
 pub mod telemetry;
 mod webhook;
@@ -222,6 +224,7 @@ pub(crate) struct Inner {
     active_cdp_sessions: AtomicUsize,
     total_cdp_sessions: AtomicU64,
     live: live::LiveRegistry,
+    sessions: sessions::SessionStoreState,
     webhooks: webhook::WebhookDispatcher,
     otlp: Option<otlp::OtlpExporter>,
     registry: Mutex<Registry>,
@@ -530,6 +533,7 @@ impl HttpServer {
             active_cdp_sessions: AtomicUsize::new(0),
             total_cdp_sessions: AtomicU64::new(0),
             live: live::LiveRegistry::default(),
+            sessions: sessions::SessionStoreState::default(),
             webhooks: webhook::WebhookDispatcher::new(config.webhook_secret),
             otlp,
             registry: Mutex::new(Registry {
@@ -702,6 +706,17 @@ impl HttpServer {
             protected = protected
                 .route("/cdp", get(cdp_gateway::ws_handler))
                 .route("/json/version", get(cdp_gateway::json_version))
+                .route("/v1/scrape", post(scrape::scrape_handler))
+                .route(
+                    "/v1/sessions",
+                    post(sessions::create_session).get(sessions::list_sessions),
+                )
+                .route(
+                    "/v1/sessions/{id}",
+                    get(sessions::get_session).delete(sessions::delete_session),
+                )
+                .route("/v1/sessions/{id}/extend", post(sessions::extend_session))
+                .route("/v1/sessions/{id}/cdp", get(sessions::cdp_ws_handler))
                 .route("/v1/profiles", get(list_profiles))
                 .route("/v1/profiles/{name}", delete(delete_profile))
                 .route("/v1/proxies", get(list_proxies))
@@ -766,6 +781,12 @@ impl HttpServer {
         }
         self.inner.lease_notify.notify_one();
         let _ = self.inner.shutdown_tx.send(true);
+        if self.inner.engine.is_some() {
+            self.inner
+                .sessions
+                .drain(grace.min(Duration::from_secs(3)))
+                .await;
+        }
         let res = match &self.inner.engine {
             Some(engine) => engine.shutdown(grace).await,
             None => Ok(()),
@@ -808,7 +829,9 @@ async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next
     let path = request.uri().path();
     let query_valid = !header_valid
         && inner.allow_query_token
-        && (path == "/cdp" || path == "/json/version")
+        && (path == "/cdp"
+            || path == "/json/version"
+            || sessions::is_session_cdp_path(path))
         && request
             .uri()
             .query()

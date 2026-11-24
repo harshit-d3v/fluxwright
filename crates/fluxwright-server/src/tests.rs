@@ -3526,3 +3526,111 @@ async fn embed_live_ws_enforces_read_only_vs_interactive_ttl_expiry_and_session_
     srv_handle.abort();
     cdp_task.abort();
 }
+
+#[tokio::test]
+async fn managed_sessions_and_scrape_validate_auth_and_bounds() {
+    let coordinator = HttpServer::coordinator(ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    for (method, path) in [
+        ("POST", "/v1/sessions"),
+        ("GET", "/v1/sessions"),
+        ("GET", "/v1/sessions/sess-1"),
+        ("POST", "/v1/sessions/sess-1/extend"),
+        ("DELETE", "/v1/sessions/sess-1"),
+        ("POST", "/v1/scrape"),
+    ] {
+        let r = call(&coordinator, method, path, Body::empty()).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // Standalone server with an idle (NeverStarts) engine to exercise route auth/validation.
+    let eng = idle_engine().await;
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.allow_query_token = true;
+    let srv = HttpServer::new(eng, cfg).unwrap();
+
+    // REST session & scrape endpoints never accept ?token=.
+    for (method, path) in [
+        ("POST", format!("/v1/sessions?token={TOKEN}")),
+        ("GET", format!("/v1/sessions?token={TOKEN}")),
+        ("POST", format!("/v1/scrape?token={TOKEN}")),
+    ] {
+        let unauth = srv
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+
+    // /v1/sessions/{id}/cdp DOES accept ?token= when allow_query_token=true (reaches handler -> 404).
+    let missing_cdp = srv
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/sessions/sess-missing/cdp?token={TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_cdp.status(), StatusCode::NOT_FOUND);
+
+    // Request validation on POST /v1/sessions and POST /v1/scrape.
+    assert_eq!(
+        call(&srv, "POST", "/v1/sessions", r#"{"ttl_secs":5}"#)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "POST", "/v1/sessions", r#"{"viewport":{"width":0,"height":720}}"#)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "POST", "/v1/sessions", r#"{"unknown":true}"#)
+            .await
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/bad/id", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/bad..id", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    assert_eq!(
+        call(&srv, "POST", "/v1/scrape", r#"{"url":"https://example.com","formats":[]}"#)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "POST", "/v1/scrape", r#"{"url":"http://169.254.169.254/latest"}"#)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "POST", "/v1/scrape", r#"{"url":"https://example.com","timeout_ms":999999}"#)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+}

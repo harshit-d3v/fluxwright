@@ -296,8 +296,52 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | GET | `/v1/proxies` | Bearer token | Inspect sanitized proxy pool health/cooldown stats (requires `--proxy`) |
 | GET | `/json/version` | Bearer (or `?token=` with `--allow-query-token`) | Standard DevTools discovery JSON pointing at `ws(s)://<host>/cdp` (standalone only) |
 | GET (WS) | `/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Pooled, context-isolated Chrome DevTools Protocol WebSocket gateway (standalone only) |
+| POST | `/v1/sessions` | Bearer token | Mint a persistent managed cloud session with `cdp_ws_url`, `live_view_url`, `profile`, `proxy_session`, `viewport`, and TTL (standalone only) |
+| GET | `/v1/sessions` | Bearer token | List active managed browser sessions (standalone only) |
+| GET | `/v1/sessions/{id}` | Bearer token | Read managed session metadata and connection state (standalone only) |
+| POST | `/v1/sessions/{id}/extend` | Bearer token | Reset a managed session's expiration TTL (`10..=3600`s) (standalone only) |
+| DELETE | `/v1/sessions/{id}` | Bearer token | Close a managed session, persist profile cookies if enabled, and dispose its context (standalone only) |
+| GET (WS) | `/v1/sessions/{id}/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Connect or reconnect (`keep_alive: true`) over CDP to an existing managed session (`409` if already connected) (standalone only) |
+| POST | `/v1/scrape` | Bearer token | Synchronously navigate and extract `markdown`, `html`, `text`, `snapshot`, `screenshot`, and/or `pdf` in one HTTP call (standalone only) |
 
-The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp` and `/json/version`, never `/v1/*` or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally. Browser `/dashboard` live streams authenticate WebSocket upgrades with single-use `?ticket=` tokens from `POST /v1/live/{id}/ticket`, while iframe embeds authenticate `GET /embed/live/{token}` and `/v1/live/{id}/ws?embed={token}` with capability tokens minted by `POST /v1/live/{id}/embed`.
+The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp`, `/json/version`, and `/v1/sessions/{id}/cdp`, never `/v1/jobs*`, `/v1/sessions`, `/v1/scrape`, or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally. Browser `/dashboard` live streams authenticate WebSocket upgrades with single-use `?ticket=` tokens from `POST /v1/live/{id}/ticket`, while iframe embeds authenticate `GET /embed/live/{token}` and `/v1/live/{id}/ws?embed={token}` with capability tokens minted by `POST /v1/live/{id}/embed`.
+
+## Managed cloud browser sessions (`/v1/sessions`)
+
+Mint long-lived, isolated Chrome contexts upfront for agent frameworks (Browser-Use, Stagehand, Playwright `connectOverCDP`, Puppeteer) paired with an embeddable Live View URL:
+
+```bash
+curl -sS -X POST http://127.0.0.1:7331/v1/sessions \
+  -H "Authorization: Bearer $FLUXWRIGHT_SERVER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ttl_secs": 300,
+    "keep_alive": true,
+    "profile": "account_1",
+    "viewport": { "width": 1280, "height": 720 },
+    "live_view_mode": "interactive"
+  }'
+```
+
+Returns `201 Created` with `{ "id", "status", "cdp_ws_url", "cdp_path", "live_view_url", "live_view_mode", "keep_alive", "connected", "url", "profile", "proxy_session", "created_at", "expires_at", "ttl_secs" }`. With `"keep_alive": true`, disconnecting the CDP WebSocket detaches only the client while preserving pages, cookies, and storage so a subsequent worker can reconnect until `ttl_secs` expires or `DELETE /v1/sessions/{id}` runs.
+
+## Synchronous one-shot scrape (`POST /v1/scrape`)
+
+Extract page content or renders without polling `/v1/jobs`:
+
+```bash
+curl -sS -X POST http://127.0.0.1:7331/v1/scrape \
+  -H "Authorization: Bearer $FLUXWRIGHT_SERVER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "formats": ["markdown", "snapshot", "screenshot"],
+    "resource_preset": "scraping",
+    "timeout_ms": 30000
+  }'
+```
+
+Supports `formats` entries `"markdown"`, `"html"`, `"text"`, `"snapshot"`, `"screenshot"`, and `"pdf"`, optional `wait_until` / `wait_for_selector`, `profile` / `proxy_session`, `screenshot_full_page` / `screenshot_annotate`, and `snapshot_interactive_only`. Enforces the same SSRF guards and 1 MiB result size cap as `/v1/jobs`.
 
 ## Live screencast viewer & human-in-the-loop
 
