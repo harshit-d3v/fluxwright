@@ -2249,25 +2249,36 @@ async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
     let sid1 = attached["result"]["sessionId"].as_str().unwrap().to_string();
     // Wait for /heavy load and confirm viewport (800x600) + blocked image (naturalWidth === 0).
     let mut heavy_ok = false;
-    for _ in 0..40 {
+    let mut last_ev = Value::Null;
+    for _ in 0..80 {
         let ev = cdp_rpc(
             &mut ws1,
             30,
             "Runtime.evaluate",
             json!({
-                "expression": "document.readyState === 'complete' && location.pathname === '/heavy' && window.innerWidth === 800 && window.innerHeight === 600 && document.querySelector('img') && document.querySelector('img').naturalWidth === 0",
+                "expression": "({ ready: document.readyState, path: location.pathname, w: window.innerWidth, h: window.innerHeight, img: document.querySelector('img') ? document.querySelector('img').naturalWidth : -1 })",
                 "returnByValue": true
             }),
             Some(&sid1),
         )
         .await;
-        if ev["result"]["result"]["value"] == json!(true) {
+        let val = &ev["result"]["result"]["value"];
+        if val["ready"] == "complete"
+            && val["path"] == "/heavy"
+            && val["w"] == 800
+            && val["h"] == 600
+            && val["img"] == 0
+        {
             heavy_ok = true;
             break;
         }
+        last_ev = ev;
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(heavy_ok, "expected 800x600 viewport and resource_preset to block /pixel.png on /heavy");
+    assert!(
+        heavy_ok,
+        "expected 800x600 viewport and resource_preset to block /pixel.png on /heavy, got: {last_ev}"
+    );
 
     let _ = cdp_rpc(
         &mut ws1,

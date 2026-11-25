@@ -432,6 +432,72 @@ pub(crate) async fn create_initial_page(
     if let Some(preset) = policy.resource_preset {
         ensure_preset_blocker(conn, state, lease, &tid, preset).await;
     }
+    if let Some((width, height)) = viewport {
+        let existing_sid = {
+            let g = state.lock().await;
+            g.blocker_sessions
+                .iter()
+                .find_map(|(sid, t)| (t == &tid).then(|| sid.clone()))
+        };
+        let emu_sid = if let Some(sid) = existing_sid {
+            Some(sid)
+        } else {
+            let attached = conn
+                .call_raw(
+                    "Target.attachToTarget",
+                    json!({ "targetId": tid, "flatten": true }),
+                    None,
+                    CDP_CMD_TIMEOUT,
+                )
+                .await;
+            let sid = attached
+                .ok()
+                .and_then(|r| r.ok())
+                .and_then(|v| v["sessionId"].as_str().map(str::to_owned));
+            if let Some(sid) = sid {
+                let should_detach = {
+                    let mut g = state.lock().await;
+                    if g.closing {
+                        true
+                    } else {
+                        lease.mark_external_session(&sid);
+                        g.blocker_sessions.insert(sid.clone(), tid.clone());
+                        false
+                    }
+                };
+                if should_detach {
+                    let _ = conn
+                        .call_raw(
+                            "Target.detachFromTarget",
+                            json!({ "sessionId": sid }),
+                            None,
+                            CLEANUP_TIMEOUT,
+                        )
+                        .await;
+                    None
+                } else {
+                    Some(sid)
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(sid) = emu_sid {
+            let _ = conn
+                .call_raw(
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({
+                        "width": width,
+                        "height": height,
+                        "deviceScaleFactor": 0,
+                        "mobile": false,
+                    }),
+                    Some(&sid),
+                    CDP_CMD_TIMEOUT,
+                )
+                .await;
+        }
+    }
     Some(tid)
 }
 
