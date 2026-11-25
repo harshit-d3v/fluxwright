@@ -26,7 +26,9 @@ pub use fluxwright_cdp::{
     RouteFetchOptions, RouteOptions, ScreenshotAnimations, ScreenshotCaret, SnapshotOptions,
     WebSocketEvent, Worker, WorkerEvent,
 };
-pub use config::{EngineConfig, JobOptions, Priority, QueueFullMode, ResourcePreset};
+pub use config::{
+    EngineConfig, JobOptions, Priority, QueueFullMode, ResourcePreset, COOKIE_BANNER_URL_PATTERNS,
+};
 pub use error::{Error, Result};
 pub use expect::{expect_locator, expect_page, LocatorExpect, PageExpect};
 pub use metrics::MetricsSnapshot;

@@ -1281,7 +1281,7 @@ async function runMcpStreamableHttpE2E(fixture) {
     await badTokenRes.body?.cancel();
     assert.equal(badTokenRes.status, 401, 'POST /mcp with wrong Bearer token must return 401');
 
-    // 3. Real HTTP MCP session A: initialize -> tools/list (21 tools) -> open -> snapshot
+    // 3. Real HTTP MCP session A: initialize -> tools/list (22 tools) -> open -> snapshot
     const clientA = createMcpHttpClient(mcpUrl, mcpToken);
     const clientB = createMcpHttpClient(mcpUrl, mcpToken);
 
@@ -1309,12 +1309,13 @@ async function runMcpStreamableHttpE2E(fixture) {
       'tabs',
       'console',
       'network',
+      'export_api_calls',
       'evaluate',
       'screenshot',
       'close',
     ];
     const actualToolNames = (listed?.tools || []).map((t) => t.name).sort();
-    assert.equal(actualToolNames.length, 21, `expected 21 MCP tools, got ${actualToolNames.length}`);
+    assert.equal(actualToolNames.length, 22, `expected 22 MCP tools, got ${actualToolNames.length}`);
     assert.deepEqual(actualToolNames, [...expectedTools].sort());
 
     const openOut = await clientA.callTool('open', { url: `${fixture.url}/` });
@@ -1322,6 +1323,7 @@ async function runMcpStreamableHttpE2E(fixture) {
 
     const snapOut = await clientA.callTool('snapshot', {});
     assert.match(snapOut, /Fluxwright E2E Fixture/);
+    assert.match(snapOut, /^rev: \d+/m);
     assert.match(snapOut, /\[ref=e\d+\]/);
 
     // 4. Multi-session context isolation: cookies, localStorage, and tabs stay isolated per session

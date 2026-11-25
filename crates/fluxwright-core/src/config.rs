@@ -10,6 +10,22 @@ use crate::adaptive::AdaptiveConfig;
 use crate::proxies::ProxyPool;
 use crate::video::RecordVideoOptions;
 
+/// Curated URL wildcard patterns matching common Consent Management Platform (CMP) / cookie-banner scripts.
+pub const COOKIE_BANNER_URL_PATTERNS: &[&str] = &[
+    "*cdn.cookielaw.org/*",
+    "*geolocation.onetrust.com/*",
+    "*consent.cookiebot.com/*",
+    "*consentcdn.cookiebot.com/*",
+    "*consent.trustarc.com/*",
+    "*sdk.privacy-center.org/*",
+    "*cdn.privacy-mgmt.com/*",
+    "*app.usercentrics.eu/*",
+    "*cmp.osano.com/*",
+    "*cdn.iubenda.com/cs/*",
+    "*consentmanager.net/*",
+    "*quantcast.mgr.consensu.org/*",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePreset {
     /// Block images, fonts, and media; keep HTML, CSS, and scripts intact.
@@ -179,6 +195,8 @@ pub struct JobOptions {
     pub block_stylesheets: bool,
     pub block_scripts: bool,
     pub block_url_patterns: Vec<String>,
+    /// Block curated Consent Management Platform (CMP) / cookie-banner URL patterns.
+    pub block_cookie_banners: bool,
     /// Proxy for this job's browser context. Other jobs on the same browser are unaffected.
     pub proxy: Option<Proxy>,
     /// User agent, locale, timezone, geolocation, viewport, scale, color scheme.
@@ -215,6 +233,7 @@ impl Default for JobOptions {
             block_stylesheets: false,
             block_scripts: false,
             block_url_patterns: Vec::new(),
+            block_cookie_banners: false,
             proxy: None,
             emulation: Emulation::default(),
             permissions: Vec::new(),
@@ -364,6 +383,11 @@ impl JobOptions {
         self
     }
 
+    pub fn block_cookie_banners(mut self, block: bool) -> Self {
+        self.block_cookie_banners = block;
+        self
+    }
+
     pub fn resource_preset(mut self, preset: ResourcePreset) -> Self {
         preset.apply(&mut self);
         self
@@ -411,6 +435,13 @@ mod tests {
         assert!(r.block_scripts && r.block_images);
         assert!(!r.block_fonts);
         assert_eq!(r.block_url_patterns, vec!["**/*.png", "**/analytics*"]);
+        assert!(!r.block_cookie_banners);
+
+        let cb = JobOptions::default().block_cookie_banners(true);
+        assert!(cb.block_cookie_banners);
+        assert_eq!(COOKIE_BANNER_URL_PATTERNS.len(), 12);
+        assert!(COOKIE_BANNER_URL_PATTERNS.contains(&"*cdn.cookielaw.org/*"));
+        assert!(COOKIE_BANNER_URL_PATTERNS.contains(&"*quantcast.mgr.consensu.org/*"));
     }
 
     #[test]

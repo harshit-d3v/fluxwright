@@ -272,23 +272,45 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
                 break;
             };
             tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
+                let mut buf = vec![0u8; 8192];
                 let mut filled = 0usize;
+                let mut header_end = None;
                 loop {
                     match stream.read(&mut buf[filled..]).await {
                         Ok(0) | Err(_) => return,
                         Ok(n) => {
                             filled += n;
-                            if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n")
-                                || filled == buf.len()
-                            {
+                            if let Some(pos) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
+                                header_end = Some(pos + 4);
+                                break;
+                            }
+                            if filled == buf.len() {
                                 break;
                             }
                         }
                     }
                 }
-                let req = String::from_utf8_lossy(&buf[..filled]);
-                let path = req
+                let head = String::from_utf8_lossy(&buf[..header_end.unwrap_or(filled)]).into_owned();
+                if let Some(end) = header_end {
+                    let content_len = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim().eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0)
+                        .min(64 * 1024);
+                    while filled < end + content_len {
+                        let mut extra = [0u8; 1024];
+                        match stream.read(&mut extra).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => filled += n,
+                        }
+                    }
+                }
+                let path = head
                     .lines()
                     .next()
                     .and_then(|l| l.split_whitespace().nth(1))
@@ -308,7 +330,7 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{popup_html}",
                         popup_html.len()
                     )
-                } else if path == "/api/ping" {
+                } else if path == "/api/ping" || path == "/api/secret" {
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ping_json}",
                         ping_json.len()
@@ -324,6 +346,18 @@ async fn spawn_fixture_server() -> (String, AbortOnDrop) {
     });
 
     (format!("http://{addr}/"), AbortOnDrop(task))
+}
+
+fn parse_snapshot_rev(snapshot: &str) -> u32 {
+    for line in snapshot.lines() {
+        if let Some(rest) = line.strip_prefix("rev: ") {
+            return rest
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_else(|e| panic!("invalid rev line {line:?} ({e}):\n{snapshot}"));
+        }
+    }
+    panic!("missing `rev: ` header in snapshot:\n{snapshot}");
 }
 
 fn find_ref_on_line(snapshot: &str, needle: &str) -> String {
@@ -369,19 +403,23 @@ async fn mcp_stdio_e2e_handshake_snapshot_refs_and_markdown() {
     );
     client.send_notification("notifications/initialized").await;
 
-    // 2. tools/list asserts all 21 tools
+    // 2. tools/list asserts all 22 tools including export_api_calls
     let listed = client.request(2, "tools/list", None).await;
     let tools = listed["result"]["tools"]
         .as_array()
         .expect("tools array in tools/list");
     assert_eq!(
         tools.len(),
-        21,
-        "expected 21 MCP tools, got {}: {tools:?}",
+        22,
+        "expected 22 MCP tools, got {}: {tools:?}",
         tools.len()
     );
+    assert!(
+        tools.iter().any(|t| t["name"] == "export_api_calls"),
+        "expected export_api_calls in tools/list: {tools:?}"
+    );
 
-    // 3. Drive open -> goto -> snapshot -> fill(@eN) -> click(@eN) -> markdown -> close
+    // 3. Drive open -> goto -> snapshot (with rev:) -> fill(@eN@rK) -> click(@eN@rK) -> markdown -> close
     let opened = client.call_tool(3, "open", json!({})).await;
     assert!(opened.contains("Chromium page ready"), "{opened}");
 
@@ -390,20 +428,24 @@ async fn mcp_stdio_e2e_handshake_snapshot_refs_and_markdown() {
 
     let snap = client.call_tool(5, "snapshot", json!({})).await;
     assert!(snap.contains("[ref=e"), "expected @eN refs in snapshot:\n{snap}");
+    let snap_rev = parse_snapshot_rev(&snap);
+    assert!(snap_rev >= 1, "expected positive snapshot rev:\n{snap}");
     let input_ref = find_ref_on_line(&snap, "textbox \"Message\"");
     let button_ref = find_ref_on_line(&snap, "button \"Apply\"");
+    let pinned_input_ref = format!("{input_ref}@r{snap_rev}");
+    let pinned_button_ref = format!("{button_ref}@r{snap_rev}");
 
     let filled = client
         .call_tool(
             6,
             "fill",
-            json!({ "selector": input_ref, "value": "stdio-e2e-ok" }),
+            json!({ "selector": pinned_input_ref, "value": "stdio-e2e-ok" }),
         )
         .await;
     assert!(filled.contains("filled @e"), "{filled}");
 
     let clicked = client
-        .call_tool(7, "click", json!({ "selector": button_ref }))
+        .call_tool(7, "click", json!({ "selector": pinned_button_ref }))
         .await;
     assert!(clicked.contains("clicked @e"), "{clicked}");
 
@@ -497,10 +539,18 @@ async fn mcp_stdio_e2e_handshake_snapshot_refs_and_markdown() {
         .expect("valid base64 screenshot");
     assert_eq!(&png_bytes[..8], b"\x89PNG\r\n\x1a\n");
 
-    // 7. goto /page2 -> back -> forward -> back
+    // 7. goto /page2 -> stale @eN@rK fails -> back -> forward -> back
     let page2_url = format!("{base_url}page2");
     let _ = client.call_tool(seq, "goto", json!({ "url": page2_url })).await;
     seq += 1;
+    let stale_err = client
+        .call_tool_expect_error(seq, "click", json!({ "selector": pinned_button_ref }))
+        .await;
+    seq += 1;
+    assert!(
+        stale_err.contains("stale snapshot rev="),
+        "expected stale rev error after navigation, got: {stale_err}"
+    );
     assert_eq!(client.call_tool(seq, "title", json!({})).await, "MCP Page Two");
     seq += 1;
     let went_back = client.call_tool(seq, "back", json!({})).await;
@@ -562,6 +612,100 @@ async fn mcp_stdio_e2e_handshake_snapshot_refs_and_markdown() {
         .await;
     seq += 1;
     assert!(closed_tab1.contains("closed tab 1"), "{closed_tab1}");
+
+    // 8b. export_api_calls filters API traffic, redacts auth headers by default, and exports curl.
+    let _ = client
+        .call_tool(
+            seq,
+            "evaluate",
+            json!({
+                "expression": "fetch('/api/secret', { method: 'POST', headers: { 'Authorization': 'Bearer super-secret-tok', 'X-Api-Key': 'secret-key-99', 'Content-Type': 'application/json' }, body: JSON.stringify({ hello: 'world' }) }).then(r => r.status)"
+            }),
+        )
+        .await;
+    seq += 1;
+
+    let exported_json = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let raw = client
+                .call_tool(seq, "export_api_calls", json!({ "limit": 20 }))
+                .await;
+            seq += 1;
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|e| {
+                panic!("expected valid JSON from export_api_calls ({e}):\n{raw}")
+            });
+            let items = parsed.as_array().expect("export_api_calls JSON array");
+            if items
+                .iter()
+                .any(|c| c["url"].as_str().is_some_and(|u| u.contains("/api/secret")) && c["status"] == json!(200))
+            {
+                return parsed;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for /api/secret in export_api_calls");
+
+    let items = exported_json.as_array().unwrap();
+    assert!(
+        items.iter().all(|c| !c["url"].as_str().unwrap_or("").ends_with("/page2")),
+        "HTML navigation should not be exported as API call: {exported_json}"
+    );
+    assert!(
+        items.iter().any(|c| c["url"].as_str().is_some_and(|u| u.contains("/api/ping"))),
+        "expected /api/ping in export_api_calls: {exported_json}"
+    );
+    let secret_call = items
+        .iter()
+        .find(|c| c["url"].as_str().is_some_and(|u| u.contains("/api/secret")))
+        .expect("/api/secret record");
+    assert_eq!(secret_call["method"], json!("POST"));
+    assert_eq!(secret_call["headers"]["authorization"], json!("[REDACTED]"));
+    assert_eq!(secret_call["headers"]["x-api-key"], json!("[REDACTED]"));
+    assert!(
+        secret_call["content_type"]
+            .as_str()
+            .is_some_and(|ct| ct.contains("application/json")),
+        "{secret_call}"
+    );
+    assert!(
+        secret_call["post_data"]
+            .as_str()
+            .is_some_and(|b| b.contains("hello")),
+        "{secret_call}"
+    );
+
+    let unredacted_raw = client
+        .call_tool(
+            seq,
+            "export_api_calls",
+            json!({ "filter": "/api/secret", "include_auth": true }),
+        )
+        .await;
+    seq += 1;
+    let unredacted: Value = serde_json::from_str(&unredacted_raw).unwrap();
+    assert_eq!(
+        unredacted[0]["headers"]["authorization"],
+        json!("Bearer super-secret-tok")
+    );
+    assert_eq!(
+        unredacted[0]["headers"]["x-api-key"],
+        json!("secret-key-99")
+    );
+
+    let curl_out = client
+        .call_tool(
+            seq,
+            "export_api_calls",
+            json!({ "filter": "/api/secret", "format": "curl" }),
+        )
+        .await;
+    seq += 1;
+    assert!(curl_out.contains("curl -X 'POST'"), "{curl_out}");
+    assert!(curl_out.contains("/api/secret"), "{curl_out}");
+    assert!(curl_out.contains("[REDACTED]"), "{curl_out}");
+    assert!(curl_out.contains("--data-raw"), "{curl_out}");
 
     // 9. Runtime & SSRF errors return MCP tool error (`isError: true`), not JSON-RPC -32603.
     let ssrf_file = client

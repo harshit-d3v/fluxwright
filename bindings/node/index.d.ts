@@ -345,6 +345,7 @@ export interface AriaSnapshot {
   truncated: boolean
   isDiff: boolean
   changed: boolean
+  revision: number
 }
 
 export interface AriaSnapshotOptions {

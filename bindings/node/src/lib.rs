@@ -107,6 +107,7 @@ pub struct AriaSnapshot {
     pub truncated: bool,
     pub is_diff: bool,
     pub changed: bool,
+    pub revision: u32,
 }
 
 #[napi(object)]
@@ -2480,6 +2481,7 @@ impl Page {
             truncated: snap.truncated,
             is_diff: snap.is_diff,
             changed: snap.changed,
+            revision: snap.revision,
         })
     }
 
