@@ -45,7 +45,7 @@ pub(crate) struct SessionViewport {
     pub(crate) height: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateSessionRequest {
     #[serde(default = "default_ttl_secs")]

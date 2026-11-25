@@ -14,10 +14,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::job::{
-    execute_job, ExecutionProgress, JobPriority, JobRequest, NavigationWait, ServerImageFormat,
-    ServerResourcePreset, ServerResourceType, Step,
+    JobPriority, JobRequest, NavigationWait, ServerImageFormat, ServerResourcePreset,
+    ServerResourceType, Step,
 };
-use crate::{ApiError, Inner, JobTraceContext};
+use crate::{execute_job, ApiError, ExecutionProgress, Inner, JobTraceContext};
 
 const DEFAULT_SCRAPE_TIMEOUT_MS: u64 = 30_000;
 const MAX_SCRAPE_TIMEOUT_MS: u64 = 120_000;
