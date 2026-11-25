@@ -198,11 +198,9 @@ The `start` / `stats` / `browsers` control channel is a Unix socket, or `\\.\pip
 
 ### HTTP server
 
-`fluxwright serve` owns a fleet and accepts JSON browser jobs from any HTTP client. It defaults
+`fluxwright serve` owns a fleet and accepts both one-shot synchronous scrapes (`POST /v1/scrape` returning `markdown`, `html`, `text`, `snapshot`, `screenshot`, and `pdf` in a single request) and async JSON browser jobs (`POST /v1/jobs`, `GET /v1/jobs/{id}`, `DELETE /v1/jobs/{id}`), as well as TTL-backed Managed Cloud Sessions (`POST /v1/sessions`, reconnectable `GET /v1/sessions/{id}/cdp`, and paired signed Live Views). It defaults
 to `127.0.0.1:7331` and requires `FLUXWRIGHT_SERVER_TOKEN` (a random token of 32–256 printable
-ASCII characters). Submit with `POST /v1/jobs`, poll with `GET /v1/jobs/{id}`, and cancel with
-`DELETE /v1/jobs/{id}`. Jobs use isolated pages, bounded admission/results, priorities, and a
-total deadline. Pass `--cdp-endpoint <url>` to connect to an existing browser over CDP instead
+ASCII characters). Pass `--cdp-endpoint <url>` to connect to an existing browser over CDP instead
 of launching local Chrome (one connection; set concurrency with `--max-contexts`). This is a
 trusted-operator API, not a public multi-tenant service.
 
@@ -211,10 +209,10 @@ limits, and deployment precautions.
 
 #### Docker quickstart
 
-Build and run the self-contained image (Debian Bookworm slim + Chromium + `tini` + `fluxwright`):
+Run the self-contained multi-arch (`linux/amd64` + `linux/arm64`) image from GHCR (Debian Bookworm slim + Chromium + `tini` + `fluxwright`):
 
 ```bash
-docker build -t fluxwright .
+docker pull ghcr.io/harshit-d3v/fluxwright:latest
 export FLUXWRIGHT_SERVER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 docker run --rm \
   -e FLUXWRIGHT_SERVER_TOKEN="$FLUXWRIGHT_SERVER_TOKEN" \
@@ -222,7 +220,7 @@ docker run --rm \
   --shm-size=1g \
   --memory=4g --cpus=4 \
   --cap-add=SYS_ADMIN \
-  fluxwright
+  ghcr.io/harshit-d3v/fluxwright:latest
 ```
 
 Fluxwright automatically detects container `--memory` and `--cpus` limits via cgroups. See [Docker in `docs/SERVER.md`](docs/SERVER.md#docker) for sandbox configuration, custom flags, and security guidance.
