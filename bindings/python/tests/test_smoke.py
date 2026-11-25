@@ -23,7 +23,7 @@ import pytest
 
 from fluxwright import Error, TimeoutError
 from fluxwright.async_api import Request, Route, async_playwright
-from fluxwright.sync_api import sync_playwright
+from fluxwright.sync_api import expect as sync_expect, sync_playwright
 
 # A page that asks "leave this page?" once its button was clicked (Chrome wants a user gesture).
 ARM_BEFOREUNLOAD = (
@@ -1405,7 +1405,7 @@ def test_multi_tab_popups_and_frames(base):
                 cross.locator("#cb").wait_for()
                 cross.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
                 cross.locator("#cb").click()
-                assert cross.locator("#cb").inner_text() == "clicked-cross"
+                sync_expect(cross.locator("#cb")).to_have_text("clicked-cross")
                 assert cross.evaluate("(x) => x * 2", 7) == 14
         finally:
             browser.close()
