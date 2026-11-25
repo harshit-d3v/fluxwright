@@ -43,6 +43,8 @@ pub struct JobRequest {
     #[serde(default)]
     pub block_url_patterns: Vec<String>,
     #[serde(default)]
+    pub block_cookie_banners: bool,
+    #[serde(default)]
     pub profile: Option<String>,
     #[serde(default = "default_true")]
     pub persist_profile: bool,
@@ -349,6 +351,7 @@ impl JobRequest {
         if !self.block_url_patterns.is_empty() {
             opts = opts.block_url_patterns(self.block_url_patterns.iter().cloned());
         }
+        opts = opts.block_cookie_banners(self.block_cookie_banners);
         opts = opts.persist_profile(self.persist_profile);
         if let Some(ref profile) = self.profile {
             opts = opts.profile(profile.clone());

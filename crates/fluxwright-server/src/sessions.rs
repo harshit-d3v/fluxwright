@@ -66,6 +66,8 @@ pub(crate) struct CreateSessionRequest {
     #[serde(default)]
     pub(crate) resource_preset: Option<ServerResourcePreset>,
     #[serde(default)]
+    pub(crate) block_cookie_banners: bool,
+    #[serde(default)]
     pub(crate) profile: Option<String>,
     #[serde(default = "default_true")]
     pub(crate) persist_profile: bool,
@@ -88,6 +90,7 @@ impl Default for CreateSessionRequest {
             keep_alive: true,
             priority: JobPriority::Normal,
             resource_preset: None,
+            block_cookie_banners: false,
             profile: None,
             persist_profile: true,
             proxy_session: None,
@@ -152,6 +155,7 @@ impl CreateSessionRequest {
         };
         let mut opts = JobOptions::default()
             .priority(priority)
+            .block_cookie_banners(self.block_cookie_banners)
             .persist_profile(self.persist_profile);
         if let Some(ref profile) = self.profile {
             opts = opts.profile(profile.clone());

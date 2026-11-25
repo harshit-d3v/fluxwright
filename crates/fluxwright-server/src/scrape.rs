@@ -55,6 +55,8 @@ pub(crate) struct ScrapeRequest {
     #[serde(default)]
     block_url_patterns: Vec<String>,
     #[serde(default)]
+    block_cookie_banners: bool,
+    #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
     persist_profile: bool,
@@ -192,6 +194,7 @@ pub(crate) async fn scrape_handler(
         resource_preset: req.resource_preset,
         block_resources: req.block_resources,
         block_url_patterns: req.block_url_patterns,
+        block_cookie_banners: req.block_cookie_banners,
         profile: req.profile,
         persist_profile: req.persist_profile,
         proxy_session: req.proxy_session,

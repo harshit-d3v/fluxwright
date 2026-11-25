@@ -267,6 +267,7 @@ pub(crate) async fn map_handler(
         resource_preset: req.resource_preset,
         block_resources: Vec::new(),
         block_url_patterns: Vec::new(),
+        block_cookie_banners: false,
         profile: req.profile,
         persist_profile: false,
         proxy_session: req.proxy_session,

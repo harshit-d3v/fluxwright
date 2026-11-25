@@ -361,7 +361,7 @@ curl -sS -X POST http://127.0.0.1:7331/v1/scrape \
   }'
 ```
 
-Supports `formats` entries `"markdown"`, `"html"`, `"text"`, `"snapshot"`, `"screenshot"`, and `"pdf"`, optional `wait_until` / `wait_for_selector`, `profile` / `proxy_session`, `screenshot_full_page` / `screenshot_annotate`, and `snapshot_interactive_only`. Enforces the same SSRF guards and 1 MiB result size cap as `/v1/jobs`.
+Supports `formats` entries `"markdown"`, `"html"`, `"text"`, `"snapshot"`, `"screenshot"`, and `"pdf"`, optional `wait_until` / `wait_for_selector`, `block_cookie_banners` (`true` to block common CMP/cookie-banner script origins), `profile` / `proxy_session`, `screenshot_full_page` / `screenshot_annotate`, and `snapshot_interactive_only`. Enforces the same SSRF guards and 1 MiB result size cap as `/v1/jobs`.
 
 ## Synchronous site link discovery (`POST /v1/map`)
 

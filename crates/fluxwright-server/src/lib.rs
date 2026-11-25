@@ -997,6 +997,7 @@ fn fallback_finished_request() -> JobRequest {
         resource_preset: None,
         block_resources: Vec::new(),
         block_url_patterns: Vec::new(),
+        block_cookie_banners: false,
         profile: None,
         persist_profile: true,
         proxy_session: None,
