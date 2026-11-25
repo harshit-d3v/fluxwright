@@ -1352,7 +1352,7 @@ fn spawn_session_reaper(
                                                         nav_url,
                                                         session.recorder.clone(),
                                                         screenshot_inflight.clone(),
-                                                        session.close_tx.clone(),
+                                                        session.close_tx.subscribe(),
                                                     );
                                                 }
                                             }
