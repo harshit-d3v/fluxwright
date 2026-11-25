@@ -36,11 +36,21 @@ const SAFE_CREATE_CONTEXT_FIELDS: &[&str] = &[
 ];
 
 #[derive(Clone)]
-struct GatewayPolicy {
-    allow_any_url: bool,
-    enforce_server_proxy: bool,
-    resource_preset: Option<ResourcePreset>,
-    download_dir: PathBuf,
+pub(crate) struct GatewayPolicy {
+    pub(crate) allow_any_url: bool,
+    pub(crate) enforce_server_proxy: bool,
+    pub(crate) resource_preset: Option<ResourcePreset>,
+    pub(crate) download_dir: PathBuf,
+}
+
+pub(crate) fn compute_enforce_server_proxy(engine: &fluxwright::BrowserEngine) -> bool {
+    engine.proxy_pool().is_some()
+        || engine
+            .config()
+            .launch
+            .extra_args
+            .iter()
+            .any(|a| a == "--proxy-server" || a.starts_with("--proxy-server="))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -201,8 +211,7 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Standard DevTools `/json/version` discovery endpoint pointing to `/cdp`.
-pub(crate) async fn json_version(headers: HeaderMap) -> Response {
+pub(crate) fn host_base(headers: &HeaderMap) -> (&'static str, &str) {
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -220,6 +229,13 @@ pub(crate) async fn json_version(headers: HeaderMap) -> Response {
                     .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'@'))
         })
         .unwrap_or("127.0.0.1:7331");
+
+    (scheme, host)
+}
+
+/// Standard DevTools `/json/version` discovery endpoint pointing to `/cdp`.
+pub(crate) async fn json_version(headers: HeaderMap) -> Response {
+    let (scheme, host) = host_base(&headers);
 
     Json(json!({
         "Browser": "Fluxwright/Chrome",
@@ -256,13 +272,7 @@ pub(crate) async fn ws_handler(
         opts = opts.timeout(Duration::from_millis(timeout_ms));
     }
 
-    let enforce_server_proxy = engine.proxy_pool().is_some()
-        || engine
-            .config()
-            .launch
-            .extra_args
-            .iter()
-            .any(|a| a == "--proxy-server" || a.starts_with("--proxy-server="));
+    let enforce_server_proxy = compute_enforce_server_proxy(&engine);
 
     let lease = engine.acquire_context_with(&opts).await.map_err(|e| match e {
         fluxwright::Error::ShuttingDown => ApiError::new(
@@ -325,7 +335,7 @@ impl Drop for ActiveCdpSessionGuard {
     }
 }
 
-struct GatewayState {
+pub(crate) struct GatewayState {
     primary_context: String,
     allowed_contexts: HashSet<String>,
     extra_contexts: Vec<String>,
@@ -349,7 +359,11 @@ struct GatewayState {
 }
 
 impl GatewayState {
-    fn new(
+    pub(crate) fn is_blocker_session(&self, sid: &str) -> bool {
+        self.blocker_sessions.contains_key(sid)
+    }
+
+    pub(crate) fn new(
         primary_context: String,
         live_target: Arc<std::sync::Mutex<Option<String>>>,
         live_url: Arc<std::sync::Mutex<String>>,
@@ -381,6 +395,112 @@ impl GatewayState {
     }
 }
 
+pub(crate) async fn create_initial_page(
+    conn: &Arc<Connection>,
+    state: &Arc<Mutex<GatewayState>>,
+    lease: &Arc<ContextLease>,
+    policy: &GatewayPolicy,
+    viewport: Option<(u32, u32)>,
+) -> Option<String> {
+    let primary_context = state.lock().await.primary_context.clone();
+    let mut params = json!({
+        "url": "about:blank",
+        "browserContextId": primary_context,
+    });
+    if let Some((width, height)) = viewport {
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("width".into(), json!(width));
+            obj.insert("height".into(), json!(height));
+        }
+    }
+    let res = conn
+        .call_raw("Target.createTarget", params, None, CDP_CMD_TIMEOUT)
+        .await
+        .ok()?
+        .ok()?;
+    let tid = res["targetId"].as_str()?.to_string();
+    {
+        let mut g = state.lock().await;
+        g.owned_targets.insert(tid.clone());
+        if !g.owned_pages.iter().any(|p| p == &tid) {
+            g.owned_pages.push(tid.clone());
+        }
+        g.owned_page_urls
+            .insert(tid.clone(), String::from("about:blank"));
+        *g.live_target.lock().unwrap() = Some(tid.clone());
+    }
+    if let Some(preset) = policy.resource_preset {
+        ensure_preset_blocker(conn, state, lease, &tid, preset).await;
+    }
+    if let Some((width, height)) = viewport {
+        let existing_sid = {
+            let g = state.lock().await;
+            g.blocker_sessions
+                .iter()
+                .find_map(|(sid, t)| (t == &tid).then(|| sid.clone()))
+        };
+        let emu_sid = if let Some(sid) = existing_sid {
+            Some(sid)
+        } else {
+            let attached = conn
+                .call_raw(
+                    "Target.attachToTarget",
+                    json!({ "targetId": tid, "flatten": true }),
+                    None,
+                    CDP_CMD_TIMEOUT,
+                )
+                .await;
+            let sid = attached
+                .ok()
+                .and_then(|r| r.ok())
+                .and_then(|v| v["sessionId"].as_str().map(str::to_owned));
+            if let Some(sid) = sid {
+                let should_detach = {
+                    let mut g = state.lock().await;
+                    if g.closing {
+                        true
+                    } else {
+                        lease.mark_external_session(&sid);
+                        g.blocker_sessions.insert(sid.clone(), tid.clone());
+                        false
+                    }
+                };
+                if should_detach {
+                    let _ = conn
+                        .call_raw(
+                            "Target.detachFromTarget",
+                            json!({ "sessionId": sid }),
+                            None,
+                            CLEANUP_TIMEOUT,
+                        )
+                        .await;
+                    None
+                } else {
+                    Some(sid)
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(sid) = emu_sid {
+            let _ = conn
+                .call_raw(
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({
+                        "width": width,
+                        "height": height,
+                        "deviceScaleFactor": 0,
+                        "mobile": false,
+                    }),
+                    Some(&sid),
+                    CDP_CMD_TIMEOUT,
+                )
+                .await;
+        }
+    }
+    Some(tid)
+}
+
 async fn run_gateway(
     socket: WebSocket,
     inner: Arc<Inner>,
@@ -388,7 +508,6 @@ async fn run_gateway(
     initial_page: bool,
     policy: GatewayPolicy,
 ) {
-    let _active_guard = ActiveCdpSessionGuard::enter(inner.clone());
     let conn = lease.cdp_connection();
     let lease = Arc::new(lease);
     let primary_context = lease.context_id().to_string();
@@ -402,10 +521,56 @@ async fn run_gateway(
         crate::now_ms(),
     );
     let state = Arc::new(Mutex::new(GatewayState::new(
-        primary_context.clone(),
+        primary_context,
         live_target,
         live_url,
     )));
+    if initial_page {
+        let _ = create_initial_page(&conn, &state, &lease, &policy, None).await;
+    }
+    let (_close_tx, close_rx) = watch::channel(false);
+    run_gateway_loop(
+        socket,
+        inner,
+        lease.clone(),
+        state.clone(),
+        policy.clone(),
+        close_rx,
+        true,
+    )
+    .await;
+    teardown_gateway_state(&conn, &state, &lease, &policy).await;
+}
+
+pub(crate) fn spawn_fail_blocked_request(conn: &Arc<Connection>, sid: &str, req_id: String) {
+    let conn = conn.clone();
+    let sid = sid.to_string();
+    tokio::spawn(async move {
+        let _ = conn
+            .call_raw(
+                "Fetch.failRequest",
+                json!({
+                    "requestId": req_id,
+                    "errorReason": "BlockedByClient",
+                }),
+                Some(&sid),
+                Duration::from_secs(5),
+            )
+            .await;
+    });
+}
+
+pub(crate) async fn run_gateway_loop(
+    socket: WebSocket,
+    inner: Arc<Inner>,
+    lease: Arc<ContextLease>,
+    state: Arc<Mutex<GatewayState>>,
+    policy: GatewayPolicy,
+    mut close_rx: watch::Receiver<bool>,
+    handle_blockers: bool,
+) {
+    let _active_guard = ActiveCdpSessionGuard::enter(inner.clone());
+    let conn = lease.cdp_connection();
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -418,35 +583,7 @@ async fn run_gateway(
         }
     });
 
-    // Subscribe to Chrome events before spawning any targets or reading client commands.
     let mut cdp_events = conn.subscribe_unbounded();
-    if initial_page {
-        if let Ok(Ok(res)) = conn
-            .call_raw(
-                "Target.createTarget",
-                json!({ "url": "about:blank", "browserContextId": primary_context }),
-                None,
-                CDP_CMD_TIMEOUT,
-            )
-            .await
-        {
-            if let Some(tid) = res["targetId"].as_str() {
-                {
-                    let mut g = state.lock().await;
-                    g.owned_targets.insert(tid.to_string());
-                    if !g.owned_pages.iter().any(|p| p == tid) {
-                        g.owned_pages.push(tid.to_string());
-                    }
-                    g.owned_page_urls
-                        .insert(tid.to_string(), String::from("about:blank"));
-                    *g.live_target.lock().unwrap() = Some(tid.to_string());
-                }
-                if let Some(preset) = policy.resource_preset {
-                    ensure_preset_blocker(&conn, &state, &lease, tid, preset).await;
-                }
-            }
-        }
-    }
 
     let mut event_task = {
         let state = state.clone();
@@ -510,24 +647,10 @@ async fn run_gateway(
                         }
                     };
                     if is_blocker {
-                        if ev.method == "Fetch.requestPaused" {
+                        if handle_blockers && ev.method == "Fetch.requestPaused" {
                             if let Some(req_id) = ev.params["requestId"].as_str().map(str::to_owned)
                             {
-                                let conn = conn.clone();
-                                let sid = sid.to_string();
-                                tokio::spawn(async move {
-                                    let _ = conn
-                                        .call_raw(
-                                            "Fetch.failRequest",
-                                            json!({
-                                                "requestId": req_id,
-                                                "errorReason": "BlockedByClient",
-                                            }),
-                                            Some(&sid),
-                                            Duration::from_secs(5),
-                                        )
-                                        .await;
-                                });
+                                spawn_fail_blocked_request(&conn, sid, req_id);
                             }
                         }
                         continue;
@@ -725,13 +848,19 @@ async fn run_gateway(
     let mut tasks = JoinSet::new();
 
     loop {
-        if *shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() || *close_rx.borrow() {
             let _ = out_tx.send(Message::Close(None));
             break;
         }
         tokio::select! {
             res = shutdown_rx.changed() => {
                 if res.is_err() || *shutdown_rx.borrow() {
+                    let _ = out_tx.send(Message::Close(None));
+                    break;
+                }
+            }
+            res = close_rx.changed() => {
+                if res.is_err() || *close_rx.borrow() {
                     let _ = out_tx.send(Message::Close(None));
                     break;
                 }
@@ -769,20 +898,61 @@ async fn run_gateway(
         }
     }
 
-    // Mark closing before aborting tasks so any in-flight createBrowserContext / attachToTarget
-    // RPCs self-dispose / self-detach on completion instead of leaking Chrome state.
-    state.lock().await.closing = true;
     event_task.abort();
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
 
-    let (sessions_to_detach, contexts_to_dispose, remove_download_dir) = {
+    drop(out_tx);
+    let _ = tokio::time::timeout(Duration::from_millis(500), writer_task).await;
+}
+
+/// Detaches only client-owned CDP target sessions while keeping pages, cookies, blocker
+/// sessions, and browser contexts alive so another CDP client can reconnect later.
+pub(crate) async fn detach_client_sessions(
+    conn: &Arc<Connection>,
+    state: &Arc<Mutex<GatewayState>>,
+    lease: &Arc<ContextLease>,
+) {
+    let sessions: Vec<String> = {
         let mut g = state.lock().await;
+        g.discover_targets = false;
+        g.auto_attach = false;
+        g.auto_attached_targets.clear();
+        g.auto_attach_waiters.clear();
+        g.owned_sessions.drain().map(|(s, _)| s).collect()
+    };
+    for sid in sessions {
+        lease.unmark_external_session(&sid);
+        let _ = conn
+            .call_raw(
+                "Target.detachFromTarget",
+                json!({ "sessionId": sid }),
+                None,
+                CLEANUP_TIMEOUT,
+            )
+            .await;
+    }
+}
+
+/// Tears down all CDP sessions, extra contexts, ephemeral download directories, and the primary
+/// browser context lease.
+pub(crate) async fn teardown_gateway_state(
+    conn: &Arc<Connection>,
+    state: &Arc<Mutex<GatewayState>>,
+    lease: &Arc<ContextLease>,
+    policy: &GatewayPolicy,
+) {
+    let (primary_context, sessions_to_detach, contexts_to_dispose, remove_download_dir) = {
+        let mut g = state.lock().await;
+        // Mark closing so any in-flight createBrowserContext / attachToTarget RPCs self-dispose
+        // instead of leaking Chrome state.
+        g.closing = true;
         let mut sessions: Vec<String> = g.owned_sessions.drain().map(|(s, _)| s).collect();
         sessions.extend(g.blocker_sessions.drain().map(|(s, _)| s));
         let contexts: Vec<String> = std::mem::take(&mut g.extra_contexts);
         let remove_dir = g.download_dir_created;
-        (sessions, contexts, remove_dir)
+        g.download_dir_created = false;
+        (g.primary_context.clone(), sessions, contexts, remove_dir)
     };
 
     for sid in sessions_to_detach {
@@ -811,12 +981,9 @@ async fn run_gateway(
     let _ = lease.close().await;
 
     if remove_download_dir {
-        let dir = policy.download_dir;
+        let dir = policy.download_dir.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
     }
-
-    drop(out_tx);
-    let _ = tokio::time::timeout(Duration::from_millis(500), writer_task).await;
 }
 
 /// Handles one incoming client JSON-RPC frame. Returns `true` when the connection should close.

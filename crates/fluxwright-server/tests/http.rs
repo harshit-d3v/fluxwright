@@ -2121,3 +2121,409 @@ async fn executes_snapshot_diff_and_screenshot_annotate_mask_steps() {
     server.shutdown(Duration::from_secs(5)).await.unwrap();
     app_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_cloud_sessions_lifecycle_keep_alive_profile_and_embed() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let profiles_dir =
+        std::env::temp_dir().join(format!("fluxwright-managed-sess-prof-{}", uuid::Uuid::new_v4()));
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .profiles_dir(&profiles_dir)
+        .build()
+        .await
+        .unwrap();
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.allow_query_token = true;
+    let server = HttpServer::new(engine, cfg).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    // 1. Create a persistent managed session with profile + viewport + resource_preset + live view embed.
+    let (st_create, created) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        json!({
+            "ttl_secs": 120,
+            "keep_alive": true,
+            "resource_preset": "scraping",
+            "profile": "cloud_user",
+            "persist_profile": true,
+            "viewport": { "width": 800, "height": 600 },
+            "live_view_mode": "interactive"
+        }),
+    )
+    .await;
+    assert_eq!(st_create, StatusCode::CREATED, "{created}");
+    let sess_id = created["id"].as_str().unwrap().to_string();
+    let cdp_path = created["cdp_path"].as_str().unwrap().to_string();
+    let live_view_url = created["live_view_url"].as_str().unwrap().to_string();
+    assert!(cdp_path.starts_with("/v1/sessions/"));
+    assert!(live_view_url.starts_with("/embed/live/"));
+    assert_eq!(created["keep_alive"], true);
+
+    // Live view embed page works immediately.
+    let embed_resp = server
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri(&live_view_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(embed_resp.status(), StatusCode::OK);
+
+    // Navigate via interactive Live View BEFORE any CDP client connects: resource_preset must
+    // still answer Fetch.requestPaused without hanging.
+    {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let embed_token = live_view_url.strip_prefix("/embed/live/").unwrap();
+        let (mut live_ws, _) = tokio_tungstenite::connect_async(&format!(
+            "ws://{addr}/v1/live/{sess_id}/ws?embed={embed_token}"
+        ))
+        .await
+        .unwrap();
+        live_ws
+            .send(WsMsg::Text(
+                json!({ "type": "navigate", "url": format!("{}/heavy", fixture.base_url) })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(WsMsg::Text(txt))) = live_ws.next().await {
+                let v: Value = serde_json::from_str(&txt).unwrap();
+                if v["type"] == "status"
+                    && v["url"].as_str().is_some_and(|u| u.ends_with("/heavy"))
+                {
+                    return;
+                }
+            }
+            panic!("live WS ended before /heavy status");
+        })
+        .await
+        .expect("interactive live navigation on resource_preset session completed without hanging");
+    }
+
+    // 2. Connect WS client 1 over ?token=, verify viewport & resource_preset blocking, then
+    // navigate to /forms, set a cookie, and disconnect.
+    let cdp_ws_url = format!("ws://{addr}{cdp_path}?token={TOKEN}");
+    let mut ws1 = connect_cdp_ws(&cdp_ws_url, None).await;
+    let _ = cdp_rpc(
+        &mut ws1,
+        1,
+        "Target.setAutoAttach",
+        json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+        None,
+    )
+    .await;
+    let targets = cdp_rpc(&mut ws1, 2, "Target.getTargets", json!({}), None).await;
+    let first_page = targets["result"]["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == "page")
+        .expect("initial page created");
+    let target_id = first_page["targetId"].as_str().unwrap().to_string();
+    let attached = cdp_rpc(
+        &mut ws1,
+        3,
+        "Target.attachToTarget",
+        json!({ "targetId": target_id, "flatten": true }),
+        None,
+    )
+    .await;
+    let sid1 = attached["result"]["sessionId"].as_str().unwrap().to_string();
+    // Wait for /heavy load and confirm viewport (800x600) + blocked image (naturalWidth === 0).
+    let mut heavy_ok = false;
+    let mut last_ev = Value::Null;
+    for _ in 0..80 {
+        let ev = cdp_rpc(
+            &mut ws1,
+            30,
+            "Runtime.evaluate",
+            json!({
+                "expression": "({ ready: document.readyState, path: location.pathname, w: window.innerWidth, h: window.innerHeight, img: document.querySelector('img') ? document.querySelector('img').naturalWidth : -1 })",
+                "returnByValue": true
+            }),
+            Some(&sid1),
+        )
+        .await;
+        let val = &ev["result"]["result"]["value"];
+        if val["ready"] == "complete"
+            && val["path"] == "/heavy"
+            && val["w"] == 800
+            && val["h"] == 600
+            && val["img"] == 0
+        {
+            heavy_ok = true;
+            break;
+        }
+        last_ev = ev;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        heavy_ok,
+        "expected 800x600 viewport and resource_preset to block /pixel.png on /heavy, got: {last_ev}"
+    );
+
+    let _ = cdp_rpc(
+        &mut ws1,
+        4,
+        "Page.navigate",
+        json!({ "url": format!("{}/forms", fixture.base_url) }),
+        Some(&sid1),
+    )
+    .await;
+    // Wait until location reflects /forms and set a persistent marker cookie.
+    for _ in 0..40 {
+        let ev = cdp_rpc(
+            &mut ws1,
+            5,
+            "Runtime.evaluate",
+            json!({ "expression": "document.readyState === 'complete' && location.pathname === '/forms'", "returnByValue": true }),
+            Some(&sid1),
+        )
+        .await;
+        if ev["result"]["result"]["value"] == json!(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut saw_forms_url = false;
+    for _ in 0..40 {
+        let (st_busy, busy_info) =
+            request(&server, "GET", &format!("/v1/sessions/{sess_id}"), Value::Null).await;
+        assert_eq!(st_busy, StatusCode::OK);
+        if busy_info["url"].as_str().unwrap_or("").ends_with("/forms") {
+            saw_forms_url = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        saw_forms_url,
+        "GET /v1/sessions/{{id}} should reflect /forms while CDP client is connected"
+    );
+    let _ = cdp_rpc(
+        &mut ws1,
+        6,
+        "Runtime.evaluate",
+        json!({ "expression": "document.cookie = 'cloud_tok=alive42; Path=/'; true", "returnByValue": true }),
+        Some(&sid1),
+    )
+    .await;
+
+    // Concurrent second connection returns 409 Conflict while ws1 is active.
+    let conflict = tokio_tungstenite::connect_async(&cdp_ws_url).await.unwrap_err();
+    assert!(matches!(
+        conflict,
+        tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == StatusCode::CONFLICT
+    ));
+
+    // Disconnect ws1 (keep_alive = true preserves page and cookie).
+    drop(ws1);
+    for _ in 0..40 {
+        let (st, info) = request(&server, "GET", &format!("/v1/sessions/{sess_id}"), Value::Null).await;
+        assert_eq!(st, StatusCode::OK);
+        if info["connected"] == false {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // 3. Extend TTL and reconnect WS client 2 to verify page + cookie survived!
+    let prev_exp = created["expires_at"].as_u64().unwrap();
+    let (st_ext, ext_body) = request(
+        &server,
+        "POST",
+        &format!("/v1/sessions/{sess_id}/extend"),
+        json!({ "ttl_secs": 600 }),
+    )
+    .await;
+    assert_eq!(st_ext, StatusCode::OK, "{ext_body}");
+    assert!(ext_body["expires_at"].as_u64().unwrap() > prev_exp);
+
+    let mut ws2 = connect_cdp_ws(&cdp_ws_url, None).await;
+    let attached2 = cdp_rpc(
+        &mut ws2,
+        10,
+        "Target.attachToTarget",
+        json!({ "targetId": target_id, "flatten": true }),
+        None,
+    )
+    .await;
+    let sid2 = attached2["result"]["sessionId"].as_str().unwrap().to_string();
+    let cookie_check = cdp_rpc(
+        &mut ws2,
+        11,
+        "Runtime.evaluate",
+        json!({ "expression": "document.cookie", "returnByValue": true }),
+        Some(&sid2),
+    )
+    .await;
+    assert!(
+        cookie_check["result"]["result"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cloud_tok=alive42"),
+        "{cookie_check}"
+    );
+    drop(ws2);
+
+    // 4. DELETE /v1/sessions/{id} closes context, persists profile cookies, and frees the single slot!
+    let (st_del, del_body) =
+        request(&server, "DELETE", &format!("/v1/sessions/{sess_id}"), Value::Null).await;
+    assert_eq!(st_del, StatusCode::OK, "{del_body}");
+    assert_eq!(del_body["status"], "closed");
+
+    let (st_missing, _) =
+        request(&server, "GET", &format!("/v1/sessions/{sess_id}"), Value::Null).await;
+    assert_eq!(st_missing, StatusCode::NOT_FOUND);
+
+    // 5. Ephemeral (keep_alive = false) session reloading saved profile 'cloud_user' auto-closes on disconnect.
+    let (st_e, created_e) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        json!({ "keep_alive": false, "profile": "cloud_user", "persist_profile": false }),
+    )
+    .await;
+    assert_eq!(st_e, StatusCode::CREATED, "{created_e}");
+    let sess_e = created_e["id"].as_str().unwrap().to_string();
+    let ws_e = connect_cdp_ws(&format!("ws://{addr}{}?token={TOKEN}", created_e["cdp_path"].as_str().unwrap()), None).await;
+    drop(ws_e);
+    let closed_e = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (st, _) = request(&server, "GET", &format!("/v1/sessions/{sess_e}"), Value::Null).await;
+            if st == StatusCode::NOT_FOUND {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(closed_e, "keep_alive=false session should close automatically on WS disconnect");
+
+    // Verify embed WS closes properly when reading active live stream on closed session (none remain).
+    let (st_prof, prof_body) = request(&server, "GET", "/v1/profiles", Value::Null).await;
+    assert_eq!(st_prof, StatusCode::OK, "{prof_body}");
+    let profs = prof_body["profiles"].as_array().unwrap();
+    assert!(profs.iter().any(|p| p["name"] == "cloud_user" && p["cookies"].as_u64().unwrap_or(0) >= 1));
+
+    let _ = std::fs::remove_dir_all(&profiles_dir);
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_session_ttl_expires_and_frees_slot() {
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+    let server = HttpServer::new(engine, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+
+    let (st, created) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        json!({ "ttl_secs": 10 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{created}");
+    let sess_id = created["id"].as_str().unwrap().to_string();
+
+    let expired = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (st, _) =
+                request(&server, "GET", &format!("/v1/sessions/{sess_id}"), Value::Null).await;
+            if st == StatusCode::NOT_FOUND {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(expired, "managed session should expire automatically after ttl_secs");
+
+    // Slot is freed immediately after TTL teardown so another session succeeds on the 1-slot engine.
+    let (st2, created2) = request(&server, "POST", "/v1/sessions", json!({})).await;
+    assert_eq!(st2, StatusCode::CREATED, "{created2}");
+    let sess2 = created2["id"].as_str().unwrap();
+    let (st_del, _) =
+        request(&server, "DELETE", &format!("/v1/sessions/{sess2}"), Value::Null).await;
+    assert_eq!(st_del, StatusCode::OK);
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_scrape_returns_multiple_formats_in_one_call() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(2)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let server = HttpServer::new(engine, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+
+    let (st, body) = request(
+        &server,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{}/scraping", fixture.base_url),
+            "formats": ["markdown", "html", "text", "snapshot", "screenshot", "pdf"],
+            "wait_for_selector": "article h1",
+            "resource_preset": "scraping",
+            "snapshot_interactive_only": false
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["title"], "scraping");
+    assert!(body["url"].as_str().unwrap().contains("/scraping"));
+    assert!(body["markdown"].as_str().unwrap().contains("Product Catalog Item"));
+    assert!(body["html"].as_str().unwrap().contains("<article>"));
+    assert!(body["text"].as_str().unwrap().contains("Benchmark scraping payload"));
+    assert!(body["snapshot"]["tree"].as_str().unwrap().contains("Product Catalog Item"));
+
+    let shot = base64::engine::general_purpose::STANDARD
+        .decode(body["screenshot_base64"].as_str().unwrap())
+        .unwrap();
+    assert!(shot.starts_with(&[0x89, b'P', b'N', b'G']));
+
+    let pdf = base64::engine::general_purpose::STANDARD
+        .decode(body["pdf_base64"].as_str().unwrap())
+        .unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
+
+    // Synchronous scrapes must not pollute the async /v1/jobs stats ring.
+    let (st_jobs, _) = request(&server, "GET", "/v1/stats", Value::Null).await;
+    assert_eq!(st_jobs, StatusCode::OK);
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+}

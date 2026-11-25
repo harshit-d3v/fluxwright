@@ -129,6 +129,7 @@ fn default_embed_ttl_secs() -> u64 {
 pub(crate) struct LiveAccess {
     pub(crate) read_only: bool,
     pub(crate) expires_at: Option<Instant>,
+    pub(crate) embed_digest: Option<[u8; 32]>,
 }
 
 struct LiveTicket {
@@ -147,6 +148,7 @@ pub(crate) struct VerifiedEmbed {
     pub(crate) session_id: String,
     pub(crate) mode: EmbedMode,
     pub(crate) expires_at: Instant,
+    pub(crate) digest: [u8; 32],
 }
 
 fn sha256_token(token: &str) -> [u8; 32] {
@@ -460,12 +462,30 @@ impl LiveRegistry {
                 session_id: tok.session_id.clone(),
                 mode: tok.mode,
                 expires_at: tok.expires_at,
+                digest,
             }
         };
         if self.get(&verified.session_id).is_none() {
             return None;
         }
         Some(verified)
+    }
+
+    pub(crate) fn extend_embeds(&self, session_id: &str, expires_at: Instant) {
+        let mut embeds = self.embeds.lock().unwrap();
+        for tok in embeds.values_mut() {
+            if tok.session_id == session_id && tok.expires_at < expires_at {
+                tok.expires_at = expires_at;
+            }
+        }
+    }
+
+    fn embed_expires_at(&self, digest: &[u8; 32]) -> Option<Instant> {
+        self.embeds
+            .lock()
+            .unwrap()
+            .get(digest)
+            .map(|tok| tok.expires_at)
     }
 
     fn acquire_viewer(&self) -> Result<ViewerGuard, ApiError> {
@@ -567,6 +587,7 @@ pub(crate) async fn authorize_ws(
         Some(LiveAccess {
             read_only: false,
             expires_at: None,
+            embed_digest: None,
         })
     } else if let Some(id) = extract_live_ws_id(request.uri().path()) {
         if let Some(q) = request.uri().query() {
@@ -580,6 +601,7 @@ pub(crate) async fn authorize_ws(
                     .map(|_| LiveAccess {
                         read_only: false,
                         expires_at: None,
+                        embed_digest: None,
                     })
             } else if has_embed {
                 extract_single_query_param(q, "embed")
@@ -587,6 +609,7 @@ pub(crate) async fn authorize_ws(
                     .map(|verified| LiveAccess {
                         read_only: verified.mode == EmbedMode::ReadOnly,
                         expires_at: Some(verified.expires_at),
+                        embed_digest: Some(verified.digest),
                     })
             } else {
                 None
@@ -1113,6 +1136,7 @@ async fn run_live_stream(
     let mut shutdown_rx = inner.shutdown_tx.subscribe();
     let mut revoked_rx = entry.revoked_tx.subscribe();
     let mut pause_rx = entry.pause_tx.as_ref().map(|tx| tx.subscribe());
+    let mut embed_expires_at = access.expires_at;
     let mut got_frame = false;
     let fallback_sleep = tokio::time::sleep(STATIC_FALLBACK_DELAY);
     tokio::pin!(fallback_sleep);
@@ -1218,11 +1242,19 @@ async fn run_live_stream(
                 }
             }
             _ = async {
-                match access.expires_at {
+                match embed_expires_at {
                     Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
                     None => std::future::pending().await,
                 }
             } => {
+                if let Some(ref digest) = access.embed_digest {
+                    if let Some(updated) = inner.live.embed_expires_at(digest) {
+                        if updated > Instant::now() {
+                            embed_expires_at = Some(updated);
+                            continue;
+                        }
+                    }
+                }
                 let _ = send_json(
                     &mut ws_tx,
                     &json!({ "type": "ended", "reason": "embed token expired" }),
