@@ -443,13 +443,14 @@ fluxwright serve --listen 127.0.0.1:7331`}</Code>
                   title: "Docker",
                   content: (
                     <>
-                      <Code label="Run Fluxwright in Docker">{`docker build -t fluxwright .
+                      <Code label="Run Fluxwright in Docker">{`docker pull ghcr.io/harshit-d3v/fluxwright:latest
 docker run --rm \\
   -e FLUXWRIGHT_SERVER_TOKEN="$FLUXWRIGHT_SERVER_TOKEN" \\
   -p 127.0.0.1:7331:7331 --shm-size=1g \\
   --memory=4g --cpus=4 --cap-add=SYS_ADMIN \\
-  fluxwright`}</Code>
+  ghcr.io/harshit-d3v/fluxwright:latest`}</Code>
                       <p className="note">
+                        Multi-arch image (<code>linux/amd64</code> + <code>linux/arm64</code>) on GHCR.
                         Reads container cgroup limits automatically for browser count and RAM ceiling,
                         and uses <code>tini</code> as PID 1 so Chromium subprocesses are always reaped.
                       </p>
@@ -472,15 +473,9 @@ docker run --rm \\
                 <ul>
                   <li>Firefox or WebKit. Fluxwright is Chromium only.</li>
                   <li>
-                    Interactive GUI codegen or a built-in Trace Viewer UI. Fluxwright ships
-                    auto-retrying web-first <code>expect()</code> assertions (Rust, Node/TS,
-                    Python), Playwright Trace Viewer-compatible <code>.zip</code> context tracing (
-                    <code>context.tracing</code>), page video recording (<code>recordVideo</code> /{" "}
-                    <code>page.video()</code>), auto-retrying visual{" "}
-                    <code>toHaveScreenshot()</code> regression, the <code>fluxwright/test</code>{" "}
-                    CLI runner (<code>fluxwright-test</code> with parallel workers, sharding,
-                    retries, and HTML reports), and an auto-loaded <code>pytest</code> plugin (
-                    <code>pytest-fluxwright</code>) — without an interactive GUI recorder yet.
+                    Interactive GUI codegen or a built-in Trace Viewer UI (Fluxwright writes
+                    Playwright-compatible <code>.zip</code> traces you can open in Playwright Trace
+                    Viewer).
                   </li>
                   <li>Java or .NET SDKs. Fluxwright targets Node, Python, and Rust.</li>
                   <li>Anti-bot evasion.</li>

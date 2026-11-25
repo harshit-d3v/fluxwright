@@ -6,7 +6,6 @@ name: release-pypi
 # falls back to PyPI OIDC Trusted Publishing (`id-token: write`).
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
