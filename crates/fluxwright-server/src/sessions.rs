@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::body::to_bytes;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, Request, State};
+use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -584,7 +584,7 @@ impl Drop for ConnectionGuard {
 pub(crate) async fn cdp_ws_handler(
     State(inner): State<Arc<Inner>>,
     Path(id): Path<String>,
-    ws: WebSocketUpgrade,
+    request: Request,
 ) -> Result<Response, ApiError> {
     validate_session_id(&id)?;
     let Some(_) = inner.engine else {
@@ -599,6 +599,10 @@ pub(crate) async fn cdp_ws_handler(
         let _ = sess.close_tx.send(true);
         return Err(session_not_found());
     }
+    let (mut parts, _) = request.into_parts();
+    let ws: WebSocketUpgrade = WebSocketUpgrade::from_request_parts(&mut parts, &inner)
+        .await
+        .map_err(|e| ApiError::new(e.status(), "invalid_websocket", e.body_text()))?;
     if sess
         .connected
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
