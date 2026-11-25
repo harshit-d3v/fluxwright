@@ -50,6 +50,7 @@ pub struct AriaSnapshot {
     pub truncated: bool,
     pub is_diff: bool,
     pub changed: bool,
+    pub revision: u32,
 }
 
 /// Controls how [`crate::CdpPage::markdown`] serializes a page or element.
@@ -76,18 +77,38 @@ impl Default for MarkdownOptions {
     }
 }
 
-/// Extracts the normalized ref key (`"e12"`) when a selector begins with `@e12` or `ref=e12`.
-pub(crate) fn extract_ax_ref(query: &str) -> Option<String> {
+/// Extracts the normalized ref key (`"e12"`) and optional snapshot revision (`Some(3)`)
+/// when a selector begins with `@e12`, `ref=e12`, `@e12@r3`, or `ref=e12@r3`.
+pub(crate) fn extract_ax_ref_with_rev(query: &str) -> Option<(String, Option<u32>)> {
     let first_part = query.split(">>").next()?.trim();
     let candidate = first_part
         .strip_prefix('@')
         .or_else(|| first_part.strip_prefix("ref="))?;
-    let rest = candidate.strip_prefix('e')?;
-    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-        Some(candidate.to_string())
-    } else {
-        None
+    let (ref_part, rev_part) = match candidate.split_once('@') {
+        Some((r, rev)) => (r, Some(rev)),
+        None => (candidate, None),
+    };
+    let rest = ref_part.strip_prefix('e')?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    let rev = match rev_part {
+        Some(raw) => {
+            let digits = raw.strip_prefix('r')?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some(digits.parse::<u32>().ok().filter(|&n| n >= 1)?)
+        }
+        None => None,
+    };
+    Some((ref_part.to_string(), rev))
+}
+
+/// Extracts the normalized ref key (`"e12"`) when a selector begins with `@e12` or `ref=e12`.
+#[allow(dead_code)]
+pub(crate) fn extract_ax_ref(query: &str) -> Option<String> {
+    extract_ax_ref_with_rev(query).map(|(id, _)| id)
 }
 
 pub(crate) fn is_interactive_role(role: &str) -> bool {
@@ -143,6 +164,7 @@ pub fn build_aria_snapshot(raw_nodes: &[Value], opts: &SnapshotOptions) -> AriaS
             truncated: !raw_nodes.is_empty() && opts.max_nodes == 0,
             is_diff: false,
             changed: true,
+            revision: 0,
         };
     }
 
@@ -193,6 +215,7 @@ pub fn build_aria_snapshot(raw_nodes: &[Value], opts: &SnapshotOptions) -> AriaS
         truncated: ctx.truncated,
         is_diff: false,
         changed: true,
+        revision: 0,
     }
 }
 
@@ -598,6 +621,26 @@ mod tests {
         assert_eq!(extract_ax_ref("@e"), None);
         assert_eq!(extract_ax_ref("@e1x"), None);
         assert_eq!(extract_ax_ref("text=@e1"), None);
+    }
+
+    #[test]
+    fn extracts_ax_ref_with_optional_revision() {
+        assert_eq!(extract_ax_ref_with_rev("@e12"), Some(("e12".into(), None)));
+        assert_eq!(extract_ax_ref_with_rev("ref=e12"), Some(("e12".into(), None)));
+        assert_eq!(extract_ax_ref_with_rev("@e12@r3"), Some(("e12".into(), Some(3))));
+        assert_eq!(extract_ax_ref_with_rev("  ref=e12@r3 >> nth=0"), Some(("e12".into(), Some(3))));
+        assert_eq!(
+            extract_ax_ref_with_rev("ref=e12@r3"),
+            Some(("e12".into(), Some(3)))
+        );
+
+        assert_eq!(extract_ax_ref_with_rev("@e12@r0"), None);
+        assert_eq!(extract_ax_ref_with_rev("@e12@r00"), None);
+        assert_eq!(extract_ax_ref_with_rev("@e12@bad"), None);
+        assert_eq!(extract_ax_ref_with_rev("@e12@r"), None);
+        assert_eq!(extract_ax_ref_with_rev("@e12@"), None);
+        assert_eq!(extract_ax_ref_with_rev("@e12@r+3"), None);
+        assert_eq!(extract_ax_ref_with_rev("@e12@r3@r4"), None);
     }
 
     #[test]

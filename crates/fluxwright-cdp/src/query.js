@@ -583,7 +583,7 @@
       const m = /^(css:light|css|xpath|text|role|label|placeholder|alt|title|testid|ref|nth|has-text|has-not-text|has|has-not|and|or)=([\s\S]*)$/.exec(part);
       const [engine, body] = m
         ? [m[1], m[2]]
-        : /^@e\d+$/.test(part)
+        : /^@e\d+(?:@r\d+)?$/.test(part)
           ? ['ref', part.slice(1)]
           : part.startsWith('//') || part.startsWith('..')
             ? ['xpath', part]

@@ -677,7 +677,8 @@ impl Engine {
             || opts.block_media
             || opts.block_stylesheets
             || opts.block_scripts
-            || !opts.block_url_patterns.is_empty();
+            || !opts.block_url_patterns.is_empty()
+            || opts.block_cookie_banners;
         let has_setup = has_blocking
             || opts.http_credentials.is_some()
             || !opts.permissions.is_empty()
@@ -1696,6 +1697,24 @@ fn drop_abandoned(queue: &mut VecDeque<Waiter>) -> usize {
     before - queue.len()
 }
 
+fn effective_blocked_url_patterns(opts: &JobOptions) -> Vec<String> {
+    let extra = if opts.block_cookie_banners {
+        crate::config::COOKIE_BANNER_URL_PATTERNS.len()
+    } else {
+        0
+    };
+    let mut patterns = Vec::with_capacity(opts.block_url_patterns.len() + extra);
+    patterns.extend(opts.block_url_patterns.iter().cloned());
+    if opts.block_cookie_banners {
+        patterns.extend(
+            crate::config::COOKIE_BANNER_URL_PATTERNS
+                .iter()
+                .map(|&p| p.to_string()),
+        );
+    }
+    patterns
+}
+
 async fn apply_context_blocking(guard: &ContextGuard, opts: &JobOptions) -> Result<()> {
     let mut types = Vec::new();
     if opts.block_images {
@@ -1719,10 +1738,11 @@ async fn apply_context_blocking(guard: &ContextGuard, opts: &JobOptions) -> Resu
             .context_block_resource_types(&guard.context, &types, Duration::from_secs(5))
             .await?;
     }
-    if !opts.block_url_patterns.is_empty() {
+    let blocked_urls = effective_blocked_url_patterns(opts);
+    if !blocked_urls.is_empty() {
         guard
             .browser
-            .context_set_blocked_urls(&guard.context, &opts.block_url_patterns, Duration::from_secs(5))
+            .context_set_blocked_urls(&guard.context, &blocked_urls, Duration::from_secs(5))
             .await?;
     }
     Ok(())
@@ -6079,5 +6099,27 @@ mod tests {
         ctx.close().await.unwrap();
         eng.shutdown(Duration::from_secs(2)).await.unwrap();
         srv.abort();
+    }
+
+    #[test]
+    fn effective_blocked_url_patterns_combines_custom_and_cookie_banner_presets() {
+        let plain = JobOptions::default();
+        assert!(effective_blocked_url_patterns(&plain).is_empty());
+
+        let cmp_only = JobOptions::default().block_cookie_banners(true);
+        let patterns = effective_blocked_url_patterns(&cmp_only);
+        assert_eq!(patterns.len(), crate::config::COOKIE_BANNER_URL_PATTERNS.len());
+        assert!(patterns.contains(&"*cdn.cookielaw.org/*".to_string()));
+
+        let combined = JobOptions::default()
+            .block_url_patterns(["*tracker.js*"])
+            .block_cookie_banners(true);
+        let merged = effective_blocked_url_patterns(&combined);
+        assert_eq!(
+            merged.len(),
+            1 + crate::config::COOKIE_BANNER_URL_PATTERNS.len()
+        );
+        assert_eq!(merged[0], "*tracker.js*");
+        assert!(merged.contains(&"*consent.cookiebot.com/*".to_string()));
     }
 }

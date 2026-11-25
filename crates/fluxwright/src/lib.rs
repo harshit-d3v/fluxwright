@@ -13,7 +13,7 @@ pub use fluxwright_core::{
     ProfileInfo, ProfileStore, ProxyLease, ProxyPool, ProxyRotation, ProxyStatus, QueueFullMode,
     RecordVideoOptions, RemoteCdp, ResourcePreset, Result, RgbaImage, Route, RouteRequest,
     ToHaveScreenshotOptions, Tracing, TracingChunkOptions, TracingStartOptions, UrlPattern, Video,
-    VideoRecorder, VisualDiff,
+    VideoRecorder, VisualDiff, COOKIE_BANNER_URL_PATTERNS,
 };
 
 pub use fluxwright_cdp::{

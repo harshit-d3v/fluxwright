@@ -3058,8 +3058,9 @@ fn public_reexports_compile() {
         AriaRef, AriaSnapshot, Har, HarContentPolicy, HarLog, HarMode, HarNotFound,
         HarRouteOptions, HarRouter, IgnoreDefaultArgs, MarkdownOptions, ProfileInfo, ProfileStore,
         ProxyLease, ProxyPool, ProxyRotation, ProxyStatus, RecordHarOptions, ResourcePreset,
-        SnapshotOptions, WebSocketEvent, Worker, WorkerEvent,
+        SnapshotOptions, WebSocketEvent, Worker, WorkerEvent, COOKIE_BANNER_URL_PATTERNS,
     };
+    assert!(!COOKIE_BANNER_URL_PATTERNS.is_empty());
     let _ = std::any::type_name::<AriaRef>();
     let _ = std::any::type_name::<AriaSnapshot>();
     let _ = std::any::type_name::<MarkdownOptions>();
@@ -3786,6 +3787,175 @@ async fn page_and_context_route_times_and_fallback_overrides() {
 
     page.close().await.unwrap();
     ctx.close().await.unwrap();
+    eng.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_revision_guardrails_and_cookie_banner_blocking() {
+    use axum::{http::header::CONTENT_TYPE, response::Html, routing::get, Router};
+    use fluxwright::{ScreenshotOptions, SnapshotOptions, COOKIE_BANNER_URL_PATTERNS};
+
+    assert!(COOKIE_BANNER_URL_PATTERNS.contains(&"*cdn.cookielaw.org/*"));
+    assert!(COOKIE_BANNER_URL_PATTERNS.contains(&"*consent.cookiebot.com/*"));
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let js_route = |path: &'static str, body: &'static str| {
+        let seen = seen.clone();
+        get(move || {
+            seen.lock().unwrap().push(path.into());
+            async move { ([(CONTENT_TYPE, "application/javascript")], body) }
+        })
+    };
+
+    let app = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                Html(concat!(
+                    "<!doctype html><title>Guardrails</title>",
+                    "<label for='name'>Name</label><input id='name' aria-label='Name' type='text'>",
+                    "<button id='save' onclick=\"document.getElementById('out').textContent=document.getElementById('name').value\">Save</button>",
+                    "<div id='out'>idle</div>",
+                    "<script src='/app.js'></script>",
+                    "<script src='/cmp/cdn.cookielaw.org/otSDKStub.js'></script>",
+                    "<script src='/cmp/consent.cookiebot.com/uc.js'></script>",
+                    "<script src='/custom-tracker.js'></script>"
+                ))
+            }),
+        )
+        .route("/next", get(|| async { Html("<!doctype html><title>Next</title><p>Done</p>") }))
+        .route("/app.js", js_route("/app.js", "window.__app = true;"))
+        .route(
+            "/cmp/cdn.cookielaw.org/otSDKStub.js",
+            js_route("/cmp/cdn.cookielaw.org/otSDKStub.js", "window.__cmp = true;"),
+        )
+        .route(
+            "/cmp/consent.cookiebot.com/uc.js",
+            js_route("/cmp/consent.cookiebot.com/uc.js", "window.__bot = true;"),
+        )
+        .route(
+            "/custom-tracker.js",
+            js_route("/custom-tracker.js", "window.__tracker = true;"),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let eng = engine(1, 2).await;
+
+    // 1. block_cookie_banners(true) + block_url_patterns blocks CMP scripts and custom trackers while keeping app.js.
+    let blocked_page = eng
+        .acquire_job(
+            &JobOptions::default()
+                .block_cookie_banners(true)
+                .block_url_patterns(["*custom-tracker.js*"]),
+        )
+        .await
+        .unwrap();
+    blocked_page.goto(&format!("{base}/")).await.unwrap();
+    assert_eq!(
+        blocked_page
+            .evaluate("[window.__app === true, window.__cmp === true, window.__bot === true, window.__tracker === true]")
+            .await
+            .unwrap(),
+        json!([true, false, false, false])
+    );
+    {
+        let reqs = seen.lock().unwrap();
+        assert!(reqs.iter().any(|p| p == "/app.js"), "{reqs:?}");
+        assert!(!reqs.iter().any(|p| p.contains("cookielaw")), "{reqs:?}");
+        assert!(!reqs.iter().any(|p| p.contains("cookiebot")), "{reqs:?}");
+        assert!(!reqs.iter().any(|p| p.contains("custom-tracker")), "{reqs:?}");
+    }
+
+    // 2. Snapshot revisions increment across snapshots & navigations; pinned @eN@rK catches stale refs.
+    let s1 = blocked_page
+        .aria_snapshot_with(&SnapshotOptions {
+            interactive_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(s1.revision >= 1);
+    let input_ref = s1
+        .refs
+        .iter()
+        .find(|r| r.role == "textbox" && r.name == "Name")
+        .expect("textbox ref");
+    let btn_ref = s1
+        .refs
+        .iter()
+        .find(|r| r.role == "button" && r.name == "Save")
+        .expect("button ref");
+
+    // Non-cache-updating annotated screenshot keeps revision intact so pinned @eN@rK still works.
+    let _ = blocked_page
+        .screenshot_with(&ScreenshotOptions {
+            annotate: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    blocked_page
+        .fill(format!("@{}@r{}", input_ref.id, s1.revision), "pinned-ok")
+        .await
+        .unwrap();
+    blocked_page
+        .click(format!("ref={}@r{}", btn_ref.id, s1.revision))
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked_page.text_content("#out").await.unwrap().as_deref(),
+        Some("pinned-ok")
+    );
+
+    let s2 = blocked_page.aria_snapshot().await.unwrap();
+    assert_eq!(s2.revision, s1.revision + 1);
+
+    let stale_after_snap = blocked_page
+        .click(format!("@{}@r{}", btn_ref.id, s1.revision))
+        .await
+        .expect_err("old snapshot revision must fail");
+    let msg1 = stale_after_snap.to_string();
+    assert!(
+        matches!(stale_after_snap, fluxwright::Error::Cdp(_))
+            && msg1.contains(&format!("stale snapshot rev={}", s1.revision))
+            && msg1.contains(&format!("current rev={}", s2.revision)),
+        "{msg1}"
+    );
+
+    // Navigation bumps revision immediately even before the next snapshot.
+    blocked_page.goto(&format!("{base}/next")).await.unwrap();
+    let stale_after_nav = blocked_page
+        .click(format!("@{}@r{}", btn_ref.id, s2.revision))
+        .await
+        .expect_err("pre-navigation revision must fail immediately");
+    let msg2 = stale_after_nav.to_string();
+    assert!(
+        matches!(stale_after_nav, fluxwright::Error::Cdp(_))
+            && msg2.contains(&format!("stale snapshot rev={}", s2.revision)),
+        "{msg2}"
+    );
+    let s3 = blocked_page.aria_snapshot().await.unwrap();
+    assert!(s3.revision > s2.revision);
+    blocked_page.close().await.unwrap();
+
+    // 3. Default JobOptions does NOT block CMP scripts.
+    seen.lock().unwrap().clear();
+    let default_page = eng.acquire_job(&JobOptions::default()).await.unwrap();
+    default_page.goto(&format!("{base}/")).await.unwrap();
+    assert_eq!(
+        default_page
+            .evaluate("[window.__app === true, window.__cmp === true, window.__bot === true, window.__tracker === true]")
+            .await
+            .unwrap(),
+        json!([true, true, true, true])
+    );
+    default_page.close().await.unwrap();
+
     eng.shutdown(Duration::from_secs(5)).await.unwrap();
     srv.abort();
 }

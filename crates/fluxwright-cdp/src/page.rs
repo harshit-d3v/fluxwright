@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ use crate::log::{DownloadResult, PageLog};
 pub type DownloadQueue = tokio::sync::mpsc::UnboundedReceiver<DownloadResult>;
 use crate::render::ScreenshotOptions;
 use crate::route::InterceptedRequest;
-use crate::snapshot::{extract_ax_ref, AriaSnapshot, MarkdownOptions, SnapshotOptions};
+use crate::snapshot::{extract_ax_ref_with_rev, AriaSnapshot, MarkdownOptions, SnapshotOptions};
 use crate::error::{Error, Result};
 use crate::worker::{Worker, WorkerEvent, WorkerRegistry};
 
@@ -618,6 +618,23 @@ const FRAME_BOX_JS: &str = "function() { const r = this.getBoundingClientRect(),
     return [this.clientWidth - px('paddingLeft') - px('paddingRight'), this.clientHeight - px('paddingTop') - px('paddingBottom'), \
         r.left + this.clientLeft + px('paddingLeft'), r.top + this.clientTop + px('paddingTop')]; }";
 
+#[derive(Default)]
+pub(crate) struct AxRefCache {
+    pub(crate) refs: std::sync::Mutex<HashMap<String, i64>>,
+    pub(crate) rev: AtomicU32,
+}
+
+impl AxRefCache {
+    pub(crate) fn clear(&self) {
+        self.refs.lock().unwrap().clear();
+        self.rev.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn current_rev(&self) -> u32 {
+        self.rev.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 pub struct CdpPage {
     pub browser: Arc<Connection>,
@@ -641,8 +658,9 @@ pub struct CdpPage {
     pub(crate) keyboard: Arc<std::sync::Mutex<KeyboardState>>,
     pub(crate) url: Arc<tokio::sync::watch::Sender<String>>,
     pub(crate) net: Arc<std::sync::Mutex<NetActivity>>,
-    /// Maps the latest accessibility snapshot's short ref (`"e1"`, `"e2"`, ...) to `backendDOMNodeId`.
-    pub(crate) ax_refs: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// Maps the latest accessibility snapshot's short ref (`"e1"`, `"e2"`, ...) to `backendDOMNodeId`,
+    /// paired with a monotonic snapshot revision counter.
+    pub(crate) ax_refs: Arc<AxRefCache>,
     /// Cached formatted tree from the most recent `aria_snapshot` call for `diff: true`.
     pub(crate) last_snapshot: Arc<std::sync::Mutex<Option<String>>>,
     /// Pre-subscribed session-routed CDP event stream for popups so early console/network events aren't missed.
@@ -784,7 +802,7 @@ impl CdpPage {
             if ev.session_id.as_deref() == Some(self.sid()) {
                 match ev.method.as_str() {
                     "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
-                        self.ax_refs.lock().unwrap().clear();
+                        self.ax_refs.clear();
                         self.worlds.lock().unwrap().clear();
                         let full = crate::browser::frame_url(&ev.params["frame"]);
                         if !full.is_empty() {
@@ -819,7 +837,7 @@ impl CdpPage {
 
     /// Navigates and waits for the main frame's lifecycle event, like Playwright's `waitUntil`.
     pub async fn goto(&self, url: &str, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
-        self.ax_refs.lock().unwrap().clear();
+        self.ax_refs.clear();
         self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         // Subscribed before navigating, so no lifecycle event can slip past; unbounded, so a
@@ -870,7 +888,7 @@ impl CdpPage {
     }
 
     pub async fn reload(&self, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
-        self.ax_refs.lock().unwrap().clear();
+        self.ax_refs.clear();
         self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         let events = self.browser.subscribe_unbounded();
@@ -889,7 +907,7 @@ impl CdpPage {
     }
 
     async fn navigate_history(&self, delta: isize, wait_until: WaitUntil, timeout: Duration) -> Result<bool> {
-        self.ax_refs.lock().unwrap().clear();
+        self.ax_refs.clear();
         self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         let hist = self.call("Page.getNavigationHistory", json!({}), timeout).await?;
@@ -927,7 +945,7 @@ impl CdpPage {
     }
 
     pub async fn set_content(&self, html: &str, wait_until: WaitUntil, timeout: Duration) -> Result<()> {
-        self.ax_refs.lock().unwrap().clear();
+        self.ax_refs.clear();
         self.worlds.lock().unwrap().clear();
         let deadline = tokio::time::Instant::now() + timeout;
         {
@@ -1340,7 +1358,7 @@ impl CdpPage {
                     return Err(Error::TargetCrashed { status: format!("during {what}") });
                 }
                 "Page.frameNavigated" if ev.params["frame"]["id"] == self.target_id.0.as_str() => {
-                    self.ax_refs.lock().unwrap().clear();
+                    self.ax_refs.clear();
                     self.worlds.lock().unwrap().clear();
                     let full = crate::browser::frame_url(&ev.params["frame"]);
                     if !full.is_empty() {
@@ -1548,11 +1566,16 @@ impl CdpPage {
         let nodes = res["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]);
         let mut snap = crate::snapshot::build_aria_snapshot(nodes, opts);
         {
-            let mut refs = self.ax_refs.lock().unwrap();
+            let mut refs = self.ax_refs.refs.lock().unwrap();
             refs.clear();
             for item in &snap.refs {
                 refs.insert(item.id.clone(), item.backend_node_id);
             }
+            snap.revision = if update_diff_cache {
+                self.ax_refs.rev.fetch_add(1, Ordering::AcqRel) + 1
+            } else {
+                self.ax_refs.current_rev()
+            };
         }
         if update_diff_cache {
             let mut last = self.last_snapshot.lock().unwrap();
@@ -1933,8 +1956,8 @@ impl CdpPage {
         }
     }
 
-    /// Evaluates the selector engine, resolving leading `@eN` / `ref=eN` references through the
-    /// latest accessibility snapshot's `backendDOMNodeId` map before delegating to `QUERY_JS`.
+    /// Evaluates the selector engine, resolving leading `@eN` / `ref=eN` (optionally pinned with `@rK`)
+    /// references through the latest accessibility snapshot's `backendDOMNodeId` map before delegating to `QUERY_JS`.
     async fn eval_engine(
         &self,
         scope: &Scope,
@@ -1944,8 +1967,8 @@ impl CdpPage {
         return_by_value: bool,
         timeout: Duration,
     ) -> Result<Value> {
-        let Some(ref_key) = (mode != "clear" && mode != "changed")
-            .then(|| extract_ax_ref(&sel.query))
+        let Some((ref_key, req_rev)) = (mode != "clear" && mode != "changed")
+            .then(|| extract_ax_ref_with_rev(&sel.query))
             .flatten()
         else {
             return self
@@ -1953,14 +1976,40 @@ impl CdpPage {
                 .await;
         };
 
-        let backend_id = self.ax_refs.lock().unwrap().get(&ref_key).copied();
-        let Some(backend_id) = backend_id else {
-            let reason = format!("unknown element ref @{ref_key}; take a snapshot first");
-            return if return_by_value {
-                Ok(json!({ "value": { "ok": false, "fatal": true, "reason": reason } }))
+        let fatal_ref_err = |reason: String, detached: bool| -> Result<Value> {
+            if return_by_value {
+                let mut val = json!({ "ok": false, "fatal": true, "reason": reason });
+                if detached {
+                    val["detached"] = json!(true);
+                }
+                Ok(json!({ "value": val }))
             } else {
                 Err(Error::NotActionable { selector: sel.to_string(), reason })
-            };
+            }
+        };
+
+        let lookup = {
+            let refs = self.ax_refs.refs.lock().unwrap();
+            let cur_rev = self.ax_refs.current_rev();
+            if let Some(req_rev) = req_rev {
+                if req_rev != cur_rev {
+                    Err(format!(
+                        "element ref @{ref_key} is from stale snapshot rev={req_rev} (current rev={cur_rev}); take a new snapshot"
+                    ))
+                } else {
+                    refs.get(&ref_key)
+                        .copied()
+                        .ok_or_else(|| format!("unknown element ref @{ref_key}; take a snapshot first"))
+                }
+            } else {
+                refs.get(&ref_key)
+                    .copied()
+                    .ok_or_else(|| format!("unknown element ref @{ref_key}; take a snapshot first"))
+            }
+        };
+        let backend_id = match lookup {
+            Ok(id) => id,
+            Err(reason) => return fatal_ref_err(reason, false),
         };
 
         let mut resolve_params = json!({ "backendNodeId": backend_id });
@@ -1980,19 +2029,10 @@ impl CdpPage {
             .and_then(|v| v["object"]["objectId"].as_str())
             .map(str::to_owned);
         let Some(obj_id) = obj_id else {
-            let reason = format!("element ref @{ref_key} is stale or detached; take a new snapshot");
-            return if return_by_value {
-                Ok(json!({
-                    "value": {
-                        "ok": false,
-                        "fatal": true,
-                        "detached": true,
-                        "reason": reason
-                    }
-                }))
-            } else {
-                Err(Error::NotActionable { selector: sel.to_string(), reason })
-            };
+            return fatal_ref_err(
+                format!("element ref @{ref_key} is stale or detached; take a new snapshot"),
+                true,
+            );
         };
 
         let effective = effective_arg(sel, arg);
@@ -4395,6 +4435,101 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(900),
             "timeout budget leaked across poll calls: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_revision_pins_and_rejects_stale_refs() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].clone();
+                let method = req["method"].as_str().unwrap_or("");
+                let reply = match method {
+                    "Accessibility.getFullAXTree" => json!({
+                        "id": id,
+                        "result": {
+                            "nodes": [
+                                { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "App" }, "childIds": ["2"] },
+                                { "nodeId": "2", "role": { "value": "button" }, "name": { "value": "Go" }, "backendDOMNodeId": 77 }
+                            ]
+                        }
+                    }),
+                    "Page.createIsolatedWorld" => {
+                        json!({ "id": id, "result": { "executionContextId": 1 } })
+                    }
+                    "DOM.resolveNode" => {
+                        json!({ "id": id, "result": { "object": { "objectId": "obj-77" } } })
+                    }
+                    "Runtime.callFunctionOn" => {
+                        json!({ "id": id, "result": { "result": { "value": { "ok": true, "count": 1 } } } })
+                    }
+                    _ => json!({ "id": id, "result": {} }),
+                };
+                if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let conn = Connection::connect(&format!("ws://{addr}")).await.unwrap();
+        let page = mock_page(conn);
+
+        let s1 = page
+            .capture_aria_snapshot(&SnapshotOptions::default(), true, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(s1.revision, 1);
+
+        // Non-cache-updating capture (e.g. annotated screenshot) must keep revision at 1.
+        let non_cache = page
+            .capture_aria_snapshot(&SnapshotOptions::default(), false, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(non_cache.revision, 1);
+
+        // Current revision pinned ref resolves.
+        assert_eq!(
+            page.count(&Selector::new("@e1@r1"), Duration::from_secs(5))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let s2 = page
+            .capture_aria_snapshot(&SnapshotOptions::default(), true, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(s2.revision, 2);
+
+        // Previous revision fails immediately as NotActionable.
+        let stale_err = page
+            .count(&Selector::new("@e1@r1"), Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            stale_err.contains("element ref @e1 is from stale snapshot rev=1 (current rev=2); take a new snapshot"),
+            "{stale_err}"
+        );
+
+        // Navigation invalidation bumps rev immediately so rev=2 becomes stale too.
+        page.ax_refs.clear();
+        let nav_err = page
+            .count(&Selector::new("ref=e1@r2"), Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            nav_err.contains("element ref @e1 is from stale snapshot rev=2 (current rev=3); take a new snapshot"),
+            "{nav_err}"
         );
     }
 }

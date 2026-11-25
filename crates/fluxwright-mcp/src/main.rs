@@ -1,7 +1,7 @@
 //! Fluxwright MCP server (stdio by default, or Streamable HTTP via `--http <ADDR>`).
 //! Claude Desktop, Codex, Cursor, and remote MCP clients can call tools to drive a Chromium fleet.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -36,6 +36,8 @@ use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, OnceCell};
 use tracing_subscriber::EnvFilter;
 
 const MAX_NET_RECORDS: usize = 500;
+const MAX_NET_HEADER_PAIRS: usize = 64;
+const MAX_NET_FIELD_BYTES: usize = 8192;
 const MIN_REMOTE_TOKEN_LEN: usize = 32;
 
 #[derive(Debug, Parser)]
@@ -60,6 +62,9 @@ struct NetRecord {
     method: String,
     url: String,
     resource_type: String,
+    request_headers: Vec<(String, String)>,
+    post_data: Option<String>,
+    response_content_type: Option<String>,
     status: Option<u16>,
     failed: Option<String>,
 }
@@ -228,6 +233,19 @@ struct NetworkArgs {
     filter: Option<String>,
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+struct ExportApiCallsArgs {
+    #[schemars(description = "Maximum recent API calls to export (default 50, max 200)")]
+    limit: Option<usize>,
+    #[schemars(description = "Optional case-insensitive substring filter on URL, method, resource type, or content type")]
+    filter: Option<String>,
+    #[schemars(description = "Include raw sensitive auth/cookie headers instead of [REDACTED] (default false)")]
+    include_auth: Option<bool>,
+    #[schemars(description = "Output format: json (default) or curl")]
+    format: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct EvalArgs {
     #[schemars(description = "JavaScript expression, e.g. document.title")]
@@ -394,54 +412,99 @@ impl FluxwrightMcp {
     }
 }
 
+fn bound_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .take(MAX_NET_HEADER_PAIRS)
+        .map(|(k, v)| (truncate(k, 256), truncate(v, MAX_NET_FIELD_BYTES)))
+        .collect()
+}
+
+fn bound_post_data(post_data: Option<String>) -> Option<String> {
+    post_data.map(|s| truncate(s, MAX_NET_FIELD_BYTES))
+}
+
+fn extract_content_type(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| truncate(v.clone(), 256))
+}
+
+fn push_net_record(guard: &mut VecDeque<NetRecord>, rec: NetRecord) {
+    while guard.len() >= MAX_NET_RECORDS {
+        guard.pop_front();
+    }
+    guard.push_back(rec);
+}
+
 fn record_net_event(buf: &Arc<std::sync::Mutex<VecDeque<NetRecord>>>, ev: NetEvent) {
     let mut guard = buf.lock().unwrap();
     match ev {
         NetEvent::Request(req) => {
-            while guard.len() >= MAX_NET_RECORDS {
-                guard.pop_front();
-            }
-            guard.push_back(NetRecord {
-                id: req.id,
-                method: req.method,
-                url: req.url,
-                resource_type: req.resource_type,
-                status: None,
-                failed: None,
-            });
+            push_net_record(
+                &mut guard,
+                NetRecord {
+                    id: req.id,
+                    method: req.method,
+                    url: req.url,
+                    resource_type: req.resource_type,
+                    request_headers: bound_headers(req.headers),
+                    post_data: bound_post_data(req.post_data),
+                    response_content_type: None,
+                    status: None,
+                    failed: None,
+                },
+            );
         }
         NetEvent::Response(resp) => {
+            let content_type = extract_content_type(&resp.headers);
             if let Some(rec) = guard.iter_mut().rev().find(|r| r.id == resp.request.id) {
                 rec.status = Some(resp.status);
-            } else {
-                while guard.len() >= MAX_NET_RECORDS {
-                    guard.pop_front();
+                if content_type.is_some() {
+                    rec.response_content_type = content_type;
                 }
-                guard.push_back(NetRecord {
-                    id: resp.request.id,
-                    method: resp.request.method,
-                    url: resp.url,
-                    resource_type: resp.request.resource_type,
-                    status: Some(resp.status),
-                    failed: None,
-                });
+                if rec.request_headers.is_empty() && !resp.request.headers.is_empty() {
+                    rec.request_headers = bound_headers(resp.request.headers);
+                }
+                if rec.post_data.is_none() && resp.request.post_data.is_some() {
+                    rec.post_data = bound_post_data(resp.request.post_data);
+                }
+            } else {
+                push_net_record(
+                    &mut guard,
+                    NetRecord {
+                        id: resp.request.id,
+                        method: resp.request.method,
+                        url: resp.url,
+                        resource_type: resp.request.resource_type,
+                        request_headers: bound_headers(resp.request.headers),
+                        post_data: bound_post_data(resp.request.post_data),
+                        response_content_type: content_type,
+                        status: Some(resp.status),
+                        failed: None,
+                    },
+                );
             }
         }
         NetEvent::Failed(req, reason) => {
             if let Some(rec) = guard.iter_mut().rev().find(|r| r.id == req.id) {
                 rec.failed = Some(reason);
             } else {
-                while guard.len() >= MAX_NET_RECORDS {
-                    guard.pop_front();
-                }
-                guard.push_back(NetRecord {
-                    id: req.id,
-                    method: req.method,
-                    url: req.url,
-                    resource_type: req.resource_type,
-                    status: None,
-                    failed: Some(reason),
-                });
+                push_net_record(
+                    &mut guard,
+                    NetRecord {
+                        id: req.id,
+                        method: req.method,
+                        url: req.url,
+                        resource_type: req.resource_type,
+                        request_headers: bound_headers(req.headers),
+                        post_data: bound_post_data(req.post_data),
+                        response_content_type: None,
+                        status: None,
+                        failed: Some(reason),
+                    },
+                );
             }
         }
         NetEvent::Finished(_) => {}
@@ -572,18 +635,32 @@ fn format_console(
     lines[start..].join("\n")
 }
 
+fn normalize_filter(filter: Option<&str>) -> Option<String> {
+    filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+}
+
+fn matches_net_filter(rec: &NetRecord, needle: Option<&str>, include_ct: bool) -> bool {
+    needle.is_none_or(|n| {
+        rec.url.to_lowercase().contains(n)
+            || rec.method.to_lowercase().contains(n)
+            || rec.resource_type.to_lowercase().contains(n)
+            || (include_ct
+                && rec
+                    .response_content_type
+                    .as_deref()
+                    .is_some_and(|ct| ct.to_lowercase().contains(n)))
+    })
+}
+
 fn format_net_records(records: &VecDeque<NetRecord>, limit: usize, filter: Option<&str>) -> String {
     let cap = limit.min(200);
-    let needle = filter.map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let needle = normalize_filter(filter);
     let matched: Vec<String> = records
         .iter()
-        .filter(|rec| {
-            needle.as_ref().is_none_or(|n| {
-                rec.url.to_lowercase().contains(n)
-                    || rec.method.to_lowercase().contains(n)
-                    || rec.resource_type.to_lowercase().contains(n)
-            })
-        })
+        .filter(|rec| matches_net_filter(rec, needle.as_deref(), false))
         .map(|rec| {
             let outcome = rec
                 .status
@@ -598,6 +675,143 @@ fn format_net_records(records: &VecDeque<NetRecord>, limit: usize, filter: Optio
     }
     let start = matched.len().saturating_sub(cap);
     matched[start..].join("\n")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Json,
+    Curl,
+}
+
+fn parse_export_format(format: Option<&str>) -> Result<ExportFormat, McpError> {
+    match format {
+        None | Some("json") => Ok(ExportFormat::Json),
+        Some("curl") => Ok(ExportFormat::Curl),
+        Some(other) => Err(McpError::invalid_params(
+            format!("export_api_calls format must be json or curl, got {other:?}"),
+            None,
+        )),
+    }
+}
+
+fn is_api_call(rec: &NetRecord) -> bool {
+    let rtype = rec.resource_type.to_ascii_lowercase();
+    if rtype == "xhr" || rtype == "fetch" {
+        return true;
+    }
+    rec.response_content_type.as_deref().is_some_and(|ct| {
+        let ct_low = ct.to_ascii_lowercase();
+        ct_low.contains("json") || ct_low.contains("graphql")
+    })
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "set-cookie" | "x-api-key" | "proxy-authorization"
+    )
+}
+
+fn redact_headers(headers: &[(String, String)], include_auth: bool) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let val = if !include_auth && is_sensitive_header(k) {
+                "[REDACTED]".to_string()
+            } else {
+                v.clone()
+            };
+            (k.clone(), val)
+        })
+        .collect()
+}
+
+fn shell_quote(s: &str) -> String {
+    let clean = s.replace('\0', "");
+    format!("'{}'", clean.replace('\'', "'\\''"))
+}
+
+fn format_curl_command(rec: &NetRecord, include_auth: bool) -> String {
+    let mut parts = vec![
+        "curl".to_string(),
+        "-X".to_string(),
+        shell_quote(&rec.method),
+        shell_quote(&rec.url),
+    ];
+    for (k, v) in redact_headers(&rec.request_headers, include_auth) {
+        parts.push("-H".to_string());
+        parts.push(shell_quote(&format!("{k}: {v}")));
+    }
+    if let Some(body) = &rec.post_data {
+        parts.push("--data-raw".to_string());
+        parts.push(shell_quote(body));
+    }
+    parts.join(" ")
+}
+
+#[derive(serde::Serialize)]
+struct ExportedApiCall<'a> {
+    method: &'a str,
+    url: &'a str,
+    resource_type: &'a str,
+    status: Option<u16>,
+    content_type: Option<&'a str>,
+    headers: BTreeMap<String, String>,
+    post_data: Option<&'a str>,
+    failed: Option<&'a str>,
+}
+
+fn format_api_calls(
+    records: &VecDeque<NetRecord>,
+    limit: usize,
+    filter: Option<&str>,
+    include_auth: bool,
+    format: ExportFormat,
+) -> String {
+    let cap = limit.min(200);
+    let needle = normalize_filter(filter);
+    let matched: Vec<&NetRecord> = records
+        .iter()
+        .filter(|rec| is_api_call(rec) && matches_net_filter(rec, needle.as_deref(), true))
+        .collect();
+    if cap == 0 || matched.is_empty() {
+        return match format {
+            ExportFormat::Json => "[]".into(),
+            ExportFormat::Curl => "# no matching API calls".into(),
+        };
+    }
+    let start = matched.len().saturating_sub(cap);
+    let slice = &matched[start..];
+    match format {
+        ExportFormat::Json => {
+            let mut items: Vec<ExportedApiCall<'_>> = slice
+                .iter()
+                .map(|rec| ExportedApiCall {
+                    method: &rec.method,
+                    url: &rec.url,
+                    resource_type: &rec.resource_type,
+                    status: rec.status,
+                    content_type: rec.response_content_type.as_deref(),
+                    headers: redact_headers(&rec.request_headers, include_auth),
+                    post_data: rec.post_data.as_deref(),
+                    failed: rec.failed.as_deref(),
+                })
+                .collect();
+            let mut json_out = serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into());
+            while json_out.len() > 40_000 && items.len() > 1 {
+                items.remove(0);
+                json_out = serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into());
+            }
+            truncate(json_out, 40_000)
+        }
+        ExportFormat::Curl => {
+            let lines: Vec<String> = slice
+                .iter()
+                .map(|rec| format_curl_command(rec, include_auth))
+                .collect();
+            truncate(lines.join("\n"), 40_000)
+        }
+    }
 }
 
 #[tool_router]
@@ -701,7 +915,8 @@ impl FluxwrightMcp {
         let url = tab.page.url();
         let title = tab.page.title().await.unwrap_or_default();
         let mut out = format!(
-            "url: {url}\ntitle: {title}\nrefs: {}\ndiff: {}\nchanged: {}\n\n{}",
+            "url: {url}\ntitle: {title}\nrev: {}\nrefs: {}\ndiff: {}\nchanged: {}\n\n{}",
+            snap.revision,
             snap.refs.len(),
             snap.is_diff,
             snap.changed,
@@ -1036,6 +1251,34 @@ impl FluxwrightMcp {
         Ok(tool_ok(truncate(out, 20_000)))
     }
 
+    #[tool(description = "Export captured API calls (XHR/fetch or JSON/GraphQL responses) from the active tab as JSON or shell-escaped curl commands (auth headers redacted by default).")]
+    async fn export_api_calls(
+        &self,
+        Parameters(ExportApiCallsArgs {
+            limit,
+            filter,
+            include_auth,
+            format,
+        }): Parameters<ExportApiCallsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let fmt = parse_export_format(format.as_deref())?;
+        let tab = match self.active_tab().await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_err(e)),
+        };
+        let out = {
+            let guard = tab.net_buf.lock().unwrap();
+            format_api_calls(
+                &guard,
+                limit.unwrap_or(50),
+                filter.as_deref(),
+                include_auth.unwrap_or(false),
+                fmt,
+            )
+        };
+        Ok(tool_ok(out))
+    }
+
     #[tool(description = "Evaluate a JavaScript expression in the active tab and return JSON.")]
     async fn evaluate(
         &self,
@@ -1095,9 +1338,9 @@ impl ServerHandler for FluxwrightMcp {
             .with_instructions(
                 "Fluxwright Chromium fleet. Tools: open, goto, title, content, snapshot, markdown, \
                  click, hover, fill, press, select, scroll, wait_for, back, forward, tabs, \
-                 console, network, evaluate, screenshot, close. \
-                 Each open() starts a fresh browser context. Use snapshot() for @eN element refs \
-                 (pass @eN as selector in click/hover/fill/press/select/scroll/wait_for) and \
+                 console, network, export_api_calls, evaluate, screenshot, close. \
+                 Each open() starts a fresh browser context. Use snapshot() for @eN (or @eN@rK) element refs \
+                 (pass @eN or @eN@rK as selector in click/hover/fill/press/select/scroll/wait_for) and \
                  markdown() for clean text extraction before falling back to content() or screenshot().",
             )
     }
@@ -1571,6 +1814,12 @@ mod tests {
             method: "GET".into(),
             url: "https://example.com/api/items".into(),
             resource_type: "fetch".into(),
+            request_headers: vec![
+                ("accept".into(), "application/json".into()),
+                ("authorization".into(), "Bearer secret-jwt".into()),
+            ],
+            post_data: None,
+            response_content_type: Some("application/json; charset=utf-8".into()),
             status: Some(200),
             failed: None,
         });
@@ -1579,6 +1828,15 @@ mod tests {
             method: "POST".into(),
             url: "https://example.com/auth".into(),
             resource_type: "xhr".into(),
+            request_headers: vec![
+                ("cookie".into(), "sid=abc".into()),
+                ("x-api-key".into(), "key-123".into()),
+                ("proxy-authorization".into(), "Basic xyz".into()),
+                ("set-cookie".into(), "a=b".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+            post_data: Some("{\"user\":\"bob's\"}".into()),
+            response_content_type: None,
             status: None,
             failed: Some("net::ERR_FAILED".into()),
         });
@@ -1587,7 +1845,21 @@ mod tests {
             method: "GET".into(),
             url: "https://example.com/app.js".into(),
             resource_type: "script".into(),
+            request_headers: Vec::new(),
+            post_data: None,
+            response_content_type: Some("application/javascript".into()),
             status: Some(304),
+            failed: None,
+        });
+        records.push_back(NetRecord {
+            id: "4".into(),
+            method: "POST".into(),
+            url: "https://example.com/graphql".into(),
+            resource_type: "other".into(),
+            request_headers: Vec::new(),
+            post_data: Some("{\"query\":\"{ viewer { id } }\"}".into()),
+            response_content_type: Some("application/graphql-response+json".into()),
+            status: Some(200),
             failed: None,
         });
 
@@ -1596,7 +1868,7 @@ mod tests {
         assert!(!filtered.contains("app.js"));
 
         let limited = format_net_records(&records, 1, None);
-        assert!(limited.contains("app.js -> 304"));
+        assert!(limited.contains("graphql -> 200"));
         assert!(!limited.contains("items"));
 
         assert_eq!(resolve_switch_index(2, Some(1)).unwrap(), 1);
@@ -1607,6 +1879,85 @@ mod tests {
         assert_eq!(resolve_close_indices(2, 1, None).unwrap(), (1, 0));
         assert_eq!(resolve_close_indices(1, 0, None).unwrap(), (0, 0));
         assert!(resolve_close_indices(1, 0, Some(1)).is_err());
+
+        // export_api_calls keeps xhr/fetch or json/graphql content-type and redacts sensitive headers by default.
+        let json_redacted = format_api_calls(&records, 50, None, false, ExportFormat::Json);
+        let parsed: serde_json::Value = serde_json::from_str(&json_redacted).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 3, "expected script/app.js excluded: {parsed}");
+        assert_eq!(arr[0]["url"], "https://example.com/api/items");
+        assert_eq!(arr[0]["headers"]["authorization"], "[REDACTED]");
+        assert_eq!(arr[0]["headers"]["accept"], "application/json");
+        assert_eq!(arr[0]["content_type"], "application/json; charset=utf-8");
+        assert_eq!(arr[1]["headers"]["cookie"], "[REDACTED]");
+        assert_eq!(arr[1]["headers"]["x-api-key"], "[REDACTED]");
+        assert_eq!(arr[1]["headers"]["proxy-authorization"], "[REDACTED]");
+        assert_eq!(arr[1]["headers"]["set-cookie"], "[REDACTED]");
+        assert_eq!(arr[1]["headers"]["content-type"], "application/json");
+        assert_eq!(arr[1]["failed"], "net::ERR_FAILED");
+        assert_eq!(arr[2]["url"], "https://example.com/graphql");
+
+        // include_auth=true exposes raw sensitive headers.
+        let json_raw = format_api_calls(&records, 50, Some("items"), true, ExportFormat::Json);
+        let parsed_raw: serde_json::Value = serde_json::from_str(&json_raw).unwrap();
+        assert_eq!(parsed_raw.as_array().unwrap().len(), 1);
+        assert_eq!(parsed_raw[0]["headers"]["authorization"], "Bearer secret-jwt");
+
+        // curl format shell-escapes single quotes cleanly and preserves redaction.
+        let curl_out = format_api_calls(&records, 50, Some("auth"), false, ExportFormat::Curl);
+        assert!(curl_out.contains("curl -X 'POST' 'https://example.com/auth'"), "{curl_out}");
+        assert!(curl_out.contains("-H 'cookie: [REDACTED]'"), "{curl_out}");
+        assert!(curl_out.contains("--data-raw '{\"user\":\"bob'\\''s\"}'"), "{curl_out}");
+
+        // Empty / invalid format handling.
+        assert_eq!(format_api_calls(&records, 50, Some("no-match"), false, ExportFormat::Json), "[]");
+        assert!(matches!(parse_export_format(None), Ok(ExportFormat::Json)));
+        assert!(matches!(parse_export_format(Some("json")), Ok(ExportFormat::Json)));
+        assert!(matches!(parse_export_format(Some("curl")), Ok(ExportFormat::Curl)));
+        assert!(parse_export_format(Some("har")).is_err());
+    }
+
+    #[test]
+    fn record_net_event_captures_and_bounds_headers_post_data_and_content_type() {
+        use fluxwright::NetRequest;
+
+        let buf = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let huge = "x".repeat(12_000);
+        let many_headers: Vec<(String, String)> = (0..80)
+            .map(|i| (format!("x-h-{i}"), huge.clone()))
+            .collect();
+        let req = NetRequest {
+            id: "req-1".into(),
+            url: "https://example.com/api".into(),
+            method: "POST".into(),
+            headers: many_headers,
+            post_data: Some(huge),
+            resource_type: "fetch".into(),
+        };
+        record_net_event(&buf, NetEvent::Request(req));
+
+        record_net_event(
+            &buf,
+            NetEvent::Failed(
+                NetRequest {
+                    id: "req-2".into(),
+                    url: "https://example.com/fail".into(),
+                    method: "GET".into(),
+                    headers: vec![("authorization".into(), "Bearer abc".into())],
+                    post_data: None,
+                    resource_type: "xhr".into(),
+                },
+                "net::ERR_ABORTED".into(),
+            ),
+        );
+
+        let guard = buf.lock().unwrap();
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard[0].request_headers.len(), MAX_NET_HEADER_PAIRS);
+        assert!(guard[0].request_headers[0].1.len() < 9000);
+        assert!(guard[0].post_data.as_ref().unwrap().len() < 9000);
+        assert_eq!(guard[1].failed.as_deref(), Some("net::ERR_ABORTED"));
+        assert_eq!(guard[1].request_headers.len(), 1);
     }
 
     #[test]
@@ -1617,6 +1968,7 @@ mod tests {
         assert!(serde_json::from_str::<ScrollArgs>("{}").is_ok());
         assert!(serde_json::from_str::<ConsoleArgs>("{}").is_ok());
         assert!(serde_json::from_str::<NetworkArgs>("{}").is_ok());
+        assert!(serde_json::from_str::<ExportApiCallsArgs>("{}").is_ok());
         assert!(serde_json::from_str::<ScreenshotArgs>("{}").is_ok());
 
         let snap: SnapshotArgs = serde_json::from_str(r#"{"diff":true,"interactive_only":true}"#).unwrap();
@@ -1958,7 +2310,8 @@ mod tests {
             .unwrap();
         let list_json = parse_first_sse_json(&list_bytes);
         let tools = list_json["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
+        assert!(tools.iter().any(|t| t["name"] == "export_api_calls"));
 
         let sid: Arc<str> = Arc::from(session_id.as_str());
         assert!(sessions.has_session(&sid).await.unwrap());
