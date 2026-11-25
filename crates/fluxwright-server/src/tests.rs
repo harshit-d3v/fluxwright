@@ -775,6 +775,7 @@ fn eviction_keeps_active_jobs() {
                 resource_preset: None,
                 block_resources: Vec::new(),
                 block_url_patterns: Vec::new(),
+                block_cookie_banners: false,
                 profile: None,
                 persist_profile: true,
                 proxy_session: None,
@@ -1297,7 +1298,8 @@ async fn validates_and_applies_resource_presets_and_block_rules() {
             "steps": [{ "action": "title" }],
             "resource_preset": "scraping",
             "block_resources": ["stylesheet"],
-            "block_url_patterns": ["**/tracker.js"]
+            "block_url_patterns": ["**/tracker.js"],
+            "block_cookie_banners": true
         }"#,
     )
     .unwrap();
@@ -1306,6 +1308,7 @@ async fn validates_and_applies_resource_presets_and_block_rules() {
     assert!(opts.block_images && opts.block_fonts && opts.block_media);
     assert!(opts.block_stylesheets);
     assert!(!opts.block_scripts);
+    assert!(opts.block_cookie_banners);
     assert_eq!(opts.block_url_patterns, vec!["**/tracker.js"]);
 
     let no_media: JobRequest = serde_json::from_str(

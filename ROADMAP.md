@@ -38,6 +38,10 @@ The goal is to be the best engine for running many browser jobs on your own mach
   - **Self-hosted Managed Cloud Sessions (`/v1/sessions`):** persistent, reconnectable Chrome sessions with server-enforced TTLs (`POST /v1/sessions`, `GET /v1/sessions`, `GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/extend`, `DELETE /v1/sessions/{id}`, `GET /v1/sessions/{id}/cdp`), `keep_alive` disconnect survival, named profile reload/persistence, `resource_preset` blocking, `Emulation.setDeviceMetricsOverride` initial viewports, and paired signed Live View URLs (`live_view_url`).
   - **Synchronous Scrape & Render API (`POST /v1/scrape`):** single-request extraction returning any combination of `markdown`, `html`, `text`, `snapshot`, `screenshot` (with optional Set-of-Marks `annotate`), and `pdf` without entering the async `/v1/jobs` queue.
   - **Multi-arch GHCR Docker images:** automated `linux/amd64` + `linux/arm64` image publishing to `ghcr.io/harshit-d3v/fluxwright` alongside tag-gated npm/PyPI release workflows.
+- **0.13.0:**
+  - **Searchable Session Replay & Network/HAR/API Export:** `GET /v1/sessions/{id}/replay` (`nav`/`console`/`network`/`frame` events, optional `"record_frames": true` JPEG capture, 15-minute retained replay buffer), `GET /v1/sessions/{id}/network` (`json`/`har` 1.2 export, `api_only`, sensitive header redaction), and Managed Sessions UI modals in `/dashboard`.
+  - **Site Link Discovery (`POST /v1/map`) & Opt-in BYOB Sessions:** synchronous rendered link discovery (`same_origin`, `include_subdomains`, `search`, `limit`), plus opt-in `cdp_endpoint` on `POST /v1/sessions` via `--allow-session-cdp-endpoint`.
+  - **AI-Agent Guardrails & Observe-Once API Export:** `@eN@rK` snapshot revision guardrails (`AriaSnapshot.revision` across Rust, Node, Python, and `fluxwright-mcp`), `export_api_calls` MCP tool #22 (`json` / `curl`), `block_cookie_banners` CMP blocking preset across Core and `fluxwright-server`, and copy-paste Browser-Use / Stagehand / Vercel AI SDK adapters under `examples/adapters/`.
 
 ## Next: the fleet at scale
 

@@ -47,8 +47,8 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "--profiles-dir",
   },
   {
-    name: "Managed cloud sessions & CDP",
-    text: "Create TTL-backed, reconnectable browser sessions via /v1/sessions (keep_alive, profiles, resource presets, viewports, and Live View embeds) or connect Playwright and Puppeteer straight to GET /cdp.",
+    name: "Managed sessions, Replay & BYOB",
+    text: "TTL-backed reconnectable sessions (/v1/sessions), searchable Replay & HAR/API export (/replay, /network), Live View embeds, Dashboard modals, opt-in BYOB cdp_endpoint, and pooled GET /cdp.",
     api: "POST /v1/sessions",
   },
   {
@@ -57,13 +57,13 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "/v1/live/{id}/embed",
   },
   {
-    name: "Sync /v1/scrape, HTTP server & cluster",
-    text: "One-shot synchronous POST /v1/scrape (markdown, html, text, snapshot, screenshot, pdf), async /v1/jobs with HMAC webhooks, OTLP traces, Prometheus /metrics, SQLite --store, GHCR multi-arch Docker, and fluxwright coordinate clusters.",
+    name: "Sync /v1/scrape, /v1/map & cluster",
+    text: "One-shot POST /v1/scrape and /v1/map link discovery with block_cookie_banners, async /v1/jobs with HMAC webhooks, OTLP traces, Prometheus /metrics, SQLite --store, GHCR multi-arch Docker, and fluxwright coordinate clusters.",
     api: "POST /v1/scrape",
   },
   {
     name: "Built for AI agents",
-    text: "21-tool MCP server over stdio or Streamable HTTP (--http) with per-session isolation, diff-only @eN ARIA snapshots, Set-of-Marks annotated screenshots, and clean Markdown extraction.",
+    text: "22-tool MCP server (--http or stdio) with @eN@rK snapshot revision guardrails, Set-of-Marks screenshots, export_api_calls (JSON/curl), Markdown extraction, and Browser-Use / Stagehand / AI SDK adapters.",
     api: "fluxwright-mcp --http",
   },
 ];
@@ -233,7 +233,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.12.0, open source under Apache-2.0. Prebuilt for Windows (x64 &amp; ARM64), macOS, and Linux (x64, ARM64 &amp; static musl) on npm, PyPI, GHCR, and GitHub Releases.
+              Version 0.13.0, open source under Apache-2.0. Prebuilt for Windows (x64 &amp; ARM64), macOS, and Linux (x64, ARM64 &amp; static musl) on npm, PyPI, GHCR, and GitHub Releases.
             </p>
           </div>
           <FleetBoard />

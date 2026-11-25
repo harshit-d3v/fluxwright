@@ -198,14 +198,14 @@ The `start` / `stats` / `browsers` control channel is a Unix socket, or `\\.\pip
 
 ### HTTP server
 
-`fluxwright serve` owns a fleet and accepts both one-shot synchronous scrapes (`POST /v1/scrape` returning `markdown`, `html`, `text`, `snapshot`, `screenshot`, and `pdf` in a single request) and async JSON browser jobs (`POST /v1/jobs`, `GET /v1/jobs/{id}`, `DELETE /v1/jobs/{id}`), as well as TTL-backed Managed Cloud Sessions (`POST /v1/sessions`, reconnectable `GET /v1/sessions/{id}/cdp`, and paired signed Live Views). It defaults
+`fluxwright serve` owns a fleet and accepts both one-shot synchronous scrapes & site discovery (`POST /v1/scrape` returning `markdown`, `html`, `text`, `snapshot`, `screenshot`, and `pdf`; `POST /v1/map` for rendered link discovery), async JSON browser jobs (`POST /v1/jobs`, `GET /v1/jobs/{id}`, `DELETE /v1/jobs/{id}`), and TTL-backed Managed Cloud Sessions (`POST /v1/sessions`, reconnectable `GET /v1/sessions/{id}/cdp`, searchable `GET /v1/sessions/{id}/replay`, HAR/API `GET /v1/sessions/{id}/network`, paired signed Live Views, and opt-in BYOB `cdp_endpoint` via `--allow-session-cdp-endpoint`, plus `block_cookie_banners`). It defaults
 to `127.0.0.1:7331` and requires `FLUXWRIGHT_SERVER_TOKEN` (a random token of 32–256 printable
 ASCII characters). Pass `--cdp-endpoint <url>` to connect to an existing browser over CDP instead
 of launching local Chrome (one connection; set concurrency with `--max-contexts`). This is a
 trusted-operator API, not a public multi-tenant service.
 
 See [the HTTP server guide](docs/SERVER.md) for startup commands, authentication, job steps,
-limits, and deployment precautions.
+limits, and deployment precautions, and [agent framework adapters](examples/adapters/README.md) for Browser-Use, Stagehand, and Vercel AI SDK starters.
 
 #### Docker quickstart
 
