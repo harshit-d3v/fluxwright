@@ -86,6 +86,7 @@ Additional server operations flags on `fluxwright serve` (also available on `flu
 - `--otlp-endpoint <url>` / `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP/HTTP JSON trace collector base URL (`POST <base>/v1/traces`).
 - `--otlp-service-name <name>` / `OTEL_SERVICE_NAME`: `service.name` resource attribute on exported OTLP spans (default `fluxwright-server`).
 - `--embed-frame-ancestors <policy>`: `Content-Security-Policy` `frame-ancestors` directive served on `GET /embed/live/{token}` (`fluxwright serve` only; default `*`).
+- `--allow-session-cdp-endpoint`: opt-in flag enabling per-session `"cdp_endpoint"` (BYOB external browser) on `POST /v1/sessions` (`fluxwright serve` only; disabled by default).
 `--max-contexts` defaults to 8 per browser. Ctrl+C (and SIGTERM on Unix) stops admission,
 cancels outstanding jobs, and shuts down Chrome, allowing up to 10 seconds for lease cleanup.
 The existing local `start` / `stats` / `browsers` commands are unchanged: the HTTP server is a
@@ -302,9 +303,12 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | POST | `/v1/sessions/{id}/extend` | Bearer token | Reset a managed session's expiration TTL (`10..=3600`s) (standalone only) |
 | DELETE | `/v1/sessions/{id}` | Bearer token | Close a managed session, persist profile cookies if enabled, and dispose its context (standalone only) |
 | GET (WS) | `/v1/sessions/{id}/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Connect or reconnect (`keep_alive: true`) over CDP to an existing managed session (`409` if already connected) (standalone only) |
+| GET | `/v1/sessions/{id}/replay` | Bearer token | Searchable session replay timeline (`?q=`, `?kind=`, `?include_frames=`) for active or recently closed sessions (standalone only) |
+| GET | `/v1/sessions/{id}/network` | Bearer token | Export recorded session network/API requests (`?filter=`, `?api_only=`, `?format=json\|har`, `?include_auth=`) (standalone only) |
 | POST | `/v1/scrape` | Bearer token | Synchronously navigate and extract `markdown`, `html`, `text`, `snapshot`, `screenshot`, and/or `pdf` in one HTTP call (standalone only) |
+| POST | `/v1/map` | Bearer token | Synchronously discover and filter deduplicated `http:`/`https:` links on a page (standalone only) |
 
-The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp`, `/json/version`, and `/v1/sessions/{id}/cdp`, never `/v1/jobs*`, `/v1/sessions`, `/v1/scrape`, or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally. Browser `/dashboard` live streams authenticate WebSocket upgrades with single-use `?ticket=` tokens from `POST /v1/live/{id}/ticket`, while iframe embeds authenticate `GET /embed/live/{token}` and `/v1/live/{id}/ws?embed={token}` with capability tokens minted by `POST /v1/live/{id}/embed`.
+The token is accepted only in the `Authorization` header by default (`--allow-query-token` unlocks `?token=` solely on `/cdp`, `/json/version`, and `/v1/sessions/{id}/cdp`, never `/v1/jobs*`, `/v1/sessions`, `/v1/sessions/*/replay`, `/v1/sessions/*/network`, `/v1/scrape`, `/v1/map`, or `/metrics`), so proxy access logs and `Referer` headers do not retain tokens accidentally. Browser `/dashboard` live streams authenticate WebSocket upgrades with single-use `?ticket=` tokens from `POST /v1/live/{id}/ticket`, while iframe embeds authenticate `GET /embed/live/{token}` and `/v1/live/{id}/ws?embed={token}` with capability tokens minted by `POST /v1/live/{id}/embed`.
 
 ## Managed cloud browser sessions (`/v1/sessions`)
 
@@ -319,11 +323,27 @@ curl -sS -X POST http://127.0.0.1:7331/v1/sessions \
     "keep_alive": true,
     "profile": "account_1",
     "viewport": { "width": 1280, "height": 720 },
-    "live_view_mode": "interactive"
+    "live_view_mode": "interactive",
+    "record_frames": true
   }'
 ```
 
-Returns `201 Created` with `{ "id", "status", "cdp_ws_url", "cdp_path", "live_view_url", "live_view_mode", "keep_alive", "connected", "url", "profile", "proxy_session", "created_at", "expires_at", "ttl_secs" }`. With `"keep_alive": true`, disconnecting the CDP WebSocket detaches only the client while preserving pages, cookies, and storage so a subsequent worker can reconnect until `ttl_secs` expires or `DELETE /v1/sessions/{id}` runs.
+Returns `201 Created` with `{ "id", "status", "cdp_ws_url", "cdp_path", "live_view_url", "live_view_mode", "keep_alive", "connected", "url", "profile", "proxy_session", "record_frames", "byob", "created_at", "expires_at", "ttl_secs" }`. With `"keep_alive": true`, disconnecting the CDP WebSocket detaches only the client while preserving pages, cookies, and storage so a subsequent worker can reconnect until `ttl_secs` expires or `DELETE /v1/sessions/{id}` runs.
+
+### Opt-in BYOB (`cdp_endpoint`)
+
+Start `fluxwright serve --allow-session-cdp-endpoint` to let `POST /v1/sessions` attach a single-use session to a caller-supplied external browser (`ws://`, `wss://`, `http://`, or `https://`), such as a local stealth browser (Patchright/Camoufox/Chrome):
+
+- **Fail-closed default:** When `--allow-session-cdp-endpoint` is off, supplying `"cdp_endpoint"` returns `403` (`byob_disabled`).
+- **SSRF boundary:** Permits loopback (`localhost`, `127.0.0.1`, `::1`) while blocking cloud metadata (`169.254.0.0/16`, `metadata.google.internal`), link-local (`fe80::/10`), and private RFC 1918 / ULA IP ranges unless `FLUXWRIGHT_SERVER_ANY_URL=1` is set.
+- **Isolation:** Closing or expiring a BYOB session disposes only its created browser context and shuts down the temporary CDP client without terminating the external browser process.
+
+### Session replay timeline & Network/API inspector
+
+Every managed session maintains bounded replay and network logs (and retains up to `32` closed sessions for `15` minutes / `900s` after `DELETE` or TTL expiry):
+
+- **Replay timeline (`GET /v1/sessions/{id}/replay`):** Supports `?q=<substring>`, `?kind=nav|console|network|frame`, and `?include_frames=true|false` (default `true`). Timeline buffer caps at `256` events; when `"record_frames": true`, top-level navigations capture throttled JPEG screenshots (`quality: 45`, capped at `40` frames and `2 MiB` base64 per session).
+- **Network & HAR export (`GET /v1/sessions/{id}/network`):** Supports `?filter=<substring>`, `?api_only=true|false` (`xhr`/`fetch` or `json`/`graphql` response content types), `?format=json|har` (HAR 1.2), and `?include_auth=true|false` (default `false`). Sensitive headers (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `proxy-authorization`) are redacted to `"[REDACTED]"` unless `include_auth=true`.
 
 ## Synchronous one-shot scrape (`POST /v1/scrape`)
 
@@ -342,6 +362,25 @@ curl -sS -X POST http://127.0.0.1:7331/v1/scrape \
 ```
 
 Supports `formats` entries `"markdown"`, `"html"`, `"text"`, `"snapshot"`, `"screenshot"`, and `"pdf"`, optional `wait_until` / `wait_for_selector`, `profile` / `proxy_session`, `screenshot_full_page` / `screenshot_annotate`, and `snapshot_interactive_only`. Enforces the same SSRF guards and 1 MiB result size cap as `/v1/jobs`.
+
+## Synchronous site link discovery (`POST /v1/map`)
+
+Discover deduplicated `http:`/`https:` links from a rendered page in one call:
+
+```bash
+curl -sS -X POST http://127.0.0.1:7331/v1/map \
+  -H "Authorization: Bearer $FLUXWRIGHT_SERVER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://example.com",
+    "same_origin": true,
+    "include_subdomains": false,
+    "search": "docs",
+    "limit": 100
+  }'
+```
+
+Supports `same_origin` (default `true`), `include_subdomains` (default `false`), case-insensitive `search` substring filter, `limit` (`1..=1000`, default `100`), `wait_until`, `timeout_ms` (`1..=120000`, default `30000`), `resource_preset`, `profile`, and `proxy_session`. Returns `{ "url", "count", "links", "duration_ms" }` and enforces the same SSRF checks as `/v1/jobs` and `/v1/scrape`.
 
 ## Live screencast viewer & human-in-the-loop
 
@@ -443,7 +482,7 @@ Exported metrics include:
 
 A standalone, accessible (WCAG AA compliant) HTML/CSS/JS dashboard is served directly at `/dashboard` and `/`. It requires no node/npm build toolchain or external CDN connections, supporting both light and dark color schemes.
 
-Opening the dashboard in a browser displays real-time fleet health, active leases, queue depth, browser reuse rate, memory utilization, and an auto-updating tabular view of recent jobs. If unauthenticated, a native modal dialog prompts for the server token, which is stored in `sessionStorage` and used to subscribe to the live event stream.
+Opening the dashboard in a browser displays real-time fleet health, active leases, queue depth, browser reuse rate, memory utilization, **Managed Sessions** (with **Live**, searchable **Replay**, and **Network / API** JSON/HAR inspector modals for active and retained sessions), and an auto-updating tabular view of recent jobs. If unauthenticated, a native modal dialog prompts for the server token, which is stored in `sessionStorage` and used to subscribe to the live event stream.
 
 ### Server-Sent Events stream (`GET /v1/events`)
 
@@ -453,6 +492,7 @@ Every 1000 ms, the server emits an event named `snapshot` with a JSON payload co
 - `fleet`: Current engine `MetricsSnapshot` (active leases, browsers, contexts, pages, memory, recycle/crash counts, reuse rate).
 - `server`: Current job totals (`queued_jobs`, `running_jobs`, `succeeded_jobs`, `failed_jobs`, `cancelled_jobs`, `max_jobs`).
 - `live_sessions`: Active live browser sessions (`id`, `kind`, `url`, `started_at`, `paused`, `pause_reason`, `can_pause`).
+- `managed_sessions`: Active and recently retained closed managed sessions (`id`, `status`, `url`, `keep_alive`, `connected`, `byob`, `record_frames`, `created_at`, `expires_at`, `closed_at`, `event_count`, `network_count`, `frame_count`).
 - `jobs`: The 100 most recent job records, newest first, with `id`, `status`, `submitted_at`, `started_at`, `finished_at`, `attempts`, `step_index`, `error`, `trace_id`, `live`, and `paused` (the counts in `server` cover every retained job).
 
 ### Distributed tracing (W3C TraceContext & OpenTelemetry)

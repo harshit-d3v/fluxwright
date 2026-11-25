@@ -132,7 +132,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     .status-dot.connected { background: var(--success); }
     .status-dot.disconnected { background: var(--danger); }
     .controls { display: flex; gap: 0.75rem; align-items: center; }
-    button, input {
+    button, input, select {
       font-family: inherit;
       font-size: 0.875rem;
       padding: 0.5rem 0.875rem;
@@ -147,7 +147,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       transition: background-color 0.15s, border-color 0.15s;
     }
     button:hover { border-color: var(--primary); }
-    button:focus-visible, input:focus-visible {
+    button:focus-visible, input:focus-visible, select:focus-visible {
       outline: 2px solid var(--primary);
       outline-offset: 2px;
     }
@@ -276,7 +276,13 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     #auth-dialog form { display: flex; flex-direction: column; gap: 1rem; }
     .badge-paused { background: #a855f733; color: #c084fc; }
     .badge-live { background: #22c55e33; color: #4ade80; }
-    #live-dialog {
+    .badge-active { background: #22c55e22; color: var(--success); }
+    .badge-closing { background: #f59e0b22; color: var(--warning); }
+    .badge-closed { background: #6b728022; color: var(--text-muted); }
+    .badge-byob { background: #38bdf822; color: var(--primary); }
+    .badge-err { background: #ef444422; color: var(--danger); }
+    .action-group { display: inline-flex; gap: 0.375rem; flex-wrap: wrap; }
+    #live-dialog, #replay-dialog, #network-dialog {
       margin: auto;
       background: var(--card-bg);
       color: var(--text);
@@ -287,9 +293,73 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       max-height: 92vh;
       padding: 0;
     }
-    #live-dialog[open] {
+    #live-dialog[open], #replay-dialog[open], #network-dialog[open] {
       display: flex;
       flex-direction: column;
+    }
+    .modal-filters {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.625rem 1rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .modal-scroll {
+      flex: 1;
+      min-height: 300px;
+      overflow: auto;
+      padding: 0.875rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.625rem;
+    }
+    .replay-item {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.625rem 0.75rem;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      gap: 0.375rem;
+    }
+    .replay-item-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8125rem;
+    }
+    .replay-thumb {
+      max-width: 360px;
+      max-height: 220px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      margin-top: 0.25rem;
+      display: block;
+    }
+    .net-details summary {
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8125rem;
+    }
+    .net-details summary:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+    .net-kv {
+      margin-top: 0.5rem;
+      padding-top: 0.5rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.75rem;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     .live-toolbar {
       display: flex;
@@ -454,6 +524,27 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
+    <section id="managed-section" hidden aria-labelledby="managed-heading" style="margin-bottom: 1.5rem;">
+      <div class="table-container">
+        <table>
+          <caption id="managed-heading">Managed Sessions</caption>
+          <thead>
+            <tr>
+              <th scope="col">Session ID</th>
+              <th scope="col">Status</th>
+              <th scope="col">URL</th>
+              <th scope="col">Activity</th>
+              <th scope="col">Age</th>
+              <th scope="col">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="managed-body">
+            <tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 1.5rem;">No managed sessions recorded.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section aria-labelledby="jobs-heading">
       <div class="table-container">
         <table>
@@ -510,6 +601,70 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <div id="live-stage" class="live-stage" tabindex="0" aria-label="Live browser viewport; click and type when interactive mode is enabled">
       <img id="live-frame" alt="Live browser viewport" draggable="false" hidden>
       <div id="live-empty" style="color: var(--text-muted); padding: 2rem;">Connecting live stream...</div>
+    </div>
+  </dialog>
+
+  <dialog id="replay-dialog" aria-labelledby="replay-title">
+    <div class="live-toolbar">
+      <div class="live-meta-group">
+        <h2 id="replay-title" style="font-size: 1rem; font-weight: 600;">Session Replay</h2>
+        <span id="replay-meta" class="mono" style="color: var(--text-muted); font-size: 0.75rem;"></span>
+      </div>
+      <div class="live-actions">
+        <button type="button" id="btn-replay-close" class="btn-sm" autofocus>Close</button>
+      </div>
+    </div>
+    <form id="replay-filter-form" class="modal-filters">
+      <label for="replay-search" class="visually-hidden">Search replay timeline</label>
+      <input type="search" id="replay-search" placeholder="Search URL, console, summary..." style="flex: 1; min-width: 200px;">
+      <label for="replay-kind" class="visually-hidden">Event kind</label>
+      <select id="replay-kind">
+        <option value="">All kinds</option>
+        <option value="nav">nav</option>
+        <option value="console">console</option>
+        <option value="network">network</option>
+        <option value="frame">frame</option>
+      </select>
+      <label style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8125rem; cursor: pointer;">
+        <input type="checkbox" id="replay-include-frames" checked>
+        Include frames
+      </label>
+      <button type="submit" class="btn-sm">Apply</button>
+    </form>
+    <div id="replay-body" class="modal-scroll">
+      <div id="replay-status" style="color: var(--text-muted); font-size: 0.875rem;">Loading replay...</div>
+      <div id="replay-events" style="display: flex; flex-direction: column; gap: 0.5rem;"></div>
+    </div>
+  </dialog>
+
+  <dialog id="network-dialog" aria-labelledby="network-title">
+    <div class="live-toolbar">
+      <div class="live-meta-group">
+        <h2 id="network-title" style="font-size: 1rem; font-weight: 600;">Network / API Inspector</h2>
+        <span id="network-meta" class="mono" style="color: var(--text-muted); font-size: 0.75rem;"></span>
+      </div>
+      <div class="live-actions">
+        <button type="button" id="btn-network-copy-json" class="btn-sm">Copy JSON</button>
+        <button type="button" id="btn-network-copy-har" class="btn-sm">Copy HAR</button>
+        <button type="button" id="btn-network-close" class="btn-sm" autofocus>Close</button>
+      </div>
+    </div>
+    <form id="network-filter-form" class="modal-filters">
+      <label for="network-filter" class="visually-hidden">Filter network URLs</label>
+      <input type="search" id="network-filter" placeholder="Filter URL substring..." style="flex: 1; min-width: 200px;">
+      <label style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8125rem; cursor: pointer;">
+        <input type="checkbox" id="network-api-only">
+        API only
+      </label>
+      <label style="display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8125rem; cursor: pointer;">
+        <input type="checkbox" id="network-include-auth">
+        Include auth headers
+      </label>
+      <button type="submit" class="btn-sm">Apply</button>
+    </form>
+    <div id="network-body" class="modal-scroll">
+      <div id="network-status" style="color: var(--text-muted); font-size: 0.875rem;">Loading network activity...</div>
+      <div id="network-entries" style="display: flex; flex-direction: column; gap: 0.5rem;"></div>
     </div>
   </dialog>
 
@@ -662,6 +817,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
         renderWorkers(data);
         renderLiveSessions(data);
+        renderManagedSessions(data);
 
         const tbody = document.getElementById('jobs-body');
         const jobs = data.jobs || [];
@@ -810,6 +966,108 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           btn.dataset.liveId = String(s.id || '');
           btn.textContent = 'Watch Live';
           tdAction.appendChild(btn);
+          tr.appendChild(tdAction);
+
+          body.appendChild(tr);
+        }
+      }
+
+      function renderManagedSessions(data) {
+        const section = document.getElementById('managed-section');
+        const body = document.getElementById('managed-body');
+        const sessions = Array.isArray(data.managed_sessions) ? data.managed_sessions : [];
+        section.hidden = sessions.length === 0;
+        if (sessions.length === 0) return;
+
+        body.textContent = '';
+        const nowMs = Date.now();
+        for (const s of sessions) {
+          const tr = document.createElement('tr');
+
+          const tdId = document.createElement('td');
+          tdId.className = 'mono';
+          tdId.textContent = String(s.id || '');
+          if (s.byob) {
+            const byobBadge = document.createElement('span');
+            byobBadge.className = 'badge badge-byob';
+            byobBadge.style.marginLeft = '0.35rem';
+            byobBadge.textContent = 'BYOB';
+            tdId.appendChild(byobBadge);
+          }
+          if (s.record_frames) {
+            const recBadge = document.createElement('span');
+            recBadge.className = 'badge badge-paused';
+            recBadge.style.marginLeft = '0.35rem';
+            recBadge.textContent = 'REC';
+            tdId.appendChild(recBadge);
+          }
+          tr.appendChild(tdId);
+
+          const tdStatus = document.createElement('td');
+          const stBadge = document.createElement('span');
+          const st = s.status === 'active' || s.status === 'closing' || s.status === 'closed' ? s.status : 'closed';
+          stBadge.className = 'badge badge-' + st;
+          stBadge.textContent = st;
+          tdStatus.appendChild(stBadge);
+          if (st === 'active' && s.connected) {
+            const connBadge = document.createElement('span');
+            connBadge.className = 'badge badge-byob';
+            connBadge.style.marginLeft = '0.35rem';
+            connBadge.textContent = 'CDP';
+            tdStatus.appendChild(connBadge);
+          }
+          tr.appendChild(tdStatus);
+
+          const tdUrl = document.createElement('td');
+          tdUrl.className = 'mono';
+          tdUrl.style.maxWidth = '320px';
+          tdUrl.style.overflow = 'hidden';
+          tdUrl.style.textOverflow = 'ellipsis';
+          tdUrl.style.whiteSpace = 'nowrap';
+          const urlText = String(s.url || 'about:blank');
+          tdUrl.textContent = urlText;
+          tdUrl.title = urlText;
+          tr.appendChild(tdUrl);
+
+          const tdAct = document.createElement('td');
+          tdAct.className = 'mono';
+          tdAct.textContent =
+            (s.event_count || 0) + ' ev \u00b7 ' +
+            (s.network_count || 0) + ' req \u00b7 ' +
+            (s.frame_count || 0) + ' img';
+          tr.appendChild(tdAct);
+
+          const tdAge = document.createElement('td');
+          const ageSec = Math.max(0, Math.round((nowMs - (s.created_at || nowMs)) / 1000));
+          tdAge.textContent = s.closed_at ? (ageSec + 's (retained)') : (ageSec + 's');
+          tr.appendChild(tdAge);
+
+          const tdAction = document.createElement('td');
+          const grp = document.createElement('div');
+          grp.className = 'action-group';
+          if (st === 'active') {
+            const liveBtn = document.createElement('button');
+            liveBtn.type = 'button';
+            liveBtn.className = 'btn-sm';
+            liveBtn.dataset.liveId = String(s.id || '');
+            liveBtn.textContent = 'Live';
+            grp.appendChild(liveBtn);
+          }
+          const replayBtn = document.createElement('button');
+          replayBtn.type = 'button';
+          replayBtn.className = 'btn-sm';
+          replayBtn.dataset.replayId = String(s.id || '');
+          replayBtn.textContent = 'Replay';
+          grp.appendChild(replayBtn);
+
+          const netBtn = document.createElement('button');
+          netBtn.type = 'button';
+          netBtn.className = 'btn-sm';
+          netBtn.dataset.networkId = String(s.id || '');
+          netBtn.textContent = 'Network / API';
+          grp.appendChild(netBtn);
+
+          tdAction.appendChild(grp);
           tr.appendChild(tdAction);
 
           body.appendChild(tr);
@@ -1048,10 +1306,331 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
 
       document.querySelector('main').addEventListener('click', function (e) {
-        const btn = e.target && e.target.closest ? e.target.closest('button[data-live-id]') : null;
-        if (!btn) return;
-        const sid = btn.dataset.liveId;
-        if (sid) openLiveViewer(sid);
+        if (!e.target || !e.target.closest) return;
+        const liveBtn = e.target.closest('button[data-live-id]');
+        if (liveBtn && liveBtn.dataset.liveId) {
+          openLiveViewer(liveBtn.dataset.liveId);
+          return;
+        }
+        const replayBtn = e.target.closest('button[data-replay-id]');
+        if (replayBtn && replayBtn.dataset.replayId) {
+          openReplayModal(replayBtn.dataset.replayId);
+          return;
+        }
+        const netBtn = e.target.closest('button[data-network-id]');
+        if (netBtn && netBtn.dataset.networkId) {
+          openNetworkModal(netBtn.dataset.networkId);
+        }
+      });
+
+      const replayDialog = document.getElementById('replay-dialog');
+      const replayTitle = document.getElementById('replay-title');
+      const replayMeta = document.getElementById('replay-meta');
+      const replaySearch = document.getElementById('replay-search');
+      const replayKind = document.getElementById('replay-kind');
+      const replayIncludeFrames = document.getElementById('replay-include-frames');
+      const replayStatus = document.getElementById('replay-status');
+      const replayEvents = document.getElementById('replay-events');
+      let activeReplayId = null;
+      let replayReqSeq = 0;
+
+      function formatTs(ts) {
+        if (!ts) return '';
+        try { return new Date(ts).toISOString().slice(11, 23); } catch (_) { return String(ts); }
+      }
+
+      async function loadReplay() {
+        if (!activeReplayId || !token) return;
+        const reqSeq = ++replayReqSeq;
+        const params = new URLSearchParams();
+        if (replaySearch.value.trim()) params.set('q', replaySearch.value.trim());
+        if (replayKind.value) params.set('kind', replayKind.value);
+        params.set('include_frames', replayIncludeFrames.checked ? 'true' : 'false');
+        replayStatus.textContent = 'Loading replay...';
+        replayEvents.textContent = '';
+        try {
+          const res = await fetch('/v1/sessions/' + encodeURIComponent(activeReplayId) + '/replay?' + params.toString(), {
+            headers: { Authorization: 'Bearer ' + token },
+            cache: 'no-store',
+          });
+          if (reqSeq !== replayReqSeq || !replayDialog.open) return;
+          if (res.status === 401) {
+            replayDialog.close();
+            askForToken();
+            return;
+          }
+          if (!res.ok) {
+            replayStatus.textContent = 'Replay unavailable (' + res.status + ').';
+            return;
+          }
+          const data = await res.json();
+          if (reqSeq !== replayReqSeq || !replayDialog.open) return;
+          replayEvents.textContent = '';
+          const list = Array.isArray(data.events) ? data.events : [];
+          replayMeta.textContent = String(data.status || '') + ' \u00b7 ' + String(data.url || 'about:blank');
+          replayStatus.textContent = 'Showing ' + list.length + ' of ' + (data.total_events || 0) + ' events';
+          for (const ev of list) {
+            const card = document.createElement('div');
+            card.className = 'replay-item';
+
+            const head = document.createElement('div');
+            head.className = 'replay-item-head';
+
+            const tsSpan = document.createElement('span');
+            tsSpan.className = 'mono';
+            tsSpan.style.color = 'var(--text-muted)';
+            tsSpan.textContent = formatTs(ev.ts);
+            head.appendChild(tsSpan);
+
+            const kindBadge = document.createElement('span');
+            kindBadge.className = 'badge badge-byob';
+            kindBadge.textContent = String(ev.kind || 'event');
+            head.appendChild(kindBadge);
+
+            const lvlBadge = document.createElement('span');
+            const lvl = String(ev.level || 'info');
+            lvlBadge.className = lvl === 'error' ? 'badge badge-err' : (lvl === 'warn' ? 'badge badge-closing' : 'badge badge-closed');
+            lvlBadge.textContent = lvl;
+            head.appendChild(lvlBadge);
+
+            if (ev.status != null) {
+              const stBadge = document.createElement('span');
+              stBadge.className = 'badge ' + (ev.status >= 500 ? 'badge-err' : (ev.status >= 400 ? 'badge-closing' : 'badge-active'));
+              stBadge.textContent = String(ev.status);
+              head.appendChild(stBadge);
+            }
+
+            if (ev.url) {
+              const urlSpan = document.createElement('span');
+              urlSpan.className = 'mono';
+              urlSpan.style.color = 'var(--text-muted)';
+              urlSpan.textContent = String(ev.url);
+              head.appendChild(urlSpan);
+            }
+            card.appendChild(head);
+
+            if (ev.summary) {
+              const sum = document.createElement('div');
+              sum.className = 'mono';
+              sum.textContent = String(ev.summary);
+              card.appendChild(sum);
+            }
+
+            if (ev.frame_base64) {
+              const img = document.createElement('img');
+              img.className = 'replay-thumb';
+              img.loading = 'lazy';
+              img.alt = 'Captured navigation frame for ' + String(ev.url || '');
+              img.src = 'data:image/jpeg;base64,' + ev.frame_base64;
+              card.appendChild(img);
+            }
+
+            replayEvents.appendChild(card);
+          }
+        } catch (err) {
+          replayStatus.textContent = 'Failed to load session replay.';
+        }
+      }
+
+      function openReplayModal(sessionId) {
+        if (!token) { askForToken(); return; }
+        activeReplayId = sessionId;
+        replayTitle.textContent = 'Session Replay: ' + sessionId.slice(0, 14);
+        replayMeta.textContent = '';
+        if (!replayDialog.open) replayDialog.showModal();
+        loadReplay();
+      }
+
+      document.getElementById('replay-filter-form').addEventListener('submit', function (e) {
+        e.preventDefault();
+        loadReplay();
+      });
+      replayKind.addEventListener('change', loadReplay);
+      replayIncludeFrames.addEventListener('change', loadReplay);
+      replaySearch.addEventListener('search', loadReplay);
+      document.getElementById('btn-replay-close').addEventListener('click', function () {
+        replayDialog.close();
+      });
+      replayDialog.addEventListener('close', function () {
+        replayReqSeq += 1;
+        activeReplayId = null;
+        replayEvents.textContent = '';
+      });
+
+      const networkDialog = document.getElementById('network-dialog');
+      const networkTitle = document.getElementById('network-title');
+      const networkMeta = document.getElementById('network-meta');
+      const networkFilter = document.getElementById('network-filter');
+      const networkApiOnly = document.getElementById('network-api-only');
+      const networkIncludeAuth = document.getElementById('network-include-auth');
+      const networkStatus = document.getElementById('network-status');
+      const networkEntries = document.getElementById('network-entries');
+      const copyJsonBtn = document.getElementById('btn-network-copy-json');
+      const copyHarBtn = document.getElementById('btn-network-copy-har');
+      let activeNetworkId = null;
+      let networkReqSeq = 0;
+
+      function networkQueryString(format) {
+        const params = new URLSearchParams();
+        if (networkFilter.value.trim()) params.set('filter', networkFilter.value.trim());
+        params.set('api_only', networkApiOnly.checked ? 'true' : 'false');
+        params.set('include_auth', networkIncludeAuth.checked ? 'true' : 'false');
+        params.set('format', format);
+        return params.toString();
+      }
+
+      function formatHeadersText(headers) {
+        if (!Array.isArray(headers) || headers.length === 0) return '(none)';
+        return headers.map(function (pair) { return String(pair[0] || '') + ': ' + String(pair[1] || ''); }).join('\n');
+      }
+
+      async function loadNetwork() {
+        if (!activeNetworkId || !token) return;
+        const reqSeq = ++networkReqSeq;
+        networkStatus.textContent = 'Loading network activity...';
+        networkEntries.textContent = '';
+        try {
+          const res = await fetch('/v1/sessions/' + encodeURIComponent(activeNetworkId) + '/network?' + networkQueryString('json'), {
+            headers: { Authorization: 'Bearer ' + token },
+            cache: 'no-store',
+          });
+          if (reqSeq !== networkReqSeq || !networkDialog.open) return;
+          if (res.status === 401) {
+            networkDialog.close();
+            askForToken();
+            return;
+          }
+          if (!res.ok) {
+            networkStatus.textContent = 'Network log unavailable (' + res.status + ').';
+            return;
+          }
+          const data = await res.json();
+          if (reqSeq !== networkReqSeq || !networkDialog.open) return;
+          networkEntries.textContent = '';
+          const list = Array.isArray(data.entries) ? data.entries : [];
+          networkMeta.textContent = String(data.status || '') + ' \u00b7 ' + String(data.url || 'about:blank');
+          networkStatus.textContent = 'Showing ' + list.length + ' of ' + (data.total_entries || 0) + ' requests';
+          for (const entry of list) {
+            const card = document.createElement('div');
+            card.className = 'replay-item';
+
+            const details = document.createElement('details');
+            details.className = 'net-details';
+
+            const summary = document.createElement('summary');
+
+            const mBadge = document.createElement('span');
+            mBadge.className = 'badge badge-byob';
+            mBadge.textContent = String(entry.method || 'GET');
+            summary.appendChild(mBadge);
+
+            const stBadge = document.createElement('span');
+            if (entry.failed) {
+              stBadge.className = 'badge badge-err';
+              stBadge.textContent = 'ERR';
+            } else if (entry.status != null) {
+              stBadge.className = 'badge ' + (entry.status >= 500 ? 'badge-err' : (entry.status >= 400 ? 'badge-closing' : 'badge-active'));
+              stBadge.textContent = String(entry.status);
+            } else {
+              stBadge.className = 'badge badge-closed';
+              stBadge.textContent = 'pending';
+            }
+            summary.appendChild(stBadge);
+
+            const rtBadge = document.createElement('span');
+            rtBadge.className = 'badge badge-closed';
+            rtBadge.textContent = String(entry.resource_type || 'Other');
+            summary.appendChild(rtBadge);
+
+            if (entry.duration_ms != null) {
+              const dur = document.createElement('span');
+              dur.className = 'mono';
+              dur.style.color = 'var(--text-muted)';
+              dur.textContent = entry.duration_ms + 'ms';
+              summary.appendChild(dur);
+            }
+
+            const urlSpan = document.createElement('span');
+            urlSpan.className = 'mono';
+            urlSpan.style.wordBreak = 'break-all';
+            urlSpan.textContent = String(entry.url || '');
+            summary.appendChild(urlSpan);
+
+            details.appendChild(summary);
+
+            const kv = document.createElement('div');
+            kv.className = 'net-kv mono';
+            const lines = [];
+            if (entry.response_content_type) lines.push('Content-Type: ' + entry.response_content_type);
+            if (entry.failed) lines.push('Error: ' + entry.failed);
+            lines.push('--- Request Headers ---\n' + formatHeadersText(entry.request_headers));
+            if (entry.post_data) lines.push('--- Post Data ---\n' + entry.post_data);
+            lines.push('--- Response Headers ---\n' + formatHeadersText(entry.response_headers));
+            kv.textContent = lines.join('\n\n');
+            details.appendChild(kv);
+
+            card.appendChild(details);
+            networkEntries.appendChild(card);
+          }
+        } catch (err) {
+          networkStatus.textContent = 'Failed to load network log.';
+        }
+      }
+
+      async function copyNetworkExport(format, btn, origLabel) {
+        if (!activeNetworkId || !token) return;
+        try {
+          const res = await fetch('/v1/sessions/' + encodeURIComponent(activeNetworkId) + '/network?' + networkQueryString(format), {
+            headers: { Authorization: 'Bearer ' + token },
+            cache: 'no-store',
+          });
+          if (!res.ok) {
+            announce('Export failed (' + res.status + ')');
+            return;
+          }
+          const txt = JSON.stringify(await res.json(), null, 2);
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(txt);
+            btn.textContent = 'Copied!';
+            announce('Copied ' + format.toUpperCase() + ' to clipboard');
+            setTimeout(function () { btn.textContent = origLabel; }, 1500);
+          } else {
+            announce('Clipboard unavailable in this browser context');
+          }
+        } catch (err) {
+          announce('Failed to copy ' + format.toUpperCase());
+        }
+      }
+
+      function openNetworkModal(sessionId) {
+        if (!token) { askForToken(); return; }
+        activeNetworkId = sessionId;
+        networkTitle.textContent = 'Network / API Inspector: ' + sessionId.slice(0, 14);
+        networkMeta.textContent = '';
+        if (!networkDialog.open) networkDialog.showModal();
+        loadNetwork();
+      }
+
+      document.getElementById('network-filter-form').addEventListener('submit', function (e) {
+        e.preventDefault();
+        loadNetwork();
+      });
+      networkApiOnly.addEventListener('change', loadNetwork);
+      networkIncludeAuth.addEventListener('change', loadNetwork);
+      networkFilter.addEventListener('search', loadNetwork);
+      copyJsonBtn.addEventListener('click', function () {
+        copyNetworkExport('json', copyJsonBtn, 'Copy JSON');
+      });
+      copyHarBtn.addEventListener('click', function () {
+        copyNetworkExport('har', copyHarBtn, 'Copy HAR');
+      });
+      document.getElementById('btn-network-close').addEventListener('click', function () {
+        networkDialog.close();
+      });
+      networkDialog.addEventListener('close', function () {
+        networkReqSeq += 1;
+        activeNetworkId = null;
+        networkEntries.textContent = '';
       });
 
       function mapCoords(e) {

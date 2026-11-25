@@ -74,6 +74,9 @@ enum Cmd {
         /// Accept `?token=<token>` on `/cdp` and `/json/version` for CDP clients that cannot send Bearer headers.
         #[arg(long, default_value_t = false)]
         allow_query_token: bool,
+        /// Allow callers to supply `cdp_endpoint` (BYOB external browser) on `POST /v1/sessions`.
+        #[arg(long, default_value_t = false)]
+        allow_session_cdp_endpoint: bool,
         /// Directory storing named persistent profiles (`storageState`) for `profile` jobs.
         #[arg(long)]
         profiles_dir: Option<PathBuf>,
@@ -207,6 +210,7 @@ async fn main() -> Result<()> {
             channel,
             chromium_args,
             allow_query_token,
+            allow_session_cdp_endpoint,
             profiles_dir,
             proxies,
             adaptive_concurrency,
@@ -240,6 +244,7 @@ async fn main() -> Result<()> {
                 channel,
                 chromium_args,
                 allow_query_token,
+                allow_session_cdp_endpoint,
                 profiles_dir,
                 proxies,
                 adaptive_concurrency,
@@ -461,6 +466,7 @@ async fn http_daemon(
     channel: Option<String>,
     chromium_args: Vec<String>,
     allow_query_token: bool,
+    allow_session_cdp_endpoint: bool,
     profiles_dir: Option<PathBuf>,
     proxies: Vec<String>,
     adaptive_concurrency: bool,
@@ -473,6 +479,7 @@ async fn http_daemon(
     let (join_token, mut config) =
         server_config_for(is_worker, max_jobs, journal, store, result_ttl_secs)?;
     config.allow_query_token = allow_query_token;
+    config.allow_session_cdp_endpoint = allow_session_cdp_endpoint;
     config = apply_server_ops_config(
         config,
         webhook_secret,
@@ -822,6 +829,7 @@ mod tests {
                 channel,
                 chromium_args,
                 allow_query_token,
+                allow_session_cdp_endpoint,
                 profiles_dir,
                 proxies,
                 adaptive_concurrency,
@@ -848,6 +856,7 @@ mod tests {
                 assert_eq!(embed_frame_ancestors, "*");
                 assert_eq!(result_ttl_secs, 3600);
                 assert!(!allow_query_token);
+                assert!(!allow_session_cdp_endpoint);
                 assert!(!adaptive_concurrency);
                 assert_eq!(prewarm_contexts, 0);
                 assert_eq!(listen, Some("0.0.0.0:7331".parse::<SocketAddr>().unwrap()));
@@ -869,6 +878,7 @@ mod tests {
             "--chromium-arg",
             "--disable-gpu",
             "--allow-query-token",
+            "--allow-session-cdp-endpoint",
             "--profiles-dir",
             "/tmp/fw-profiles",
             "--proxy",
@@ -896,6 +906,7 @@ mod tests {
                 channel,
                 chromium_args,
                 allow_query_token,
+                allow_session_cdp_endpoint,
                 profiles_dir,
                 proxies,
                 adaptive_concurrency,
@@ -911,6 +922,7 @@ mod tests {
                 assert_eq!(channel.as_deref(), Some("chrome"));
                 assert_eq!(chromium_args, vec!["--disable-gpu"]);
                 assert!(allow_query_token);
+                assert!(allow_session_cdp_endpoint);
                 assert_eq!(profiles_dir.as_deref(), Some(std::path::Path::new("/tmp/fw-profiles")));
                 assert_eq!(
                     proxies,

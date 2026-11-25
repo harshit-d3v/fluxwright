@@ -3653,3 +3653,419 @@ async fn managed_sessions_and_scrape_validate_auth_and_bounds() {
 
     srv.shutdown(Duration::ZERO).await.unwrap();
 }
+
+#[tokio::test]
+async fn replay_network_map_and_byob_auth_bounds_and_ssrf() {
+    // 1. Coordinator returns 404 for replay, network, and /v1/map.
+    let coordinator = HttpServer::coordinator(ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    for (method, path) in [
+        ("GET", "/v1/sessions/sess-1/replay"),
+        ("GET", "/v1/sessions/sess-1/network"),
+        ("POST", "/v1/map"),
+    ] {
+        let r = call(&coordinator, method, path, Body::empty()).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // 2. Standalone server with allow_query_token=true still rejects ?token= on replay/network/map.
+    let eng = idle_engine().await;
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.allow_query_token = true;
+    let srv = HttpServer::new(eng, cfg).unwrap();
+
+    for (method, path) in [
+        ("GET", format!("/v1/sessions/sess-1/replay?token={TOKEN}")),
+        ("GET", format!("/v1/sessions/sess-1/network?token={TOKEN}")),
+        ("POST", format!("/v1/map?token={TOKEN}")),
+    ] {
+        let r = srv
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+
+    // Query parameter validation on /replay and /network.
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/bad..id/replay", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-1/replay?kind=invalid", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-1/replay?include_frames=maybe", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-1/network?format=xml", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-1/network?api_only=maybe", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-1/replay", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-1/network", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // 3. BYOB cdp_endpoint fails closed with 403 byob_disabled when opt-in flag is off.
+    let byob_off = call(
+        &srv,
+        "POST",
+        "/v1/sessions",
+        r#"{"cdp_endpoint":"ws://127.0.0.1:9222/devtools/browser/1"}"#,
+    )
+    .await;
+    assert_eq!(byob_off.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(byob_off).await["error"]["code"], "byob_disabled");
+
+    // 4. /v1/map bounds & SSRF validation.
+    for payload in [
+        r#"{"url":"https://example.com","limit":0}"#,
+        r#"{"url":"https://example.com","limit":1001}"#,
+        r#"{"url":"https://example.com","timeout_ms":0}"#,
+        r#"{"url":"https://example.com","timeout_ms":120001}"#,
+        r#"{"url":"http://169.254.169.254/latest/meta-data"}"#,
+        r#"{"url":"file:///etc/passwd"}"#,
+    ] {
+        assert_eq!(
+            call(&srv, "POST", "/v1/map", payload).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{payload}"
+        );
+    }
+    assert_eq!(
+        call(&srv, "POST", "/v1/map", r#"{"url":"https://example.com","unknown":1}"#)
+            .await
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let oversized_map = format!(
+        r#"{{"url":"https://example.com/{}"}}"#,
+        "a".repeat(MAX_REQUEST_BYTES + 128)
+    );
+    assert_eq!(
+        call(&srv, "POST", "/v1/map", oversized_map).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    // Dashboard HTML exposes Managed Sessions, Replay, and Network modals.
+    let dash = srv
+        .router()
+        .oneshot(Request::builder().uri("/dashboard").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let dash_html = String::from_utf8(
+        to_bytes(dash.into_body(), 1024 * 1024).await.unwrap().to_vec(),
+    )
+    .unwrap();
+    assert!(dash_html.contains("Managed Sessions"));
+    assert!(dash_html.contains("replay-dialog"));
+    assert!(dash_html.contains("network-dialog"));
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+
+    // 5. BYOB SSRF validation when allow_session_cdp_endpoint = true.
+    let eng2 = idle_engine().await;
+    let mut byob_cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    byob_cfg.allow_session_cdp_endpoint = true;
+    let byob_srv = HttpServer::new(eng2, byob_cfg).unwrap();
+
+    for bad_ep in [
+        "http://169.254.169.254/json/version",
+        "ws://169.254.169.254:9222/devtools/browser/1",
+        "ws://2852039166:9222/devtools/browser/1",
+        "ws://10.0.0.1:9222/devtools/browser/1",
+        "ws://172.16.0.1:9222/devtools/browser/1",
+        "ws://192.168.1.10:9222/devtools/browser/1",
+        "ws://[fe80::1]:9222/devtools/browser/1",
+        "ws://[fd00:ec2::254]:9222/devtools/browser/1",
+        "ws://[::ffff:169.254.169.254]:9222/devtools/browser/1",
+        "http://metadata.google.internal:9222",
+        "ftp://127.0.0.1:9222",
+        "ws://user@127.0.0.1:9222",
+    ] {
+        let payload = json!({ "cdp_endpoint": bad_ep }).to_string();
+        let resp = call(&byob_srv, "POST", "/v1/sessions", payload).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad_ep}");
+    }
+    byob_srv.shutdown(Duration::ZERO).await.unwrap();
+
+    // Loopback endpoints pass syntax/SSRF validation (for local stealth browsers).
+    for ok_ep in [
+        "ws://127.0.0.1:9222/devtools/browser/1",
+        "http://localhost:9222",
+        "ws://[::1]:9222/devtools/browser/1",
+        "https://cdp.example.com:9443/devtools/browser/1",
+    ] {
+        assert!(
+            sessions::validate_cdp_endpoint_syntax(ok_ep, false).is_ok(),
+            "{ok_ep}"
+        );
+    }
+    assert!(sessions::validate_cdp_endpoint_syntax("ws://10.0.0.1:9222", false).is_err());
+    assert!(sessions::validate_cdp_endpoint_syntax("ws://10.0.0.1:9222", true).is_ok());
+}
+
+#[test]
+fn replay_har_redaction_bounds_and_map_filter_unit() {
+    use crate::replay::{
+        RetainedReplay, RetainedReplayStore, SessionRecorder, MAX_FRAME_BYTES, MAX_NETWORK_ENTRIES,
+        MAX_RETAINED_FRAMES, MAX_RETAINED_REPLAYS, MAX_TIMELINE_EVENTS, RETAINED_REPLAY_TTL_MS,
+    };
+
+    let mut rec = SessionRecorder::default();
+    rec.push_nav(1_000, "https://app.example.com/login");
+    rec.record_cdp_event(
+        1_010,
+        "Runtime.consoleAPICalled",
+        &json!({
+            "type": "error",
+            "args": [{ "value": "login" }, { "value": "failed" }]
+        }),
+        "https://app.example.com/login",
+    );
+    rec.record_cdp_event(
+        1_020,
+        "Network.requestWillBeSent",
+        &json!({
+            "requestId": "r1",
+            "type": "Fetch",
+            "request": {
+                "url": "https://app.example.com/api/auth?scope=read",
+                "method": "POST",
+                "headers": {
+                    "Authorization": "Bearer secret-jwt",
+                    "Cookie": "sid=abc",
+                    "X-Api-Key": "key-999",
+                    "Proxy-Authorization": "Basic xyz",
+                    "Content-Type": "application/json"
+                },
+                "postData": "{\"user\":\"ada\"}"
+            }
+        }),
+        "https://app.example.com/login",
+    );
+    rec.record_cdp_event(
+        1_030,
+        "Network.responseReceived",
+        &json!({
+            "requestId": "r1",
+            "response": {
+                "status": 401,
+                "statusText": "Unauthorized",
+                "mimeType": "application/json",
+                "headers": {
+                    "Set-Cookie": "sess=bad; HttpOnly",
+                    "X-Trace": "t1"
+                }
+            }
+        }),
+        "https://app.example.com/login",
+    );
+    rec.record_cdp_event(
+        1_040,
+        "Network.requestWillBeSent",
+        &json!({
+            "requestId": "r2",
+            "type": "Document",
+            "request": {
+                "url": "https://app.example.com/home",
+                "method": "GET",
+                "headers": {}
+            }
+        }),
+        "https://app.example.com/home",
+    );
+    rec.record_cdp_event(
+        1_050,
+        "Network.responseReceived",
+        &json!({
+            "requestId": "r2",
+            "response": {
+                "status": 200,
+                "statusText": "OK",
+                "mimeType": "text/html",
+                "headers": {}
+            }
+        }),
+        "https://app.example.com/home",
+    );
+    rec.push_frame(1_060, "https://app.example.com/home", "/9j/FAKEJPEG".into());
+
+    // Searchable replay queries.
+    let (total, matched) = rec.query_replay(Some("login failed"), Some("console"), true);
+    assert_eq!(total, 4); // nav + console + network(401) + frame
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].level, "error");
+
+    let (_, no_frames) = rec.query_replay(None, Some("frame"), false);
+    assert_eq!(no_frames.len(), 1);
+    assert!(no_frames[0].frame_base64.is_none());
+
+    // Sensitive header redaction & api_only filter.
+    let (total_net, api_redacted) = rec.export_network_entries(None, true, false);
+    assert_eq!(total_net, 2);
+    assert_eq!(api_redacted.len(), 1);
+    for (k, v) in &api_redacted[0].request_headers {
+        if matches!(
+            k.to_ascii_lowercase().as_str(),
+            "authorization" | "cookie" | "x-api-key" | "proxy-authorization"
+        ) {
+            assert_eq!(v, "[REDACTED]", "{k}");
+        }
+    }
+    assert_eq!(
+        api_redacted[0]
+            .response_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.as_str()),
+        Some("[REDACTED]")
+    );
+
+    // include_auth=true preserves raw secrets.
+    let (_, api_raw) = rec.export_network_entries(Some("/api/auth"), true, true);
+    assert_eq!(api_raw.len(), 1);
+    assert_eq!(
+        api_raw[0]
+            .request_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str()),
+        Some("Bearer secret-jwt")
+    );
+
+    // HAR 1.2 export & roundtrip parse.
+    let har = rec.export_har(None, true, false);
+    let har_json = serde_json::to_string(&har).unwrap();
+    let parsed_har = fluxwright::Har::from_json_str(&har_json).unwrap();
+    assert_eq!(parsed_har.log.version, "1.2");
+    assert_eq!(parsed_har.log.creator.name, "fluxwright");
+    assert_eq!(parsed_har.log.entries.len(), 1);
+    assert_eq!(parsed_har.log.entries[0].response.status, 401);
+    assert!(parsed_har.log.entries[0]
+        .request
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("authorization") && h.value == "[REDACTED]"));
+
+    // Frame count & byte caps + timeline/network bounds.
+    let mut bounded = SessionRecorder::default();
+    for i in 0..(MAX_TIMELINE_EVENTS + 30) {
+        bounded.push_nav(i as u64, &format!("https://example.com/{i}"));
+    }
+    assert_eq!(bounded.timeline.len(), MAX_TIMELINE_EVENTS);
+
+    for i in 0..(MAX_RETAINED_FRAMES + 10) {
+        bounded.push_frame(i as u64, "https://example.com", "A".repeat(100));
+    }
+    assert_eq!(bounded.frame_count, MAX_RETAINED_FRAMES);
+    assert_eq!(bounded.frame_bytes, MAX_RETAINED_FRAMES * 100);
+
+    // Large frames stay within MAX_FRAME_BYTES (2 MiB).
+    let mut byte_capped = SessionRecorder::default();
+    for i in 0..5 {
+        byte_capped.push_frame(i as u64, "https://example.com", "B".repeat(700_000));
+    }
+    assert!(byte_capped.frame_bytes <= MAX_FRAME_BYTES);
+    assert_eq!(byte_capped.frame_count, 2);
+
+    for i in 0..(MAX_NETWORK_ENTRIES + 20) {
+        bounded.record_cdp_event(
+            i as u64,
+            "Network.requestWillBeSent",
+            &json!({
+                "requestId": format!("r{i}"),
+                "type": "XHR",
+                "request": { "url": format!("https://example.com/api/{i}"), "method": "GET", "headers": {} }
+            }),
+            "https://example.com",
+        );
+    }
+    assert_eq!(bounded.network.len(), MAX_NETWORK_ENTRIES);
+
+    // RetainedReplayStore capacity (32) and TTL (900_000 ms).
+    let mut store = RetainedReplayStore::default();
+    for i in 0..(MAX_RETAINED_REPLAYS + 5) {
+        store.push(
+            RetainedReplay {
+                id: format!("sess-{i}"),
+                created_at: 100,
+                closed_at: 1_000 + i as u64,
+                url: "https://example.com".into(),
+                keep_alive: true,
+                profile: None,
+                proxy_session: None,
+                byob: false,
+                record_frames: false,
+                recorder: SessionRecorder::default(),
+            },
+            2_000,
+        );
+    }
+    assert!(store.with_entry("sess-0", 2_000, |_| ()).is_none());
+    assert!(store.with_entry("sess-36", 2_000, |_| ()).is_some());
+    assert!(store
+        .with_entry("sess-36", 1_036 + RETAINED_REPLAY_TTL_MS, |_| ())
+        .is_none());
+
+    // /v1/map link filtering (same_origin, include_subdomains, search, limit, dedup).
+    let raw = vec![
+        json!("https://example.com/docs/intro"),
+        json!("https://example.com/docs/intro"),
+        json!("https://docs.example.com/api"),
+        json!("https://notexample.com/docs"),
+        json!("https://example.com/about"),
+        json!("mailto:hello@example.com"),
+    ];
+    assert_eq!(
+        map::filter_links(&raw, "https://example.com/", true, false, None, 10),
+        vec![
+            "https://example.com/docs/intro",
+            "https://example.com/about",
+        ]
+    );
+    assert_eq!(
+        map::filter_links(&raw, "https://example.com/", true, true, Some("DOCS"), 10),
+        vec![
+            "https://example.com/docs/intro",
+            "https://docs.example.com/api",
+        ]
+    );
+    assert_eq!(
+        map::filter_links(&raw, "https://example.com/", false, false, None, 2),
+        vec![
+            "https://example.com/docs/intro",
+            "https://docs.example.com/api",
+        ]
+    );
+}

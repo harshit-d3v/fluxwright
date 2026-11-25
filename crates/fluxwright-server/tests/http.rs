@@ -2527,3 +2527,553 @@ async fn sync_scrape_returns_multiple_formats_in_one_call() {
 
     server.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_replay_frames_network_har_redaction_and_retained_after_delete() {
+    let app = axum::Router::new()
+        .route(
+            "/app",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>ReplayApp</title><h1>Replay App</h1>",
+                    "<script>",
+                    "console.log('replay-console-log');",
+                    "console.error('replay-console-err');",
+                    "fetch('/api/items', {",
+                    "  method: 'POST',",
+                    "  headers: { 'Authorization': 'Bearer supersecret', 'X-Api-Key': 'key-123', 'Content-Type': 'application/json' },",
+                    "  body: JSON.stringify({ q: 'test' })",
+                    "}).then(() => fetch('/missing-api')).finally(() => { window.__replayDone = true; });",
+                    "</script>"
+                ))
+            }),
+        )
+        .route(
+            "/api/items",
+            axum::routing::post(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::SET_COOKIE, "sess=secretcookie; Path=/"),
+                    ],
+                    r#"{"ok":true,"items":[1,2]}"#,
+                )
+            }),
+        )
+        .route(
+            "/missing-api",
+            axum::routing::get(|| async { (StatusCode::NOT_FOUND, "not found") }),
+        );
+    let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_base = format!("http://127.0.0.1:{}", app_listener.local_addr().unwrap().port());
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(app_listener, app).await;
+    });
+
+    let server = server().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    let (st_create, created) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        json!({ "record_frames": true, "ttl_secs": 120 }),
+    )
+    .await;
+    assert_eq!(st_create, StatusCode::CREATED, "{created}");
+    assert_eq!(created["record_frames"], true);
+    let sess_id = created["id"].as_str().unwrap().to_string();
+    let cdp_path = created["cdp_path"].as_str().unwrap().to_string();
+
+    let mut ws = connect_cdp_ws(&format!("ws://{addr}{cdp_path}"), Some(TOKEN)).await;
+    let targets = cdp_rpc(&mut ws, 1, "Target.getTargets", json!({}), None).await;
+    let tid = targets["result"]["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == "page")
+        .unwrap()["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sid = cdp_rpc(
+        &mut ws,
+        2,
+        "Target.attachToTarget",
+        json!({ "targetId": tid, "flatten": true }),
+        None,
+    )
+    .await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let app_url = format!("{app_base}/app");
+    cdp_rpc(&mut ws, 3, "Page.navigate", json!({ "url": app_url }), Some(&sid)).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for seq in 10.. {
+            let ev = cdp_rpc(
+                &mut ws,
+                seq,
+                "Runtime.evaluate",
+                json!({ "expression": "window.__replayDone === true", "returnByValue": true }),
+                Some(&sid),
+            )
+            .await;
+            if ev["result"]["result"]["value"] == json!(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("app fetch sequence completed");
+
+    // Wait for async JPEG screenshot and all timeline events to land.
+    let replay_body = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (st, body) = request(
+                &server,
+                "GET",
+                &format!("/v1/sessions/{sess_id}/replay"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{body}");
+            let events = body["events"].as_array().unwrap();
+            let has_nav = events.iter().any(|e| {
+                e["kind"] == "nav" && e["url"].as_str().is_some_and(|u| u.ends_with("/app"))
+            });
+            let has_console = events.iter().any(|e| {
+                e["kind"] == "console"
+                    && e["summary"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("replay-console-err"))
+            });
+            let has_net_err = events.iter().any(|e| {
+                e["kind"] == "network"
+                    && e["status"] == 404
+                    && e["url"]
+                        .as_str()
+                        .is_some_and(|u| u.ends_with("/missing-api"))
+            });
+            let has_frame = events.iter().any(|e| {
+                e["kind"] == "frame"
+                    && e["frame_base64"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+            });
+            if has_nav && has_console && has_net_err && has_frame {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replay captured nav, console, network 404, and JPEG frame");
+
+    assert_eq!(replay_body["status"], "active");
+    let frame_b64 = replay_body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "frame")
+        .unwrap()["frame_base64"]
+        .as_str()
+        .unwrap();
+    let jpeg = base64::engine::general_purpose::STANDARD
+        .decode(frame_b64)
+        .unwrap();
+    assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF]);
+
+    // Searchable query & include_frames=false.
+    let (st_q, q_body) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/replay?q=replay-console-log&kind=console"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_q, StatusCode::OK);
+    assert_eq!(q_body["events"].as_array().unwrap().len(), 1);
+
+    let (st_nf, nf_body) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/replay?kind=frame&include_frames=false"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_nf, StatusCode::OK);
+    let nf_events = nf_body["events"].as_array().unwrap();
+    assert!(!nf_events.is_empty());
+    assert!(nf_events.iter().all(|e| e.get("frame_base64").is_none()));
+
+    // Network inspector: default redacts sensitive headers; include_auth=true reveals them.
+    let (st_net, net_body) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/network?api_only=true"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_net, StatusCode::OK, "{net_body}");
+    let api_entries = net_body["entries"].as_array().unwrap();
+    assert!(
+        !api_entries.iter().any(|e| e["url"].as_str().unwrap_or("").ends_with("/app")),
+        "api_only=true must omit HTML Document requests: {net_body}"
+    );
+    let api_item = api_entries
+        .iter()
+        .find(|e| e["url"].as_str().unwrap_or("").ends_with("/api/items"))
+        .expect("/api/items captured");
+    assert_eq!(api_item["status"], 200);
+    let req_hdrs = api_item["request_headers"].as_array().unwrap();
+    assert!(
+        req_hdrs.iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("authorization") && h[1] == "[REDACTED]"
+        }),
+        "{api_item}"
+    );
+    assert!(
+        req_hdrs.iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("x-api-key") && h[1] == "[REDACTED]"
+        }),
+        "{api_item}"
+    );
+    let resp_hdrs = api_item["response_headers"].as_array().unwrap();
+    assert!(
+        resp_hdrs.iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie") && h[1] == "[REDACTED]"
+        }),
+        "{api_item}"
+    );
+
+    let (st_auth, auth_body) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/network?filter=/api/items&include_auth=true"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_auth, StatusCode::OK);
+    let auth_item = &auth_body["entries"].as_array().unwrap()[0];
+    assert!(
+        auth_item["request_headers"].as_array().unwrap().iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("authorization")
+                && h[1] == "Bearer supersecret"
+        }),
+        "{auth_item}"
+    );
+    assert!(
+        auth_item["response_headers"].as_array().unwrap().iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie")
+                && h[1] == "sess=secretcookie; Path=/"
+        }),
+        "{auth_item}"
+    );
+
+    // HAR 1.2 export with redaction.
+    let (st_har, har_body) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/network?format=har&api_only=true"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_har, StatusCode::OK);
+    let parsed_har: fluxwright::Har = serde_json::from_value(har_body).unwrap();
+    assert_eq!(parsed_har.log.version, "1.2");
+    assert_eq!(parsed_har.log.creator.name, "fluxwright");
+    assert!(parsed_har
+        .log
+        .entries
+        .iter()
+        .any(|e| e.request.url.ends_with("/api/items")));
+
+    drop(ws);
+
+    // Delete session and confirm retained replay + network remain queryable!
+    let (st_del, _) = request(
+        &server,
+        "DELETE",
+        &format!("/v1/sessions/{sess_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_del, StatusCode::OK);
+
+    let (st_gone, _) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_gone, StatusCode::NOT_FOUND);
+
+    let (st_ret_replay, ret_replay) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/replay"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_ret_replay, StatusCode::OK, "{ret_replay}");
+    assert_eq!(ret_replay["status"], "closed");
+    assert!(ret_replay["closed_at"].as_u64().is_some());
+    assert!(!ret_replay["events"].as_array().unwrap().is_empty());
+
+    let (st_ret_har, ret_har) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/network?format=har&api_only=true"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_ret_har, StatusCode::OK);
+    assert_eq!(ret_har["log"]["version"], "1.2");
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_task.abort();
+    app_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_map_discovers_and_filters_links() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            axum::response::Html(concat!(
+                "<!doctype html><title>SiteMap</title>",
+                "<nav>",
+                "<a href='/forms'>Forms</a>",
+                "<a href='/docs/intro'>Docs Intro</a>",
+                "<a href='/docs/api'>Docs API</a>",
+                "<a href='/docs/api'>Docs API Duplicate</a>",
+                "<a href='https://external.example/offsite'>Offsite</a>",
+                "<a href='mailto:hi@example.com'>Mail</a>",
+                "<a href='javascript:void(0)'>JS</a>",
+                "</nav>"
+            ))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let server = server().await;
+
+    // 1. Same-origin mapping deduplicates links and filters non-HTTP/cross-origin links.
+    let (st_same, body_same) = request(
+        &server,
+        "POST",
+        "/v1/map",
+        json!({ "url": base_url }),
+    )
+    .await;
+    assert_eq!(st_same, StatusCode::OK, "{body_same}");
+    let same_links: Vec<&str> = body_same["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(body_same["count"], 3, "{body_same}");
+    assert_eq!(
+        same_links,
+        vec![
+            format!("{base_url}/forms"),
+            format!("{base_url}/docs/intro"),
+            format!("{base_url}/docs/api"),
+        ]
+    );
+
+    // 2. Search filter narrows to matching links.
+    let (st_search, body_search) = request(
+        &server,
+        "POST",
+        "/v1/map",
+        json!({ "url": base_url, "search": "DOCS" }),
+    )
+    .await;
+    assert_eq!(st_search, StatusCode::OK, "{body_search}");
+    assert_eq!(body_search["count"], 2, "{body_search}");
+
+    // 3. same_origin=false includes external link and respects limit.
+    let (st_all, body_all) = request(
+        &server,
+        "POST",
+        "/v1/map",
+        json!({ "url": base_url, "same_origin": false }),
+    )
+    .await;
+    assert_eq!(st_all, StatusCode::OK, "{body_all}");
+    assert_eq!(body_all["count"], 4, "{body_all}");
+    assert!(body_all["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "https://external.example/offsite"));
+
+    let (st_lim, body_lim) = request(
+        &server,
+        "POST",
+        "/v1/map",
+        json!({ "url": base_url, "same_origin": false, "limit": 2 }),
+    )
+    .await;
+    assert_eq!(st_lim, StatusCode::OK);
+    assert_eq!(body_lim["count"], 2);
+
+    // 4. Works cleanly against benchmark_server too.
+    let (st_bench, body_bench) = request(
+        &server,
+        "POST",
+        "/v1/map",
+        json!({ "url": format!("{}/scraping", fixture.base_url) }),
+    )
+    .await;
+    assert_eq!(st_bench, StatusCode::OK, "{body_bench}");
+    assert_eq!(body_bench["count"], 0);
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    app_task.abort();
+    fixture.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn byob_session_connects_to_external_chrome_navigates_and_cleans_up() {
+    let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
+    let chrome = debuggable_chrome().await;
+
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.allow_session_cdp_endpoint = true;
+    let server = HttpServer::new(engine.clone(), cfg).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    let (st_create, created) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        json!({ "cdp_endpoint": chrome.ws_url, "ttl_secs": 120 }),
+    )
+    .await;
+    assert_eq!(st_create, StatusCode::CREATED, "{created}");
+    assert_eq!(created["byob"], true);
+    let sess_id = created["id"].as_str().unwrap().to_string();
+    let cdp_path = created["cdp_path"].as_str().unwrap().to_string();
+
+    // BYOB session must not occupy a slot in the server's primary pooled engine.
+    assert_eq!(engine.metrics().await.active_leases, 0);
+
+    let mut ws = connect_cdp_ws(&format!("ws://{addr}{cdp_path}"), Some(TOKEN)).await;
+    let targets = cdp_rpc(&mut ws, 1, "Target.getTargets", json!({}), None).await;
+    let tid = targets["result"]["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == "page")
+        .unwrap()["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sid = cdp_rpc(
+        &mut ws,
+        2,
+        "Target.attachToTarget",
+        json!({ "targetId": tid, "flatten": true }),
+        None,
+    )
+    .await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let forms_url = format!("{}/forms", fixture.base_url);
+    cdp_rpc(&mut ws, 3, "Page.navigate", json!({ "url": forms_url }), Some(&sid)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for seq in 10.. {
+            let ev = cdp_rpc(
+                &mut ws,
+                seq,
+                "Runtime.evaluate",
+                json!({ "expression": "document.readyState === 'complete' && document.title === 'forms'", "returnByValue": true }),
+                Some(&sid),
+            )
+            .await;
+            if ev["result"]["result"]["value"] == json!(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("BYOB navigation completed");
+
+    let (st_rep, rep) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/replay?kind=nav"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_rep, StatusCode::OK);
+    assert!(rep["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["url"].as_str().is_some_and(|u| u.ends_with("/forms"))));
+
+    drop(ws);
+    let (st_del, _) = request(
+        &server,
+        "DELETE",
+        &format!("/v1/sessions/{sess_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_del, StatusCode::OK);
+
+    // Retained replay stays available after BYOB session closes.
+    let (st_ret, ret) = request(
+        &server,
+        "GET",
+        &format!("/v1/sessions/{sess_id}/replay"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_ret, StatusCode::OK);
+    assert_eq!(ret["status"], "closed");
+
+    // External Chrome browser process remains alive after BYOB session teardown.
+    assert!(fluxwright_cdp::CdpBrowser::connect(&chrome.ws_url).await.is_ok());
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_task.abort();
+    drop(chrome);
+    fixture.abort();
+}
