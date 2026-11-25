@@ -47,9 +47,9 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "--profiles-dir",
   },
   {
-    name: "Pooled CDP gateway",
-    text: "Connect existing Playwright, Puppeteer, or Chrome DevTools scripts straight to Fluxwright's pooled Chrome fleet with context isolation and /json/version discovery.",
-    api: "GET /cdp",
+    name: "Managed cloud sessions & CDP",
+    text: "Create TTL-backed, reconnectable browser sessions via /v1/sessions (keep_alive, profiles, resource presets, viewports, and Live View embeds) or connect Playwright and Puppeteer straight to GET /cdp.",
+    api: "POST /v1/sessions",
   },
   {
     name: "Live screencast & HITL",
@@ -57,9 +57,9 @@ const FEATURES: { name: string; text: string; api: string }[] = [
     api: "/v1/live/{id}/embed",
   },
   {
-    name: "HTTP server & cluster mode",
-    text: "Bearer-authenticated job API, signed HMAC-SHA256 webhooks, OTLP/HTTP JSON trace export, Prometheus /metrics, W3C traceparent spans, --journal and SQLite --store persistence, Docker image, and pull-based fluxwright coordinate clusters.",
-    api: "fluxwright serve",
+    name: "Sync /v1/scrape, HTTP server & cluster",
+    text: "One-shot synchronous POST /v1/scrape (markdown, html, text, snapshot, screenshot, pdf), async /v1/jobs with HMAC webhooks, OTLP traces, Prometheus /metrics, SQLite --store, GHCR multi-arch Docker, and fluxwright coordinate clusters.",
+    api: "POST /v1/scrape",
   },
   {
     name: "Built for AI agents",
@@ -233,7 +233,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.11.0, open source under Apache-2.0. Prebuilt for Windows (x64 &amp; ARM64), macOS, and Linux (x64, ARM64 &amp; static musl) on npm, PyPI, and GitHub Releases.
+              Version 0.12.0, open source under Apache-2.0. Prebuilt for Windows (x64 &amp; ARM64), macOS, and Linux (x64, ARM64 &amp; static musl) on npm, PyPI, GHCR, and GitHub Releases.
             </p>
           </div>
           <FleetBoard />
