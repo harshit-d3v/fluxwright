@@ -183,7 +183,9 @@ impl SessionRecorder {
                 self.push_console(ts, "error", url, &text);
             }
             "Network.requestWillBeSent" => self.record_request_will_be_sent(ts, params),
+            "Network.requestWillBeSentExtraInfo" => self.record_request_extra_info(params),
             "Network.responseReceived" => self.record_response_received(ts, params),
+            "Network.responseReceivedExtraInfo" => self.record_response_extra_info(params),
             "Network.loadingFinished" => self.record_loading_finished(params),
             "Network.loadingFailed" => self.record_loading_failed(ts, params),
             _ => {}
@@ -255,18 +257,17 @@ impl SessionRecorder {
         let status_text = r["statusText"]
             .as_str()
             .map(|s| truncate_bytes(s, MAX_STATUS_TEXT_BYTES));
-        let response_headers = parse_cdp_headers(&r["headers"]);
+        merge_cdp_headers(&mut entry.response_headers, &r["headers"]);
         let response_content_type = r["mimeType"]
             .as_str()
             .filter(|s| !s.is_empty())
             .map(|s| truncate_bytes(s, 256))
             .or_else(|| {
-                header_ci(&response_headers, "content-type").map(|s| truncate_bytes(&s, 256))
+                header_ci(&entry.response_headers, "content-type").map(|s| truncate_bytes(&s, 256))
             });
 
         entry.status = status;
         entry.status_text = status_text;
-        entry.response_headers = response_headers;
         entry.response_content_type = response_content_type;
         entry.duration_ms = entry
             .started_mono
@@ -286,6 +287,26 @@ impl SessionRecorder {
                 status: Some(st),
                 frame_base64: None,
             });
+        }
+    }
+
+    pub(crate) fn record_request_extra_info(&mut self, params: &Value) {
+        let req_id = params["requestId"].as_str().unwrap_or("");
+        if req_id.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.network.iter_mut().rev().find(|e| e.id == req_id) {
+            merge_cdp_headers(&mut entry.request_headers, &params["headers"]);
+        }
+    }
+
+    pub(crate) fn record_response_extra_info(&mut self, params: &Value) {
+        let req_id = params["requestId"].as_str().unwrap_or("");
+        if req_id.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.network.iter_mut().rev().find(|e| e.id == req_id) {
+            merge_cdp_headers(&mut entry.response_headers, &params["headers"]);
         }
     }
 
@@ -563,21 +584,32 @@ fn redact_headers(headers: &mut [(String, String)]) {
 }
 
 fn parse_cdp_headers(v: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    merge_cdp_headers(&mut out, v);
+    out
+}
+
+fn merge_cdp_headers(target: &mut Vec<(String, String)>, v: &Value) {
     let Some(map) = v.as_object() else {
-        return Vec::new();
+        return;
     };
-    let mut out = Vec::with_capacity(map.len().min(MAX_HEADERS_PER_MSG));
-    for (k, val) in map.iter().take(MAX_HEADERS_PER_MSG) {
+    for (k, val) in map {
+        if target.len() >= MAX_HEADERS_PER_MSG {
+            break;
+        }
+        let name = truncate_bytes(k, MAX_HEADER_NAME_BYTES);
         let raw_val = val
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| val.to_string());
-        out.push((
-            truncate_bytes(k, MAX_HEADER_NAME_BYTES),
-            truncate_bytes(&raw_val, MAX_HEADER_VALUE_BYTES),
-        ));
+        let value = truncate_bytes(&raw_val, MAX_HEADER_VALUE_BYTES);
+        if !target
+            .iter()
+            .any(|(ek, ev)| ek.eq_ignore_ascii_case(&name) && ev == &value)
+        {
+            target.push((name, value));
+        }
     }
-    out
 }
 
 fn header_ci(headers: &[(String, String)], name: &str) -> Option<String> {

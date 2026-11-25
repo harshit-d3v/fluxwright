@@ -2735,16 +2735,25 @@ async fn session_replay_frames_network_har_redaction_and_retained_after_delete()
         .expect("/api/items captured");
     assert_eq!(api_item["status"], 200);
     let req_hdrs = api_item["request_headers"].as_array().unwrap();
-    assert!(req_hdrs.iter().any(|h| {
-        h[0].as_str().unwrap().eq_ignore_ascii_case("authorization") && h[1] == "[REDACTED]"
-    }));
-    assert!(req_hdrs.iter().any(|h| {
-        h[0].as_str().unwrap().eq_ignore_ascii_case("x-api-key") && h[1] == "[REDACTED]"
-    }));
+    assert!(
+        req_hdrs.iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("authorization") && h[1] == "[REDACTED]"
+        }),
+        "{api_item}"
+    );
+    assert!(
+        req_hdrs.iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("x-api-key") && h[1] == "[REDACTED]"
+        }),
+        "{api_item}"
+    );
     let resp_hdrs = api_item["response_headers"].as_array().unwrap();
-    assert!(resp_hdrs.iter().any(|h| {
-        h[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie") && h[1] == "[REDACTED]"
-    }));
+    assert!(
+        resp_hdrs.iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie") && h[1] == "[REDACTED]"
+        }),
+        "{api_item}"
+    );
 
     let (st_auth, auth_body) = request(
         &server,
@@ -2755,14 +2764,20 @@ async fn session_replay_frames_network_har_redaction_and_retained_after_delete()
     .await;
     assert_eq!(st_auth, StatusCode::OK);
     let auth_item = &auth_body["entries"].as_array().unwrap()[0];
-    assert!(auth_item["request_headers"].as_array().unwrap().iter().any(|h| {
-        h[0].as_str().unwrap().eq_ignore_ascii_case("authorization")
-            && h[1] == "Bearer supersecret"
-    }));
-    assert!(auth_item["response_headers"].as_array().unwrap().iter().any(|h| {
-        h[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie")
-            && h[1] == "sess=secretcookie; Path=/"
-    }));
+    assert!(
+        auth_item["request_headers"].as_array().unwrap().iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("authorization")
+                && h[1] == "Bearer supersecret"
+        }),
+        "{auth_item}"
+    );
+    assert!(
+        auth_item["response_headers"].as_array().unwrap().iter().any(|h| {
+            h[0].as_str().unwrap().eq_ignore_ascii_case("set-cookie")
+                && h[1] == "sess=secretcookie; Path=/"
+        }),
+        "{auth_item}"
+    );
 
     // HAR 1.2 export with redaction.
     let (st_har, har_body) = request(

@@ -1377,7 +1377,9 @@ fn spawn_session_reaper(
                                 "Runtime.consoleAPICalled"
                                 | "Runtime.exceptionThrown"
                                 | "Network.requestWillBeSent"
+                                | "Network.requestWillBeSentExtraInfo"
                                 | "Network.responseReceived"
+                                | "Network.responseReceivedExtraInfo"
                                 | "Network.loadingFinished"
                                 | "Network.loadingFailed" => {
                                     let current_url = session.current_url();
