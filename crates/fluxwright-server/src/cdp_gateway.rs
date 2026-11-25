@@ -363,6 +363,10 @@ impl GatewayState {
         self.blocker_sessions.contains_key(sid)
     }
 
+    pub(crate) fn is_allowed_context(&self, ctx_id: &str) -> bool {
+        self.allowed_contexts.contains(ctx_id)
+    }
+
     pub(crate) fn new(
         primary_context: String,
         live_target: Arc<std::sync::Mutex<Option<String>>>,
@@ -1891,6 +1895,83 @@ async fn ensure_preset_blocker(
             let _ = handle.await;
         }
     }
+}
+
+/// Attaches (or reuses) an internal flat observer session on `target_id` and enables `Page`,
+/// `Runtime`, and `Network` domains for session replay and network inspection.
+pub(crate) async fn ensure_session_observer(
+    conn: &Arc<Connection>,
+    state: &Arc<Mutex<GatewayState>>,
+    lease: &Arc<ContextLease>,
+    target_id: &str,
+) -> Option<String> {
+    let existing_sid = {
+        let g = state.lock().await;
+        if g.closing {
+            return None;
+        }
+        g.blocker_sessions
+            .iter()
+            .find_map(|(sid, t)| (t == target_id).then(|| sid.clone()))
+    };
+    let (sid, created_fresh) = if let Some(sid) = existing_sid {
+        (sid, false)
+    } else {
+        let attached = conn
+            .call_raw(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+                None,
+                CDP_CMD_TIMEOUT,
+            )
+            .await
+            .ok()?
+            .ok()?;
+        let sid = attached["sessionId"].as_str()?.to_string();
+        let should_detach = {
+            let mut g = state.lock().await;
+            if g.closing {
+                true
+            } else {
+                lease.mark_external_session(&sid);
+                g.blocker_sessions.insert(sid.clone(), target_id.to_string());
+                false
+            }
+        };
+        if should_detach {
+            let _ = conn
+                .call_raw(
+                    "Target.detachFromTarget",
+                    json!({ "sessionId": sid }),
+                    None,
+                    CLEANUP_TIMEOUT,
+                )
+                .await;
+            return None;
+        }
+        (sid, true)
+    };
+    let (p, r, n) = tokio::join!(
+        conn.call_raw("Page.enable", json!({}), Some(&sid), Duration::from_secs(5)),
+        conn.call_raw("Runtime.enable", json!({}), Some(&sid), Duration::from_secs(5)),
+        conn.call_raw("Network.enable", json!({}), Some(&sid), Duration::from_secs(5)),
+    );
+    if p.is_err() && r.is_err() && n.is_err() {
+        if created_fresh {
+            state.lock().await.blocker_sessions.remove(&sid);
+            lease.unmark_external_session(&sid);
+            let _ = conn
+                .call_raw(
+                    "Target.detachFromTarget",
+                    json!({ "sessionId": sid }),
+                    None,
+                    CLEANUP_TIMEOUT,
+                )
+                .await;
+        }
+        return None;
+    }
+    Some(sid)
 }
 
 fn filter_create_context_params(

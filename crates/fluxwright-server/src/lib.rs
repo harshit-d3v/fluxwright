@@ -10,8 +10,10 @@ mod http_post;
 mod job;
 mod journal;
 mod live;
+mod map;
 mod otlp;
 pub mod prometheus;
+mod replay;
 mod scrape;
 mod sessions;
 mod store;
@@ -84,6 +86,9 @@ pub struct ServerConfig {
     /// Disable the server-side SSRF URL guard (same effect as `FLUXWRIGHT_SERVER_ANY_URL=1`).
     /// Disabled by default.
     pub allow_any_url: bool,
+    /// Allow callers to supply `cdp_endpoint` on `POST /v1/sessions` (BYOB external browser).
+    /// Disabled by default.
+    pub allow_session_cdp_endpoint: bool,
     webhook_secret: Option<Vec<u8>>,
     otlp_endpoint: Option<String>,
     otlp_service_name: String,
@@ -153,6 +158,7 @@ impl ServerConfig {
             min_delay_per_host: None,
             allow_query_token: false,
             allow_any_url: false,
+            allow_session_cdp_endpoint: false,
             webhook_secret: None,
             otlp_endpoint: None,
             otlp_service_name: DEFAULT_OTLP_SERVICE_NAME.to_string(),
@@ -217,6 +223,7 @@ pub(crate) struct Inner {
     min_delay_per_host_ms: Option<u64>,
     allow_query_token: bool,
     allow_any_url: bool,
+    allow_session_cdp_endpoint: bool,
     embed_frame_ancestors: String,
     lease_ms: AtomicU64,
     lease_notify: tokio::sync::Notify,
@@ -426,6 +433,7 @@ impl Inner {
                 "workers": workers,
                 "workers_summary": workers_summary,
                 "live_sessions": self.live.snapshot(),
+                "managed_sessions": self.sessions.list_with_retained(),
                 "jobs": jobs,
             })
         })
@@ -526,6 +534,7 @@ impl HttpServer {
             min_delay_per_host_ms,
             allow_query_token: config.allow_query_token,
             allow_any_url: config.allow_any_url,
+            allow_session_cdp_endpoint: config.allow_session_cdp_endpoint,
             embed_frame_ancestors: config.embed_frame_ancestors,
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
             lease_notify: tokio::sync::Notify::new(),
@@ -706,6 +715,7 @@ impl HttpServer {
                 .route("/cdp", get(cdp_gateway::ws_handler))
                 .route("/json/version", get(cdp_gateway::json_version))
                 .route("/v1/scrape", post(scrape::scrape_handler))
+                .route("/v1/map", post(map::map_handler))
                 .route(
                     "/v1/sessions",
                     post(sessions::create_session).get(sessions::list_sessions),
@@ -715,6 +725,8 @@ impl HttpServer {
                     get(sessions::get_session).delete(sessions::delete_session),
                 )
                 .route("/v1/sessions/{id}/extend", post(sessions::extend_session))
+                .route("/v1/sessions/{id}/replay", get(sessions::get_session_replay))
+                .route("/v1/sessions/{id}/network", get(sessions::get_session_network))
                 .route("/v1/sessions/{id}/cdp", get(sessions::cdp_ws_handler))
                 .route("/v1/profiles", get(list_profiles))
                 .route("/v1/profiles/{name}", delete(delete_profile))
@@ -1825,6 +1837,28 @@ fn now_ms() -> u64 {
 
 fn bounded_error(message: &str) -> String {
     message.chars().take(2048).collect()
+}
+
+pub(crate) fn map_sync_job_error(err: fluxwright::Error, failed_code: &'static str) -> ApiError {
+    match err {
+        fluxwright::Error::QueueFull => {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "capacity_exceeded", err.to_string())
+        }
+        fluxwright::Error::ShuttingDown | fluxwright::Error::AcquireTimeout => {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", err.to_string())
+        }
+        fluxwright::Error::JobTimeout => {
+            ApiError::new(StatusCode::GATEWAY_TIMEOUT, "timeout", err.to_string())
+        }
+        other => {
+            let msg = other.to_string();
+            if msg.contains("profiles_dir") {
+                ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", msg)
+            } else {
+                ApiError::new(StatusCode::BAD_GATEWAY, failed_code, msg)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
