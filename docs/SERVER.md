@@ -78,6 +78,19 @@ session affinity (`"proxy_session"`) and exponential cooldown backoff on failure
 `--adaptive-concurrency` enables an AIMD concurrency limiter that backs off under high browser RSS
 pressure or failed jobs and grows smoothly back toward configured capacity while queue demand exists.
 
+`--low-memory` (default `false`) opts headless Chromium launches into `--disable-gpu`,
+`--disable-software-rasterizer`, and `--js-flags=--max-old-space-size=256` (when not already
+supplied or ignored via launch options) without changing default browser launches.
+
+`--recycle-rss-mb <mb>` (`NonZeroU64`) drains and recycles a managed local browser once its
+process-tree RSS reaches `<mb>` MiB, allowing active jobs to finish before closing.
+
+`--fast-cdp-endpoint <url>` accepts an optional external lightweight CDP endpoint (`ws://` or
+`http://`) for pluggable external light-CDP backends such as Moli, Obscura, or Lightpanda without
+bundling AGPL code. Optional Chrome-only CDP calls (`Target.createBrowserContext`,
+`Emulation.setDeviceMetricsOverride`, and optional `Fetch.enable`) degrade gracefully on `-32601`
+Method Not Found errors so lightweight CDP engines stay compatible alongside Chromium.
+
 Without `--max-browsers` or `--memory-ceiling-mb`, the engine sizes itself to the machine.
 
 Additional server operations flags on `fluxwright serve` (also available on `fluxwright coordinate` except `--embed-frame-ancestors`):
@@ -357,17 +370,27 @@ curl -sS -X POST http://127.0.0.1:7331/v1/scrape \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://example.com",
+    "mode": "auto",
     "formats": ["markdown", "snapshot", "screenshot"],
     "resource_preset": "scraping",
     "timeout_ms": 30000
   }'
 ```
 
-Supports `formats` entries `"markdown"`, `"html"`, `"text"`, `"snapshot"`, `"screenshot"`, and `"pdf"`, optional `wait_until` / `wait_for_selector`, `block_cookie_banners` (`true` to block common CMP/cookie-banner script origins), `profile` / `proxy_session`, `screenshot_full_page` / `screenshot_annotate`, and `snapshot_interactive_only`. Enforces the same SSRF guards and 1 MiB result size cap as `/v1/jobs`.
+Supports:
+- `formats`: entries `"markdown"`, `"html"`, `"text"`, `"snapshot"`, `"screenshot"`, and `"pdf"` (default `["markdown"]`).
+- `mode`: `"auto"` (default), `"http"`, or `"browser"`:
+  - `"auto"`: attempts the Tier 1 pure-Rust SSRF-safe HTTP fast path (`fast_fetch` + `fast_html`) first for static HTML pages, and automatically escalates to a pooled browser context if the HTTP response triggers escalation (HTTP `401`/`403`/`429`/`5xx`, non-HTML `Content-Type`, challenge markers, unhydrated SPA shells such as `#root`/`#app`/`#__next`/`#__nuxt` with `<script>` tags and `<200` chars readable text or `<noscript>` JS requirements, or fetch errors). Skips the HTTP fast path directly when `formats` includes `"screenshot"`, `"pdf"`, or `"snapshot"`, or when `wait_for_selector`, `profile`, `persist_profile`, `block_resources`, or `block_url_patterns` is set.
+  - `"http"`: requires the Tier 1 HTTP fast path only and returns an error (`400`/`502`) instead of falling back to a browser.
+  - `"browser"`: bypasses the HTTP fast path and executes directly in a browser.
+- `resource_preset`: defaults to `"scraping"` on browser-backed non-visual `/v1/scrape` jobs (no `"screenshot"` or `"pdf"` in `formats`) when omitted; visual scrapes leave `resource_preset` unset unless provided.
+- Optional `wait_until`, `wait_for_selector`, `block_cookie_banners` (`true` to block common CMP/cookie-banner script origins), `profile` / `proxy_session`, `screenshot_full_page` / `screenshot_annotate`, and `snapshot_interactive_only`.
+
+Returns `{ "url", "title", "duration_ms", "engine", ... }` with optional `"fallback_reason"` (present when `"auto"` escalated to `"browser"`), where `"engine"` is `"http"` or `"browser"`. Enforces the same SSRF guards (including DNS-pinned redirect validation on every hop in the HTTP fast path) and 1 MiB result size cap as `/v1/jobs`.
 
 ## Synchronous site link discovery (`POST /v1/map`)
 
-Discover deduplicated `http:`/`https:` links from a rendered page in one call:
+Discover deduplicated `http:`/`https:` links from a page in one call:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:7331/v1/map \
@@ -375,14 +398,21 @@ curl -sS -X POST http://127.0.0.1:7331/v1/map \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://example.com",
+    "mode": "auto",
     "same_origin": true,
     "include_subdomains": false,
+    "include_sitemap": false,
     "search": "docs",
     "limit": 100
   }'
 ```
 
-Supports `same_origin` (default `true`), `include_subdomains` (default `false`), case-insensitive `search` substring filter, `limit` (`1..=1000`, default `100`), `wait_until`, `timeout_ms` (`1..=120000`, default `30000`), `resource_preset`, `block_cookie_banners`, `profile`, and `proxy_session`. Returns `{ "url", "count", "links", "duration_ms" }` and enforces the same SSRF checks as `/v1/jobs` and `/v1/scrape`.
+Supports:
+- `mode`: `"auto"` (default), `"http"`, or `"browser"` (same Tier 1 HTTP fast-path and SPA/challenge escalation rules as `/v1/scrape`, skipping the HTTP fast path when `profile` is set).
+- `include_sitemap`: boolean (default `false`); fetches `sitemap.xml` via the SSRF-guarded HTTP fetcher and includes extracted XML `<loc>` URLs alongside discovered `<a href>` links before applying `same_origin`, `include_subdomains`, `search`, and `limit`.
+- `same_origin` (default `true`), `include_subdomains` (default `false`), case-insensitive `search` substring filter, `limit` (`1..=1000`, default `100`), `wait_until`, `timeout_ms` (`1..=120000`, default `30000`), `resource_preset` (defaults to `"scraping"` when omitted on browser-backed `/v1/map` jobs), `block_cookie_banners`, `profile`, and `proxy_session`.
+
+Returns `{ "url", "count", "links", "duration_ms", "engine" }` with optional `"fallback_reason"` when `"auto"` escalated to `"browser"`, where `"engine"` is `"http"` or `"browser"`. Enforces the same SSRF checks as `/v1/jobs` and `/v1/scrape`.
 
 ## Live screencast viewer & human-in-the-loop
 
@@ -479,6 +509,8 @@ Exported metrics include:
   - `fluxwright_http_jobs_total{status="succeeded|failed|cancelled"}`: Total number of HTTP jobs completed by final status (counter).
   - `fluxwright_http_jobs_active{status="queued|running"}`: Current number of active HTTP jobs (gauge).
   - `fluxwright_http_jobs_capacity`: Configured maximum job capacity (`--max-jobs`).
+  - `fluxwright_fastpath_hits_total`: Total number of `/v1/scrape` and `/v1/map` requests served directly by the Tier 1 HTTP fast path (counter).
+  - `fluxwright_fastpath_fallbacks_total`: Total number of `mode: "auto"` `/v1/scrape` and `/v1/map` requests that escalated from the HTTP fast path to browser execution (counter).
 
 ### Live fleet dashboard (`GET /dashboard` and `GET /`)
 

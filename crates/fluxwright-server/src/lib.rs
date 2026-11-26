@@ -6,6 +6,9 @@
 mod cdp_gateway;
 mod cluster;
 pub mod dashboard;
+mod fast_cdp;
+mod fast_fetch;
+mod fast_html;
 mod http_post;
 mod job;
 mod journal;
@@ -93,6 +96,7 @@ pub struct ServerConfig {
     otlp_endpoint: Option<String>,
     otlp_service_name: String,
     embed_frame_ancestors: String,
+    fast_cdp_endpoint: Option<String>,
 }
 
 const DEFAULT_LEASE_TIMEOUT_MS: u64 = 30_000;
@@ -120,6 +124,80 @@ pub enum ConfigError {
     InvalidOtlpEndpoint(String),
     #[error("invalid embed frame-ancestors policy: {0}")]
     InvalidFrameAncestors(String),
+    #[error("invalid fast CDP endpoint: {0}")]
+    InvalidFastCdpEndpoint(String),
+}
+
+/// Validates and normalizes an optional external lightweight CDP endpoint URL (`ws://`, `wss://`,
+/// `http://`, or `https://`).
+pub fn validate_fast_cdp_endpoint(raw: &str) -> Result<String, ConfigError> {
+    if raw.is_empty()
+        || raw.len() > 2048
+        || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        || raw.contains('\\')
+    {
+        return Err(ConfigError::InvalidFastCdpEndpoint(
+            "must be 1-2048 characters without whitespace, control characters, or backslashes"
+                .into(),
+        ));
+    }
+    let (scheme_raw, rest) = raw.split_once("://").ok_or_else(|| {
+        ConfigError::InvalidFastCdpEndpoint("must use ws://, wss://, http://, or https://".into())
+    })?;
+    let scheme = scheme_raw.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "ws" | "wss" | "http" | "https") {
+        return Err(ConfigError::InvalidFastCdpEndpoint(
+            "must use ws://, wss://, http://, or https://".into(),
+        ));
+    }
+    let rest_no_frag = rest.split('#').next().unwrap_or(rest);
+    let auth_end = rest_no_frag.find(['/', '?']).unwrap_or(rest_no_frag.len());
+    let authority = &rest_no_frag[..auth_end];
+    if authority.is_empty() || authority.contains('@') {
+        return Err(ConfigError::InvalidFastCdpEndpoint(
+            "authority is invalid or contains userinfo".into(),
+        ));
+    }
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((ip_str, tail)) = after_bracket.split_once(']') else {
+            return Err(ConfigError::InvalidFastCdpEndpoint(
+                "has an unclosed IPv6 host".into(),
+            ));
+        };
+        if ip_str.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(ConfigError::InvalidFastCdpEndpoint(
+                "has an invalid IPv6 host".into(),
+            ));
+        }
+        if !tail.is_empty() {
+            let _port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .filter(|&p| p != 0)
+                .ok_or_else(|| {
+                    ConfigError::InvalidFastCdpEndpoint("has an invalid port".into())
+                })?;
+        }
+        ip_str
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.is_empty() || h.contains(':') {
+            return Err(ConfigError::InvalidFastCdpEndpoint("has an invalid host".into()));
+        }
+        let _port = p
+            .parse::<u16>()
+            .ok()
+            .filter(|&n| n != 0)
+            .ok_or_else(|| ConfigError::InvalidFastCdpEndpoint("has an invalid port".into()))?;
+        h
+    } else {
+        authority
+    };
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ConfigError::InvalidFastCdpEndpoint(
+            "has an empty or invalid host".into(),
+        ));
+    }
+    Ok(format!("{scheme}://{rest}"))
 }
 
 fn validate_token(token: &str) -> Result<(), ConfigError> {
@@ -163,6 +241,7 @@ impl ServerConfig {
             otlp_endpoint: None,
             otlp_service_name: DEFAULT_OTLP_SERVICE_NAME.to_string(),
             embed_frame_ancestors: DEFAULT_EMBED_FRAME_ANCESTORS.to_string(),
+            fast_cdp_endpoint: None,
         })
     }
 
@@ -207,6 +286,15 @@ impl ServerConfig {
         self.embed_frame_ancestors = validate_frame_ancestors(&policy)?;
         Ok(self)
     }
+
+    /// Configures an optional external lightweight CDP endpoint (`ws://`, `wss://`, `http://`, or
+    /// `https://`) used as a Tier 2 fallback when `/v1/scrape` or `/v1/map` escalates from the
+    /// HTTP fast path for eligible non-visual requests.
+    pub fn with_fast_cdp_endpoint(mut self, endpoint: String) -> Result<Self, ConfigError> {
+        let normalized = validate_fast_cdp_endpoint(&endpoint)?;
+        self.fast_cdp_endpoint = Some(normalized);
+        Ok(self)
+    }
 }
 
 #[derive(Clone)]
@@ -225,11 +313,15 @@ pub(crate) struct Inner {
     allow_any_url: bool,
     allow_session_cdp_endpoint: bool,
     embed_frame_ancestors: String,
+    fast_cdp_endpoint: Option<String>,
+    fast_cdp_browser: tokio::sync::Mutex<Option<Arc<fluxwright_cdp::CdpBrowser>>>,
     lease_ms: AtomicU64,
     lease_notify: tokio::sync::Notify,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     active_cdp_sessions: AtomicUsize,
     total_cdp_sessions: AtomicU64,
+    fastpath_hits: AtomicU64,
+    fastpath_fallbacks: AtomicU64,
     live: live::LiveRegistry,
     sessions: sessions::SessionStoreState,
     webhooks: webhook::WebhookDispatcher,
@@ -361,6 +453,8 @@ impl Inner {
                 expired_leases: workers_summary.expired_leases,
                 active_cdp_sessions: self.active_cdp_sessions.load(Ordering::Relaxed),
                 total_cdp_sessions: self.total_cdp_sessions.load(Ordering::Relaxed),
+                fastpath_hits: self.fastpath_hits.load(Ordering::Relaxed),
+                fastpath_fallbacks: self.fastpath_fallbacks.load(Ordering::Relaxed),
             }
         });
         metrics.to_prometheus_text()
@@ -475,6 +569,9 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // Workers and completion monitors hold Weak<Inner>, so dropping the last server/router
         // aborts outstanding jobs rather than keeping the fleet alive forever.
+        if let Some(browser) = self.fast_cdp_browser.get_mut().take() {
+            browser.start_kill();
+        }
         let registry = self.registry.get_mut().unwrap_or_else(|e| e.into_inner());
         for record in &registry.jobs {
             if let Some(abort) = &record.abort {
@@ -536,11 +633,15 @@ impl HttpServer {
             allow_any_url: config.allow_any_url,
             allow_session_cdp_endpoint: config.allow_session_cdp_endpoint,
             embed_frame_ancestors: config.embed_frame_ancestors,
+            fast_cdp_endpoint: config.fast_cdp_endpoint,
+            fast_cdp_browser: tokio::sync::Mutex::new(None),
             lease_ms: AtomicU64::new(DEFAULT_LEASE_TIMEOUT_MS),
             lease_notify: tokio::sync::Notify::new(),
             shutdown_tx,
             active_cdp_sessions: AtomicUsize::new(0),
             total_cdp_sessions: AtomicU64::new(0),
+            fastpath_hits: AtomicU64::new(0),
+            fastpath_fallbacks: AtomicU64::new(0),
             live: live::LiveRegistry::default(),
             sessions: sessions::SessionStoreState::default(),
             webhooks: webhook::WebhookDispatcher::new(config.webhook_secret),
@@ -799,6 +900,10 @@ impl HttpServer {
                 .sessions
                 .drain(grace.min(Duration::from_secs(3)))
                 .await;
+        }
+        let fast_cdp_browser = self.inner.fast_cdp_browser.lock().await.take();
+        if let Some(browser) = fast_cdp_browser {
+            let _ = tokio::time::timeout(grace.min(Duration::from_secs(2)), browser.close()).await;
         }
         let res = match &self.inner.engine {
             Some(engine) => engine.shutdown(grace).await,

@@ -66,7 +66,7 @@ pub enum ServerResourcePreset {
 }
 
 impl ServerResourcePreset {
-    fn into_core(self) -> ResourcePreset {
+    pub(crate) fn into_core(self) -> ResourcePreset {
         match self {
             Self::Scraping => ResourcePreset::Scraping,
             Self::Minimal => ResourcePreset::Minimal,
@@ -946,7 +946,7 @@ pub enum NavigationWait {
 }
 
 impl NavigationWait {
-    fn into_core(self) -> WaitUntil {
+    pub(crate) fn into_core(self) -> WaitUntil {
         match self {
             Self::Load => WaitUntil::Load,
             Self::DomContentLoaded => WaitUntil::DomContentLoaded,

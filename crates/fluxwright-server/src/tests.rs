@@ -4083,3 +4083,767 @@ fn replay_har_redaction_bounds_and_map_filter_unit() {
         ]
     );
 }
+
+#[test]
+fn fast_html_markdown_links_and_sitemap_extraction() {
+    let html = r#"<!doctype html>
+<html>
+  <head>
+    <title>FastPath Guide</title>
+    <base href="https://example.com/docs/">
+    <style>.hidden { display: none; }</style>
+    <script>console.log("ignored script text");</script>
+  </head>
+  <body>
+    <noscript>ignored noscript</noscript>
+    <template><p>ignored template</p></template>
+    <svg><title>svg title</title><text>ignored svg</text></svg>
+    <iframe src="/frame">ignored iframe</iframe>
+    <div hidden>hidden div</div>
+    <div aria-hidden="true">aria hidden</div>
+    <div style="display: none">inline hidden</div>
+    <h1>Welcome</h1>
+    <h2>Details</h2>
+    <p>Visit <a href="getting-started">Getting <strong>Started</strong></a> and <em>enjoy</em> <code>fast()</code>.</p>
+    <p><a href="javascript:void(0)">Noop</a> and <a href="https://other.test/raw"></a></p>
+    <ul>
+      <li>Alpha<ul><li>Nested</li></ul></li>
+      <li>Beta</li>
+    </ul>
+    <ol start="3">
+      <li>Third</li>
+      <li>Fourth</li>
+    </ol>
+    <pre><code>let x = 1;
+let y = 2;</code></pre>
+    <blockquote><p>Quoted line</p></blockquote>
+    <hr>
+    <table>
+      <tr><th>Col | A</th><th>Col \ B</th></tr>
+      <tr><td>val1</td></tr>
+    </table>
+    <a href="mailto:hi@example.com">Mail</a>
+  </body>
+</html>"#;
+
+    let extracted = fast_html::extract_html(html, "https://example.com/blog/post");
+    assert_eq!(extracted.title, "FastPath Guide");
+
+    let md = &extracted.markdown;
+    assert!(!md.contains("ignored script"));
+    assert!(!md.contains("ignored noscript"));
+    assert!(!md.contains("ignored template"));
+    assert!(!md.contains("ignored svg"));
+    assert!(!md.contains("ignored iframe"));
+    assert!(!md.contains("hidden div"));
+    assert!(!md.contains("aria hidden"));
+    assert!(!md.contains("inline hidden"));
+    assert!(md.contains("# Welcome"));
+    assert!(md.contains("## Details"));
+    assert!(md.contains("[Getting **Started**](https://example.com/docs/getting-started)"));
+    assert!(md.contains("*enjoy*"));
+    assert!(md.contains("`fast()`"));
+    assert!(md.contains("Noop and https://other.test/raw"));
+    assert!(md.contains("- Alpha"));
+    assert!(md.contains("  - Nested"));
+    assert!(md.contains("3. Third"));
+    assert!(md.contains("4. Fourth"));
+    assert!(md.contains("```\nlet x = 1;\nlet y = 2;\n```"));
+    assert!(md.contains("> Quoted line"));
+    assert!(md.contains("| Col \\| A | Col \\\\ B |"));
+    assert!(md.contains("| val1 |  |"));
+
+    assert!(!extracted.text.contains("ignored script"));
+    assert!(extracted.text.contains("Welcome"));
+    assert!(extracted.text.contains("Getting Started"));
+
+    assert_eq!(
+        extracted.links,
+        vec![
+            "https://example.com/docs/getting-started",
+            "https://other.test/raw",
+        ]
+    );
+
+    let sitemap_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- comment with <loc>https://ignored.example/x</loc> -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/a?x=1&amp;y=2</loc></url>
+  <url><loc><![CDATA[https://example.com/cdata]]></loc></url>
+  <url><loc>ftp://example.com/ignored</loc></url>
+  <url><loc>https://example.com/a?x=1&amp;y=2</loc></url>
+</urlset>"#;
+    assert_eq!(
+        fast_html::parse_sitemap_locs(sitemap_xml),
+        vec![
+            "https://example.com/a?x=1&y=2",
+            "https://example.com/cdata",
+        ]
+    );
+
+    let scoped_md = fast_html::html_to_markdown(
+        "<header>Nav</header><main><h1>Core</h1><img src='/pic.png' alt='Logo'><a href='/x'>X</a></main>",
+        "https://example.com/",
+        true,
+        false,
+        true,
+    );
+    assert!(!scoped_md.contains("Nav"));
+    assert!(scoped_md.contains("# Core"));
+    assert!(scoped_md.contains("![Logo](https://example.com/pic.png)"));
+    assert!(!scoped_md.contains("https://example.com/x"));
+}
+
+#[test]
+fn fast_html_escalation_detection_covers_status_markers_and_spa() {
+    let ok_headers: Vec<(String, String)> = Vec::new();
+    let ok_html = "<!doctype html><title>Static</title><p>Hello world</p>";
+
+    for status in [401, 403, 429, 500, 502, 503] {
+        let reason = fast_html::detect_escalation(status, &ok_headers, Some("text/html"), ok_html);
+        assert!(reason.is_some(), "expected escalation for status {status}");
+    }
+    assert!(fast_html::detect_escalation(200, &ok_headers, Some("text/html"), ok_html).is_none());
+    assert!(fast_html::detect_escalation(404, &ok_headers, Some("text/html"), ok_html).is_none());
+
+    // Non-HTML Content-Type escalates.
+    assert!(
+        fast_html::detect_escalation(200, &ok_headers, Some("application/json"), r#"{"ok":true}"#)
+            .is_some()
+    );
+    assert!(
+        fast_html::detect_escalation(200, &ok_headers, Some("application/pdf"), "%PDF-1.7")
+            .is_some()
+    );
+
+    // Challenge headers and markers escalate.
+    let cf_headers = vec![("CF-Mitigated".to_string(), "challenge".to_string())];
+    assert!(
+        fast_html::detect_escalation(200, &cf_headers, Some("text/html"), ok_html)
+            .unwrap()
+            .contains("cf-mitigated")
+    );
+    for marker_html in [
+        "<html><title>Just a moment...</title></html>",
+        "<html><script src='/cdn-cgi/challenge-platform/h/b/orchestrate'></script></html>",
+        "<html><iframe src='/_Incapsula_Resource?SWJIYLWA=1'></iframe></html>",
+        "<html><body>Protected by DDoS-Guard</body></html>",
+    ] {
+        assert!(
+            fast_html::detect_escalation(200, &ok_headers, Some("text/html"), marker_html)
+                .is_some(),
+            "expected challenge escalation for {marker_html}"
+        );
+    }
+
+    // Unhydrated SPA shells escalate; hydrated SSR pages with >=200 chars text do not.
+    for spa_html in [
+        "<!doctype html><body><div id='root'></div><script src='/main.js'></script></body>",
+        "<!doctype html><body><div id='app'>Loading...</div><script src='/app.js'></script></body>",
+        "<!doctype html><body><div id='__next'></div><script src='/_next/static/app.js'></script></body>",
+        "<!doctype html><body><div id='__nuxt'></div><script src='/_nuxt/entry.js'></script></body>",
+        "<!doctype html><body><noscript>You need to enable JavaScript to run this app.</noscript></body>",
+    ] {
+        assert!(
+            fast_html::detect_escalation(200, &ok_headers, Some("text/html"), spa_html).is_some(),
+            "expected SPA escalation for {spa_html}"
+        );
+    }
+
+    let hydrated_ssr = format!(
+        "<!doctype html><body><div id='__next'><p>{}</p></div><script src='/app.js'></script></body>",
+        "SSR content word ".repeat(20)
+    );
+    assert!(
+        fast_html::detect_escalation(200, &ok_headers, Some("text/html"), &hydrated_ssr).is_none()
+    );
+
+    // Benign tracking pixel inside <noscript> or non-SPA minimal <nav> with <script> must not escalate.
+    let benign_html = "<!doctype html><body><noscript><img src='/p.gif'></noscript><nav><a href='/a'>Link</a></nav><script src='/analytics.js'></script></body>";
+    assert!(
+        fast_html::detect_escalation(200, &ok_headers, Some("text/html"), benign_html).is_none()
+    );
+}
+
+#[test]
+fn fetch_mode_and_request_deserialization() {
+    use fast_fetch::FetchMode;
+
+    assert_eq!(
+        serde_json::from_str::<FetchMode>(r#""auto""#).unwrap(),
+        FetchMode::Auto
+    );
+    assert_eq!(
+        serde_json::from_str::<FetchMode>(r#""http""#).unwrap(),
+        FetchMode::Http
+    );
+    assert_eq!(
+        serde_json::from_str::<FetchMode>(r#""browser""#).unwrap(),
+        FetchMode::Browser
+    );
+    assert!(serde_json::from_str::<FetchMode>(r#""curl""#).is_err());
+
+    let scrape_default: scrape::ScrapeRequest =
+        serde_json::from_str(r#"{"url":"https://example.com"}"#).unwrap();
+    assert_eq!(scrape_default.mode, FetchMode::Auto);
+
+    let scrape_http: scrape::ScrapeRequest =
+        serde_json::from_str(r#"{"url":"https://example.com","mode":"http"}"#).unwrap();
+    assert_eq!(scrape_http.mode, FetchMode::Http);
+
+    let map_default: map::MapRequest =
+        serde_json::from_str(r#"{"url":"https://example.com"}"#).unwrap();
+    assert_eq!(map_default.mode, FetchMode::Auto);
+    assert!(!map_default.include_sitemap);
+
+    let map_opts: map::MapRequest = serde_json::from_str(
+        r#"{"url":"https://example.com","mode":"browser","include_sitemap":true}"#,
+    )
+    .unwrap();
+    assert_eq!(map_opts.mode, FetchMode::Browser);
+    assert!(map_opts.include_sitemap);
+}
+
+#[tokio::test]
+async fn fast_fetch_blocks_ssrf_redirects_and_decodes_compressed_bodies() {
+    use std::io::Write as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let srv = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let response: Vec<u8> = match target {
+                    "/redir-imds" => b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-fe80" => b"HTTP/1.1 302 Found\r\nLocation: http://[fe80::1]/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-fd00" => b"HTTP/1.1 302 Found\r\nLocation: http://[fd00:ec2::254]/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-v4mapped" => b"HTTP/1.1 302 Found\r\nLocation: http://[::ffff:169.254.169.254]/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-dec" => b"HTTP/1.1 302 Found\r\nLocation: http://2852039166/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-hex" => b"HTTP/1.1 302 Found\r\nLocation: http://0xa9.0xfe.0xa9.0xfe/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-file" => b"HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-loop" => b"HTTP/1.1 302 Found\r\nLocation: /redir-loop\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-ok" => b"HTTP/1.1 302 Found\r\nLocation: /gzip\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/gzip" => {
+                        let mut enc = flate2::write::GzEncoder::new(
+                            Vec::new(),
+                            flate2::Compression::default(),
+                        );
+                        enc.write_all(b"<!doctype html><title>Gz</title><p>gzipped</p>")
+                            .unwrap();
+                        let gz = enc.finish().unwrap();
+                        let mut chunked = Vec::new();
+                        chunked.extend_from_slice(
+                            format!("{:x}\r\n", gz.len()).as_bytes(),
+                        );
+                        chunked.extend_from_slice(&gz);
+                        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+                        let mut out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(&chunked);
+                        out
+                    }
+                    "/deflate" => {
+                        let mut enc = flate2::write::ZlibEncoder::new(
+                            Vec::new(),
+                            flate2::Compression::default(),
+                        );
+                        enc.write_all(b"<p>deflated</p>").unwrap();
+                        let z = enc.finish().unwrap();
+                        let mut out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: deflate\r\nContent-Length: {}\r\n\r\n",
+                            z.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(&z);
+                        out
+                    }
+                    "/too-big" => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                        fast_fetch::MAX_FAST_FETCH_BODY_BYTES + 1
+                    )
+                    .into_bytes(),
+                    _ => b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 10\r\n\r\n<p>ok</p>!".to_vec(),
+                };
+                let _ = sock.write_all(&response).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    // SSRF redirects blocked before connecting across IPv4/IPv6 link-local, AWS IMDS, decimal/hex IPv4, and file://.
+    for path in [
+        "/redir-imds",
+        "/redir-fe80",
+        "/redir-fd00",
+        "/redir-v4mapped",
+        "/redir-dec",
+        "/redir-hex",
+        "/redir-file",
+    ] {
+        let err = fast_fetch::fetch_url(
+            &format!("{base}{path}"),
+            Duration::from_secs(5),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, fast_fetch::FastFetchError::InvalidOrBlocked(_)),
+            "expected InvalidOrBlocked for {path}, got {err:?}"
+        );
+    }
+
+    // Redirect loop > 10 hops fails cleanly.
+    let loop_err = fast_fetch::fetch_url(
+        &format!("{base}/redir-loop"),
+        Duration::from_secs(5),
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(loop_err, fast_fetch::FastFetchError::Transport(_)));
+
+    // 302 -> /gzip follows redirect and decodes chunked gzip body.
+    let gz_resp = fast_fetch::fetch_url(
+        &format!("{base}/redir-ok"),
+        Duration::from_secs(5),
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(gz_resp.final_url, format!("{base}/gzip"));
+    assert_eq!(
+        String::from_utf8_lossy(&gz_resp.body),
+        "<!doctype html><title>Gz</title><p>gzipped</p>"
+    );
+
+    // Deflate decoding.
+    let def_resp = fast_fetch::fetch_url(
+        &format!("{base}/deflate"),
+        Duration::from_secs(5),
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(String::from_utf8_lossy(&def_resp.body), "<p>deflated</p>");
+
+    // 10 MiB body cap enforced before reading oversized payload and on decompressed gzip zip-bombs.
+    let big_err = fast_fetch::fetch_url(
+        &format!("{base}/too-big"),
+        Duration::from_secs(5),
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(big_err, fast_fetch::FastFetchError::Transport(_)));
+
+    let mut bomb_enc =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    bomb_enc
+        .write_all(&vec![b'A'; fast_fetch::MAX_FAST_FETCH_BODY_BYTES + 1024])
+        .unwrap();
+    let bomb_gz = bomb_enc.finish().unwrap();
+    assert!(bomb_gz.len() < 128 * 1024);
+    let bomb_err = fast_fetch::decode_content_encoding(bomb_gz, Some("gzip")).unwrap_err();
+    assert!(matches!(bomb_err, fast_fetch::FastFetchError::Transport(_)));
+
+    // HTTP proxy pool integration (absolute-form request with Basic Proxy-Authorization).
+    let proxy_seen = Arc::new(Mutex::new(String::new()));
+    let proxy_seen_srv = proxy_seen.clone();
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
+    let proxy_task = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = proxy_listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            *proxy_seen_srv.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = "<!doctype html><title>ViaProxy</title><p>proxied</p>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    let pool = fluxwright::ProxyPool::from_urls([format!("http://alice:s3cr3t@127.0.0.1:{proxy_port}")])
+        .unwrap();
+    let proxied = fast_fetch::fetch_url(
+        "http://example.invalid/page",
+        Duration::from_secs(5),
+        false,
+        Some(&pool),
+        Some("sess-1"),
+    )
+    .await
+    .unwrap();
+    assert!(String::from_utf8_lossy(&proxied.body).contains("ViaProxy"));
+    let raw_proxy_req = proxy_seen.lock().unwrap().clone();
+    assert!(raw_proxy_req.starts_with("GET http://example.invalid/page HTTP/1.1\r\n"));
+    assert!(raw_proxy_req.contains("Proxy-Authorization: Basic "));
+
+    // mode: "http" succeeds on idle_engine (without Chromium) and updates Prometheus fastpath hits.
+    let eng = idle_engine().await;
+    let http_srv = HttpServer::new(eng, ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    let scrape_resp = call(
+        &http_srv,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base}/gzip"), "mode": "http", "formats": ["markdown", "text"] })
+            .to_string(),
+    )
+    .await;
+    assert_eq!(scrape_resp.status(), StatusCode::OK);
+    let scrape_json = body(scrape_resp).await;
+    assert_eq!(scrape_json["engine"], "http");
+    assert_eq!(scrape_json["title"], "Gz");
+    assert_eq!(scrape_json["markdown"], "gzipped");
+    assert_eq!(scrape_json["text"], "gzipped");
+
+    // mode: "http" rejects visual format with 400 and rejects SSRF redirect with 400.
+    let bad_vis = call(
+        &http_srv,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base}/gzip"), "mode": "http", "formats": ["screenshot"] })
+            .to_string(),
+    )
+    .await;
+    assert_eq!(bad_vis.status(), StatusCode::BAD_REQUEST);
+
+    let bad_ssrf = call(
+        &http_srv,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base}/redir-imds"), "mode": "http" }).to_string(),
+    )
+    .await;
+    assert_eq!(bad_ssrf.status(), StatusCode::BAD_REQUEST);
+
+    let metrics_text = String::from_utf8(
+        to_bytes(call(&http_srv, "GET", "/metrics", Body::empty()).await.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(metrics_text.contains("fluxwright_fastpath_hits_total 1\n"));
+    assert!(metrics_text.contains("fluxwright_fastpath_fallbacks_total 0\n"));
+
+    http_srv.shutdown(Duration::ZERO).await.unwrap();
+    proxy_task.abort();
+    srv.abort();
+}
+
+#[tokio::test]
+async fn with_fast_cdp_endpoint_validates_and_wires_config() {
+    let cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_fast_cdp_endpoint("WS://127.0.0.1:9222/devtools/browser/1".into())
+        .expect("valid ws endpoint");
+    let srv = HttpServer::new(idle_engine().await, cfg).unwrap();
+    assert_eq!(
+        srv.inner.fast_cdp_endpoint.as_deref(),
+        Some("ws://127.0.0.1:9222/devtools/browser/1")
+    );
+    srv.shutdown(Duration::ZERO).await.unwrap();
+
+    for ok in [
+        "wss://cdp.example.com:9443/ws",
+        "http://localhost:9222",
+        "https://[::1]:9222/json/version",
+    ] {
+        assert!(
+            ServerConfig::new(TOKEN.into())
+                .unwrap()
+                .with_fast_cdp_endpoint(ok.into())
+                .is_ok(),
+            "expected valid fast-CDP endpoint: {ok}"
+        );
+    }
+
+    for bad in [
+        "",
+        "ftp://127.0.0.1:9222",
+        "127.0.0.1:9222",
+        "ws://",
+        "ws://user:pass@127.0.0.1:9222",
+        "ws://127.0.0.1:0",
+        "ws://127.0.0.1:abc",
+        "ws://[::1",
+        "ws://127.0.0.1:9222 bad",
+        "ws://127.0.0.1\\9222",
+    ] {
+        let err = match ServerConfig::new(TOKEN.into())
+            .unwrap()
+            .with_fast_cdp_endpoint(bad.into())
+        {
+            Ok(_) => panic!("expected invalid fast-CDP endpoint to fail: {bad:?}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ConfigError::InvalidFastCdpEndpoint(_)),
+            "unexpected error for {bad:?}: {err}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fast_cdp_tier_handles_escalated_scrape_and_map_with_32601_fallback() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{http_port}");
+    let http_srv_task = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = http_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = match target {
+                    "/map-spa" => {
+                        "<!doctype html><title>MapShell</title><body><div id='app'></div><script>app()</script></body>"
+                    }
+                    _ => {
+                        "<!doctype html><title>Shell</title><body><div id='root'></div><script>hydrate()</script></body>"
+                    }
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    let cdp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdp_addr = cdp_listener.local_addr().unwrap();
+    let closed_targets = Arc::new(AtomicUsize::new(0));
+    let closed_targets_srv = closed_targets.clone();
+    let base_for_cdp = base.clone();
+
+    let cdp_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = cdp_listener.accept().await {
+            let closed_targets_conn = closed_targets_srv.clone();
+            let base_conn = base_for_cdp.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let mut target_seq = 0usize;
+                let mut current_url = String::from("about:blank");
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&text).unwrap();
+                    let id = req["id"].clone();
+                    let method = req["method"].as_str().unwrap_or_default();
+                    let reply = match method {
+                        "Browser.getVersion" => json!({
+                            "id": id,
+                            "result": { "product": "Lightpanda/0.1.0", "protocolVersion": "1.3" }
+                        }),
+                        "Target.createBrowserContext"
+                        | "Target.disposeBrowserContext"
+                        | "Page.setLifecycleEventsEnabled"
+                        | "Fetch.enable"
+                        | "Emulation.setDeviceMetricsOverride"
+                        | "Network.enable"
+                        | "Network.setBlockedURLs" => json!({
+                            "id": id,
+                            "error": { "code": -32601, "message": "Method not found" }
+                        }),
+                        "Target.createTarget" => {
+                            target_seq += 1;
+                            let tid = format!("T-FAST-{target_seq}");
+                            let sid = format!("S-FAST-{target_seq}");
+                            let ev = json!({
+                                "method": "Target.attachedToTarget",
+                                "params": {
+                                    "sessionId": sid,
+                                    "waitingForDebugger": false,
+                                    "targetInfo": {
+                                        "targetId": tid,
+                                        "type": "page",
+                                        "url": "about:blank"
+                                    }
+                                }
+                            });
+                            if ws.send(Message::Text(ev.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            json!({ "id": id, "result": { "targetId": tid } })
+                        }
+                        "Target.closeTarget" => {
+                            closed_targets_conn.fetch_add(1, Ordering::SeqCst);
+                            json!({ "id": id, "result": { "success": true } })
+                        }
+                        "Page.navigate" => {
+                            let url = req["params"]["url"].as_str().unwrap_or("about:blank");
+                            current_url = url.to_string();
+                            let tid = format!("T-FAST-{target_seq}");
+                            let sid = format!("S-FAST-{target_seq}");
+                            let ev = json!({
+                                "method": "Page.frameNavigated",
+                                "sessionId": sid,
+                                "params": { "frame": { "id": tid, "url": url } }
+                            });
+                            if ws.send(Message::Text(ev.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            json!({ "id": id, "result": { "frameId": tid } })
+                        }
+                        "Runtime.evaluate" => {
+                            let expr = req["params"]["expression"].as_str().unwrap_or("");
+                            let val = if expr == "location.href" {
+                                if current_url.ends_with("/ssrf-sim") {
+                                    json!("http://169.254.169.254/latest/meta-data")
+                                } else {
+                                    json!(current_url)
+                                }
+                            } else if expr == "document.title" {
+                                json!("LightCDP Hydrated")
+                            } else if expr == "document.documentElement.outerHTML" {
+                                json!("<html><body><h1>LightCDP</h1></body></html>")
+                            } else if expr.contains("innerText") {
+                                json!("LightCDP hydrated text")
+                            } else if expr.contains("SKIP_TAGS") {
+                                json!("# LightCDP\n\nHydrated by external fast-CDP")
+                            } else if expr.contains("querySelectorAll('a[href]')") {
+                                json!([
+                                    format!("{base_conn}/spa-link"),
+                                    "https://external.example/skip"
+                                ])
+                            } else {
+                                json!("complete")
+                            };
+                            json!({
+                                "id": id,
+                                "result": { "result": { "type": "object", "value": val } }
+                            })
+                        }
+                        _ => json!({ "id": id, "result": {} }),
+                    };
+                    if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    // Uses idle_engine() (NeverStarts): passing proves Tier 2 fast-CDP handled the escalated requests
+    // without touching local Chromium.
+    let cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_fast_cdp_endpoint(format!("ws://{cdp_addr}"))
+        .unwrap();
+    let srv = HttpServer::new(idle_engine().await, cfg).unwrap();
+
+    let scrape_resp = call(
+        &srv,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{base}/spa"),
+            "formats": ["markdown", "html", "text"]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(scrape_resp.status(), StatusCode::OK);
+    let scrape_json = body(scrape_resp).await;
+    assert_eq!(scrape_json["engine"], "browser");
+    assert!(scrape_json["fallback_reason"]
+        .as_str()
+        .unwrap_or("")
+        .contains("SPA shell"));
+    assert_eq!(scrape_json["title"], "LightCDP Hydrated");
+    assert_eq!(
+        scrape_json["markdown"],
+        "# LightCDP\n\nHydrated by external fast-CDP"
+    );
+    assert_eq!(
+        scrape_json["html"],
+        "<html><body><h1>LightCDP</h1></body></html>"
+    );
+    assert_eq!(scrape_json["text"], "LightCDP hydrated text");
+
+    let map_resp = call(
+        &srv,
+        "POST",
+        "/v1/map",
+        json!({ "url": format!("{base}/map-spa") }).to_string(),
+    )
+    .await;
+    assert_eq!(map_resp.status(), StatusCode::OK);
+    let map_json = body(map_resp).await;
+    assert_eq!(map_json["engine"], "browser");
+    assert!(map_json["fallback_reason"].is_string());
+    assert_eq!(map_json["links"], json!([format!("{base}/spa-link")]));
+
+    // If fast-CDP navigation lands on a link-local SSRF destination, it is blocked with 400.
+    let ssrf_resp = call(
+        &srv,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base}/ssrf-sim") }).to_string(),
+    )
+    .await;
+    assert_eq!(ssrf_resp.status(), StatusCode::BAD_REQUEST);
+    let ssrf_json = body(ssrf_resp).await;
+    assert_eq!(ssrf_json["error"]["code"], "invalid_request");
+
+    assert_eq!(closed_targets.load(Ordering::SeqCst), 3);
+
+    let metrics_text = String::from_utf8(
+        to_bytes(call(&srv, "GET", "/metrics", Body::empty()).await.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(metrics_text.contains("fluxwright_fastpath_hits_total 0\n"), "{metrics_text}");
+    assert!(
+        metrics_text.contains("fluxwright_fastpath_fallbacks_total 3\n"),
+        "{metrics_text}"
+    );
+
+    srv.shutdown(Duration::from_secs(2)).await.unwrap();
+    cdp_task.abort();
+    http_srv_task.abort();
+}

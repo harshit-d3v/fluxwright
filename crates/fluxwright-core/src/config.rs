@@ -167,6 +167,7 @@ impl Default for EngineConfig {
             queue_full_mode: QueueFullMode::Error,
             launch: LaunchOptions {
                 no_sandbox,
+                low_memory: false,
                 ..LaunchOptions::default()
             },
             acquire_timeout: Duration::from_secs(30),
@@ -452,6 +453,8 @@ mod tests {
         assert_eq!(auto_tune(64, 1), (16, 1), "never 0 MB, which would mean no ceiling");
         let config = EngineConfig::default();
         assert!(config.max_browsers >= 1 && config.memory_ceiling_mb >= 1);
+        assert!(!config.launch.low_memory);
+        assert!(config.recycle_rss_mb.is_none());
     }
 
     #[test]

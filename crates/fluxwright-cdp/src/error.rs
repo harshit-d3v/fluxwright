@@ -71,6 +71,7 @@ pub struct LaunchOptions {
     pub channel: Option<String>,
     pub headless: bool,
     pub no_sandbox: bool,
+    pub low_memory: bool,
     pub extra_args: Vec<String>,
     pub ignore_default_args: IgnoreDefaultArgs,
 }
@@ -82,6 +83,7 @@ impl Default for LaunchOptions {
             channel: None,
             headless: true,
             no_sandbox: false,
+            low_memory: false,
             extra_args: Vec::new(),
             ignore_default_args: IgnoreDefaultArgs::None,
         }
