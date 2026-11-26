@@ -6,6 +6,10 @@ name: benchmarks
 on:
   workflow_dispatch:
     inputs:
+      run_fleet:
+        description: Run Playwright and Puppeteer fleet comparison
+        type: boolean
+        default: true
       chaos:
         description: Also kill a browser every two seconds during 1,000 jobs
         type: boolean
@@ -13,6 +17,10 @@ on:
       soak_minutes:
         description: Also soak for this many minutes (0 for none)
         default: "0"
+      fastpath:
+        description: Also run Tier 1 HTTP fast-path vs browser benchmark
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -53,12 +61,14 @@ jobs:
           echo "$out"
           echo "FLUXWRIGHT_CHROMIUM=$(echo "$out" | tail -1 | cut -d' ' -f2-)" >> "$GITHUB_ENV"
       - name: Run
+        if: inputs.run_fleet
         env:
           CHAOS: ${{ inputs.chaos && '--chaos' || '' }}
           SOAK: ${{ inputs.soak_minutes != '0' && format('--soak-minutes {0}', inputs.soak_minutes) || '' }}
         # Unquoted on purpose: each is one flag (with its value) or nothing.
         run: cargo run --release -p fluxwright-benchmarks -- --out bench-results $CHAOS $SOAK
       - name: Summary
+        if: inputs.run_fleet
         run: |
           {
             echo "### Benchmarks: $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB, $(date -u +%F)"
@@ -70,8 +80,23 @@ jobs:
             echo "Memory is the driver plus every process it started, summed as RSS. In the chaos rows the Playwright and Puppeteer runners have no relaunch code."
             node -e "for (const r of require('./bench-results/latest.json')) if (r.memory_samples_mb.length) console.log(r.scenario + ' memory (MB, one a minute): ' + r.memory_samples_mb.join(', '))"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run fast-path benchmark
+        if: inputs.fastpath
+        run: |
+          cargo build --release -p fluxwright-cli
+          node benchmarks/fastpath-bench.mjs --bin target/release/fluxwright --out bench-results
+      - name: Fast-path summary
+        if: inputs.fastpath
+        run: |
+          {
+            echo "### Tier 1 HTTP Fast-Path vs Browser: $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB, $(date -u +%F)"
+            echo
+            echo "| scenario | endpoint | mode | preset | req/s | p50 ms | p95 ms | http | browser | rss MB | fail % |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            node -e "for (const r of require('./bench-results/fastpath-latest.json').scenarios) console.log('| ' + [r.scenario, r.endpoint, r.mode, r.resource_preset, r.req_per_sec.toFixed(2), r.p50_ms.toFixed(1), r.p95_ms.toFixed(1), r.engine.http, r.engine.browser, r.server_rss_mb, (r.failure_rate * 100).toFixed(1) + '%'].join(' | ') + ' |')"
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-results
-          path: bench-results/latest.json
+          path: bench-results/*.json
           if-no-files-found: error
