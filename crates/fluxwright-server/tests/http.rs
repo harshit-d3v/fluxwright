@@ -3080,7 +3080,7 @@ async fn byob_session_connects_to_external_chrome_navigates_and_cleans_up() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn managed_session_blocks_cookie_banners_via_gateway() {
-    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let js_route = |path: &'static str, body: &'static str| {
         let seen = seen.clone();
         axum::routing::get(move || {
