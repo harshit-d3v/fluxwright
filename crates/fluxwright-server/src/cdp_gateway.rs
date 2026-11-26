@@ -35,12 +35,53 @@ const SAFE_CREATE_CONTEXT_FIELDS: &[&str] = &[
     "proxyBypassList",
 ];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BlockerConfig {
+    pub(crate) resource_preset: Option<ResourcePreset>,
+    pub(crate) block_cookie_banners: bool,
+}
+
+impl BlockerConfig {
+    pub(crate) fn is_enabled(self) -> bool {
+        self.resource_preset.is_some() || self.block_cookie_banners
+    }
+
+    fn fetch_patterns(self) -> Vec<Value> {
+        let mut patterns = match self.resource_preset {
+            Some(preset) => preset_fetch_patterns(preset),
+            None => Vec::new(),
+        };
+        if self.block_cookie_banners {
+            patterns.extend(
+                fluxwright::COOKIE_BANNER_URL_PATTERNS
+                    .iter()
+                    .map(|pat| json!({ "urlPattern": pat, "requestStage": "Request" })),
+            );
+        }
+        patterns
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct GatewayPolicy {
     pub(crate) allow_any_url: bool,
     pub(crate) enforce_server_proxy: bool,
     pub(crate) resource_preset: Option<ResourcePreset>,
+    pub(crate) block_cookie_banners: bool,
     pub(crate) download_dir: PathBuf,
+}
+
+impl GatewayPolicy {
+    pub(crate) fn blocker_config(&self) -> BlockerConfig {
+        BlockerConfig {
+            resource_preset: self.resource_preset,
+            block_cookie_banners: self.block_cookie_banners,
+        }
+    }
+
+    pub(crate) fn has_blocker(&self) -> bool {
+        self.blocker_config().is_enabled()
+    }
 }
 
 pub(crate) fn compute_enforce_server_proxy(engine: &fluxwright::BrowserEngine) -> bool {
@@ -303,6 +344,7 @@ pub(crate) async fn ws_handler(
         allow_any_url: inner.allow_any_url(),
         enforce_server_proxy,
         resource_preset: query.resource_preset,
+        block_cookie_banners: false,
         download_dir: std::env::temp_dir().join(format!(
             "fluxwright-cdp-dl-{}",
             uuid::Uuid::new_v4().simple()
@@ -433,8 +475,8 @@ pub(crate) async fn create_initial_page(
             .insert(tid.clone(), String::from("about:blank"));
         *g.live_target.lock().unwrap() = Some(tid.clone());
     }
-    if let Some(preset) = policy.resource_preset {
-        ensure_preset_blocker(conn, state, lease, &tid, preset).await;
+    if policy.has_blocker() {
+        ensure_preset_blocker(conn, state, lease, &tid, policy.blocker_config()).await;
     }
     if let Some((width, height)) = viewport {
         let existing_sid = {
@@ -594,7 +636,7 @@ pub(crate) async fn run_gateway_loop(
         let conn = conn.clone();
         let lease = lease.clone();
         let out_tx = out_tx.clone();
-        let preset = policy.resource_preset;
+        let blocker = policy.blocker_config();
         tokio::spawn(async move {
             while let Some(ev) = cdp_events.recv().await {
                 if ev.method == "Fluxwright.disconnected" {
@@ -632,7 +674,7 @@ pub(crate) async fn run_gateway_loop(
                                             {
                                                 g.owned_pages.push(child_tid.clone());
                                             }
-                                            if preset.is_some()
+                                            if blocker.is_enabled()
                                                 && matches!(child_ty, "page" | "iframe")
                                             {
                                                 blocker_child_tid = Some(child_tid);
@@ -672,12 +714,13 @@ pub(crate) async fn run_gateway_loop(
                                 .await;
                         });
                     }
-                    if let (Some(child_tid), Some(p)) = (blocker_child_tid, preset) {
+                    if let Some(child_tid) = blocker_child_tid {
                         let conn = conn.clone();
                         let state = state.clone();
                         let lease = lease.clone();
                         tokio::spawn(async move {
-                            ensure_preset_blocker(&conn, &state, &lease, &child_tid, p).await;
+                            ensure_preset_blocker(&conn, &state, &lease, &child_tid, blocker)
+                                .await;
                         });
                     }
                     if forward {
@@ -738,7 +781,7 @@ pub(crate) async fn run_gateway_loop(
                                     None
                                 };
                                 let should_block = ev.method == "Target.targetCreated"
-                                    && preset.is_some()
+                                    && blocker.is_enabled()
                                     && matches!(ty, "page" | "iframe")
                                     && !g.blocker_targets.contains(tid);
                                 (true, g.discover_targets, attach_tx, should_block)
@@ -748,15 +791,13 @@ pub(crate) async fn run_gateway_loop(
                             continue;
                         }
                         if should_block {
-                            if let Some(p) = preset {
-                                let conn = conn.clone();
-                                let state = state.clone();
-                                let lease = lease.clone();
-                                let tid = tid.to_string();
-                                tokio::spawn(async move {
-                                    ensure_preset_blocker(&conn, &state, &lease, &tid, p).await;
-                                });
-                            }
+                            let conn = conn.clone();
+                            let state = state.clone();
+                            let lease = lease.clone();
+                            let tid = tid.to_string();
+                            tokio::spawn(async move {
+                                ensure_preset_blocker(&conn, &state, &lease, &tid, blocker).await;
+                            });
                         }
                         if discover {
                             send_event(&out_tx, &ev.method, &ev.params, None);
@@ -776,7 +817,7 @@ pub(crate) async fn run_gateway_loop(
                                     &out_tx,
                                     &tid,
                                     Some(info),
-                                    preset,
+                                    blocker,
                                 )
                                 .await;
                                 state.lock().await.auto_attach_waiters.remove(&tid);
@@ -1417,8 +1458,11 @@ async fn handle_browser_command(
                     } else {
                         PostCreateAttach::None
                     };
-                    if let (Some(ref tid), Some(preset)) = (&created_tid, policy.resource_preset) {
-                        ensure_preset_blocker(conn, state, lease, tid, preset).await;
+                    if policy.has_blocker() {
+                        if let Some(ref tid) = created_tid {
+                            ensure_preset_blocker(conn, state, lease, tid, policy.blocker_config())
+                                .await;
+                        }
                     }
                     // Emit `Target.attachedToTarget` before the `Target.createTarget` result so
                     // clients like Playwright `connectOverCDP` already have the page session registered.
@@ -1431,7 +1475,7 @@ async fn handle_browser_command(
                                 out_tx,
                                 &tid,
                                 None,
-                                policy.resource_preset,
+                                policy.blocker_config(),
                             )
                             .await;
                         }
@@ -1477,7 +1521,7 @@ async fn handle_browser_command(
                 out_tx,
                 &tid,
                 None,
-                policy.resource_preset,
+                policy.blocker_config(),
             )
             .await
             {
@@ -1593,7 +1637,7 @@ async fn handle_browser_command(
                     out_tx,
                     &tid,
                     Some(info),
-                    policy.resource_preset,
+                    policy.blocker_config(),
                 )
                 .await;
             }
@@ -1779,8 +1823,11 @@ async fn ensure_preset_blocker(
     state: &Arc<Mutex<GatewayState>>,
     lease: &Arc<ContextLease>,
     target_id: &str,
-    preset: ResourcePreset,
+    blocker: BlockerConfig,
 ) {
+    if !blocker.is_enabled() {
+        return;
+    }
     enum BlockerPlan {
         Install(watch::Sender<bool>),
         Wait(watch::Receiver<bool>),
@@ -1865,7 +1912,7 @@ async fn ensure_preset_blocker(
                         .call_raw(
                             "Fetch.enable",
                             json!({
-                                "patterns": preset_fetch_patterns(preset),
+                                "patterns": blocker.fetch_patterns(),
                                 "handleAuthRequests": false,
                             }),
                             Some(&bsid),
@@ -2113,7 +2160,7 @@ async fn attach_target(
     out_tx: &mpsc::UnboundedSender<Message>,
     target_id: &str,
     info_hint: Option<Value>,
-    resource_preset: Option<ResourcePreset>,
+    blocker: BlockerConfig,
 ) -> Result<String, ErrPayload> {
     if state.lock().await.closing {
         return Err(ErrPayload::Msg("CDP gateway disconnected".into()));
@@ -2203,10 +2250,8 @@ async fn attach_target(
             g.owned_pages.push(target_id.to_string());
         }
     }
-    if let Some(preset) = resource_preset {
-        if matches!(ty, "page" | "iframe" | "") {
-            ensure_preset_blocker(conn, state, lease, target_id, preset).await;
-        }
+    if blocker.is_enabled() && matches!(ty, "page" | "iframe" | "") {
+        ensure_preset_blocker(conn, state, lease, target_id, blocker).await;
     }
 
     send_event(
@@ -2527,6 +2572,7 @@ mod tests {
             allow_any_url: false,
             enforce_server_proxy: false,
             resource_preset: None,
+            block_cookie_banners: false,
             download_dir: ephemeral.clone(),
         };
         let state = Arc::new(Mutex::new(GatewayState::new(
@@ -2568,5 +2614,29 @@ mod tests {
             .filter_map(|v| v["resourceType"].as_str())
             .collect();
         assert_eq!(nm_types, vec!["Image", "Media"]);
+    }
+
+    #[test]
+    fn blocker_config_combines_resource_preset_and_cookie_banners() {
+        let cmp_only = BlockerConfig {
+            resource_preset: None,
+            block_cookie_banners: true,
+        };
+        assert!(cmp_only.is_enabled());
+        let patterns = cmp_only.fetch_patterns();
+        assert_eq!(patterns.len(), fluxwright::COOKIE_BANNER_URL_PATTERNS.len());
+        assert!(patterns
+            .iter()
+            .any(|p| p["urlPattern"] == "*cdn.cookielaw.org/*"));
+        assert!(patterns.iter().all(|p| p.get("resourceType").is_none()));
+
+        let combined = BlockerConfig {
+            resource_preset: Some(ResourcePreset::Scraping),
+            block_cookie_banners: true,
+        };
+        assert_eq!(
+            combined.fetch_patterns().len(),
+            3 + fluxwright::COOKIE_BANNER_URL_PATTERNS.len()
+        );
     }
 }

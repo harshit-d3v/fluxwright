@@ -724,6 +724,7 @@ pub(crate) async fn create_session(
             ServerResourcePreset::Minimal => fluxwright::ResourcePreset::Minimal,
             ServerResourcePreset::NoMedia => fluxwright::ResourcePreset::NoMedia,
         }),
+        block_cookie_banners: req.block_cookie_banners,
         download_dir: std::env::temp_dir().join(format!("fluxwright-sess-dl-{}", Uuid::new_v4().simple())),
     };
 
@@ -1227,6 +1228,7 @@ fn spawn_session_frame_capture(
     nav_url: String,
     recorder: Arc<StdMutex<SessionRecorder>>,
     inflight: Arc<AtomicBool>,
+    captured_url: Arc<StdMutex<Option<String>>>,
     close_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -1245,11 +1247,12 @@ fn spawn_session_frame_capture(
                 "Page.captureScreenshot",
                 json!({ "format": "jpeg", "quality": 45 }),
                 Some(&sid),
-                Duration::from_secs(5),
+                Duration::from_secs(10),
             )
             .await
         {
             if let Some(data) = res["data"].as_str().filter(|s| !s.is_empty()) {
+                *captured_url.lock().unwrap() = Some(nav_url.clone());
                 recorder
                     .lock()
                     .unwrap()
@@ -1275,13 +1278,14 @@ fn spawn_session_reaper(
         let _live_guard = live_guard;
         let mut shutdown_rx = inner.shutdown_tx.subscribe();
         let conn = session.lease.cdp_connection();
-        let has_preset = session.policy.resource_preset.is_some();
+        let has_blocker = session.policy.has_blocker();
         let observer_sids: Arc<StdMutex<HashSet<String>>> =
             Arc::new(StdMutex::new(initial_observer.into_iter().collect()));
         let mut observed_targets: HashSet<String> = HashSet::from([initial_tid]);
         let mut main_frames: HashMap<String, String> = HashMap::new();
         let mut last_frame_at: Option<std::time::Instant> = None;
         let screenshot_inflight = Arc::new(AtomicBool::new(false));
+        let captured_url: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let sleep = tokio::time::sleep_until(expires_rx.borrow().0);
         tokio::pin!(sleep);
         loop {
@@ -1314,7 +1318,7 @@ fn spawn_session_reaper(
                         break;
                     }
                     if let Some(sid) = ev.session_id.as_deref() {
-                        if has_preset && ev.method == "Fetch.requestPaused"
+                        if has_blocker && ev.method == "Fetch.requestPaused"
                             && session.state.lock().await.is_blocker_session(sid)
                         {
                             if let Some(req_id) =
@@ -1335,6 +1339,7 @@ fn spawn_session_reaper(
                                             }
                                             *session.live_url.lock().unwrap() = nav_url.clone();
                                             session.recorder.lock().unwrap().push_nav(now_ms(), &nav_url);
+                                            *captured_url.lock().unwrap() = None;
                                             if session.record_frames && nav_url != "about:blank" {
                                                 let due = last_frame_at.is_none_or(|t| {
                                                     t.elapsed() >= MIN_FRAME_CAPTURE_INTERVAL
@@ -1356,6 +1361,7 @@ fn spawn_session_reaper(
                                                         nav_url,
                                                         session.recorder.clone(),
                                                         screenshot_inflight.clone(),
+                                                        captured_url.clone(),
                                                         session.close_tx.subscribe(),
                                                     );
                                                 }
@@ -1375,6 +1381,39 @@ fn spawn_session_reaper(
                                                 .lock()
                                                 .unwrap()
                                                 .push_nav(now_ms(), nav_url);
+                                        }
+                                    }
+                                }
+                                "Page.loadEventFired" => {
+                                    if session.record_frames {
+                                        let nav_url = session.current_url();
+                                        let already_captured = captured_url
+                                            .lock()
+                                            .unwrap()
+                                            .as_deref()
+                                            == Some(nav_url.as_str());
+                                        if !nav_url.is_empty()
+                                            && nav_url != "about:blank"
+                                            && !already_captured
+                                            && screenshot_inflight
+                                                .compare_exchange(
+                                                    false,
+                                                    true,
+                                                    Ordering::AcqRel,
+                                                    Ordering::Acquire,
+                                                )
+                                                .is_ok()
+                                        {
+                                            last_frame_at = Some(std::time::Instant::now());
+                                            spawn_session_frame_capture(
+                                                conn.clone(),
+                                                sid.to_string(),
+                                                nav_url,
+                                                session.recorder.clone(),
+                                                screenshot_inflight.clone(),
+                                                captured_url.clone(),
+                                                session.close_tx.subscribe(),
+                                            );
                                         }
                                     }
                                 }

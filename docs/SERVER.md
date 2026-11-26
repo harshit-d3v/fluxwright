@@ -186,6 +186,7 @@ failed job returns **409**.
   "retries": 0,
   "profile": "acct-prod",
   "persist_profile": true,
+  "block_cookie_banners": true,
   "proxy_session": "user-42",
   "webhook_url": "https://hooks.example.com/fluxwright",
   "webhook_headers": {
@@ -199,7 +200,7 @@ failed job returns **409**.
 }
 ```
 
-Optional `webhook_url` (`http://` or `https://`, validated against SSRF rules unless `FLUXWRIGHT_SERVER_ANY_URL=1` and DNS-pinned on delivery) triggers an asynchronous completion callback when the job reaches a terminal state (`succeeded`, `failed`, or `cancelled`). Optional `webhook_headers` supports up to 16 custom headers (CR/LF/control characters and reserved `host`, `content-length`, `connection`, `transfer-encoding`, and `x-fluxwright-*` names are rejected) and is omitted from public `Job` responses so secrets do not leak.
+Optional `block_cookie_banners` (`true`) blocks common CMP and cookie-banner script origins on job pages. Optional `webhook_url` (`http://` or `https://`, validated against SSRF rules unless `FLUXWRIGHT_SERVER_ANY_URL=1` and DNS-pinned on delivery) triggers an asynchronous completion callback when the job reaches a terminal state (`succeeded`, `failed`, or `cancelled`). Optional `webhook_headers` supports up to 16 custom headers (CR/LF/control characters and reserved `host`, `content-length`, `connection`, `transfer-encoding`, and `x-fluxwright-*` names are rejected) and is omitted from public `Job` responses so secrets do not leak.
 
 | Action | Fields | Result |
 |---|---|---|
@@ -321,6 +322,7 @@ curl -sS -X POST http://127.0.0.1:7331/v1/sessions \
   -d '{
     "ttl_secs": 300,
     "keep_alive": true,
+    "block_cookie_banners": true,
     "profile": "account_1",
     "viewport": { "width": 1280, "height": 720 },
     "live_view_mode": "interactive",
@@ -328,7 +330,7 @@ curl -sS -X POST http://127.0.0.1:7331/v1/sessions \
   }'
 ```
 
-Returns `201 Created` with `{ "id", "status", "cdp_ws_url", "cdp_path", "live_view_url", "live_view_mode", "keep_alive", "connected", "url", "profile", "proxy_session", "record_frames", "byob", "created_at", "expires_at", "ttl_secs" }`. With `"keep_alive": true`, disconnecting the CDP WebSocket detaches only the client while preserving pages, cookies, and storage so a subsequent worker can reconnect until `ttl_secs` expires or `DELETE /v1/sessions/{id}` runs.
+Returns `201 Created` with `{ "id", "status", "cdp_ws_url", "cdp_path", "live_view_url", "live_view_mode", "keep_alive", "connected", "url", "profile", "proxy_session", "record_frames", "byob", "created_at", "expires_at", "ttl_secs" }`. Optional `"block_cookie_banners": true` blocks common CMP/cookie-banner origins across session pages and iframes via the gateway Fetch blocker. With `"keep_alive": true`, disconnecting the CDP WebSocket detaches only the client while preserving pages, cookies, and storage so a subsequent worker can reconnect until `ttl_secs` expires or `DELETE /v1/sessions/{id}` runs.
 
 ### Opt-in BYOB (`cdp_endpoint`)
 
@@ -380,7 +382,7 @@ curl -sS -X POST http://127.0.0.1:7331/v1/map \
   }'
 ```
 
-Supports `same_origin` (default `true`), `include_subdomains` (default `false`), case-insensitive `search` substring filter, `limit` (`1..=1000`, default `100`), `wait_until`, `timeout_ms` (`1..=120000`, default `30000`), `resource_preset`, `profile`, and `proxy_session`. Returns `{ "url", "count", "links", "duration_ms" }` and enforces the same SSRF checks as `/v1/jobs` and `/v1/scrape`.
+Supports `same_origin` (default `true`), `include_subdomains` (default `false`), case-insensitive `search` substring filter, `limit` (`1..=1000`, default `100`), `wait_until`, `timeout_ms` (`1..=120000`, default `30000`), `resource_preset`, `block_cookie_banners`, `profile`, and `proxy_session`. Returns `{ "url", "count", "links", "duration_ms" }` and enforces the same SSRF checks as `/v1/jobs` and `/v1/scrape`.
 
 ## Live screencast viewer & human-in-the-loop
 
