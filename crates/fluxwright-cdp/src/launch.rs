@@ -332,6 +332,27 @@ pub fn find_channel(channel: &str) -> Result<PathBuf> {
         .ok_or_else(|| Error::Launch(format!("browser channel `{channel}` is not installed")))
 }
 
+fn flag_name(arg: &str) -> &str {
+    arg.split_once('=').map_or(arg, |(k, _)| k)
+}
+
+fn is_arg_ignored(ignore: &IgnoreDefaultArgs, flag: &str) -> bool {
+    match ignore {
+        IgnoreDefaultArgs::None => false,
+        IgnoreDefaultArgs::All => true,
+        IgnoreDefaultArgs::Some(ignored) => ignored
+            .iter()
+            .any(|ig| flag == ig || flag.split_once('=').is_some_and(|(k, _)| k == ig)),
+    }
+}
+
+fn has_extra_flag(extra_args: &[String], flag: &str) -> bool {
+    let key = flag_name(flag);
+    extra_args
+        .iter()
+        .any(|a| a == flag || flag_name(a) == key)
+}
+
 pub(crate) fn build_chrome_args(opts: &LaunchOptions, user_data_dir: &Path) -> Vec<String> {
     let mut default_args = vec![
         "--no-first-run".to_string(),
@@ -375,12 +396,8 @@ pub(crate) fn build_chrome_args(opts: &LaunchOptions, user_data_dir: &Path) -> V
     match &opts.ignore_default_args {
         IgnoreDefaultArgs::None => {}
         IgnoreDefaultArgs::All => default_args.clear(),
-        IgnoreDefaultArgs::Some(ignored) => {
-            default_args.retain(|a| {
-                !ignored
-                    .iter()
-                    .any(|ig| a == ig || a.split_once('=').is_some_and(|(k, _)| k == ig))
-            });
+        IgnoreDefaultArgs::Some(_) => {
+            default_args.retain(|a| !is_arg_ignored(&opts.ignore_default_args, a));
         }
     }
 
@@ -400,6 +417,19 @@ pub(crate) fn build_chrome_args(opts: &LaunchOptions, user_data_dir: &Path) -> V
         }
         if !opts.extra_args.iter().any(|a| a == "--disable-setuid-sandbox") {
             args.push("--disable-setuid-sandbox".to_string());
+        }
+    }
+    if opts.low_memory && opts.headless {
+        for flag in [
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--js-flags=--max-old-space-size=256",
+        ] {
+            if !has_extra_flag(&opts.extra_args, flag)
+                && !is_arg_ignored(&opts.ignore_default_args, flag)
+            {
+                args.push(flag.to_string());
+            }
         }
     }
     if cfg!(unix) {
@@ -892,6 +922,93 @@ mod tests {
         assert!(some_ignored
             .iter()
             .any(|a| a == "--user-data-dir=/custom/profile"));
+    }
+
+    #[test]
+    fn build_chrome_args_low_memory_opt_in_leaves_defaults_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let def_opts = LaunchOptions::default();
+        assert!(!def_opts.low_memory);
+        let def = build_chrome_args(&def_opts, tmp.path());
+        assert!(!def.iter().any(|a| a == "--disable-gpu"));
+        assert!(!def.iter().any(|a| a == "--disable-software-rasterizer"));
+        assert!(!def.iter().any(|a| a.starts_with("--js-flags=")));
+
+        let low = build_chrome_args(
+            &LaunchOptions {
+                low_memory: true,
+                headless: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        assert!(low.iter().any(|a| a == "--disable-gpu"));
+        assert!(low.iter().any(|a| a == "--disable-software-rasterizer"));
+        assert!(low
+            .iter()
+            .any(|a| a == "--js-flags=--max-old-space-size=256"));
+
+        // Non-headless launches keep GPU enabled even when low_memory is true.
+        let headed = build_chrome_args(
+            &LaunchOptions {
+                low_memory: true,
+                headless: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        assert!(!headed.iter().any(|a| a == "--disable-gpu"));
+        assert!(!headed.iter().any(|a| a == "--disable-software-rasterizer"));
+        assert!(!headed.iter().any(|a| a.starts_with("--js-flags=")));
+
+        // Explicit extra_args and ignore_default_args take precedence over low_memory flags.
+        let overridden = build_chrome_args(
+            &LaunchOptions {
+                low_memory: true,
+                headless: true,
+                extra_args: vec![
+                    "--disable-gpu".into(),
+                    "--js-flags=--max-old-space-size=512".into(),
+                ],
+                ignore_default_args: IgnoreDefaultArgs::Some(vec![
+                    "--disable-software-rasterizer".into(),
+                ]),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        assert_eq!(
+            overridden.iter().filter(|a| *a == "--disable-gpu").count(),
+            1
+        );
+        assert!(!overridden
+            .iter()
+            .any(|a| a == "--disable-software-rasterizer"));
+        assert_eq!(
+            overridden
+                .iter()
+                .filter(|a| a.starts_with("--js-flags="))
+                .count(),
+            1
+        );
+        assert!(overridden
+            .iter()
+            .any(|a| a == "--js-flags=--max-old-space-size=512"));
+
+        let all_ignored = build_chrome_args(
+            &LaunchOptions {
+                low_memory: true,
+                headless: true,
+                ignore_default_args: IgnoreDefaultArgs::All,
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        assert!(!all_ignored.iter().any(|a| a == "--disable-gpu"));
+        assert!(!all_ignored
+            .iter()
+            .any(|a| a == "--disable-software-rasterizer"));
+        assert!(!all_ignored.iter().any(|a| a.starts_with("--js-flags=")));
     }
 
     #[cfg(windows)]

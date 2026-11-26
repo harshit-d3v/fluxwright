@@ -4897,6 +4897,10 @@ impl EngineBuilder {
         self.config.launch.no_sandbox = v;
         self
     }
+    pub fn low_memory(mut self, v: bool) -> Self {
+        self.config.launch.low_memory = v;
+        self
+    }
     pub fn headless(mut self, v: bool) -> Self {
         self.config.launch.headless = v;
         self

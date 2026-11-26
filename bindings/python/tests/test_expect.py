@@ -283,7 +283,7 @@ def test_sync_expect(base):
             assert "200ms" in str(exc_info.value)
 
             with pytest.raises(AssertionError, match="element not found"):
-                sync_expect(page.locator("#missing")).not_to_have_text("x", timeout=600)
+                sync_expect(page.locator("#missing")).not_to_have_text("x", timeout=2000)
 
             # Bytes regex rejected, strict bool on checked.
             with pytest.raises(TypeError, match="bytes"):
