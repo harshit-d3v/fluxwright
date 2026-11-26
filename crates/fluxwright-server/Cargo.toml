@@ -27,6 +27,9 @@ base64.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
+scraper.workspace = true
+flate2.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 benchmark-server.workspace = true

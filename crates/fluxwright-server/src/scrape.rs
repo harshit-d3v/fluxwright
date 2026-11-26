@@ -1,8 +1,9 @@
 //! Synchronous one-shot scrape and render endpoint (`POST /v1/scrape`).
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
@@ -13,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::fast_fetch::{self, FastFetchError, FetchMode};
+use crate::fast_html;
 use crate::job::{
     JobPriority, JobRequest, NavigationWait, ServerImageFormat, ServerResourcePreset,
     ServerResourceType, Step,
@@ -40,6 +43,8 @@ pub(crate) struct ScrapeRequest {
     url: String,
     #[serde(default = "default_formats")]
     formats: Vec<ScrapeFormat>,
+    #[serde(default)]
+    mode: FetchMode,
     #[serde(default)]
     wait_until: NavigationWait,
     #[serde(default)]
@@ -126,6 +131,24 @@ pub(crate) async fn scrape_handler(
     let formats = dedup_formats(&req.formats)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
+    let has_visual = formats
+        .iter()
+        .any(|f| matches!(f, ScrapeFormat::Screenshot | ScrapeFormat::Pdf));
+    let has_snapshot = formats.iter().any(|f| matches!(f, ScrapeFormat::Snapshot));
+    let has_browser_only_opts = has_visual
+        || has_snapshot
+        || req.wait_for_selector.is_some()
+        || req.profile.is_some()
+        || req.persist_profile
+        || !req.block_resources.is_empty()
+        || !req.block_url_patterns.is_empty();
+    let is_about_blank = req.url.trim().eq_ignore_ascii_case("about:blank");
+
+    let req_url = req.url.clone();
+    let proxy_session = req.proxy_session.clone();
+    let mode = req.mode;
+    let total_timeout_ms = req.timeout_ms;
+
     let mut steps = vec![Step::Goto {
         url: req.url,
         wait_until: req.wait_until,
@@ -186,12 +209,16 @@ pub(crate) async fn scrape_handler(
         });
     }
 
-    let job_req = JobRequest {
+    let browser_resource_preset = req
+        .resource_preset
+        .or_else(|| (!has_visual).then_some(ServerResourcePreset::Scraping));
+
+    let mut job_req = JobRequest {
         steps,
-        timeout_ms: req.timeout_ms,
+        timeout_ms: total_timeout_ms,
         retries: 0,
         priority: req.priority,
-        resource_preset: req.resource_preset,
+        resource_preset: browser_resource_preset,
         block_resources: req.block_resources,
         block_url_patterns: req.block_url_patterns,
         block_cookie_banners: req.block_cookie_banners,
@@ -205,11 +232,116 @@ pub(crate) async fn scrape_handler(
         .validate_with(inner.allow_any_url())
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
+    if mode == FetchMode::Http && (has_browser_only_opts || is_about_blank) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "mode 'http' cannot be used with about:blank, screenshot, pdf, snapshot, wait_for_selector, profile, persist_profile, block_resources, or block_url_patterns",
+        ));
+    }
+
+    let started = Instant::now();
+    let mut fallback_reason: Option<String> = None;
+
+    let try_fastpath = mode != FetchMode::Browser && !has_browser_only_opts && !is_about_blank;
+    if try_fastpath {
+        let fetch_res = fast_fetch::fetch_url(
+            &req_url,
+            Duration::from_millis(total_timeout_ms),
+            inner.allow_any_url(),
+            engine.proxy_pool(),
+            proxy_session.as_deref(),
+        )
+        .await;
+
+        match fetch_res {
+            Err(FastFetchError::InvalidOrBlocked(msg)) => {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", msg));
+            }
+            Err(FastFetchError::Transport(msg)) => {
+                if mode == FetchMode::Http {
+                    return Err(ApiError::new(StatusCode::BAD_GATEWAY, "scrape_failed", msg));
+                }
+                inner.fastpath_fallbacks.fetch_add(1, Ordering::Relaxed);
+                fallback_reason = Some(format!("fetch error: {msg}"));
+            }
+            Ok(resp) => {
+                let html_str =
+                    fast_html::decode_body_text(&resp.body, resp.content_type.as_deref());
+                if let Some(reason) = fast_html::detect_escalation(
+                    resp.status,
+                    &resp.headers,
+                    resp.content_type.as_deref(),
+                    &html_str,
+                ) {
+                    if mode == FetchMode::Http {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_GATEWAY,
+                            "scrape_failed",
+                            reason,
+                        ));
+                    }
+                    inner.fastpath_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    fallback_reason = Some(reason);
+                } else {
+                    inner.fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                    let want_markdown = formats.contains(&ScrapeFormat::Markdown);
+                    let want_text = formats.contains(&ScrapeFormat::Text);
+                    let extracted = fast_html::extract_scrape_fields(
+                        &html_str,
+                        &resp.final_url,
+                        want_markdown,
+                        want_text,
+                    );
+                    let duration_ms = started.elapsed().as_millis() as u64;
+
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("url".into(), Value::String(resp.final_url));
+                    obj.insert("title".into(), Value::String(extracted.title));
+                    obj.insert("duration_ms".into(), json!(duration_ms));
+                    obj.insert("engine".into(), Value::String("http".into()));
+                    for &fmt in &formats {
+                        match fmt {
+                            ScrapeFormat::Markdown => {
+                                obj.insert(
+                                    "markdown".into(),
+                                    Value::String(extracted.markdown.clone().unwrap_or_default()),
+                                );
+                            }
+                            ScrapeFormat::Html => {
+                                obj.insert("html".into(), Value::String(html_str.clone()));
+                            }
+                            ScrapeFormat::Text => {
+                                obj.insert(
+                                    "text".into(),
+                                    Value::String(extracted.text.clone().unwrap_or_default()),
+                                );
+                            }
+                            ScrapeFormat::Snapshot
+                            | ScrapeFormat::Screenshot
+                            | ScrapeFormat::Pdf => {}
+                        }
+                    }
+                    return Ok((StatusCode::OK, Json(Value::Object(obj))).into_response());
+                }
+            }
+        }
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= total_timeout_ms {
+            return Err(ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "scrape request timed out",
+            ));
+        }
+        job_req.timeout_ms = total_timeout_ms.saturating_sub(elapsed_ms).max(1);
+    }
+
     let traceparent = headers.get("traceparent").and_then(|v| v.to_str().ok());
     let trace_ctx = JobTraceContext::from_headers(traceparent);
     let progress = Arc::new(Mutex::new(ExecutionProgress::default()));
 
-    let started = Instant::now();
     let results = execute_job(
         engine,
         job_req,
@@ -240,6 +372,10 @@ pub(crate) async fn scrape_handler(
     obj.insert("url".into(), Value::String(final_url));
     obj.insert("title".into(), Value::String(title));
     obj.insert("duration_ms".into(), json!(duration_ms));
+    obj.insert("engine".into(), Value::String("browser".into()));
+    if let Some(reason) = fallback_reason {
+        obj.insert("fallback_reason".into(), Value::String(reason));
+    }
 
     for (idx, fmt) in formats.iter().enumerate() {
         let Some(val) = results.get(base + 2 + idx) else {

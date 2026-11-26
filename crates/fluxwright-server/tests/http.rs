@@ -3232,3 +3232,312 @@ async fn managed_session_blocks_cookie_banners_via_gateway() {
     srv_task.abort();
     app_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fastpath_http_scrape_and_map_with_sitemap_and_browser_escalations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    let challenge_hits = Arc::new(AtomicUsize::new(0));
+    let challenge_hits_route = challenge_hits.clone();
+    let sitemap_base: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+    let sitemap_base_route = sitemap_base.clone();
+
+    let app = axum::Router::new()
+        .route(
+            "/static",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>Static Page</title>",
+                    "<body>",
+                    "<h1>Fast Path Heading</h1>",
+                    "<p>Pure Rust HTTP extraction with <a href='/docs/start'>Start</a>.</p>",
+                    "<script>window.__ignored = true;</script>",
+                    "</body>"
+                ))
+            }),
+        )
+        .route(
+            "/sitemap.xml",
+            axum::routing::get(move || {
+                let base_lock = sitemap_base_route.clone();
+                async move {
+                    let b = base_lock.get().map(String::as_str).unwrap_or("");
+                    (
+                        [(header::CONTENT_TYPE, "application/xml")],
+                        format!(
+                            r#"<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>{b}/from-sitemap</loc></url><url><loc>https://offsite.example/ext</loc></url></urlset>"#
+                        ),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/spa",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>Shell</title>",
+                    "<body><div id='root'></div>",
+                    "<script>",
+                    "document.getElementById('root').innerHTML = '<h1>Hydrated SPA</h1><p>Loaded in Chromium</p>';",
+                    "document.title = 'Hydrated';",
+                    "</script></body>"
+                ))
+            }),
+        )
+        .route(
+            "/map-spa",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>MapSPA</title>",
+                    "<body><div id='app'></div>",
+                    "<script>",
+                    "document.getElementById('app').innerHTML = '<a href=\"/spa-discovered\">SPA Link</a>';",
+                    "</script></body>"
+                ))
+            }),
+        )
+        .route(
+            "/challenge",
+            axum::routing::get(move || {
+                let hits = challenge_hits_route.clone();
+                async move {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        (
+                            StatusCode::FORBIDDEN,
+                            [
+                                (header::CONTENT_TYPE, "text/html"),
+                                (header::HeaderName::from_static("cf-mitigated"), "challenge"),
+                            ],
+                            "<!doctype html><title>Just a moment...</title><p>Checking browser</p>",
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [
+                                (header::CONTENT_TYPE, "text/html"),
+                                (header::HeaderName::from_static("x-test"), "ok"),
+                            ],
+                            "<!doctype html><title>Cleared</title><p>Browser challenge passed</p>",
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/always-403",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    axum::response::Html("<!doctype html><title>Denied</title><p>Forbidden</p>"),
+                )
+            }),
+        )
+        .route(
+            "/redir-imds",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(header::LOCATION, "http://169.254.169.254/latest/meta-data")],
+                    "",
+                )
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let _ = sitemap_base.set(base_url.clone());
+
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let server = server().await;
+
+    // 1. Static HTML served directly by HTTP fast path (`engine: "http"`).
+    let (st_static, body_static) = request(
+        &server,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{base_url}/static"),
+            "formats": ["markdown", "html", "text"]
+        }),
+    )
+    .await;
+    assert_eq!(st_static, StatusCode::OK, "{body_static}");
+    assert_eq!(body_static["engine"], "http");
+    assert!(body_static.get("fallback_reason").is_none());
+    assert_eq!(body_static["title"], "Static Page");
+    assert!(body_static["markdown"].as_str().unwrap().contains("# Fast Path Heading"));
+    let expected_start_md = format!("[Start]({base_url}/docs/start)");
+    assert!(
+        body_static["markdown"]
+            .as_str()
+            .unwrap()
+            .contains(&expected_start_md),
+        "{body_static}"
+    );
+    assert!(body_static["text"].as_str().unwrap().contains("Pure Rust HTTP extraction"));
+
+    // 2. `/v1/map` with `include_sitemap: true` served by `engine: "http"` combines page + sitemap links.
+    let (st_map, body_map) = request(
+        &server,
+        "POST",
+        "/v1/map",
+        json!({
+            "url": format!("{base_url}/static"),
+            "include_sitemap": true
+        }),
+    )
+    .await;
+    assert_eq!(st_map, StatusCode::OK, "{body_map}");
+    assert_eq!(body_map["engine"], "http");
+    assert!(body_map.get("fallback_reason").is_none());
+    let map_links: Vec<&str> = body_map["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let expected_start = format!("{base_url}/docs/start");
+    let expected_sitemap = format!("{base_url}/from-sitemap");
+    assert!(map_links.contains(&expected_start.as_str()), "{map_links:?}");
+    assert!(map_links.contains(&expected_sitemap.as_str()), "{map_links:?}");
+    assert!(!map_links.contains(&"https://offsite.example/ext"), "{map_links:?}");
+
+    // 3. SPA shell escalates cleanly to Chromium (`engine: "browser"`, `fallback_reason` set).
+    let (st_spa, body_spa) = request(
+        &server,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base_url}/spa") }),
+    )
+    .await;
+    assert_eq!(st_spa, StatusCode::OK, "{body_spa}");
+    assert_eq!(body_spa["engine"], "browser");
+    assert!(body_spa["fallback_reason"]
+        .as_str()
+        .unwrap_or("")
+        .contains("SPA shell"));
+    assert_eq!(body_spa["title"], "Hydrated");
+    assert!(body_spa["markdown"].as_str().unwrap().contains("Hydrated SPA"));
+
+    // 4. 403 challenge escalates cleanly to Chromium.
+    let (st_chal, body_chal) = request(
+        &server,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base_url}/challenge") }),
+    )
+    .await;
+    assert_eq!(st_chal, StatusCode::OK, "{body_chal}");
+    assert_eq!(body_chal["engine"], "browser");
+    assert!(body_chal["fallback_reason"].is_string());
+    assert_eq!(body_chal["title"], "Cleared");
+    assert!(body_chal["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("Browser challenge passed"));
+
+    // 5. `/v1/map` on SPA shell escalates to Chromium and discovers JS-rendered links.
+    let (st_map_spa, body_map_spa) = request(
+        &server,
+        "POST",
+        "/v1/map",
+        json!({ "url": format!("{base_url}/map-spa") }),
+    )
+    .await;
+    assert_eq!(st_map_spa, StatusCode::OK, "{body_map_spa}");
+    assert_eq!(body_map_spa["engine"], "browser");
+    assert!(body_map_spa["fallback_reason"].is_string());
+    let expected_spa_link = format!("{base_url}/spa-discovered");
+    assert!(body_map_spa["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some(expected_spa_link.as_str())));
+
+    // 6. `mode: "http"` does NOT fall back to Chromium on 403.
+    let (st_http_403, _) = request(
+        &server,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base_url}/always-403"), "mode": "http" }),
+    )
+    .await;
+    assert_eq!(st_http_403, StatusCode::BAD_GATEWAY);
+
+    // 7. 302 redirect to 169.254.169.254 is blocked before connect in both auto and http modes.
+    for mode in ["auto", "http"] {
+        let (st_ssrf, body_ssrf) = request(
+            &server,
+            "POST",
+            "/v1/scrape",
+            json!({ "url": format!("{base_url}/redir-imds"), "mode": mode }),
+        )
+        .await;
+        assert_eq!(st_ssrf, StatusCode::BAD_REQUEST, "{body_ssrf}");
+        assert_eq!(body_ssrf["error"]["code"], "invalid_request");
+    }
+
+    // 8. Visual formats and `mode: "browser"` bypass HTTP fast path immediately (no fallback_reason).
+    let (st_vis, body_vis) = request(
+        &server,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{base_url}/static"),
+            "formats": ["markdown", "screenshot"]
+        }),
+    )
+    .await;
+    assert_eq!(st_vis, StatusCode::OK, "{body_vis}");
+    assert_eq!(body_vis["engine"], "browser");
+    assert!(body_vis.get("fallback_reason").is_none());
+    assert!(body_vis["screenshot_base64"].as_str().unwrap().starts_with("iVBOR"));
+
+    let (st_bmode, body_bmode) = request(
+        &server,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{base_url}/static"),
+            "mode": "browser"
+        }),
+    )
+    .await;
+    assert_eq!(st_bmode, StatusCode::OK, "{body_bmode}");
+    assert_eq!(body_bmode["engine"], "browser");
+    assert!(body_bmode.get("fallback_reason").is_none());
+
+    // 9. Verify Prometheus counters reflect hits and escalations.
+    let metrics_resp = server
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_resp.status(), StatusCode::OK);
+    let metrics_text = String::from_utf8(
+        to_bytes(metrics_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(metrics_text.contains("fluxwright_fastpath_hits_total 2\n"), "{metrics_text}");
+    assert!(
+        metrics_text.contains("fluxwright_fastpath_fallbacks_total 3\n"),
+        "{metrics_text}"
+    );
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    app_task.abort();
+}

@@ -18,6 +18,8 @@ pub struct ServerMetrics {
     pub expired_leases: u64,
     pub active_cdp_sessions: usize,
     pub total_cdp_sessions: u64,
+    pub fastpath_hits: u64,
+    pub fastpath_fallbacks: u64,
 }
 
 impl ServerMetrics {
@@ -199,6 +201,22 @@ impl ServerMetrics {
             self.total_cdp_sessions,
         );
 
+        write_metric(
+            &mut out,
+            "fluxwright_fastpath_hits_total",
+            "Total number of scrape/map requests served by the HTTP fast path.",
+            "counter",
+            self.fastpath_hits,
+        );
+
+        write_metric(
+            &mut out,
+            "fluxwright_fastpath_fallbacks_total",
+            "Total number of scrape/map requests that escalated from HTTP fast path to Chromium.",
+            "counter",
+            self.fastpath_fallbacks,
+        );
+
         out
     }
 }
@@ -257,6 +275,8 @@ mod tests {
             expired_leases: 3,
             active_cdp_sessions: 2,
             total_cdp_sessions: 7,
+            fastpath_hits: 15,
+            fastpath_fallbacks: 3,
         };
 
         let text = metrics.to_prometheus_text();
@@ -275,6 +295,8 @@ mod tests {
         assert!(text.contains("fluxwright_cluster_lease_expirations_total 3\n"));
         assert!(text.contains("fluxwright_cdp_sessions_active 2\n"));
         assert!(text.contains("fluxwright_cdp_sessions_total 7\n"));
+        assert!(text.contains("fluxwright_fastpath_hits_total 15\n"));
+        assert!(text.contains("fluxwright_fastpath_fallbacks_total 3\n"));
         assert!(text.contains("fluxwright_effective_concurrency_limit 16\n"));
     }
 }

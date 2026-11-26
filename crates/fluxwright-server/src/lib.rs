@@ -6,6 +6,8 @@
 mod cdp_gateway;
 mod cluster;
 pub mod dashboard;
+mod fast_fetch;
+mod fast_html;
 mod http_post;
 mod job;
 mod journal;
@@ -230,6 +232,8 @@ pub(crate) struct Inner {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     active_cdp_sessions: AtomicUsize,
     total_cdp_sessions: AtomicU64,
+    fastpath_hits: AtomicU64,
+    fastpath_fallbacks: AtomicU64,
     live: live::LiveRegistry,
     sessions: sessions::SessionStoreState,
     webhooks: webhook::WebhookDispatcher,
@@ -361,6 +365,8 @@ impl Inner {
                 expired_leases: workers_summary.expired_leases,
                 active_cdp_sessions: self.active_cdp_sessions.load(Ordering::Relaxed),
                 total_cdp_sessions: self.total_cdp_sessions.load(Ordering::Relaxed),
+                fastpath_hits: self.fastpath_hits.load(Ordering::Relaxed),
+                fastpath_fallbacks: self.fastpath_fallbacks.load(Ordering::Relaxed),
             }
         });
         metrics.to_prometheus_text()
@@ -541,6 +547,8 @@ impl HttpServer {
             shutdown_tx,
             active_cdp_sessions: AtomicUsize::new(0),
             total_cdp_sessions: AtomicU64::new(0),
+            fastpath_hits: AtomicU64::new(0),
+            fastpath_fallbacks: AtomicU64::new(0),
             live: live::LiveRegistry::default(),
             sessions: sessions::SessionStoreState::default(),
             webhooks: webhook::WebhookDispatcher::new(config.webhook_secret),
