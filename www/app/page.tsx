@@ -233,7 +233,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Version 0.13.0, open source under Apache-2.0. Prebuilt for Windows (x64 &amp; ARM64), macOS, and Linux (x64, ARM64 &amp; static musl) on npm, PyPI, GHCR, and GitHub Releases.
+              Version 0.13.1, open source under Apache-2.0. Prebuilt for Windows, macOS, and Linux across npm and PyPI (5 native targets), GitHub Releases (7 targets including Windows ARM64 and Linux musl), and multi-arch GHCR.
             </p>
           </div>
           <FleetBoard />
@@ -289,14 +289,14 @@ export default function Home() {
                 handles the fleet. Node and Python load a native module, so there is no driver process in between.
               </p>
               <p className="note">
-                The 21-tool MCP server exposes navigation and tabs (<code>open</code>,{" "}
+                The 22-tool MCP server exposes navigation and tabs (<code>open</code>,{" "}
                 <code>goto</code>, <code>back</code>, <code>forward</code>, <code>tabs</code>,{" "}
                 <code>close</code>), AI inspection (<code>snapshot</code> with <code>@eN</code>{" "}
                 refs, <code>markdown</code>, <code>title</code>, <code>content</code>,{" "}
                 <code>screenshot</code>), page actions (<code>click</code>, <code>hover</code>,{" "}
                 <code>fill</code>, <code>press</code>, <code>select</code>, <code>scroll</code>,{" "}
                 <code>wait_for</code>, <code>evaluate</code>), and diagnostics (
-                <code>console</code>, <code>network</code>). Or connect Playwright/Puppeteer
+                <code>console</code>, <code>network</code>, <code>export_api_calls</code>). Or connect Playwright/Puppeteer
                 scripts over the pooled <code>/cdp</code> WebSocket gateway.
               </p>
             </div>

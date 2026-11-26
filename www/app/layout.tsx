@@ -27,7 +27,7 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://fluxwright.vercel.app"),
   title: "Fluxwright: run a fleet of headless Chrome",
   description:
-    "A Rust engine that pools Chrome with isolated pages, built-in E2E testing (expect, .zip tracing, video, test runners), a pooled CDP gateway, live HITL dashboard, AI snapshots and Markdown extraction, 21-tool MCP server, and HTTP server/cluster mode for Node, Python, and Rust.",
+    "A Rust engine that pools Chrome with isolated pages, built-in E2E testing (expect, .zip tracing, video, test runners), a pooled CDP gateway, live HITL dashboard, AI snapshots and Markdown extraction, 22-tool MCP server, and HTTP server/cluster mode for Node, Python, and Rust.",
   icons: { icon: "/favicon.svg" },
   openGraph: {
     title: "Fluxwright: run a fleet of headless Chrome",

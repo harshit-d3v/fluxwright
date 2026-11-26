@@ -3077,3 +3077,146 @@ async fn byob_session_connects_to_external_chrome_navigates_and_cleans_up() {
     drop(chrome);
     fixture.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_session_blocks_cookie_banners_via_gateway() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let js_route = |path: &'static str, body: &'static str| {
+        let seen = seen.clone();
+        axum::routing::get(move || {
+            seen.lock().unwrap().push(path.into());
+            async move { ([(header::CONTENT_TYPE, "application/javascript")], body) }
+        })
+    };
+    let app = axum::Router::new()
+        .route(
+            "/app",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>SessionCMP</title>",
+                    "<script src='/app.js'></script>",
+                    "<script src='/cmp/cdn.cookielaw.org/otSDKStub.js'></script>",
+                    "<script src='/cmp/consent.cookiebot.com/uc.js'></script>"
+                ))
+            }),
+        )
+        .route("/app.js", js_route("/app.js", "window.__app = true;"))
+        .route(
+            "/cmp/cdn.cookielaw.org/otSDKStub.js",
+            js_route("/cmp/cdn.cookielaw.org/otSDKStub.js", "window.__cmp = true;"),
+        )
+        .route(
+            "/cmp/consent.cookiebot.com/uc.js",
+            js_route("/cmp/consent.cookiebot.com/uc.js", "window.__bot = true;"),
+        );
+
+    let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_base = format!("http://127.0.0.1:{}", app_listener.local_addr().unwrap().port());
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(app_listener, app).await;
+    });
+
+    let server = server().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn({
+        let router = server.router();
+        async move { axum::serve(listener, router).await }
+    });
+
+    let (st_create, created) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        json!({ "block_cookie_banners": true, "ttl_secs": 120 }),
+    )
+    .await;
+    assert_eq!(st_create, StatusCode::CREATED, "{created}");
+    let sess_id = created["id"].as_str().unwrap().to_string();
+    let cdp_path = created["cdp_path"].as_str().unwrap().to_string();
+
+    let mut ws = connect_cdp_ws(&format!("ws://{addr}{cdp_path}"), Some(TOKEN)).await;
+    let targets = cdp_rpc(&mut ws, 1, "Target.getTargets", json!({}), None).await;
+    let tid = targets["result"]["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["type"] == "page")
+        .unwrap()["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sid = cdp_rpc(
+        &mut ws,
+        2,
+        "Target.attachToTarget",
+        json!({ "targetId": tid, "flatten": true }),
+        None,
+    )
+    .await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    cdp_rpc(
+        &mut ws,
+        3,
+        "Page.navigate",
+        json!({ "url": format!("{app_base}/app") }),
+        Some(&sid),
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for seq in 10.. {
+            let ev = cdp_rpc(
+                &mut ws,
+                seq,
+                "Runtime.evaluate",
+                json!({ "expression": "window.__app === true", "returnByValue": true }),
+                Some(&sid),
+            )
+            .await;
+            if ev["result"]["result"]["value"] == json!(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("app script executed in managed session");
+
+    let flags = cdp_rpc(
+        &mut ws,
+        999,
+        "Runtime.evaluate",
+        json!({
+            "expression": "[window.__app === true, window.__cmp === true, window.__bot === true]",
+            "returnByValue": true
+        }),
+        Some(&sid),
+    )
+    .await;
+    assert_eq!(flags["result"]["result"]["value"], json!([true, false, false]));
+
+    {
+        let reqs = seen.lock().unwrap();
+        assert!(reqs.iter().any(|p| p == "/app.js"), "{reqs:?}");
+        assert!(!reqs.iter().any(|p| p.contains("cookielaw")), "{reqs:?}");
+        assert!(!reqs.iter().any(|p| p.contains("cookiebot")), "{reqs:?}");
+    }
+
+    drop(ws);
+    let (st_del, _) = request(
+        &server,
+        "DELETE",
+        &format!("/v1/sessions/{sess_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_del, StatusCode::OK);
+
+    server.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv_task.abort();
+    app_task.abort();
+}

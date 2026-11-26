@@ -42,6 +42,7 @@ The goal is to be the best engine for running many browser jobs on your own mach
   - **Searchable Session Replay & Network/HAR/API Export:** `GET /v1/sessions/{id}/replay` (`nav`/`console`/`network`/`frame` events, optional `"record_frames": true` JPEG capture, 15-minute retained replay buffer), `GET /v1/sessions/{id}/network` (`json`/`har` 1.2 export, `api_only`, sensitive header redaction), and Managed Sessions UI modals in `/dashboard`.
   - **Site Link Discovery (`POST /v1/map`) & Opt-in BYOB Sessions:** synchronous rendered link discovery (`same_origin`, `include_subdomains`, `search`, `limit`), plus opt-in `cdp_endpoint` on `POST /v1/sessions` via `--allow-session-cdp-endpoint`.
   - **AI-Agent Guardrails & Observe-Once API Export:** `@eN@rK` snapshot revision guardrails (`AriaSnapshot.revision` across Rust, Node, Python, and `fluxwright-mcp`), `export_api_calls` MCP tool #22 (`json` / `curl`), `block_cookie_banners` CMP blocking preset across Core and `fluxwright-server`, and copy-paste Browser-Use / Stagehand / Vercel AI SDK adapters under `examples/adapters/`.
+- **0.13.1:** Enforce `block_cookie_banners` on managed `POST /v1/sessions` via the gateway Fetch blocker, add `Page.loadEventFired` fallback and 10s screenshot budget for session replay frames, and align `22-tool` / `export_api_calls` / platform target docs across `README.md`, `docs/SERVER.md`, and `www`.
 
 ## Next: the fleet at scale
 

@@ -116,7 +116,7 @@ def test_homepage(page: Page) -> None:
 - **Polite crawling:** a cap on the pages on one host at once and a minimum delay between navigations to it, kept across the whole fleet (`maxConcurrencyPerHost`, `minDelayPerHost`).
 - **Crash recovery:** a dead browser fails its jobs at once and they retry on a healthy one. Chrome is tied to the engine process, so it never outlives it.
 - **Adaptive fleet control:** AIMD concurrency scaling under memory pressure or failures (`--adaptive-concurrency`), named persistent profiles (`--profiles-dir`), rotating proxy sessions with exponential cooldown (`--proxy`), pooled CDP WebSocket gateway (`GET /cdp`), signed job webhooks, OTLP/HTTP JSON traces (`--otlp-endpoint`), and live `/dashboard` screencasts with embeddable Live View URLs and Human-in-the-Loop controls.
-- **For AI agents:** a 21-tool MCP server (`fluxwright-mcp`, stdio or Streamable HTTP `--http <ADDR>` with bearer auth and isolated per-session contexts), `@eN` accessibility tree snapshots (`snapshot` with `{ diff: true }`), Set-of-Marks annotated screenshots (`screenshot({ annotate: true })`), and clean Markdown extraction (`markdown`) let Claude, Codex or Cursor drive the fleet.
+- **For AI agents:** a 22-tool MCP server (`fluxwright-mcp`, stdio or Streamable HTTP `--http <ADDR>` with bearer auth and isolated per-session contexts), `@eN` accessibility tree snapshots (`snapshot` with `{ diff: true }`), Set-of-Marks annotated screenshots (`screenshot({ annotate: true })`), and clean Markdown extraction (`markdown`) let Claude, Codex or Cursor drive the fleet.
 
 ## When to use Playwright instead
 
@@ -174,7 +174,7 @@ Requires Rust 1.95+ and Chrome or Chromium (found on the standard install paths,
 | `fluxwright-core` | Pool, scheduler, memory ceiling, recycling, metrics |
 | `fluxwright` | Public API |
 | `fluxwright-cli` | `fluxwright start` / `stats` / `browsers` / `doctor` / `install` / `benchmark` / `serve` / `coordinate` |
-| `fluxwright-mcp` | 21-tool MCP server (`open`, `goto`, `back`, `forward`, `tabs`, `close`, `snapshot` with `@eN` refs, `markdown`, `title`, `content`, `click`, `hover`, `fill`, `press`, `select`, `scroll`, `wait_for`, `evaluate`, `console`, `network`, `screenshot`) |
+| `fluxwright-mcp` | 22-tool MCP server (`open`, `goto`, `back`, `forward`, `tabs`, `close`, `snapshot` with `@eN` refs, `markdown`, `title`, `content`, `click`, `hover`, `fill`, `press`, `select`, `scroll`, `wait_for`, `evaluate`, `console`, `network`, `screenshot`, `export_api_calls`) |
 | `fluxwright-server` | Authenticated HTTP job API over one local or remote CDP fleet |
 
 ## MCP server
