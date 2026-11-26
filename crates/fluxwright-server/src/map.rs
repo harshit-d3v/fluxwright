@@ -60,6 +60,8 @@ pub(crate) struct MapRequest {
     #[serde(default)]
     resource_preset: Option<ServerResourcePreset>,
     #[serde(default)]
+    block_cookie_banners: bool,
+    #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
     proxy_session: Option<String>,
@@ -267,7 +269,7 @@ pub(crate) async fn map_handler(
         resource_preset: req.resource_preset,
         block_resources: Vec::new(),
         block_url_patterns: Vec::new(),
-        block_cookie_banners: false,
+        block_cookie_banners: req.block_cookie_banners,
         profile: req.profile,
         persist_profile: false,
         proxy_session: req.proxy_session,

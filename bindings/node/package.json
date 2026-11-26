@@ -1,6 +1,6 @@
 {
   "name": "fluxwright",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "description": "Run hundreds of headless Chrome jobs on one machine: pooling, queueing, recycling and crash recovery, with a Playwright-style API.",
   "main": "addon.js",
   "types": "addon.d.ts",
@@ -88,10 +88,10 @@
     "typescript": "^7.0.2"
   },
   "optionalDependencies": {
-    "fluxwright-darwin-arm64": "0.13.1",
-    "fluxwright-darwin-x64": "0.13.1",
-    "fluxwright-linux-arm64-gnu": "0.13.1",
-    "fluxwright-linux-x64-gnu": "0.13.1",
-    "fluxwright-win32-x64-msvc": "0.13.1"
+    "fluxwright-darwin-arm64": "0.13.2",
+    "fluxwright-darwin-x64": "0.13.2",
+    "fluxwright-linux-arm64-gnu": "0.13.2",
+    "fluxwright-linux-x64-gnu": "0.13.2",
+    "fluxwright-win32-x64-msvc": "0.13.2"
   }
 }

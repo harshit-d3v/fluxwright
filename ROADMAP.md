@@ -43,6 +43,7 @@ The goal is to be the best engine for running many browser jobs on your own mach
   - **Site Link Discovery (`POST /v1/map`) & Opt-in BYOB Sessions:** synchronous rendered link discovery (`same_origin`, `include_subdomains`, `search`, `limit`), plus opt-in `cdp_endpoint` on `POST /v1/sessions` via `--allow-session-cdp-endpoint`.
   - **AI-Agent Guardrails & Observe-Once API Export:** `@eN@rK` snapshot revision guardrails (`AriaSnapshot.revision` across Rust, Node, Python, and `fluxwright-mcp`), `export_api_calls` MCP tool #22 (`json` / `curl`), `block_cookie_banners` CMP blocking preset across Core and `fluxwright-server`, and copy-paste Browser-Use / Stagehand / Vercel AI SDK adapters under `examples/adapters/`.
 - **0.13.1:** Enforce `block_cookie_banners` on managed `POST /v1/sessions` via the gateway Fetch blocker, add `Page.loadEventFired` fallback and 10s screenshot budget for session replay frames, and align `22-tool` / `export_api_calls` / platform target docs across `README.md`, `docs/SERVER.md`, and `www`.
+- **0.13.2:** Add `block_cookie_banners` support to `POST /v1/map`, track session replay URLs and frame capture per target with consistent throttling, and install gateway blockers on new session targets even when no CDP WebSocket is connected.
 
 ## Next: the fleet at scale
 

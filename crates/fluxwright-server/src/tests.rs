@@ -3766,6 +3766,17 @@ async fn replay_network_map_and_byob_auth_bounds_and_ssrf() {
         );
     }
     assert_eq!(
+        call(
+            &srv,
+            "POST",
+            "/v1/map",
+            r#"{"url":"http://169.254.169.254/latest/meta-data","block_cookie_banners":true}"#
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
         call(&srv, "POST", "/v1/map", r#"{"url":"https://example.com","unknown":1}"#)
             .await
             .status(),
