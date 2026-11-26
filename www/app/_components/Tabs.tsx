@@ -11,16 +11,25 @@ export function Tabs({ label, tabs }: { label: string; tabs: Tab[] }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
   const id = useId();
 
+  function selectTab(index: number) {
+    setSelected(index);
+    refs.current[index]?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
   function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
     const next =
-      e.key === "ArrowRight" ? (selected + 1) % tabs.length
-      : e.key === "ArrowLeft" ? (selected - 1 + tabs.length) % tabs.length
-      : e.key === "Home" ? 0
-      : e.key === "End" ? tabs.length - 1
-      : null;
+      e.key === "ArrowRight"
+        ? (selected + 1) % tabs.length
+        : e.key === "ArrowLeft"
+          ? (selected - 1 + tabs.length) % tabs.length
+          : e.key === "Home"
+            ? 0
+            : e.key === "End"
+              ? tabs.length - 1
+              : null;
     if (next === null) return;
     e.preventDefault();
-    setSelected(next);
+    selectTab(next);
     refs.current[next]?.focus();
   }
 
@@ -40,7 +49,7 @@ export function Tabs({ label, tabs }: { label: string; tabs: Tab[] }) {
             aria-selected={i === selected}
             tabIndex={i === selected ? 0 : -1}
             className="tab"
-            onClick={() => setSelected(i)}
+            onClick={() => selectTab(i)}
           >
             {tab.title}
           </button>
@@ -53,7 +62,7 @@ export function Tabs({ label, tabs }: { label: string; tabs: Tab[] }) {
           id={`${id}-panel-${i}`}
           aria-labelledby={`${id}-tab-${i}`}
           hidden={i !== selected}
-          tabIndex={0}
+          tabIndex={i === selected ? 0 : undefined}
           className="tabpanel"
         >
           {tab.content}

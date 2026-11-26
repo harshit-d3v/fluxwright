@@ -1,85 +1,60 @@
 import type { CSSProperties } from "react";
+import { BackToTop } from "./_components/BackToTop";
+import { CapabilityGallery } from "./_components/CapabilityGallery";
+import { CodeBlock } from "./_components/CodeBlock";
 import { CopyCommand } from "./_components/CopyCommand";
 import { FleetBoard } from "./_components/FleetBoard";
 import { SiteHeader } from "./_components/SiteHeader";
-import { GITHUB, Logo, NPM, PYPI, RELEASES, SECTIONS } from "./_components/site";
+import {
+  CLUSTER_DOCS,
+  GHCR,
+  GITHUB,
+  Logo,
+  NPM,
+  PYPI,
+  RELEASES,
+  SECTIONS,
+  SERVER_DOCS,
+} from "./_components/site";
 import { Tabs } from "./_components/Tabs";
 
-const FEATURES: { name: string; text: string; api: string }[] = [
+const HERO_PRESETS = [
+  { label: "npm", command: "npm install fluxwright" },
+  { label: "pip", command: "pip install fluxwright" },
+  { label: "CLI", command: "cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-cli" },
+  { label: "Docker", command: "docker pull ghcr.io/harshit-d3v/fluxwright:latest" },
+];
+
+const TIERS: { tier: string; title: string; detail: string; spec: string }[] = [
   {
-    name: "A fresh page per job",
-    text: "Every job gets its own browser context on a pooled Chrome. Cookies, storage and cache never leak into the next job.",
-    api: "browser.newPage()",
+    tier: "TIER 1 · DEFAULT",
+    title: "Pure-Rust HTTP + html5ever",
+    detail:
+      "Fetches static docs, blogs, sitemaps, and server-rendered pages using rustls + ring and DNS-pinned SSRF checks on every redirect hop. Zero Chrome launched.",
+    spec: "mode: \"auto\" | \"http\"",
   },
   {
-    name: "A queue with priorities",
-    text: "When every slot is busy, jobs wait in a priority queue, or fail fast if you would rather shed load.",
-    api: "QueueFullMode::Wait",
+    tier: "TIER 2 · OPTIONAL",
+    title: "External Light-CDP Server",
+    detail:
+      "Routes non-visual escalated JS jobs to a user-supplied lightweight CDP endpoint (such as Moli, Obscura, or Lightpanda) with graceful -32601 fallback and zero AGPL entanglement.",
+    spec: "--fast-cdp-endpoint <url>",
   },
   {
-    name: "Container-aware memory ceiling",
-    text: "Auto-sizes to 1 browser per 4 CPUs and 75% of free RAM (reading cgroup limits in Docker). No new work starts above budget.",
-    api: "memory_ceiling_mb",
-  },
-  {
-    name: "Recycling",
-    text: "A browser drains running jobs without pausing the pool after a job count, age, or memory threshold, and shuts down when idle.",
-    api: "recycle_after_jobs",
-  },
-  {
-    name: "Crash recovery",
-    text: "A dead browser fails its jobs at once and they retry on a healthy one. Chrome is tied to the engine, so it never outlives a crash.",
-    api: "JobOptions::retries",
-  },
-  {
-    name: "Full Playwright-style API",
-    text: "Locators, cross-origin frameLocator, page.clock, route({ times }) & route.fallback(overrides), screenshot masking, page.pdf(), HAR 1.2 record/replay, prewarmContexts, ResourcePreset, multi-tab contexts, APIRequestContext, and newCDPSession.",
-    api: "page.getByRole()",
-  },
-  {
-    name: "End-to-end testing built in",
-    text: "Auto-retrying web-first expect() assertions (Rust, Node/TS, Python), Playwright Trace Viewer-compatible .zip context tracing with DOM frame snapshots, page video recording, visual toHaveScreenshot() regression, open Shadow DOM CSS piercing, the fluxwright/test CLI runner (parallel workers, sharding, retries, HTML reports), and an auto-loaded pytest plugin.",
-    api: "fluxwright/test",
-  },
-  {
-    name: "Profiles, proxies & AIMD",
-    text: "Named persistent profiles, rotating proxy pools with sticky affinity and exponential cooldowns, per-host rate limits, and AIMD adaptive concurrency under memory pressure.",
-    api: "--profiles-dir",
-  },
-  {
-    name: "Managed sessions, Replay & BYOB",
-    text: "TTL-backed reconnectable sessions (/v1/sessions), searchable Replay & HAR/API export (/replay, /network), Live View embeds, Dashboard modals, opt-in BYOB cdp_endpoint, and pooled GET /cdp.",
-    api: "POST /v1/sessions",
-  },
-  {
-    name: "Live screencast & HITL",
-    text: "Watch live JPEG streams in /dashboard, generate signed read-only or interactive embeddable Live View URLs, pause sessions with pause_for_human, drive mouse/keyboard/navigation remotely, and resume cleanly.",
-    api: "/v1/live/{id}/embed",
-  },
-  {
-    name: "Sync /v1/scrape, /v1/map & cluster",
-    text: "One-shot POST /v1/scrape and /v1/map link discovery with block_cookie_banners, async /v1/jobs with HMAC webhooks, OTLP traces, Prometheus /metrics, SQLite --store, GHCR multi-arch Docker, and fluxwright coordinate clusters.",
-    api: "POST /v1/scrape",
-  },
-  {
-    name: "Built for AI agents",
-    text: "22-tool MCP server (--http or stdio) with @eN@rK snapshot revision guardrails, Set-of-Marks screenshots, export_api_calls (JSON/curl), Markdown extraction, and Browser-Use / Stagehand / AI SDK adapters.",
-    api: "fluxwright-mcp --http",
+    tier: "TIER 3 · FULL FIDELITY",
+    title: "Pooled chrome-headless-shell",
+    detail:
+      "Automatically takes over for SPAs, challenge pages, interactions, screenshots, PDFs, or snapshots with isolated contexts, crash retries, and optional --low-memory flags.",
+    spec: "--low-memory · cgroup 75%",
   },
 ];
 
-const STEPS: { title: string; text: string }[] = [
-  { title: "Submit", text: "Your code asks for a page with browser.newPage(), or hands a job to engine.run()." },
-  {
-    title: "Admit",
-    text: "If every slot is busy or memory is over the ceiling, the job waits in the queue by priority.",
-  },
-  { title: "Lease", text: "The job gets a fresh context on the least busy Chrome. Nothing is shared with other jobs." },
-  { title: "Run", text: "Your code drives the page: navigation, locators, evaluate, screenshots." },
-  {
-    title: "Release",
-    text: "Closing the page destroys the context. A browser that reached its limits drains and restarts.",
-  },
+const STEPS: { num: string; title: string; text: string }[] = [
+  { num: "01", title: "Route", text: "Static scrapes hit Tier 1 Rust HTTP first; browser jobs enter engine.run()." },
+  { num: "02", title: "Admit", text: "Busy pools queue by priority or shed load above the cgroup RAM ceiling." },
+  { num: "03", title: "Lease", text: "Each job gets an isolated context on the least busy Chrome. Zero shared state." },
+  { num: "04", title: "Run", text: "Drives navigation, locators, snapshots, screencasts, or visual diffs safely." },
+  { num: "05", title: "Recycle", text: "Destroys the context immediately and drains bloated browsers without stalling." },
 ];
 
 // GitHub Actions benchmarks run 45227204313 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.36), 23 November 2026.
@@ -98,25 +73,22 @@ const TS_EXAMPLE = `import { chromium } from "fluxwright";
 
 const browser = await chromium.launch({ maxBrowsers: 4 });
 
-// A fresh browser context on a pooled Chrome.
+// Fresh browser context on a pooled Chrome.
 const page = await browser.newPage();
 await page.goto("https://example.com", { waitUntil: "domcontentloaded" });
-console.log(await page.title());
 
-// Locators wait until the element can be used.
 await page.getByRole("button", { name: "Accept" }).click();
 await page.getByRole("textbox", { name: "Search" }).fill("chromium");
 
-// Cross-origin iframes work the same way.
+// Cross-origin iframes pierce cleanly with the same locator API.
 const payment = page.frameLocator("iframe#payment");
-const card = payment.getByRole("textbox", { name: "Card number" });
-await card.fill("4242 4242 4242 4242");
+await payment.getByRole("textbox", { name: "Card" }).fill("4242");
 
-// AI-native accessibility tree (@eN refs) and clean Markdown.
+// AI accessibility snapshots (@eN@rK revision guardrails) + Markdown.
 const snapshot = await page.ariaSnapshot();
 const markdown = await page.markdown();
 
-await page.close(); // the context is destroyed and the slot is free
+await page.close(); // destroys context and frees the pool slot
 await browser.close();`;
 
 const PY_EXAMPLE = `import asyncio
@@ -126,16 +98,15 @@ async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(max_browsers=4)
 
-        # A fresh browser context on a pooled Chrome.
+        # Fresh browser context on a pooled Chrome.
         page = await browser.new_page()
         await page.goto("https://example.com", wait_until="domcontentloaded")
         print(await page.title())
 
-        # Locators wait until the element can be used.
         await page.get_by_role("button", name="Accept").click()
         await page.get_by_role("textbox", name="Search").fill("chromium")
 
-        await page.close()  # the context is destroyed and the slot is free
+        await page.close()  # destroys context and frees the pool slot
 
 asyncio.run(main())`;
 
@@ -144,12 +115,13 @@ const RUST_EXAMPLE = `use fluxwright::{BrowserEngine, JobOptions, Priority};
 let engine = BrowserEngine::builder()
     .max_browsers(8)
     .max_contexts_per_browser(10)
-    .memory_ceiling_mb(8192)   // admit no new jobs above this footprint
-    .recycle_after_jobs(200)   // restart each Chrome after 200 jobs
+    .memory_ceiling_mb(8192)
+    .recycle_after_jobs(200)
+    .low_memory(true)
     .build()
     .await?;
 
-// run() queues, leases, retries after a crash, and always releases the page.
+// run() queues, leases, retries on renderer crash, and drops the context.
 let job = JobOptions::default().priority(Priority::High).retries(2);
 let title = engine
     .run(job, |page| async move {
@@ -158,23 +130,27 @@ let title = engine
     })
     .await?;`;
 
-const MCP_EXAMPLE = `{
-  "mcpServers": {
-    "fluxwright": { "command": "fluxwright-mcp" }
-  }
-}`;
+const HYBRID_EXAMPLE = `// POST /v1/scrape with Tier 1 pure-Rust HTTP fast path ("mode": "auto")
+const res = await fetch("http://127.0.0.1:7331/v1/scrape", {
+  method: "POST",
+  headers: {
+    "Authorization": \`Bearer \${process.env.FLUXWRIGHT_SERVER_TOKEN}\`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    url: "https://docs.example.com/guide",
+    mode: "auto",                  // "auto" | "http" | "browser"
+    formats: ["markdown", "text"],
+    block_cookie_banners: true,
+  }),
+});
 
-const GATEWAY_EXAMPLE = `// Start the pooled server with CDP gateway, profiles, and AIMD
-// $ fluxwright serve --allow-query-token --profiles-dir ./profiles --adaptive-concurrency
+const data = await res.json();
+// data.engine => "http" (static) or "browser" (auto-escalated SPA)
+// data.fallback_reason => populated whenever Tier 1 escalates
 
-// Connect existing Playwright scripts straight to the pooled fleet
-import { chromium } from "playwright";
-
-const browser = await chromium.connectOverCDP(
-  \`ws://127.0.0.1:7331/cdp?token=\${process.env.FLUXWRIGHT_SERVER_TOKEN}\`,
-);
-const page = await browser.newPage();
-await page.goto("https://example.com");`;
+// POST /v1/map discovers links + optional XML sitemaps cleanly:
+// { "url": "https://example.com", "mode": "auto", "include_sitemap": true }`;
 
 const E2E_EXAMPLE = `import { test, expect } from "fluxwright/test";
 
@@ -187,16 +163,33 @@ test("homepage renders", async ({ page }) => {
   await expect(page).toHaveScreenshot("home.png");
 });
 
-// Run in parallel with retries, sharding, and HTML report:
+// Parallel runner with sharding, retries, and HTML report:
 // $ npx fluxwright-test --workers=4 --retries=1 --reporter=list,html`;
 
-function Code({ children, label }: { children: string; label: string }) {
-  return (
-    <pre className="code" aria-label={label}>
-      <code>{children}</code>
-    </pre>
-  );
-}
+const GATEWAY_EXAMPLE = `// Serve hybrid HTTP API + pooled /cdp gateway + managed sessions
+// $ fluxwright serve \\
+//     --low-memory \\
+//     --recycle-rss-mb 512 \\
+//     --fast-cdp-endpoint ws://127.0.0.1:9222 \\
+//     --allow-query-token --profiles-dir ./profiles --adaptive-concurrency
+
+// Point existing Playwright scripts directly at the pooled gateway:
+import { chromium } from "playwright";
+
+const browser = await chromium.connectOverCDP(
+  \`ws://127.0.0.1:7331/cdp?token=\${process.env.FLUXWRIGHT_SERVER_TOKEN}\`,
+);
+const page = await browser.newPage();
+await page.goto("https://example.com");`;
+
+const MCP_EXAMPLE = `{
+  "mcpServers": {
+    "fluxwright": {
+      "command": "fluxwright-mcp",
+      "args": ["--http", "127.0.0.1:7440"]
+    }
+  }
+}`;
 
 function Bar({ value }: { value: number }) {
   return (
@@ -216,62 +209,61 @@ export default function Home() {
       <main id="main" tabIndex={-1}>
         <section className="hero container" id="top" aria-labelledby="hero-title">
           <div className="hero-text">
-            <h1 id="hero-title">Run hundreds of Chrome jobs on one machine.</h1>
+            <p className="eyebrow">APACHE-2.0 · V0.13.2 RELEASED · HYBRID ENGINE ON MAIN</p>
+            <h1 id="hero-title">
+              Run a fast, isolated <em className="serif-italic">fleet</em> of headless Chrome.
+            </h1>
             <p className="lead">
-              Fluxwright pools Chrome, gives every job a fresh isolated page, queues work when the
-              fleet is full, restarts browsers before they bloat, and retries when one crashes. Use
-              it from Node, Python, or Rust, over the HTTP server and pooled CDP gateway, or from
-              AI agents via MCP.
+              Fluxwright resolves static pages in pure Rust HTTP first, routes non-visual scripts
+              through an optional light-CDP tier, and pools isolated Chrome contexts with automatic
+              crash recovery, replayable sessions, built-in E2E tests, and a 22-tool MCP server.
             </p>
-            <CopyCommand command="npm install fluxwright" />
+            <CopyCommand presets={HERO_PRESETS} />
             <div className="actions">
               <a className="button primary" href="#code">
-                See the code
+                Explore the code →
               </a>
-              <a className="button" href={GITHUB}>
-                View on GitHub
+              <a className="button" href="#benchmarks">
+                View CI benchmarks
               </a>
             </div>
             <p className="meta">
-              Version 0.13.2, open source under Apache-2.0. Prebuilt for Windows, macOS, and Linux across npm and PyPI (5 native targets), GitHub Releases (7 targets including Windows ARM64 and Linux musl), and multi-arch GHCR.
+              Published at <strong>v0.13.2</strong> across npm (6 unscoped packages, 5 native targets), PyPI (5 wheels + sdist), GitHub Releases (7 targets including Windows ARM64 and Linux musl), and multi-arch GHCR.
             </p>
           </div>
           <FleetBoard />
         </section>
 
-        <section className="section" id="features" aria-labelledby="features-title">
-          <div className="container">
-            <div className="section-head">
-              <h2 id="features-title">What it takes care of</h2>
-              <p>
-                Libraries like Playwright and Puppeteer drive one browser well. Running many at once
-                needs a control plane: how many Chromes, when to refuse work, when to restart one,
-                what to do when a renderer dies. That is Fluxwright.
-              </p>
-            </div>
-            <dl className="features">
-              {FEATURES.map((f) => (
-                <div className="feature" key={f.name}>
-                  <dt>{f.name}</dt>
-                  <dd>{f.text}</dd>
-                  <dd className="feature-api">
-                    <code>{f.api}</code>
-                  </dd>
-                </div>
-              ))}
-            </dl>
-          </div>
-        </section>
+        <CapabilityGallery />
 
         <section className="section" id="how" aria-labelledby="how-title">
           <div className="container">
             <div className="section-head">
-              <h2 id="how-title">How a job runs</h2>
-              <p>The same five steps whether a job comes from Node, Python, Rust or an agent.</p>
+              <span className="eyebrow">02 / EXECUTION ARCHITECTURE</span>
+              <h2 id="how-title">
+                Three tiers when speed counts, <em className="serif-italic">one</em> lifecycle underneath.
+              </h2>
+              <p>
+                Stay in zero-browser Rust HTTP when the HTML already has what you need, or escalate
+                seamlessly to external light-CDP or pooled Chromium without changing callers.
+              </p>
             </div>
+
+            <div className="tier-grid">
+              {TIERS.map((t) => (
+                <article className="tier-card" key={t.tier}>
+                  <span className="tier-kicker">{t.tier}</span>
+                  <h3>{t.title}</h3>
+                  <p>{t.detail}</p>
+                  <code className="tier-spec">{t.spec}</code>
+                </article>
+              ))}
+            </div>
+
             <ol className="steps">
               {STEPS.map((s) => (
                 <li key={s.title}>
+                  <span className="step-badge">{s.num}</span>
                   <h3>{s.title}</h3>
                   <p>{s.text}</p>
                 </li>
@@ -283,32 +275,36 @@ export default function Home() {
         <section className="section" id="code" aria-labelledby="code-title">
           <div className="container split">
             <div className="section-head">
-              <h2 id="code-title">The code</h2>
+              <span className="eyebrow">03 / POLYGLOT SDK &amp; PROTOCOLS</span>
+              <h2 id="code-title">
+                Native speed in every <em className="serif-italic">runtime</em>.
+              </h2>
               <p>
-                A small API on purpose: pages you lease, locators that wait, and an engine that
-                handles the fleet. Node and Python load a native module, so there is no driver process in between.
+                Node and Python load a compiled Rust native module directly in process, eliminating
+                intermediate Node/Go driver hops. Use one Playwright-style API across TypeScript,
+                Python, Rust, HTTP, CDP WebSockets, and MCP.
               </p>
               <p className="note">
-                The 22-tool MCP server exposes navigation and tabs (<code>open</code>,{" "}
-                <code>goto</code>, <code>back</code>, <code>forward</code>, <code>tabs</code>,{" "}
-                <code>close</code>), AI inspection (<code>snapshot</code> with <code>@eN</code>{" "}
-                refs, <code>markdown</code>, <code>title</code>, <code>content</code>,{" "}
-                <code>screenshot</code>), page actions (<code>click</code>, <code>hover</code>,{" "}
+                The 22-tool MCP server exposes navigation (<code>open</code>, <code>goto</code>,{" "}
+                <code>back</code>, <code>forward</code>, <code>tabs</code>, <code>close</code>), AI
+                inspection (<code>snapshot</code> with <code>@eN@rK</code> revision guardrails,{" "}
+                <code>markdown</code>, <code>title</code>, <code>content</code>,{" "}
+                <code>screenshot</code>), actions (<code>click</code>, <code>hover</code>,{" "}
                 <code>fill</code>, <code>press</code>, <code>select</code>, <code>scroll</code>,{" "}
                 <code>wait_for</code>, <code>evaluate</code>), and diagnostics (
-                <code>console</code>, <code>network</code>, <code>export_api_calls</code>). Or connect Playwright/Puppeteer
-                scripts over the pooled <code>/cdp</code> WebSocket gateway.
+                <code>console</code>, <code>network</code>, <code>export_api_calls</code>).
               </p>
             </div>
             <Tabs
               label="Code examples"
               tabs={[
-                { title: "TypeScript", content: <Code label="TypeScript example">{TS_EXAMPLE}</Code> },
-                { title: "Python", content: <Code label="Python example">{PY_EXAMPLE}</Code> },
-                { title: "Rust", content: <Code label="Rust example">{RUST_EXAMPLE}</Code> },
-                { title: "E2E Test", content: <Code label="E2E test runner example">{E2E_EXAMPLE}</Code> },
-                { title: "Server / CDP", content: <Code label="Server and CDP gateway example">{GATEWAY_EXAMPLE}</Code> },
-                { title: "MCP", content: <Code label="Claude Desktop configuration">{MCP_EXAMPLE}</Code> },
+                { title: "TypeScript", content: <CodeBlock label="TypeScript SDK">{TS_EXAMPLE}</CodeBlock> },
+                { title: "Python", content: <CodeBlock label="Python async SDK">{PY_EXAMPLE}</CodeBlock> },
+                { title: "Rust", content: <CodeBlock label="Rust BrowserEngine">{RUST_EXAMPLE}</CodeBlock> },
+                { title: "Hybrid Scrape", content: <CodeBlock label="POST /v1/scrape and /v1/map">{HYBRID_EXAMPLE}</CodeBlock> },
+                { title: "E2E Test", content: <CodeBlock label="fluxwright/test E2E runner">{E2E_EXAMPLE}</CodeBlock> },
+                { title: "Server / CDP", content: <CodeBlock label="fluxwright serve and CDP gateway">{GATEWAY_EXAMPLE}</CodeBlock> },
+                { title: "MCP", content: <CodeBlock label="fluxwright-mcp configuration">{MCP_EXAMPLE}</CodeBlock> },
               ]}
             />
           </div>
@@ -317,44 +313,77 @@ export default function Home() {
         <section className="section" id="benchmarks" aria-labelledby="bench-title">
           <div className="container">
             <div className="section-head">
-              <h2 id="bench-title">Benchmarks</h2>
+              <span className="eyebrow">04 / MEASURED IN GITHUB ACTIONS</span>
+              <h2 id="bench-title">
+                Benchmarks that hold under <em className="serif-italic">chaos</em>.
+              </h2>
               <p>
-                Jobs per second, higher is better. Every tool ran on the same chrome-headless-shell
-                binary and loaded a small local page with fresh isolated contexts per job.
+                Every runner executed on identical <code>chrome-headless-shell 158.0.8127.36</code>{" "}
+                binaries with isolated browser contexts per job on <code>ubuntu-latest</code> (4 vCPU).
               </p>
             </div>
+
+            <div className="kpi-strip">
+              <div className="kpi-card">
+                <span className="kpi-label">8 / 8 scenarios</span>
+                <strong>Fastest</strong>
+                <span>Beat Playwright and Puppeteer in every CI test case</span>
+              </div>
+              <div className="kpi-card">
+                <span className="kpi-label">Peak RAM delta</span>
+                <strong>-37.3%</strong>
+                <span>Memory reclaimed vs Playwright under load</span>
+              </div>
+              <div className="kpi-card">
+                <span className="kpi-label">Chaos throughput</span>
+                <strong>49.2 /s</strong>
+                <span>vs 23.2 /s for Playwright with browser kills every 2s</span>
+              </div>
+              <div className="kpi-card">
+                <span className="kpi-label">Chaos reliability</span>
+                <strong>0.0% failed</strong>
+                <span>Playwright and Puppeteer dropped 69.9% of jobs</span>
+              </div>
+            </div>
+
             <table className="bench">
               <caption className="visually-hidden">Throughput in jobs per second</caption>
               <thead>
                 <tr>
-                  <th scope="col">Setup</th>
-                  <th scope="col">Fluxwright</th>
-                  <th scope="col">Playwright</th>
+                  <th scope="col">Workload scenario</th>
+                  <th scope="col">Fluxwright (jobs/s)</th>
+                  <th scope="col">Playwright (jobs/s)</th>
+                  <th scope="col">Speedup</th>
                 </tr>
               </thead>
               <tbody>
-                {BENCH.map((b) => (
-                  <tr key={b.setup}>
-                    <th scope="row">{b.setup}</th>
-                    <td>
-                      <span className="bench-value">{b.flux.toFixed(1)}</span>
-                      <Bar value={b.flux} />
-                    </td>
-                    <td className="bench-other">
-                      <span className="bench-value">{b.pw.toFixed(1)}</span>
-                      <Bar value={b.pw} />
-                    </td>
-                  </tr>
-                ))}
+                {BENCH.map((b) => {
+                  const pct = Math.round(((b.flux - b.pw) / b.pw) * 100);
+                  return (
+                    <tr key={b.setup}>
+                      <th scope="row">{b.setup}</th>
+                      <td>
+                        <span className="bench-value">{b.flux.toFixed(1)}</span>
+                        <Bar value={b.flux} />
+                      </td>
+                      <td className="bench-other">
+                        <span className="bench-value">{b.pw.toFixed(1)}</span>
+                        <Bar value={b.pw} />
+                      </td>
+                      <td className="bench-delta">
+                        <span className="delta-pill">+{pct}%</span>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
+
             <p className="note bench-note">
-              Measured on GitHub&apos;s ubuntu-latest runner (4 vCPU, 23 November 2026,
-              chrome-headless-shell 158.0.8127.36). Fluxwright beat Playwright and Puppeteer in
-              all 8 scenarios with 0.0% failures and 0 leaked processes; in chaos mode Playwright
-              and Puppeteer dropped 69.9% of jobs. A shared cloud runner varies from run to
-              run. Run it yourself from the repository&apos;s Actions tab (benchmarks), and measure
-              your own workload with <code>cargo run --release -p fluxwright-benchmarks</code>.
+              Measured in GitHub Actions run <code>45227204313</code> (23 November 2026). Shared CI
+              runners vary between runs; reproduce browser fleet measurements with{" "}
+              <code>cargo run --release -p fluxwright-benchmarks</code> and test Tier 1 HTTP fast-path
+              latency locally with <code>node benchmarks/fastpath-bench.mjs</code>.
             </p>
           </div>
         </section>
@@ -362,12 +391,16 @@ export default function Home() {
         <section className="section" id="install" aria-labelledby="install-title">
           <div className="container split">
             <div className="section-head">
-              <h2 id="install-title">Install</h2>
+              <span className="eyebrow">05 / DEPLOYMENT TARGETS</span>
+              <h2 id="install-title">
+                Install in seconds, run <em className="serif-italic">anywhere</em>.
+              </h2>
               <p>
-                You need Chrome or Chromium on the machine. Headless runs use chrome-headless-shell
-                when it is installed, which opened pages 5 to 10 times faster in our runs.
+                Tier 1 HTTP fast-path endpoints run with zero browser binaries installed. For full
+                Chromium rendering, install <code>chrome-headless-shell</code>, which opened pages 5
+                to 10 times faster than full headed Chrome in our CI runs.
               </p>
-              <CopyCommand command="npx @puppeteer/browsers install chrome-headless-shell@stable" />
+              <CopyCommand command="fluxwright install" />
             </div>
             <Tabs
               label="Install instructions"
@@ -376,10 +409,10 @@ export default function Home() {
                   title: "npm",
                   content: (
                     <>
-                      <Code label="npm install">{`npm install fluxwright`}</Code>
+                      <CodeBlock label="Install via npm">{`npm install fluxwright`}</CodeBlock>
                       <p className="note">
-                        Prebuilt for Windows x64, macOS (Apple silicon &amp; Intel), and Linux (x64
-                        &amp; ARM64 glibc). Node 18 or later.
+                        Unscoped prebuilt binaries across Windows x64, macOS (Apple silicon &amp; Intel),
+                        and Linux (x64 &amp; ARM64 glibc). Requires Node 18 or later.
                       </p>
                     </>
                   ),
@@ -388,10 +421,10 @@ export default function Home() {
                   title: "pip",
                   content: (
                     <>
-                      <Code label="pip install">{`pip install fluxwright`}</Code>
+                      <CodeBlock label="Install via pip">{`pip install fluxwright`}</CodeBlock>
                       <p className="note">
-                        Wheels for Windows x64, macOS (Apple silicon &amp; Intel), and Linux (x64
-                        &amp; ARM64 glibc). Python 3.10 or later, with asyncio and blocking APIs.
+                        ABI3 wheels and source dist across Windows x64, macOS (Apple silicon &amp; Intel),
+                        and Linux (x64 &amp; ARM64 glibc). Python 3.10+, asyncio &amp; sync APIs + pytest plugin.
                       </p>
                     </>
                   ),
@@ -400,10 +433,10 @@ export default function Home() {
                   title: "Rust",
                   content: (
                     <>
-                      <Code label="Cargo.toml dependency">{`[dependencies]
+                      <CodeBlock label="Add to Cargo.toml">{`[dependencies]
 fluxwright = { git = "https://github.com/harshit-d3v/fluxwright" }
-tokio = { version = "1", features = ["full"] }`}</Code>
-                      <p className="note">Rust 1.95 or later.</p>
+tokio = { version = "1", features = ["full"] }`}</CodeBlock>
+                      <p className="note">Rust 1.95 or later with pure-Rust ring TLS (zero cmake/nasm required).</p>
                     </>
                   ),
                 },
@@ -411,12 +444,11 @@ tokio = { version = "1", features = ["full"] }`}</Code>
                   title: "MCP",
                   content: (
                     <>
-                      <Code label="Install the MCP server">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-mcp`}</Code>
+                      <CodeBlock label="Install fluxwright-mcp">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-mcp
+fluxwright-mcp --http 127.0.0.1:7440`}</CodeBlock>
                       <p className="note">
-                        Prebuilt binaries are also available on{" "}
-                        <a href={RELEASES}>GitHub Releases</a>. Add it to Claude Desktop, Codex, or
-                        Cursor as shown in the code section. The fleet runs on your machine or your
-                        own container, so serverless hosts cannot run it.
+                        Prebuilt <code>fluxwright-mcp</code> archives for all 7 targets are on{" "}
+                        <a href={RELEASES}>GitHub Releases</a>.
                       </p>
                     </>
                   ),
@@ -425,16 +457,13 @@ tokio = { version = "1", features = ["full"] }`}</Code>
                   title: "CLI",
                   content: (
                     <>
-                      <Code label="Install and use the CLI">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-cli
+                      <CodeBlock label="Install and launch fluxwright-cli">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-cli
 fluxwright install
 fluxwright doctor
-fluxwright start --max-browsers 4 --max-contexts 8
-fluxwright serve --listen 127.0.0.1:7331`}</Code>
+fluxwright serve --listen 127.0.0.1:7331 --low-memory --recycle-rss-mb 512`}</CodeBlock>
                       <p className="note">
-                        Prebuilt CLI archives are on <a href={RELEASES}>GitHub Releases</a>.{" "}
-                        <code>fluxwright install</code> fetches managed Chromium binaries; use{" "}
-                        <code>fluxwright serve</code> and <code>fluxwright coordinate</code> for
-                        HTTP and cluster mode.
+                        Add <code>--fast-cdp-endpoint ws://...</code> for external light-CDP execution or use{" "}
+                        <code>fluxwright coordinate</code> for multi-node cluster leases.
                       </p>
                     </>
                   ),
@@ -443,16 +472,16 @@ fluxwright serve --listen 127.0.0.1:7331`}</Code>
                   title: "Docker",
                   content: (
                     <>
-                      <Code label="Run Fluxwright in Docker">{`docker pull ghcr.io/harshit-d3v/fluxwright:latest
+                      <CodeBlock label="Multi-arch GHCR container">{`docker pull ghcr.io/harshit-d3v/fluxwright:latest
 docker run --rm \\
   -e FLUXWRIGHT_SERVER_TOKEN="$FLUXWRIGHT_SERVER_TOKEN" \\
   -p 127.0.0.1:7331:7331 --shm-size=1g \\
   --memory=4g --cpus=4 --cap-add=SYS_ADMIN \\
-  ghcr.io/harshit-d3v/fluxwright:latest`}</Code>
+  ghcr.io/harshit-d3v/fluxwright:latest`}</CodeBlock>
                       <p className="note">
                         Multi-arch image (<code>linux/amd64</code> + <code>linux/arm64</code>) on GHCR.
-                        Reads container cgroup limits automatically for browser count and RAM ceiling,
-                        and uses <code>tini</code> as PID 1 so Chromium subprocesses are always reaped.
+                        Reads container cgroup limits automatically and reaps Chromium subprocesses via{" "}
+                        <code>tini</code>.
                       </p>
                     </>
                   ),
@@ -465,33 +494,34 @@ docker run --rm \\
         <section className="section" id="scope" aria-labelledby="scope-title">
           <div className="container">
             <div className="section-head">
-              <h2 id="scope-title">Know before you choose it</h2>
+              <span className="eyebrow">06 / HONEST BOUNDARIES</span>
+              <h2 id="scope-title">
+                Know before you <em className="serif-italic">choose</em> it.
+              </h2>
             </div>
             <div className="scope">
-              <div>
+              <div className="scope-card">
                 <h3>What it does not do</h3>
                 <ul>
-                  <li>Firefox or WebKit. Fluxwright is Chromium only.</li>
+                  <li>Firefox or WebKit. Fluxwright is HTTP fast-path + Chromium CDP only.</li>
                   <li>
                     Interactive GUI codegen or a built-in Trace Viewer UI (Fluxwright writes
-                    Playwright-compatible <code>.zip</code> traces you can open in Playwright Trace
-                    Viewer).
+                    Playwright-compatible <code>.zip</code> traces you open in Playwright Trace Viewer).
                   </li>
-                  <li>Java or .NET SDKs. Fluxwright targets Node, Python, and Rust.</li>
+                  <li>Java or .NET SDKs. Official bindings target Node, Python, and Rust.</li>
                   <li>Anti-bot evasion.</li>
                 </ul>
               </div>
-              <div>
+              <div className="scope-card">
                 <h3>Safe by default</h3>
                 <ul>
-                  <li>Chrome&apos;s sandbox stays on unless you set FLUXWRIGHT_NO_SANDBOX=1.</li>
-                  <li>On Linux and macOS the engine talks to Chrome over a private pipe, not a debugging port.</li>
-                  <li>Jobs never share cookies or storage.</li>
-                  <li>Chrome exits when the engine exits, even after a crash.</li>
-                  <li>Bearer tokens are required on HTTP and CDP server endpoints even on loopback, with single-use WebSocket tickets for live dashboard streams.</li>
+                  <li>Chrome&apos;s sandbox stays enabled unless <code>FLUXWRIGHT_NO_SANDBOX=1</code> is set.</li>
+                  <li>Tier 1 HTTP fast path validates URLs via netguard DNS pinning on every 3xx redirect hop.</li>
+                  <li>Linux and macOS control Chrome over a private pipe, never an open debug port.</li>
+                  <li>Jobs never share cookies or storage; Chrome exits immediately when the engine exits.</li>
                   <li>
-                    Saved profiles and job journals are written owner-only (<code>0600</code> on Unix),
-                    and cluster workers support isolated <code>FLUXWRIGHT_WORKER_TOKEN</code> and native TLS.
+                    HTTP and CDP endpoints require bearer tokens; saved profiles and journals write{" "}
+                    <code>0600</code> on Unix with isolated <code>FLUXWRIGHT_WORKER_TOKEN</code> TLS support.
                   </li>
                 </ul>
               </div>
@@ -501,35 +531,76 @@ docker run --rm \\
       </main>
 
       <footer className="site-footer">
-        <div className="container footer-row">
-          <a className="wordmark" href="#top">
-            <Logo />
-            <span>Fluxwright</span>
-          </a>
-          <nav aria-label="Footer">
-            <ul>
-              {SECTIONS.map((s) => (
-                <li key={s.href}>
-                  <a href={s.href}>{s.label}</a>
+        <div className="container">
+          <div className="footer-grid">
+            <div className="footer-brand">
+              <a className="wordmark" href="#top">
+                <Logo />
+                <span>
+                  Fluxwright<span className="wordmark-dot" aria-hidden="true">.</span>
+                </span>
+              </a>
+              <p>
+                Built for fleets, not single tabs. Apache-2.0 open source engine in Rust, Node, and Python.
+              </p>
+            </div>
+            <nav className="footer-col" aria-label="Page sections">
+              <h4>Explore</h4>
+              <ul>
+                {SECTIONS.map((s) => (
+                  <li key={s.href}>
+                    <a href={s.href}>{s.label}</a>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+            <nav className="footer-col" aria-label="Documentation and distributions">
+              <h4>Distributions</h4>
+              <ul>
+                <li>
+                  <a href={NPM}>npm package</a>
                 </li>
-              ))}
-              <li>
-                <a href={GITHUB}>GitHub</a>
-              </li>
-              <li>
-                <a href={NPM}>npm</a>
-              </li>
-              <li>
-                <a href={PYPI}>PyPI</a>
-              </li>
-              <li>
-                <a href={RELEASES}>Releases</a>
-              </li>
-            </ul>
-          </nav>
-          <p className="footer-note">Apache-2.0 licensed.</p>
+                <li>
+                  <a href={PYPI}>PyPI package</a>
+                </li>
+                <li>
+                  <a href={GHCR}>GHCR container</a>
+                </li>
+                <li>
+                  <a href={RELEASES}>GitHub Releases</a>
+                </li>
+              </ul>
+            </nav>
+            <nav className="footer-col" aria-label="Documentation">
+              <h4>References</h4>
+              <ul>
+                <li>
+                  <a href={GITHUB}>Source repository</a>
+                </li>
+                <li>
+                  <a href={SERVER_DOCS}>HTTP Server &amp; MCP docs</a>
+                </li>
+                <li>
+                  <a href={CLUSTER_DOCS}>Cluster coordination docs</a>
+                </li>
+              </ul>
+            </nav>
+          </div>
+
+          <hr className="footer-dotted" />
+
+          <div className="footer-bottom">
+            <p className="footer-note">Apache-2.0 licensed · Published release v0.13.2</p>
+            <div className="footer-links">
+              <a href={GITHUB}>GitHub</a>
+              <a href={NPM}>npm</a>
+              <a href={PYPI}>PyPI</a>
+              <a href={RELEASES}>Releases</a>
+            </div>
+          </div>
         </div>
       </footer>
+      <BackToTop />
     </>
   );
 }
