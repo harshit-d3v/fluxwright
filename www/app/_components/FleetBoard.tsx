@@ -2,11 +2,10 @@
 
 import { useEffect, useReducer, useState, type CSSProperties } from "react";
 
-// A simulated fleet: five Chrome processes, eight page slots each. Jobs queue, lease a
-// slot on the least-loaded browser, finish, and leave a little memory behind; a browser
-// over the limit drains and restarts. Illustrative only: the numbers are not measured.
+// A simulated 3-tier fleet: incoming jobs hit Tier 1 HTTP fast path first, escalating
+// dynamic/browser jobs into five pooled Chrome processes with eight page slots each.
+// Illustrative simulation only: numbers are not measured benchmark data.
 
-const BROWSERS = 5;
 const SLOTS = 8;
 const LIMIT_MB = 900;
 const FRESH_MB = 80;
@@ -14,9 +13,17 @@ const QUEUE_MAX = 8;
 
 type Slot = "free" | "lease" | "crash";
 type Browser = { slots: Slot[]; mb: number; recycling: number | null };
-type Fleet = { browsers: Browser[]; queue: number; done: number; recycled: number; retried: number; seed: number };
+type Fleet = {
+  browsers: Browser[];
+  queue: number;
+  fastHits: number;
+  done: number;
+  recycled: number;
+  retried: number;
+  seed: number;
+};
 
-// mulberry32: a deterministic PRNG, so the server and the first client render agree.
+// mulberry32 deterministic PRNG so SSR and initial client render match.
 function rand(state: Fleet): number {
   let t = (state.seed = (state.seed + 0x6d2b79f5) | 0);
   t = Math.imul(t ^ (t >>> 15), t | 1);
@@ -34,6 +41,7 @@ function initial(): Fleet {
       recycling: null,
     })),
     queue: 3,
+    fastHits: 842,
     done: 1284,
     recycled: 3,
     retried: 1,
@@ -42,19 +50,24 @@ function initial(): Fleet {
 }
 
 function step(prev: Fleet): Fleet {
-  const s: Fleet = { ...prev, browsers: prev.browsers.map((b) => ({ ...b, slots: [...b.slots] })) };
+  const s: Fleet = {
+    ...prev,
+    browsers: prev.browsers.map((b) => ({ ...b, slots: [...b.slots] })),
+  };
+
+  // Tier 1 pure-Rust HTTP resolves static/doc requests without touching Chrome slots.
+  s.fastHits += 1 + Math.floor(rand(s) * 3);
 
   for (const b of s.browsers) {
     b.slots = b.slots.map((slot) => {
       if (slot === "crash") return "free";
       if (slot === "lease" && rand(s) < 0.14) {
         s.done += 1;
-        b.mb -= 24; // the context is gone, but a little memory stays behind
+        b.mb = Math.max(FRESH_MB, b.mb - 24);
         return "free";
       }
       return slot;
     });
-    // A renderer dies now and then: its job goes back to the queue and runs elsewhere.
     const leased = b.slots.flatMap((slot, i) => (slot === "lease" ? [i] : []));
     if (leased.length && rand(s) < 0.015) {
       b.slots[leased[Math.floor(rand(s) * leased.length)]] = "crash";
@@ -77,7 +90,10 @@ function step(prev: Fleet): Fleet {
   while (s.queue > 0) {
     const open = s.browsers
       .filter((b) => b.recycling === null && b.slots.includes("free"))
-      .sort((a, b) => a.slots.filter((x) => x === "lease").length - b.slots.filter((x) => x === "lease").length);
+      .sort(
+        (a, b) =>
+          a.slots.filter((x) => x === "lease").length - b.slots.filter((x) => x === "lease").length,
+      );
     if (!open.length) break;
     const b = open[0];
     b.slots[b.slots.indexOf("free")] = "lease";
@@ -93,7 +109,7 @@ export function FleetBoard() {
   const [fleet, tick] = useReducer(step, undefined, initial);
   const [playing, setPlaying] = useState(false);
 
-  // Motion is opt-out: start playing unless the visitor asked for reduced motion.
+  // Motion is opt-out when reduced-motion is not active, with explicit pause control.
   useEffect(() => {
     setPlaying(!window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   }, []);
@@ -107,16 +123,30 @@ export function FleetBoard() {
   return (
     <figure className="board">
       <div className="board-head">
-        <p className="board-title">Simulated fleet</p>
+        <div className="board-title-group">
+          <span className="board-kicker">LIVE TOPOLOGY SIMULATION</span>
+          <p className="board-title">Hybrid fast-path &amp; pooled Chrome fleet</p>
+        </div>
         <button type="button" className="board-toggle" onClick={() => setPlaying((p) => !p)}>
           {playing ? "Pause" : "Play"}
           <span className="visually-hidden"> the fleet animation</span>
         </button>
       </div>
 
+      <div className="board-tier1" aria-hidden="true">
+        <div className="tier1-head">
+          <span className="tier1-dot" />
+          <span className="tier1-name">Tier 1 · Rust HTTP + html5ever</span>
+          <span className="tier1-tag">0 browsers launched</span>
+        </div>
+        <div className="tier1-meter">
+          <span className="tier1-bar" />
+        </div>
+      </div>
+
       <div className="board-grid" aria-hidden="true">
         <div className="board-row">
-          <span className="board-label">Queue</span>
+          <span className="board-label">Escalated queue</span>
           <span className="queue">
             {Array.from({ length: QUEUE_MAX }, (_, i) => (
               <span key={i} className={i < fleet.queue ? "pill waiting" : "pill"} />
@@ -134,7 +164,10 @@ export function FleetBoard() {
             </span>
             <span className="board-mem">
               {b.recycling === null ? `${fmt.format(b.mb)} MB` : "recycling"}
-              <span className="mem-bar" style={{ "--fill": `${Math.min(100, (b.mb / LIMIT_MB) * 100)}%` } as CSSProperties} />
+              <span
+                className="mem-bar"
+                style={{ "--fill": `${Math.min(100, (b.mb / LIMIT_MB) * 100)}%` } as CSSProperties}
+              />
             </span>
           </div>
         ))}
@@ -142,30 +175,45 @@ export function FleetBoard() {
 
       <dl className="board-stats">
         <div>
-          <dt>Jobs done</dt>
+          <dt>HTTP fast hits</dt>
+          <dd className="stat-accent">{fmt.format(fleet.fastHits)}</dd>
+        </div>
+        <div>
+          <dt>Browser jobs</dt>
           <dd>{fmt.format(fleet.done)}</dd>
         </div>
         <div>
-          <dt>Browsers recycled</dt>
+          <dt>Recycled</dt>
           <dd>{fleet.recycled}</dd>
         </div>
         <div>
-          <dt>Crashes retried</dt>
+          <dt>Retried</dt>
           <dd>{fleet.retried}</dd>
         </div>
       </dl>
 
       <figcaption className="board-caption">
-        Each row is one Chrome process with eight page slots. A job leases a free slot on the
-        least busy browser; when every slot is taken it waits in the queue. A browser that grows
-        past {LIMIT_MB} MB takes no new jobs, finishes the ones it has, and restarts. An
-        illustration, not measured data.
+        Static pages resolve in Tier 1 Rust HTTP without waking Chrome. Dynamic SPAs and visual
+        jobs lease free contexts across pooled Chromes, drain above {LIMIT_MB} MB, and retry if a
+        renderer dies. Illustrative simulation, not measured data.
       </figcaption>
+
       <ul className="legend" aria-hidden="true">
-        <li><span className="slot lease" /> Running job</li>
-        <li><span className="slot free" /> Free slot</li>
-        <li><span className="pill waiting" /> Queued</li>
-        <li><span className="slot crash" /> Crashed, retried</li>
+        <li>
+          <span className="legend-dot tier1" /> Tier 1 HTTP hit
+        </li>
+        <li>
+          <span className="slot lease" /> Active slot
+        </li>
+        <li>
+          <span className="slot free" /> Free slot
+        </li>
+        <li>
+          <span className="pill waiting" /> Queued
+        </li>
+        <li>
+          <span className="slot crash" /> Crashed, retried
+        </li>
       </ul>
     </figure>
   );
