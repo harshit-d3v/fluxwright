@@ -44,7 +44,7 @@ pub(crate) struct ScrapeRequest {
     #[serde(default = "default_formats")]
     formats: Vec<ScrapeFormat>,
     #[serde(default)]
-    mode: FetchMode,
+    pub(crate) mode: FetchMode,
     #[serde(default)]
     wait_until: NavigationWait,
     #[serde(default)]

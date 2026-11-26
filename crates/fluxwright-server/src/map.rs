@@ -56,9 +56,9 @@ pub(crate) struct MapRequest {
     #[serde(default)]
     include_subdomains: bool,
     #[serde(default)]
-    include_sitemap: bool,
+    pub(crate) include_sitemap: bool,
     #[serde(default)]
-    mode: FetchMode,
+    pub(crate) mode: FetchMode,
     #[serde(default)]
     search: Option<String>,
     #[serde(default = "default_limit")]

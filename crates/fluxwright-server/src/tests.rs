@@ -4327,6 +4327,11 @@ async fn fast_fetch_blocks_ssrf_redirects_and_decodes_compressed_bodies() {
 
                 let response: Vec<u8> = match target {
                     "/redir-imds" => b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-fe80" => b"HTTP/1.1 302 Found\r\nLocation: http://[fe80::1]/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-fd00" => b"HTTP/1.1 302 Found\r\nLocation: http://[fd00:ec2::254]/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-v4mapped" => b"HTTP/1.1 302 Found\r\nLocation: http://[::ffff:169.254.169.254]/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-dec" => b"HTTP/1.1 302 Found\r\nLocation: http://2852039166/\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    "/redir-hex" => b"HTTP/1.1 302 Found\r\nLocation: http://0xa9.0xfe.0xa9.0xfe/\r\nContent-Length: 0\r\n\r\n".to_vec(),
                     "/redir-file" => b"HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nContent-Length: 0\r\n\r\n".to_vec(),
                     "/redir-loop" => b"HTTP/1.1 302 Found\r\nLocation: /redir-loop\r\nContent-Length: 0\r\n\r\n".to_vec(),
                     "/redir-ok" => b"HTTP/1.1 302 Found\r\nLocation: /gzip\r\nContent-Length: 0\r\n\r\n".to_vec(),
@@ -4379,8 +4384,16 @@ async fn fast_fetch_blocks_ssrf_redirects_and_decodes_compressed_bodies() {
         }
     });
 
-    // SSRF redirects blocked before connecting.
-    for path in ["/redir-imds", "/redir-file"] {
+    // SSRF redirects blocked before connecting across IPv4/IPv6 link-local, AWS IMDS, decimal/hex IPv4, and file://.
+    for path in [
+        "/redir-imds",
+        "/redir-fe80",
+        "/redir-fd00",
+        "/redir-v4mapped",
+        "/redir-dec",
+        "/redir-hex",
+        "/redir-file",
+    ] {
         let err = fast_fetch::fetch_url(
             &format!("{base}{path}"),
             Duration::from_secs(5),
