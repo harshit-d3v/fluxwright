@@ -198,11 +198,11 @@ The `start` / `stats` / `browsers` control channel is a Unix socket, or `\\.\pip
 
 ### HTTP server
 
-`fluxwright serve` owns a fleet and accepts both one-shot synchronous scrapes & site discovery (`POST /v1/scrape` returning `markdown`, `html`, `text`, `snapshot`, `screenshot`, and `pdf`; `POST /v1/map` for rendered link discovery), async JSON browser jobs (`POST /v1/jobs`, `GET /v1/jobs/{id}`, `DELETE /v1/jobs/{id}`), and TTL-backed Managed Cloud Sessions (`POST /v1/sessions`, reconnectable `GET /v1/sessions/{id}/cdp`, searchable `GET /v1/sessions/{id}/replay`, HAR/API `GET /v1/sessions/{id}/network`, paired signed Live Views, and opt-in BYOB `cdp_endpoint` via `--allow-session-cdp-endpoint`, plus `block_cookie_banners`). It defaults
-to `127.0.0.1:7331` and requires `FLUXWRIGHT_SERVER_TOKEN` (a random token of 32–256 printable
-ASCII characters). Pass `--cdp-endpoint <url>` to connect to an existing browser over CDP instead
-of launching local Chrome (one connection; set concurrency with `--max-contexts`). This is a
-trusted-operator API, not a public multi-tenant service.
+`fluxwright serve` owns a fleet and accepts both one-shot synchronous scrapes and site discovery (`POST /v1/scrape` returning `markdown`, `html`, `text`, `snapshot`, `screenshot`, and `pdf`; `POST /v1/map` for link discovery with optional `include_sitemap`), async JSON browser jobs (`POST /v1/jobs`, `GET /v1/jobs/{id}`, `DELETE /v1/jobs/{id}`), and TTL-backed Managed Cloud Sessions (`POST /v1/sessions`, reconnectable `GET /v1/sessions/{id}/cdp`, searchable `GET /v1/sessions/{id}/replay`, HAR/API `GET /v1/sessions/{id}/network`, paired signed Live Views, and opt-in BYOB `cdp_endpoint` via `--allow-session-cdp-endpoint`, plus `block_cookie_banners`).
+
+For `/v1/scrape` and `/v1/map`, `mode` defaults to `"auto"` (Tier 1 pure-Rust SSRF-safe HTTP fast path with automatic browser escalation for SPAs or challenges), and also accepts `"http"` (fast path only) or `"browser"`. Responses report `engine` (`"http"` | `"browser"`) and optional `fallback_reason`, while non-visual browser-backed scrape/map calls default `resource_preset` to `"scraping"`. Prometheus `/metrics` exposes `fluxwright_fastpath_hits_total` and `fluxwright_fastpath_fallbacks_total`.
+
+The server defaults to `127.0.0.1:7331` and requires `FLUXWRIGHT_SERVER_TOKEN` (a random token of 32-256 printable ASCII characters). Pass `--cdp-endpoint <url>` to connect to an existing browser over CDP instead of launching local Chrome (one connection; set concurrency with `--max-contexts`), `--low-memory` for opt-in low-memory headless Chromium flags, `--recycle-rss-mb <mb>` to recycle browsers at an RSS threshold, or `--fast-cdp-endpoint <url>` for pluggable external light-CDP backends (such as Moli, Obscura, or Lightpanda) without bundling AGPL code. This is a trusted-operator API, not a public multi-tenant service.
 
 See [the HTTP server guide](docs/SERVER.md) for startup commands, authentication, job steps,
 limits, and deployment precautions, and [agent framework adapters](examples/adapters/README.md) for Browser-Use, Stagehand, and Vercel AI SDK starters.
@@ -230,9 +230,11 @@ Fluxwright automatically detects container `--memory` and `--cpus` limits via cg
 ```bash
 cargo run --release -p fluxwright-benchmarks
 # two-hour soak (memory over time): cargo run --release -p fluxwright-benchmarks -- --soak
+# compare /v1/scrape and /v1/map fast path (mode: auto) vs browser mode:
+node benchmarks/fastpath-bench.mjs
 ```
 
-The harness talks to `benchmark-server` (localhost only). Playwright and Puppeteer adapters run if their Node packages are installed.
+The Rust harness talks to `benchmark-server` (localhost only). Playwright and Puppeteer adapters run if their Node packages are installed. `benchmarks/fastpath-bench.mjs` benchmarks `POST /v1/scrape` and `POST /v1/map` against a local HTTP fixture server with static HTML and client-side SPA pages, reporting req/s, p50/p95 ms, `engine` breakdown, and server RSS MB.
 
 ## Development
 
