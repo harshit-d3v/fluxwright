@@ -128,13 +128,13 @@ Use Fluxwright when you run many browser jobs — scraping, crawling, PDF and sc
 
 ## Speed
 
-Measured on GitHub's ubuntu-latest runner (4 vCPU, 2026-11-23, run `45227204313`): every tool on the same chrome-headless-shell 158.0.8127.36 binary with fresh isolated contexts per job. Fluxwright beat Playwright and Puppeteer in all 8 scenarios with 0.0% failures and 0 leaked processes: `1-browser-10-pages` **42.8 vs 36.7** jobs/s (-13.3% peak RAM), `10-concurrent-browsers` **50.7 vs 34.6** jobs/s (-37.3% peak RAM), `100-concurrent` **50.9 vs 36.6** jobs/s (-24.2% peak RAM), `500-concurrent` **48.5 vs 36.7** jobs/s (-18.8% peak RAM), `1000-queued` **47.3 vs 41.7** jobs/s, `100-pdfs` **52.0 vs 41.6** jobs/s, `scraping-200` (with `ResourcePreset::Scraping`) **38.2 vs 31.0** jobs/s, and `chaos-1000-queued` **49.2 jobs/s with 0.0% failures** across 9 browser kills (vs 69.9% failures on Playwright and Puppeteer). A shared cloud machine varies from run to run, so rerun it (Actions → benchmarks) and measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
+Measured on GitHub's ubuntu-latest runner (4 vCPU, 2026-11-26, run `45825257140`): every tool on the same chrome-headless-shell 158.0.8127.88 binary with fresh isolated contexts per job. Fluxwright beat Playwright and Puppeteer in all 8 fleet scenarios with 0.0% failures and 0 leaked processes: `1-browser-10-pages` **46.1 vs 36.9** jobs/s, `10-concurrent-browsers` **66.1 vs 36.3** jobs/s (-36.3% peak RAM: 3,869 vs 6,073 MB), `100-concurrent` **53.7 vs 39.7** jobs/s (-9.5% peak RAM), `500-concurrent` **54.0 vs 38.3** jobs/s (-21.9% peak RAM), `1000-queued` **52.0 vs 40.5** jobs/s, `100-pdfs` **50.1 vs 39.2** jobs/s, `scraping-200` **35.7 vs 30.6** jobs/s, and `chaos-1000-queued` **48.6 jobs/s with 0.0% failures** across 9 browser kills (vs 71.3% failures on Playwright and 67.7% on Puppeteer). In the same run, a 5-minute soak (`soak-5m`) completed 7,898 jobs with 0.0% failures, 0 leaked processes, and stable RSS after recycling (`505 -> 517 -> 443 -> 442` MB), while Tier 1 pure-Rust HTTP fast path (`benchmarks/fastpath-bench.mjs`, 30 requests x 8 concurrency) reached **518.8 req/s** (`13.9 ms` p50, `13 MB` server RSS vs `28.9 req/s` / `384 MB` browser scraping) on static `/v1/scrape` and **1,140.7 req/s** (`6.7 ms` p50) on `/v1/map`. A shared cloud machine varies from run to run, so rerun it (Actions → benchmarks) and measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
 
 ## Rust
 
 ```toml
 [dependencies]
-fluxwright = { git = "https://github.com/harshit-d3v/fluxwright" }
+fluxwright = "0.14"
 ```
 
 ```rust
@@ -180,7 +180,7 @@ Requires Rust 1.95+ and Chrome or Chromium (found on the standard install paths,
 ## MCP server
 
 ```bash
-cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-mcp
+cargo install fluxwright-mcp
 ```
 
 Then add `{ "mcpServers": { "fluxwright": { "command": "fluxwright-mcp" } } }` to your client's configuration (Windows: `install-mcp.bat`).

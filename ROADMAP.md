@@ -44,11 +44,10 @@ The goal is to be the best engine for running many browser jobs on your own mach
   - **AI-Agent Guardrails & Observe-Once API Export:** `@eN@rK` snapshot revision guardrails (`AriaSnapshot.revision` across Rust, Node, Python, and `fluxwright-mcp`), `export_api_calls` MCP tool #22 (`json` / `curl`), `block_cookie_banners` CMP blocking preset across Core and `fluxwright-server`, and copy-paste Browser-Use / Stagehand / Vercel AI SDK adapters under `examples/adapters/`.
 - **0.13.1:** Enforce `block_cookie_banners` on managed `POST /v1/sessions` via the gateway Fetch blocker, add `Page.loadEventFired` fallback and 10s screenshot budget for session replay frames, and align `22-tool` / `export_api_calls` / platform target docs across `README.md`, `docs/SERVER.md`, and `www`.
 - **0.13.2:** Add `block_cookie_banners` support to `POST /v1/map`, track session replay URLs and frame capture per target with consistent throttling, and install gateway blockers on new session targets even when no CDP WebSocket is connected.
-
-## Planned (v0.14.0)
-
-- **Tier 1 HTTP fast path with auto browser escalation:** pure-Rust SSRF-safe HTTP/1.1 + HTTPS fetcher and HTML5 markdown/link extractor for `POST /v1/scrape` and `POST /v1/map` (`mode: "auto" | "http" | "browser"`, `engine: "http" | "browser"`, `fallback_reason`, `include_sitemap`, default `resource_preset: "scraping"` on non-visual scrape/map jobs, and `fluxwright_fastpath_hits_total` / `fluxwright_fastpath_fallbacks_total` Prometheus counters).
-- **Low-memory launch preset and pluggable light-CDP backends:** opt-in `--low-memory` headless Chromium flags, `--recycle-rss-mb` threshold recycling, and `--fast-cdp-endpoint` for external lightweight CDP engines (such as Moli, Obscura, or Lightpanda) with `-32601` Method Not Found graceful fallback, without bundling AGPL code.
+- **0.14.0:** 3-tier hybrid engine, CI fast-path + soak benchmarks, and first `crates.io` publication:
+  - **Tier 1 HTTP fast path with auto browser escalation:** pure-Rust SSRF-safe HTTP/1.1 + HTTPS fetcher and HTML5 markdown/link extractor for `POST /v1/scrape` and `POST /v1/map` (`mode: "auto" | "http" | "browser"`, `engine: "http" | "browser"`, `fallback_reason`, `include_sitemap`, default `resource_preset: "scraping"` on non-visual scrape/map jobs, and `fluxwright_fastpath_hits_total` / `fluxwright_fastpath_fallbacks_total` Prometheus counters).
+  - **Low-memory launch preset and pluggable light-CDP backends:** opt-in `--low-memory` headless Chromium flags, `--recycle-rss-mb` threshold recycling, and `--fast-cdp-endpoint` for external lightweight CDP engines (such as Moli, Obscura, or Lightpanda) with `-32601` Method Not Found graceful fallback, without bundling AGPL code.
+  - **Verified CI benchmarks (`45825257140` on `ubuntu-latest`, `chrome-headless-shell 158.0.8127.88`):** Tier 1 `/v1/scrape` hit `518.8 req/s` (`13.9 ms` p50, `13 MB` RSS vs `28.9 req/s` / `384 MB` in browser scraping mode), `/v1/map` hit `1,140.7 req/s` (`6.7 ms` p50), mixed `80/20` static/SPA ran `130.2 req/s`, `soak-5m` completed `7,898` jobs with `0.0%` failures and `0` leaked Chrome processes (RSS `20 -> 505 -> 517 -> 443 -> 442 MB`), and `chaos-1000-queued` held `48.6 jobs/s` with `0.0%` failures across `9` browser kills.
 
 ## Next: the fleet at scale
 
@@ -68,7 +67,7 @@ Experimental cluster mode (`fluxwright coordinate` + `fluxwright serve --join <u
 
 ## Distribution and trust (ongoing)
 
-- Publish the crates on crates.io.
+- Published all 6 workspace crates (`fluxwright-cdp`, `fluxwright-core`, `fluxwright`, `fluxwright-server`, `fluxwright-cli`, `fluxwright-mcp`) on crates.io.
 - Prebuilt MCP and CLI binaries workflow configured in `.github/workflows/release-binaries.yml`.
 - Node binding tests and type checks in CI, on all three operating systems.
 - Good first issues (`CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, and issue/PR templates are in place).

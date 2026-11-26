@@ -59,12 +59,12 @@ export function SiteHeader() {
     <>
       <div className="announce-bar">
         <div className="container announce-inner">
-          <span className="announce-pill">v0.13.2 Published</span>
+          <span className="announce-pill">v0.14.0 Published</span>
           <span className="announce-copy">
-            <strong>main</strong> now ships the 3-tier hybrid engine, Rust HTTP fast path, and pluggable light-CDP support.
+            <strong>3-tier hybrid engine</strong> is now live at v0.14.0 across crates.io, npm, PyPI, GHCR, and GitHub Releases.
           </span>
-          <a className="announce-link" href={`${RELEASES}/tag/v0.13.2`}>
-            Release v0.13.2 →
+          <a className="announce-link" href={`${RELEASES}/tag/v0.14.0`}>
+            Release v0.14.0 →
           </a>
         </div>
       </div>

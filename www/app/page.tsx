@@ -7,6 +7,7 @@ import { FleetBoard } from "./_components/FleetBoard";
 import { SiteHeader } from "./_components/SiteHeader";
 import {
   CLUSTER_DOCS,
+  CRATES,
   GHCR,
   GITHUB,
   Logo,
@@ -21,7 +22,7 @@ import { Tabs } from "./_components/Tabs";
 const HERO_PRESETS = [
   { label: "npm", command: "npm install fluxwright" },
   { label: "pip", command: "pip install fluxwright" },
-  { label: "CLI", command: "cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-cli" },
+  { label: "CLI", command: "cargo install fluxwright-cli" },
   { label: "Docker", command: "docker pull ghcr.io/harshit-d3v/fluxwright:latest" },
 ];
 
@@ -57,17 +58,17 @@ const STEPS: { num: string; title: string; text: string }[] = [
   { num: "05", title: "Recycle", text: "Destroys the context immediately and drains bloated browsers without stalling." },
 ];
 
-// GitHub Actions benchmarks run 45227204313 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.36), 23 November 2026.
+// GitHub Actions benchmarks run 45825257140 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.88), 26 November 2026.
 const BENCH: { setup: string; flux: number; pw: number }[] = [
-  { setup: "1 browser, 10 pages (100 jobs)", flux: 42.8, pw: 36.7 },
-  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 50.7, pw: 34.6 },
-  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 48.5, pw: 36.7 },
-  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 47.3, pw: 41.7 },
-  { setup: "100 PDFs (8 browsers × 2 pages)", flux: 52.0, pw: 41.6 },
-  { setup: "200 scraping jobs (images + fonts)", flux: 38.2, pw: 31.0 },
-  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 49.2, pw: 23.2 },
+  { setup: "1 browser, 10 pages (100 jobs)", flux: 46.1, pw: 36.9 },
+  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 66.1, pw: 36.3 },
+  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 54.0, pw: 38.3 },
+  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 52.0, pw: 40.5 },
+  { setup: "100 PDFs (8 browsers × 2 pages)", flux: 50.1, pw: 39.2 },
+  { setup: "200 scraping jobs (images + fonts)", flux: 35.7, pw: 30.6 },
+  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 48.6, pw: 23.5 },
 ];
-const BENCH_MAX = 55;
+const BENCH_MAX = 70;
 
 const TS_EXAMPLE = `import { chromium } from "fluxwright";
 
@@ -209,7 +210,7 @@ export default function Home() {
       <main id="main" tabIndex={-1}>
         <section className="hero container" id="top" aria-labelledby="hero-title">
           <div className="hero-text">
-            <p className="eyebrow">APACHE-2.0 · V0.13.2 RELEASED · HYBRID ENGINE ON MAIN</p>
+            <p className="eyebrow">APACHE-2.0 · V0.14.0 RELEASED · 3-TIER HYBRID ENGINE</p>
             <h1 id="hero-title">
               Run a fast, isolated <em className="serif-italic">fleet</em> of headless Chrome.
             </h1>
@@ -228,7 +229,7 @@ export default function Home() {
               </a>
             </div>
             <p className="meta">
-              Published at <strong>v0.13.2</strong> across npm (6 unscoped packages, 5 native targets), PyPI (5 wheels + sdist), GitHub Releases (7 targets including Windows ARM64 and Linux musl), and multi-arch GHCR.
+              Published at <strong>v0.14.0</strong> across crates.io (6 crates), npm (6 unscoped packages, 5 native targets), PyPI (5 wheels + sdist), GitHub Releases (7 targets including Windows ARM64 and Linux musl), and multi-arch GHCR.
             </p>
           </div>
           <FleetBoard />
@@ -318,7 +319,7 @@ export default function Home() {
                 Benchmarks that hold under <em className="serif-italic">chaos</em>.
               </h2>
               <p>
-                Every runner executed on identical <code>chrome-headless-shell 158.0.8127.36</code>{" "}
+                Every runner executed on identical <code>chrome-headless-shell 158.0.8127.88</code>{" "}
                 binaries with isolated browser contexts per job on <code>ubuntu-latest</code> (4 vCPU).
               </p>
             </div>
@@ -330,19 +331,19 @@ export default function Home() {
                 <span>Beat Playwright and Puppeteer in every CI test case</span>
               </div>
               <div className="kpi-card">
-                <span className="kpi-label">Peak RAM delta</span>
-                <strong>-37.3%</strong>
-                <span>Memory reclaimed vs Playwright under load</span>
+                <span className="kpi-label">Tier 1 fast path</span>
+                <strong>518.8 /s</strong>
+                <span>Static /v1/scrape in 13 MB RSS vs 28.9 /s in browser</span>
               </div>
               <div className="kpi-card">
                 <span className="kpi-label">Chaos throughput</span>
-                <strong>49.2 /s</strong>
-                <span>vs 23.2 /s for Playwright with browser kills every 2s</span>
+                <strong>48.6 /s</strong>
+                <span>vs 23.5 /s for Playwright with browser kills every 2s</span>
               </div>
               <div className="kpi-card">
                 <span className="kpi-label">Chaos reliability</span>
                 <strong>0.0% failed</strong>
-                <span>Playwright and Puppeteer dropped 69.9% of jobs</span>
+                <span>Playwright dropped 71.3% and Puppeteer 67.7% of jobs</span>
               </div>
             </div>
 
@@ -380,10 +381,10 @@ export default function Home() {
             </table>
 
             <p className="note bench-note">
-              Measured in GitHub Actions run <code>45227204313</code> (23 November 2026). Shared CI
-              runners vary between runs; reproduce browser fleet measurements with{" "}
-              <code>cargo run --release -p fluxwright-benchmarks</code> and test Tier 1 HTTP fast-path
-              latency locally with <code>node benchmarks/fastpath-bench.mjs</code>.
+              Measured in GitHub Actions run <code>45825257140</code> (26 November 2026):{" "}
+              <code>10-concurrent-browsers</code> saved 36.3% peak RAM (3,869 MB vs 6,073 MB),{" "}
+              <code>soak-5m</code> completed 7,898 jobs with 0 failures and flat RSS (505 to 442 MB), and{" "}
+              <code>fastpath-bench.mjs</code> reached 518.8 req/s on <code>/v1/scrape</code> (13.9 ms p50, 13 MB RSS) and 1,140.7 req/s on <code>/v1/map</code>.
             </p>
           </div>
         </section>
@@ -434,9 +435,9 @@ export default function Home() {
                   content: (
                     <>
                       <CodeBlock label="Add to Cargo.toml">{`[dependencies]
-fluxwright = { git = "https://github.com/harshit-d3v/fluxwright" }
+fluxwright = "0.14"
 tokio = { version = "1", features = ["full"] }`}</CodeBlock>
-                      <p className="note">Rust 1.95 or later with pure-Rust ring TLS (zero cmake/nasm required).</p>
+                      <p className="note">Published on crates.io for Rust 1.95+ with pure-Rust ring TLS (zero cmake/nasm required).</p>
                     </>
                   ),
                 },
@@ -444,7 +445,7 @@ tokio = { version = "1", features = ["full"] }`}</CodeBlock>
                   title: "MCP",
                   content: (
                     <>
-                      <CodeBlock label="Install fluxwright-mcp">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-mcp
+                      <CodeBlock label="Install fluxwright-mcp">{`cargo install fluxwright-mcp
 fluxwright-mcp --http 127.0.0.1:7440`}</CodeBlock>
                       <p className="note">
                         Prebuilt <code>fluxwright-mcp</code> archives for all 7 targets are on{" "}
@@ -457,7 +458,7 @@ fluxwright-mcp --http 127.0.0.1:7440`}</CodeBlock>
                   title: "CLI",
                   content: (
                     <>
-                      <CodeBlock label="Install and launch fluxwright-cli">{`cargo install --git https://github.com/harshit-d3v/fluxwright fluxwright-cli
+                      <CodeBlock label="Install and launch fluxwright-cli">{`cargo install fluxwright-cli
 fluxwright install
 fluxwright doctor
 fluxwright serve --listen 127.0.0.1:7331 --low-memory --recycle-rss-mb 512`}</CodeBlock>
@@ -558,6 +559,9 @@ docker run --rm \\
               <h4>Distributions</h4>
               <ul>
                 <li>
+                  <a href={CRATES}>crates.io crates</a>
+                </li>
+                <li>
                   <a href={NPM}>npm package</a>
                 </li>
                 <li>
@@ -590,9 +594,10 @@ docker run --rm \\
           <hr className="footer-dotted" />
 
           <div className="footer-bottom">
-            <p className="footer-note">Apache-2.0 licensed · Published release v0.13.2</p>
+            <p className="footer-note">Apache-2.0 licensed · Published release v0.14.0</p>
             <div className="footer-links">
               <a href={GITHUB}>GitHub</a>
+              <a href={CRATES}>crates.io</a>
               <a href={NPM}>npm</a>
               <a href={PYPI}>PyPI</a>
               <a href={RELEASES}>Releases</a>
