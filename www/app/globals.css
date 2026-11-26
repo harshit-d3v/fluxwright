@@ -3,7 +3,7 @@
 /* ---------------------------------------------------------------- tokens */
 @layer base {
   :root {
-    color-scheme: light dark;
+    color-scheme: light;
 
     --bg: #f6f6f5;
     --tray: #eaeae8;
@@ -72,34 +72,6 @@
     --code-line: #1d2028;
   }
 
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #0d0e10;
-      --tray: #16181c;
-      --surface: #1b1d22;
-      --surface-subtle: #14161a;
-      --line: #2b2e37;
-      --line-soft: #1f2229;
-      --ink: #f3f3ef;
-      --muted: #a1a19a;
-      --cta-bg: #f3f3ef;
-      --cta-text: #0d0e10;
-
-      --coral: #ff6b4a;
-      --coral-ink: #0d0e10;
-      --lease: #60a5fa;
-      --queue: #fbbf24;
-      --crash: #f87171;
-      --fast: #4ade80;
-      --link: #7ca9ff;
-      --focus: #60a5fa;
-
-      --stage-dark: #08090b;
-      --stage-line: #20232b;
-      --code-bg: #08090c;
-      --code-line: #1d2028;
-    }
-  }
 }
 
 /* ---------------------------------------------------------------- reset */

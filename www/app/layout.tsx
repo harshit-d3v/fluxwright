@@ -41,19 +41,17 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  colorScheme: "light dark",
-  themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#f6f6f5" },
-    { media: "(prefers-color-scheme: dark)", color: "#0d0e10" },
-  ],
+  colorScheme: "light",
+  themeColor: "#f6f6f5",
 };
 
-const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem('fw-theme');if(t==='light'||t==='dark'){document.documentElement.dataset.theme=t;}}catch(_){}})();`;
+const THEME_INIT_SCRIPT = `(function(){try{if(localStorage.getItem('fw-theme')==='dark'){document.documentElement.dataset.theme='dark';}}catch(_){}})();`;
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html
       lang="en"
+      data-theme="light"
       className={`${sans.variable} ${serif.variable} ${mono.variable}`}
       suppressHydrationWarning
     >

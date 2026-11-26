@@ -32,12 +32,7 @@ export function SiteHeader() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
 
   useEffect(() => {
-    const explicit = document.documentElement.dataset.theme;
-    if (explicit === "light" || explicit === "dark") {
-      setTheme(explicit);
-      return;
-    }
-    setTheme(window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    setTheme(document.documentElement.dataset.theme === "dark" ? "dark" : "light");
   }, []);
 
   useEffect(() => {
