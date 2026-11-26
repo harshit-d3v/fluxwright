@@ -38,13 +38,13 @@ pub struct TargetId(pub String);
 
 /// Runtime capabilities inferred from CDP `Browser.getVersion`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CdpCapabilities {
-    pub product: String,
-    pub is_chromium: bool,
+pub(crate) struct CdpCapabilities {
+    pub(crate) product: String,
+    pub(crate) is_chromium: bool,
 }
 
 impl CdpCapabilities {
-    pub fn from_version(version: &Value) -> Self {
+    pub(crate) fn from_version(version: &Value) -> Self {
         let product = version["product"].as_str().unwrap_or_default().to_string();
         let lower = product.to_ascii_lowercase();
         let is_chromium = lower.contains("chrome")
@@ -66,7 +66,7 @@ fn is_method_not_found_message(message: &str) -> bool {
 }
 
 /// Returns true when `err` represents a CDP JSON-RPC `-32601` / method-not-found error.
-pub fn is_method_not_found(err: &Error) -> bool {
+pub(crate) fn is_method_not_found(err: &Error) -> bool {
     match err {
         Error::Command { message, .. } => is_method_not_found_message(message),
         _ => false,
@@ -494,7 +494,7 @@ pub struct CdpBrowser {
     pub pid: u32,
     pub headless: bool,
     pub ws_endpoint: Option<String>,
-    pub capabilities: CdpCapabilities,
+    pub(crate) capabilities: CdpCapabilities,
     conn: Arc<Connection>,
     _child: Mutex<Option<Child>>,
     _profile: Option<tempfile::TempDir>,
@@ -758,7 +758,7 @@ impl CdpBrowser {
         Ok(browser)
     }
 
-    pub fn capabilities(&self) -> &CdpCapabilities {
+    pub(crate) fn capabilities(&self) -> &CdpCapabilities {
         &self.capabilities
     }
 
