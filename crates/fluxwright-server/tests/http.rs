@@ -2848,23 +2848,34 @@ async fn session_replay_frames_network_har_redaction_and_retained_after_delete()
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_map_discovers_and_filters_links() {
     let fixture = benchmark_server::spawn("127.0.0.1:0").await.unwrap();
-    let app = axum::Router::new().route(
-        "/",
-        axum::routing::get(|| async {
-            axum::response::Html(concat!(
-                "<!doctype html><title>SiteMap</title>",
-                "<nav>",
-                "<a href='/forms'>Forms</a>",
-                "<a href='/docs/intro'>Docs Intro</a>",
-                "<a href='/docs/api'>Docs API</a>",
-                "<a href='/docs/api'>Docs API Duplicate</a>",
-                "<a href='https://external.example/offsite'>Offsite</a>",
-                "<a href='mailto:hi@example.com'>Mail</a>",
-                "<a href='javascript:void(0)'>JS</a>",
-                "</nav>"
-            ))
-        }),
-    );
+    let cmp_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cmp_hit_route = cmp_hit.clone();
+    let app = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>SiteMap</title>",
+                    "<script src='/cmp/cdn.cookielaw.org/otSDKStub.js'></script>",
+                    "<nav>",
+                    "<a href='/forms'>Forms</a>",
+                    "<a href='/docs/intro'>Docs Intro</a>",
+                    "<a href='/docs/api'>Docs API</a>",
+                    "<a href='/docs/api'>Docs API Duplicate</a>",
+                    "<a href='https://external.example/offsite'>Offsite</a>",
+                    "<a href='mailto:hi@example.com'>Mail</a>",
+                    "<a href='javascript:void(0)'>JS</a>",
+                    "</nav>"
+                ))
+            }),
+        )
+        .route(
+            "/cmp/cdn.cookielaw.org/otSDKStub.js",
+            axum::routing::get(move || {
+                cmp_hit_route.store(true, std::sync::atomic::Ordering::SeqCst);
+                async move { ([(header::CONTENT_TYPE, "application/javascript")], "window.__cmp = true;") }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let app_task = tokio::spawn(async move {
@@ -2873,15 +2884,16 @@ async fn sync_map_discovers_and_filters_links() {
 
     let server = server().await;
 
-    // 1. Same-origin mapping deduplicates links and filters non-HTTP/cross-origin links.
+    // 1. Same-origin mapping deduplicates links, filters non-HTTP/cross-origin links, and respects block_cookie_banners.
     let (st_same, body_same) = request(
         &server,
         "POST",
         "/v1/map",
-        json!({ "url": base_url }),
+        json!({ "url": base_url, "block_cookie_banners": true }),
     )
     .await;
     assert_eq!(st_same, StatusCode::OK, "{body_same}");
+    assert!(!cmp_hit.load(std::sync::atomic::Ordering::SeqCst));
     let same_links: Vec<&str> = body_same["links"]
         .as_array()
         .unwrap()

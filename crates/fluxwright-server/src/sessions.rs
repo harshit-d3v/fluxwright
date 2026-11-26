@@ -30,8 +30,9 @@ use uuid::Uuid;
 
 use crate::cdp_gateway::{
     compute_enforce_server_proxy, create_initial_page, detach_client_sessions,
-    ensure_session_observer, host_base, percent_decode_str, run_gateway_loop,
-    spawn_fail_blocked_request, teardown_gateway_state, GatewayPolicy, GatewayState,
+    ensure_preset_blocker, ensure_session_observer, host_base, percent_decode_str,
+    run_gateway_loop, spawn_fail_blocked_request, teardown_gateway_state, GatewayPolicy,
+    GatewayState,
 };
 use crate::job::{JobPriority, ServerResourcePreset};
 use crate::live::{EmbedMode, LiveGuard};
@@ -1228,7 +1229,8 @@ fn spawn_session_frame_capture(
     nav_url: String,
     recorder: Arc<StdMutex<SessionRecorder>>,
     inflight: Arc<AtomicBool>,
-    captured_url: Arc<StdMutex<Option<String>>>,
+    captured_urls: Arc<StdMutex<HashMap<String, String>>>,
+    last_frame_at: Arc<StdMutex<Option<std::time::Instant>>>,
     close_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -1252,7 +1254,11 @@ fn spawn_session_frame_capture(
             .await
         {
             if let Some(data) = res["data"].as_str().filter(|s| !s.is_empty()) {
-                *captured_url.lock().unwrap() = Some(nav_url.clone());
+                *last_frame_at.lock().unwrap() = Some(std::time::Instant::now());
+                captured_urls
+                    .lock()
+                    .unwrap()
+                    .insert(sid.clone(), nav_url.clone());
                 recorder
                     .lock()
                     .unwrap()
@@ -1278,14 +1284,17 @@ fn spawn_session_reaper(
         let _live_guard = live_guard;
         let mut shutdown_rx = inner.shutdown_tx.subscribe();
         let conn = session.lease.cdp_connection();
-        let has_blocker = session.policy.has_blocker();
+        let blocker = session.policy.blocker_config();
+        let has_blocker = blocker.is_enabled();
         let observer_sids: Arc<StdMutex<HashSet<String>>> =
             Arc::new(StdMutex::new(initial_observer.into_iter().collect()));
         let mut observed_targets: HashSet<String> = HashSet::from([initial_tid]);
         let mut main_frames: HashMap<String, String> = HashMap::new();
-        let mut last_frame_at: Option<std::time::Instant> = None;
+        let mut observer_urls: HashMap<String, String> = HashMap::new();
+        let last_frame_at: Arc<StdMutex<Option<std::time::Instant>>> = Arc::new(StdMutex::new(None));
         let screenshot_inflight = Arc::new(AtomicBool::new(false));
-        let captured_url: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured_urls: Arc<StdMutex<HashMap<String, String>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
         let sleep = tokio::time::sleep_until(expires_rx.borrow().0);
         tokio::pin!(sleep);
         loop {
@@ -1337,11 +1346,14 @@ fn spawn_session_reaper(
                                             if let Some(fid) = frame["id"].as_str() {
                                                 main_frames.insert(sid.to_string(), fid.to_string());
                                             }
+                                            observer_urls.insert(sid.to_string(), nav_url.clone());
                                             *session.live_url.lock().unwrap() = nav_url.clone();
                                             session.recorder.lock().unwrap().push_nav(now_ms(), &nav_url);
-                                            *captured_url.lock().unwrap() = None;
+                                            if nav_url != "about:blank" {
+                                                captured_urls.lock().unwrap().remove(sid);
+                                            }
                                             if session.record_frames && nav_url != "about:blank" {
-                                                let due = last_frame_at.is_none_or(|t| {
+                                                let due = last_frame_at.lock().unwrap().is_none_or(|t| {
                                                     t.elapsed() >= MIN_FRAME_CAPTURE_INTERVAL
                                                 });
                                                 if due
@@ -1354,14 +1366,14 @@ fn spawn_session_reaper(
                                                         )
                                                         .is_ok()
                                                 {
-                                                    last_frame_at = Some(std::time::Instant::now());
                                                     spawn_session_frame_capture(
                                                         conn.clone(),
                                                         sid.to_string(),
                                                         nav_url,
                                                         session.recorder.clone(),
                                                         screenshot_inflight.clone(),
-                                                        captured_url.clone(),
+                                                        captured_urls.clone(),
+                                                        last_frame_at.clone(),
                                                         session.close_tx.subscribe(),
                                                     );
                                                 }
@@ -1375,6 +1387,7 @@ fn spawn_session_reaper(
                                         if let Some(nav_url) =
                                             ev.params["url"].as_str().filter(|s| !s.is_empty())
                                         {
+                                            observer_urls.insert(sid.to_string(), nav_url.to_string());
                                             *session.live_url.lock().unwrap() = nav_url.to_string();
                                             session
                                                 .recorder
@@ -1386,15 +1399,23 @@ fn spawn_session_reaper(
                                 }
                                 "Page.loadEventFired" => {
                                     if session.record_frames {
-                                        let nav_url = session.current_url();
-                                        let already_captured = captured_url
+                                        let nav_url = observer_urls
+                                            .get(sid)
+                                            .cloned()
+                                            .unwrap_or_else(|| session.current_url());
+                                        let already_captured = captured_urls
                                             .lock()
                                             .unwrap()
-                                            .as_deref()
+                                            .get(sid)
+                                            .map(String::as_str)
                                             == Some(nav_url.as_str());
+                                        let due = last_frame_at.lock().unwrap().is_none_or(|t| {
+                                            t.elapsed() >= MIN_FRAME_CAPTURE_INTERVAL
+                                        });
                                         if !nav_url.is_empty()
                                             && nav_url != "about:blank"
                                             && !already_captured
+                                            && due
                                             && screenshot_inflight
                                                 .compare_exchange(
                                                     false,
@@ -1404,14 +1425,14 @@ fn spawn_session_reaper(
                                                 )
                                                 .is_ok()
                                         {
-                                            last_frame_at = Some(std::time::Instant::now());
                                             spawn_session_frame_capture(
                                                 conn.clone(),
                                                 sid.to_string(),
                                                 nav_url,
                                                 session.recorder.clone(),
                                                 screenshot_inflight.clone(),
-                                                captured_url.clone(),
+                                                captured_urls.clone(),
+                                                last_frame_at.clone(),
                                                 session.close_tx.subscribe(),
                                             );
                                         }
@@ -1440,7 +1461,8 @@ fn spawn_session_reaper(
                         match ev.method.as_str() {
                             "Target.targetCreated" => {
                                 let info = &ev.params["targetInfo"];
-                                if info["type"].as_str() == Some("page") {
+                                let ty = info["type"].as_str().unwrap_or("");
+                                if ty == "page" || (ty == "iframe" && has_blocker) {
                                     if let (Some(tid), Some(ctx_id)) = (
                                         info["targetId"].as_str(),
                                         info["browserContextId"].as_str(),
@@ -1455,18 +1477,27 @@ fn spawn_session_reaper(
                                             let observer_sids = observer_sids.clone();
                                             let tid = tid.to_string();
                                             let ctx_id = ctx_id.to_string();
+                                            let is_page = ty == "page";
                                             tokio::spawn(async move {
                                                 let is_ours = {
                                                     let g = state.lock().await;
                                                     g.is_allowed_context(&ctx_id)
                                                 };
                                                 if is_ours {
-                                                    if let Some(obs_sid) = ensure_session_observer(
-                                                        &conn, &state, &lease, &tid,
-                                                    )
-                                                    .await
-                                                    {
-                                                        observer_sids.lock().unwrap().insert(obs_sid);
+                                                    if has_blocker {
+                                                        ensure_preset_blocker(
+                                                            &conn, &state, &lease, &tid, blocker,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    if is_page {
+                                                        if let Some(obs_sid) = ensure_session_observer(
+                                                            &conn, &state, &lease, &tid,
+                                                        )
+                                                        .await
+                                                        {
+                                                            observer_sids.lock().unwrap().insert(obs_sid);
+                                                        }
                                                     }
                                                 }
                                             });
@@ -1478,6 +1509,8 @@ fn spawn_session_reaper(
                                 if let Some(detached_sid) = ev.params["sessionId"].as_str() {
                                     observer_sids.lock().unwrap().remove(detached_sid);
                                     main_frames.remove(detached_sid);
+                                    observer_urls.remove(detached_sid);
+                                    captured_urls.lock().unwrap().remove(detached_sid);
                                 }
                             }
                             "Target.targetDestroyed" => {

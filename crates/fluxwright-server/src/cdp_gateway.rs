@@ -1818,7 +1818,7 @@ fn preset_fetch_patterns(preset: ResourcePreset) -> Vec<Value> {
         .collect()
 }
 
-async fn ensure_preset_blocker(
+pub(crate) async fn ensure_preset_blocker(
     conn: &Arc<Connection>,
     state: &Arc<Mutex<GatewayState>>,
     lease: &Arc<ContextLease>,
