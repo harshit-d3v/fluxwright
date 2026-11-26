@@ -22,7 +22,7 @@ from urllib.parse import quote, urlparse
 import pytest
 
 from fluxwright import Error, TimeoutError
-from fluxwright.async_api import Request, Route, async_playwright
+from fluxwright.async_api import Request, Route, async_playwright, expect as async_expect
 from fluxwright.sync_api import expect as sync_expect, sync_playwright
 
 # A page that asks "leave this page?" once its button was clicked (Chrome wants a user gesture).
@@ -1357,8 +1357,10 @@ def test_multi_tab_popups_and_frames(base):
                     await same.locator("#sb").click()
                     assert await same.locator("#sb").inner_text() == "clicked-same"
                     assert await same.title() == "SameTitle"
+                    await cross.locator("#cb").wait_for()
+                    await cross.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
                     await cross.locator("#cb").click()
-                    assert await cross.locator("#cb").inner_text() == "clicked-cross"
+                    await async_expect(cross.locator("#cb")).to_have_text("clicked-cross")
                     assert await cross.title() == "CrossTitle"
                     assert "clicked-cross" in await cross.content()
                     assert await cross.evaluate("(x) => x + 10", 5) == 15
