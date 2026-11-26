@@ -36,6 +36,78 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TargetId(pub String);
 
+/// Runtime capabilities inferred from CDP `Browser.getVersion`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CdpCapabilities {
+    pub product: String,
+    pub is_chromium: bool,
+}
+
+impl CdpCapabilities {
+    pub fn from_version(version: &Value) -> Self {
+        let product = version["product"].as_str().unwrap_or_default().to_string();
+        let lower = product.to_ascii_lowercase();
+        let is_chromium = lower.contains("chrome")
+            || lower.contains("chromium")
+            || lower.contains("edg")
+            || lower.contains("electron");
+        Self {
+            product,
+            is_chromium,
+        }
+    }
+}
+
+fn is_method_not_found_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.contains("-32601")
+        || lower.contains("method not found")
+        || lower.contains("wasn't found")
+}
+
+/// Returns true when `err` represents a CDP JSON-RPC `-32601` / method-not-found error.
+pub fn is_method_not_found(err: &Error) -> bool {
+    match err {
+        Error::Command { message, .. } => is_method_not_found_message(message),
+        _ => false,
+    }
+}
+
+async fn call_cdp(
+    conn: &Connection,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+    timeout: Duration,
+) -> Result<Value> {
+    match conn.call_raw(method, params, session_id, timeout).await? {
+        Ok(val) => Ok(val),
+        Err(err) => {
+            let code = err.get("code").and_then(|v| v.as_i64());
+            let mut message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cdp error")
+                .to_string();
+            if code == Some(-32601) && !is_method_not_found_message(&message) {
+                message = format!("{message} (-32601)");
+            }
+            Err(Error::Command {
+                method: method.to_string(),
+                message,
+            })
+        }
+    }
+}
+
+struct PendingFallbackGuard<'a>(&'a std::sync::Mutex<Option<String>>);
+
+impl Drop for PendingFallbackGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
 /// A proxy for one browser context (one lease), like Playwright's `newContext({ proxy })`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Proxy {
@@ -422,6 +494,7 @@ pub struct CdpBrowser {
     pub pid: u32,
     pub headless: bool,
     pub ws_endpoint: Option<String>,
+    pub capabilities: CdpCapabilities,
     conn: Arc<Connection>,
     _child: Mutex<Option<Child>>,
     _profile: Option<tempfile::TempDir>,
@@ -435,6 +508,12 @@ pub struct CdpBrowser {
     /// any other context belong to someone else: attaching prepares their pages and our dialog
     /// and route handlers then answer theirs.
     contexts: Arc<Mutex<HashSet<String>>>,
+    /// Synthetic contexts created by falling back to the engine's default context when
+    /// `Target.createBrowserContext` returns `-32601`.
+    fallback_contexts: Arc<Mutex<HashSet<String>>>,
+    default_context_only: AtomicBool,
+    fallback_create_lock: Arc<Mutex<()>>,
+    pending_fallback_context: Arc<std::sync::Mutex<Option<String>>>,
     /// Browser contexts delegated to external CDP gateway clients (not prepared by `CdpBrowser`).
     external_contexts: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Sessions owned by external CDP gateway clients (child targets belong to those clients).
@@ -467,7 +546,8 @@ impl CdpBrowser {
         };
         // Over a pipe nothing has waited for Chrome to start yet. A first, cold start on a busy CI
         // machine has taken over 20 s.
-        conn.call(
+        let version = call_cdp(
+            &conn,
             "Browser.getVersion",
             json!({}),
             None,
@@ -479,11 +559,16 @@ impl CdpBrowser {
                 "chromium did not answer on its DevTools connection: {e}"
             ))
         })?;
+        let mut capabilities = CdpCapabilities::from_version(&version);
+        if capabilities.product.is_empty() {
+            capabilities.is_chromium = true;
+        }
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
             pid: launched.pid,
             headless,
             ws_endpoint,
+            capabilities,
             conn: conn.clone(),
             _child: Mutex::new(Some(launched.child)),
             _profile: Some(launched.user_data_dir),
@@ -491,6 +576,10 @@ impl CdpBrowser {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            fallback_contexts: Default::default(),
+            default_context_only: AtomicBool::new(false),
+            fallback_create_lock: Default::default(),
+            pending_fallback_context: Default::default(),
             external_contexts: Default::default(),
             external_sessions: Default::default(),
             worker_sessions: Default::default(),
@@ -563,27 +652,39 @@ impl CdpBrowser {
     pub async fn connect(endpoint_url: &str) -> Result<Arc<Self>> {
         let ws_url = resolve_ws_endpoint(endpoint_url).await?;
         let conn = Connection::connect(&ws_url).await?;
-        if let Err(e) = conn
-            .call(
-                "Browser.getVersion",
-                json!({}),
-                None,
-                Duration::from_secs(30),
-            )
-            .await
+        let version = match call_cdp(
+            &conn,
+            "Browser.getVersion",
+            json!({}),
+            None,
+            Duration::from_secs(30),
+        )
+        .await
         {
-            // A failed handshake must not leave the socket and its tasks running.
-            conn.close();
-            return Err(Error::Launch(format!(
-                "remote chromium did not answer on its DevTools connection: {e}"
-            )));
-        }
+            Ok(v) => v,
+            Err(e) if is_method_not_found(&e) => {
+                debug!(
+                    error = %e,
+                    "remote CDP endpoint does not implement Browser.getVersion; assuming lightweight CDP"
+                );
+                json!({})
+            }
+            Err(e) => {
+                // A failed handshake must not leave the socket and its tasks running.
+                conn.close();
+                return Err(Error::Launch(format!(
+                    "remote chromium did not answer on its DevTools connection: {e}"
+                )));
+            }
+        };
+        let capabilities = CdpCapabilities::from_version(&version);
 
         let browser = Arc::new(Self {
             id: BrowserId(Uuid::new_v4()),
             pid: 0,
             headless: true,
             ws_endpoint: Some(ws_url),
+            capabilities,
             conn: conn.clone(),
             _child: Mutex::new(None),
             _profile: None,
@@ -591,6 +692,10 @@ impl CdpBrowser {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            fallback_contexts: Default::default(),
+            default_context_only: AtomicBool::new(false),
+            fallback_create_lock: Default::default(),
+            pending_fallback_context: Default::default(),
             external_contexts: Default::default(),
             external_sessions: Default::default(),
             worker_sessions: Default::default(),
@@ -605,28 +710,36 @@ impl CdpBrowser {
         });
 
         let handshake = async {
-            browser
-                .conn
-                .call(
-                    "Target.setDiscoverTargets",
-                    json!({ "discover": true }),
-                    None,
-                    Duration::from_secs(10),
-                )
-                .await?;
-            browser
-                .conn
-                .call(
-                    "Target.setAutoAttach",
-                    json!({
-                        "autoAttach": true,
-                        "waitForDebuggerOnStart": true,
-                        "flatten": true
-                    }),
-                    None,
-                    Duration::from_secs(10),
-                )
-                .await
+            if let Err(e) = call_cdp(
+                &browser.conn,
+                "Target.setDiscoverTargets",
+                json!({ "discover": true }),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                if is_method_not_found(&e) && !browser.capabilities.is_chromium {
+                    warn!(
+                        error = %e,
+                        "Target.setDiscoverTargets not supported by lightweight CDP; continuing"
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+            call_cdp(
+                &browser.conn,
+                "Target.setAutoAttach",
+                json!({
+                    "autoAttach": true,
+                    "waitForDebuggerOnStart": true,
+                    "flatten": true
+                }),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
         };
 
         if let Err(e) = handshake.await {
@@ -636,8 +749,17 @@ impl CdpBrowser {
         }
         spawn_keepalive(browser.conn.clone());
 
-        info!(browser_id = %browser.id.0, "remote browser ready over CDP");
+        info!(
+            browser_id = %browser.id.0,
+            product = %browser.capabilities.product,
+            is_chromium = browser.capabilities.is_chromium,
+            "remote browser ready over CDP"
+        );
         Ok(browser)
+    }
+
+    pub fn capabilities(&self) -> &CdpCapabilities {
+        &self.capabilities
     }
 
     pub fn ws_endpoint(&self) -> Option<&str> {
@@ -733,6 +855,10 @@ impl CdpBrowser {
                     return;
                 }
                 debug!(%target_id, %session_id, %ty, "attachedToTarget");
+                let ctx_known_ours = match ctx.as_deref() {
+                    Some(c) => self.contexts.lock().await.contains(c),
+                    None => false,
+                };
 
                 let (owner_page, effective_opener, effective_ctx, url_tx, net, frames, workers, worlds, closed) = {
                     let mut targets = self.targets.lock().await;
@@ -791,7 +917,25 @@ impl CdpBrowser {
                         (None, None, None, None, None, None)
                     };
 
-                    let effective_ctx = ctx.clone().or(parent_ctx);
+                    let mut effective_ctx =
+                        if (ty == "iframe" || ty == "worker") && parent_ctx.is_some() && !ctx_known_ours
+                        {
+                            parent_ctx
+                        } else {
+                            ctx.clone().or(parent_ctx)
+                        };
+                    if ty == "page"
+                        && !ctx_known_ours
+                        && self.default_context_only.load(Ordering::SeqCst)
+                    {
+                        let opener_ctx = opener_from_info.as_deref().and_then(|op| {
+                            targets.get(op).and_then(|t| t.browser_context_id.clone())
+                        });
+                        let pending_ctx = self.pending_fallback_context.lock().unwrap().clone();
+                        if let Some(fb) = opener_ctx.or(pending_ctx) {
+                            effective_ctx = Some(fb);
+                        }
+                    }
                     let state = targets.entry(target_id.clone()).or_insert_with(|| {
                         TargetState::new(
                             &target_id,
@@ -969,7 +1113,17 @@ impl CdpBrowser {
                 };
                 let me = self.clone();
                 tokio::spawn(async move {
-                    match prepare_session(&me.conn, &session_id, &ty, waiting, setup, page_setup).await {
+                    match prepare_session(
+                        &me.conn,
+                        &session_id,
+                        &ty,
+                        waiting,
+                        setup,
+                        page_setup,
+                        me.capabilities.is_chromium,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             let waiters = match me.targets.lock().await.get_mut(&target_id) {
                                 Some(t) => {
@@ -1560,6 +1714,10 @@ impl CdpBrowser {
         }
     }
 
+    async fn is_fallback_context(&self, id: &str) -> bool {
+        self.fallback_contexts.lock().await.contains(id)
+    }
+
     pub async fn call(
         &self,
         method: &str,
@@ -1570,7 +1728,7 @@ impl CdpBrowser {
         if self.conn.is_dead() {
             return Err(Error::BrowserDead { pid: self.pid });
         }
-        self.conn.call(method, params, session_id, timeout).await
+        call_cdp(&self.conn, method, params, session_id, timeout).await
     }
 
     pub async fn create_context(&self, proxy: Option<&Proxy>) -> Result<ContextId> {
@@ -1581,14 +1739,30 @@ impl CdpBrowser {
                 params["proxyBypassList"] = json!(bypass);
             }
         }
-        let res = self
+        let res = match self
             .call(
                 "Target.createBrowserContext",
                 params,
                 None,
                 Duration::from_secs(10),
             )
-            .await?;
+            .await
+        {
+            Ok(res) => res,
+            Err(e) if proxy.is_none() && is_method_not_found(&e) => {
+                warn!(
+                    product = %self.capabilities.product,
+                    error = %e,
+                    "Target.createBrowserContext not supported; falling back to default context"
+                );
+                self.default_context_only.store(true, Ordering::SeqCst);
+                let id = format!("default-{}", Uuid::new_v4());
+                self.fallback_contexts.lock().await.insert(id.clone());
+                self.contexts.lock().await.insert(id.clone());
+                return Ok(ContextId(id));
+            }
+            Err(e) => return Err(e),
+        };
         let id = res["browserContextId"]
             .as_str()
             .ok_or_else(|| Error::Other("createBrowserContext: no id".into()))?
@@ -1607,8 +1781,10 @@ impl CdpBrowser {
 
     pub async fn dispose_context(&self, id: &ContextId) -> Result<()> {
         self.contexts.lock().await.remove(&id.0);
+        let is_fallback = self.fallback_contexts.lock().await.remove(&id.0);
         self.external_contexts.lock().unwrap().remove(&id.0);
         self.setups.lock().await.remove(&id.0);
+        let mut page_targets_to_close = Vec::new();
         let removed_targets: Vec<String> = {
             let mut targets = self.targets.lock().await;
             let keys: Vec<String> = targets
@@ -1626,6 +1802,9 @@ impl CdpBrowser {
                         }
                     } else if t.r#type == "page" {
                         t.workers.lock().unwrap().close_all();
+                        if is_fallback {
+                            page_targets_to_close.push(k.clone());
+                        }
                     }
                 }
             }
@@ -1637,14 +1816,27 @@ impl CdpBrowser {
                 ps.remove(&k);
             }
         }
-        let _ = self
-            .call(
-                "Target.disposeBrowserContext",
-                json!({ "browserContextId": id.0 }),
-                None,
-                Duration::from_secs(10),
-            )
-            .await;
+        if is_fallback {
+            for target_id in page_targets_to_close {
+                let _ = self
+                    .call(
+                        "Target.closeTarget",
+                        json!({ "targetId": target_id }),
+                        None,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+            }
+        } else {
+            let _ = self
+                .call(
+                    "Target.disposeBrowserContext",
+                    json!({ "browserContextId": id.0 }),
+                    None,
+                    Duration::from_secs(10),
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -1668,16 +1860,28 @@ impl CdpBrowser {
     }
 
     pub async fn create_page(&self, ctx: &ContextId, timeout: Duration) -> Result<CdpPage> {
+        let is_fallback = self.is_fallback_context(&ctx.0).await;
+        let _fallback_lock = if is_fallback {
+            Some(self.fallback_create_lock.lock().await)
+        } else {
+            None
+        };
+        let _pending_guard = if is_fallback {
+            *self.pending_fallback_context.lock().unwrap() = Some(ctx.0.clone());
+            Some(PendingFallbackGuard(&self.pending_fallback_context))
+        } else {
+            None
+        };
+        let params = if is_fallback {
+            json!({ "url": "about:blank" })
+        } else {
+            json!({
+                "url": "about:blank",
+                "browserContextId": ctx.0
+            })
+        };
         let res = self
-            .call(
-                "Target.createTarget",
-                json!({
-                    "url": "about:blank",
-                    "browserContextId": ctx.0
-                }),
-                None,
-                timeout,
-            )
+            .call("Target.createTarget", params, None, timeout)
             .await?;
         let target_id = res["targetId"]
             .as_str()
@@ -1691,6 +1895,9 @@ impl CdpBrowser {
             match targets.get_mut(&target_id) {
                 Some(t) => {
                     t.owner_page.get_or_insert_with(|| target_id.clone());
+                    if is_fallback {
+                        t.browser_context_id = Some(ctx.0.clone());
+                    }
                     (
                         t.url_tx.clone(),
                         t.net.clone(),
@@ -1716,6 +1923,8 @@ impl CdpBrowser {
                 ),
             }
         };
+        drop(_pending_guard);
+        drop(_fallback_lock);
         Ok(CdpPage {
             browser: self.conn.clone(),
             browser_pid: self.pid,
@@ -1865,14 +2074,22 @@ impl CdpBrowser {
     }
 
     pub async fn context_allow_downloads(&self, ctx: &ContextId, dir: &Path, timeout: Duration) -> Result<()> {
-        let params = json!({
+        let mut params = json!({
             "behavior": "allowAndName",
-            "browserContextId": ctx.0,
             "downloadPath": dir.to_string_lossy(),
             "eventsEnabled": true
         });
-        self.call("Browser.setDownloadBehavior", params, None, timeout).await?;
-        Ok(())
+        if !self.is_fallback_context(&ctx.0).await {
+            params["browserContextId"] = json!(ctx.0);
+        }
+        match self.call("Browser.setDownloadBehavior", params, None, timeout).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_method_not_found(&e) => {
+                debug!(error = %e, "Browser.setDownloadBehavior not supported; skipping");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn start_har_recording(
@@ -1900,8 +2117,15 @@ impl CdpBrowser {
         }
         let mut e = e.clone();
         if e.locale.is_some() && e.user_agent.is_none() {
-            let v = self.call("Browser.getVersion", json!({}), None, timeout).await?;
-            e.user_agent = v["userAgent"].as_str().map(str::to_owned);
+            match self.call("Browser.getVersion", json!({}), None, timeout).await {
+                Ok(v) => {
+                    e.user_agent = v["userAgent"].as_str().map(str::to_owned);
+                }
+                Err(err) if is_method_not_found(&err) => {
+                    debug!(error = %err, "Browser.getVersion not supported during locale emulation");
+                }
+                Err(err) => return Err(err),
+            }
         }
         self.setups.lock().await.entry(ctx.0.clone()).or_default().emulation = Some(e.clone());
         let sessions = self.context_session_details(&ctx.0).await;
@@ -1920,24 +2144,28 @@ impl CdpBrowser {
         if permissions.is_empty() {
             return Ok(());
         }
-        self.call(
-            "Browser.grantPermissions",
-            json!({ "permissions": permissions, "browserContextId": ctx.0 }),
-            None,
-            timeout,
-        )
-        .await?;
-        Ok(())
+        let mut params = json!({ "permissions": permissions });
+        if !self.is_fallback_context(&ctx.0).await {
+            params["browserContextId"] = json!(ctx.0);
+        }
+        match self.call("Browser.grantPermissions", params, None, timeout).await {
+            Ok(_) => Ok(()),
+            Err(e) if is_method_not_found(&e) => {
+                debug!(error = %e, "Browser.grantPermissions not supported; skipping");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn context_cookies(&self, ctx: &ContextId, timeout: Duration) -> Result<Vec<Cookie>> {
+        let params = if self.is_fallback_context(&ctx.0).await {
+            json!({})
+        } else {
+            json!({ "browserContextId": ctx.0 })
+        };
         let res = self
-            .call(
-                "Storage.getCookies",
-                json!({ "browserContextId": ctx.0 }),
-                None,
-                timeout,
-            )
+            .call("Storage.getCookies", params, None, timeout)
             .await?;
         Ok(res["cookies"]
             .as_array()
@@ -1960,24 +2188,23 @@ impl CdpBrowser {
             return Ok(());
         }
         let cookies: Vec<Value> = cookies.iter().map(Cookie::to_cdp).collect();
-        self.call(
-            "Storage.setCookies",
-            json!({ "cookies": cookies, "browserContextId": ctx.0 }),
-            None,
-            timeout,
-        )
-        .await?;
+        let mut params = json!({ "cookies": cookies });
+        if !self.is_fallback_context(&ctx.0).await {
+            params["browserContextId"] = json!(ctx.0);
+        }
+        self.call("Storage.setCookies", params, None, timeout)
+            .await?;
         Ok(())
     }
 
     pub async fn context_clear_cookies(&self, ctx: &ContextId, timeout: Duration) -> Result<()> {
-        self.call(
-            "Storage.clearCookies",
-            json!({ "browserContextId": ctx.0 }),
-            None,
-            timeout,
-        )
-        .await?;
+        let params = if self.is_fallback_context(&ctx.0).await {
+            json!({})
+        } else {
+            json!({ "browserContextId": ctx.0 })
+        };
+        self.call("Storage.clearCookies", params, None, timeout)
+            .await?;
         Ok(())
     }
 
@@ -2243,16 +2470,17 @@ fn spawn_keepalive(conn: Arc<Connection>) {
             if conn.is_dead() {
                 break;
             }
-            match conn
-                .call(
-                    "Browser.getVersion",
-                    json!({}),
-                    None,
-                    Duration::from_secs(10),
-                )
-                .await
+            match call_cdp(
+                &conn,
+                "Browser.getVersion",
+                json!({}),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
             {
                 Ok(_) => {}
+                Err(e) if is_method_not_found(&e) => {}
                 Err(e) => {
                     warn!(error = %e, "cdp keepalive failed; marking the connection dead");
                     conn.mark_dead();
@@ -2436,6 +2664,7 @@ async fn prepare_session(
     waiting_for_debugger: bool,
     setup: Option<ContextSetup>,
     page_setup: Option<PageSetup>,
+    is_chromium: bool,
 ) -> Result<()> {
     let mut calls = vec![(
         "Target.setAutoAttach",
@@ -2484,6 +2713,9 @@ async fn prepare_session(
     if waiting_for_debugger {
         calls.push(("Runtime.runIfWaitingForDebugger", json!({})));
     }
+    let fetch_required = setup.as_ref().is_some_and(|s| {
+        s.routes.is_some() || s.http_auth.is_some() || s.proxy_auth.is_some()
+    }) || page_setup.as_ref().is_some_and(|p| p.routes.is_some());
     // Pipelined: Chrome runs a session's commands in order, so one round trip instead of
     // one per command. Sequential calls cost ~1 s per page on a busy browser.
     let methods: Vec<&'static str> = calls.iter().map(|(m, _)| *m).collect();
@@ -2492,10 +2724,15 @@ async fn prepare_session(
     let results = futures_util::future::join_all(
         calls
             .into_iter()
-            .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(30))),
+            .map(|(m, p)| call_cdp(conn, m, p, Some(session_id), Duration::from_secs(30))),
     )
     .await;
-    check_prepare_results(session_id, methods.into_iter().zip(results).collect())
+    check_prepare_results_with(
+        session_id,
+        methods.into_iter().zip(results).collect(),
+        fetch_required,
+        is_chromium,
+    )
 }
 
 async fn prepare_worker_session(
@@ -2511,7 +2748,7 @@ async fn prepare_worker_session(
     let results = futures_util::future::join_all(
         calls
             .into_iter()
-            .map(|(m, p)| conn.call(m, p, Some(session_id), Duration::from_secs(30))),
+            .map(|(m, p)| call_cdp(conn, m, p, Some(session_id), Duration::from_secs(30))),
     )
     .await;
     check_prepare_results(session_id, methods.into_iter().zip(results).collect())
@@ -2520,6 +2757,15 @@ async fn prepare_worker_session(
 fn check_prepare_results(
     session_id: &str,
     results: Vec<(&'static str, Result<Value>)>,
+) -> Result<()> {
+    check_prepare_results_with(session_id, results, true, true)
+}
+
+fn check_prepare_results_with(
+    session_id: &str,
+    results: Vec<(&'static str, Result<Value>)>,
+    fetch_required: bool,
+    is_chromium: bool,
 ) -> Result<()> {
     let mut failure = None;
     for (method, res) in results {
@@ -2531,7 +2777,22 @@ fn check_prepare_results(
             // debugger release.
             let fatal = if e.is_timeout() {
                 matches!(method, "Fetch.enable" | "Runtime.runIfWaitingForDebugger")
-            } else if method == "Page.setInterceptFileChooserDialog" && matches!(e, Error::Command { .. }) {
+            } else if method == "Page.setInterceptFileChooserDialog"
+                && matches!(e, Error::Command { .. })
+            {
+                false
+            } else if method == "Fetch.enable" && !fetch_required && is_method_not_found(&e) {
+                false
+            } else if !is_chromium
+                && is_method_not_found(&e)
+                && matches!(
+                    method,
+                    "Target.setAutoAttach"
+                        | "Page.setLifecycleEventsEnabled"
+                        | "Network.enable"
+                        | "Network.setBlockedURLs"
+                )
+            {
                 false
             } else {
                 !method.starts_with("Emulation.") || !matches!(e, Error::Command { .. })
@@ -2747,6 +3008,7 @@ mod tests {
             pid: 0,
             headless: true,
             ws_endpoint: Some(ws_url),
+            capabilities: CdpCapabilities::default(),
             conn: conn.clone(),
             _child: Mutex::new(None),
             _profile: None,
@@ -2754,6 +3016,10 @@ mod tests {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            fallback_contexts: Default::default(),
+            default_context_only: AtomicBool::new(false),
+            fallback_create_lock: Default::default(),
+            pending_fallback_context: Default::default(),
             external_contexts: Default::default(),
             external_sessions: Default::default(),
             worker_sessions: Default::default(),
@@ -2846,6 +3112,7 @@ mod tests {
             pid: 0,
             headless: true,
             ws_endpoint: Some(ws_url),
+            capabilities: CdpCapabilities::default(),
             conn: conn.clone(),
             _child: Mutex::new(None),
             _profile: None,
@@ -2853,6 +3120,10 @@ mod tests {
             setups: Default::default(),
             page_setups: Default::default(),
             contexts: Default::default(),
+            fallback_contexts: Default::default(),
+            default_context_only: AtomicBool::new(false),
+            fallback_create_lock: Default::default(),
+            pending_fallback_context: Default::default(),
             external_contexts: Default::default(),
             external_sessions: Default::default(),
             worker_sessions: Default::default(),
@@ -2937,5 +3208,243 @@ mod tests {
             )],
         );
         assert!(dead.is_err());
+    }
+
+    #[test]
+    fn is_method_not_found_matches_json_rpc_32601_and_messages_only() {
+        assert!(is_method_not_found(&Error::Command {
+            method: "Target.createBrowserContext".into(),
+            message: "Method not found".into(),
+        }));
+        assert!(is_method_not_found(&Error::Command {
+            method: "Fetch.enable".into(),
+            message: "'Fetch.enable' wasn't found".into(),
+        }));
+        assert!(is_method_not_found(&Error::Command {
+            method: "Custom.call".into(),
+            message: "unsupported (-32601)".into(),
+        }));
+
+        assert!(!is_method_not_found(&Error::Command {
+            method: "Fetch.enable".into(),
+            message: "bad pattern".into(),
+        }));
+        assert!(!is_method_not_found(&Error::Command {
+            method: "Bad.method".into(),
+            message: "Invalid params (-32602)".into(),
+        }));
+        assert!(!is_method_not_found(&Error::timeout("Fetch.enable", 500)));
+        assert!(!is_method_not_found(&Error::SessionGone("s1".into())));
+        assert!(!is_method_not_found(&Error::WebSocket("closed".into())));
+    }
+
+    #[test]
+    fn cdp_capabilities_detects_chromium_vs_lightweight() {
+        let chrome = CdpCapabilities::from_version(&json!({ "product": "Chrome/134.0.6998.165" }));
+        assert_eq!(chrome.product, "Chrome/134.0.6998.165");
+        assert!(chrome.is_chromium);
+
+        let headless =
+            CdpCapabilities::from_version(&json!({ "product": "HeadlessChrome/134.0.0.0" }));
+        assert!(headless.is_chromium);
+
+        let edge = CdpCapabilities::from_version(&json!({ "product": "Edg/134.0.0.0" }));
+        assert!(edge.is_chromium);
+
+        let lightpanda = CdpCapabilities::from_version(&json!({ "product": "Lightpanda/0.1.0" }));
+        assert_eq!(lightpanda.product, "Lightpanda/0.1.0");
+        assert!(!lightpanda.is_chromium);
+
+        let moli = CdpCapabilities::from_version(&json!({ "product": "Moli/0.2" }));
+        assert!(!moli.is_chromium);
+
+        let empty = CdpCapabilities::from_version(&json!({}));
+        assert_eq!(empty.product, "");
+        assert!(!empty.is_chromium);
+    }
+
+    #[test]
+    fn prepare_results_degrades_optional_calls_on_32601_without_masking_real_errors() {
+        let not_found = |m: &'static str| {
+            (
+                m,
+                Err(Error::Command {
+                    method: m.into(),
+                    message: "Method not found (-32601)".into(),
+                }),
+            )
+        };
+
+        // Optional Fetch.enable (no intercept/auth required) degrades cleanly on -32601.
+        assert!(check_prepare_results_with("s1", vec![not_found("Fetch.enable")], false, true).is_ok());
+
+        // Strict Fetch.enable (intercept/auth required) still fails on -32601.
+        assert!(check_prepare_results_with("s1", vec![not_found("Fetch.enable")], true, false).is_err());
+
+        // Non-32601 Fetch.enable errors are never masked even when fetch_required == false.
+        assert!(check_prepare_results_with(
+            "s1",
+            vec![(
+                "Fetch.enable",
+                Err(Error::Command {
+                    method: "Fetch.enable".into(),
+                    message: "bad pattern".into(),
+                }),
+            )],
+            false,
+            false,
+        )
+        .is_err());
+
+        // Emulation.setDeviceMetricsOverride degrades cleanly on -32601, but SessionGone fails.
+        assert!(check_prepare_results_with(
+            "s1",
+            vec![not_found("Emulation.setDeviceMetricsOverride")],
+            false,
+            true,
+        )
+        .is_ok());
+        assert!(check_prepare_results_with(
+            "s1",
+            vec![(
+                "Emulation.setDeviceMetricsOverride",
+                Err(Error::SessionGone("s1".into())),
+            )],
+            false,
+            false,
+        )
+        .is_err());
+
+        // Lightweight external CDP tolerates -32601 on Chrome-only domain enables, Chromium does not.
+        assert!(check_prepare_results_with(
+            "s1",
+            vec![
+                ("Page.enable", Ok(json!({}))),
+                ("Runtime.enable", Ok(json!({}))),
+                not_found("Page.setLifecycleEventsEnabled"),
+                not_found("Target.setAutoAttach"),
+                not_found("Network.enable"),
+            ],
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(check_prepare_results_with(
+            "s1",
+            vec![not_found("Page.setLifecycleEventsEnabled")],
+            false,
+            true,
+        )
+        .is_err());
+        // Core Page.enable -32601 is still fatal even on lightweight CDP.
+        assert!(check_prepare_results_with("s1", vec![not_found("Page.enable")], false, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn lightweight_cdp_falls_back_to_default_context_on_32601() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].clone();
+                let method = req["method"].as_str().unwrap_or_default().to_string();
+                let _ = seen_tx.send(req.clone());
+
+                let reply = match method.as_str() {
+                    "Browser.getVersion" => json!({
+                        "id": id,
+                        "result": { "product": "Lightpanda/0.1.0", "protocolVersion": "1.3" }
+                    }),
+                    "Target.createBrowserContext"
+                    | "Target.disposeBrowserContext"
+                    | "Page.setLifecycleEventsEnabled"
+                    | "Fetch.enable"
+                    | "Emulation.setDeviceMetricsOverride"
+                    | "Browser.setDownloadBehavior" => json!({
+                        "id": id,
+                        "error": { "code": -32601, "message": "unsupported command" }
+                    }),
+                    "Target.createTarget" => {
+                        let ev = json!({
+                            "method": "Target.attachedToTarget",
+                            "params": {
+                                "sessionId": "S-LIGHT-1",
+                                "waitingForDebugger": false,
+                                "targetInfo": {
+                                    "targetId": "T-LIGHT-1",
+                                    "type": "page",
+                                    "url": "about:blank"
+                                }
+                            }
+                        });
+                        ws.send(Message::Text(ev.to_string().into())).await.unwrap();
+                        json!({ "id": id, "result": { "targetId": "T-LIGHT-1" } })
+                    }
+                    _ => json!({ "id": id, "result": {} }),
+                };
+                if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let browser = CdpBrowser::connect(&format!("ws://{addr}"))
+            .await
+            .expect("connect to lightweight CDP");
+        assert_eq!(browser.capabilities().product, "Lightpanda/0.1.0");
+        assert!(!browser.capabilities().is_chromium);
+
+        let ctx = browser
+            .create_context(None)
+            .await
+            .expect("createBrowserContext -32601 should fall back to default context");
+        // Optional resource blocking + viewport emulation should degrade cleanly when Fetch/Emulation return -32601.
+        browser
+            .context_block_resource_types(&ctx, &[ResourceType::Image], Duration::from_secs(2))
+            .await
+            .unwrap();
+        browser
+            .context_emulate(
+                &ctx,
+                &Emulation {
+                    viewport: Some((1280, 720)),
+                    ..Default::default()
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+
+        let page = browser
+            .create_page(&ctx, Duration::from_secs(5))
+            .await
+            .expect("create_page in fallback default context");
+        assert_eq!(page.target_id.0, "T-LIGHT-1");
+
+        browser.dispose_context(&ctx).await.unwrap();
+        browser.close().await.unwrap();
+        drop(browser);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+
+        let mut methods = Vec::new();
+        let mut create_target_had_ctx = false;
+        while let Ok(msg) = seen_rx.try_recv() {
+            let m = msg["method"].as_str().unwrap_or_default().to_string();
+            if m == "Target.createTarget" {
+                create_target_had_ctx = msg["params"].get("browserContextId").is_some();
+            }
+            methods.push(m);
+        }
+        assert!(!create_target_had_ctx, "fallback Target.createTarget must omit browserContextId");
+        assert!(methods.iter().any(|m| m == "Target.closeTarget"));
+        assert!(!methods.iter().any(|m| m == "Target.disposeBrowserContext"));
     }
 }

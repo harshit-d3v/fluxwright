@@ -98,6 +98,15 @@ enum Cmd {
         /// CSP frame-ancestors policy for GET /embed/live/{token} (default "*").
         #[arg(long, default_value = "*")]
         embed_frame_ancestors: String,
+        /// Enable low-memory headless Chromium flags (`--disable-gpu`, `--disable-software-rasterizer`, `--js-flags=--max-old-space-size=256`).
+        #[arg(long, default_value_t = false)]
+        low_memory: bool,
+        /// Recycle a managed Chromium process once its process-tree RSS reaches this threshold (MB).
+        #[arg(long, value_name = "MB")]
+        recycle_rss_mb: Option<NonZeroU64>,
+        /// Optional external lightweight CDP endpoint URL for fast Tier-2 fallback (e.g. ws://127.0.0.1:9222).
+        #[arg(long, value_name = "URL")]
+        fast_cdp_endpoint: Option<String>,
     },
     /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
     Coordinate {
@@ -218,6 +227,9 @@ async fn main() -> Result<()> {
             otlp_endpoint,
             otlp_service_name,
             embed_frame_ancestors,
+            low_memory,
+            recycle_rss_mb,
+            fast_cdp_endpoint,
         } => {
             let address = listen.unwrap_or_else(|| {
                 if join.is_some() {
@@ -252,6 +264,9 @@ async fn main() -> Result<()> {
                 otlp_endpoint,
                 otlp_service_name,
                 embed_frame_ancestors,
+                low_memory,
+                recycle_rss_mb,
+                fast_cdp_endpoint,
             )
             .await
         }
@@ -447,6 +462,65 @@ async fn coordinator_daemon(
     serve_http(listener, address, server, None).await
 }
 
+fn validate_fast_cdp_endpoint(raw: &str) -> Result<String> {
+    if raw.is_empty()
+        || raw.len() > 2048
+        || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        || raw.contains('\\')
+    {
+        anyhow::bail!(
+            "--fast-cdp-endpoint must be 1-2048 characters without whitespace, control characters, or backslashes"
+        );
+    }
+    let (scheme_raw, rest) = raw
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("--fast-cdp-endpoint must use ws://, wss://, http://, or https://"))?;
+    let scheme = scheme_raw.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "ws" | "wss" | "http" | "https") {
+        anyhow::bail!("--fast-cdp-endpoint must use ws://, wss://, http://, or https://");
+    }
+    let rest_no_frag = rest.split('#').next().unwrap_or(rest);
+    let auth_end = rest_no_frag.find(['/', '?']).unwrap_or(rest_no_frag.len());
+    let authority = &rest_no_frag[..auth_end];
+    if authority.is_empty() || authority.contains('@') {
+        anyhow::bail!("--fast-cdp-endpoint authority is invalid or contains userinfo");
+    }
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((ip_str, tail)) = after_bracket.split_once(']') else {
+            anyhow::bail!("--fast-cdp-endpoint has an unclosed IPv6 host");
+        };
+        if ip_str.parse::<std::net::Ipv6Addr>().is_err() {
+            anyhow::bail!("--fast-cdp-endpoint has an invalid IPv6 host");
+        }
+        if !tail.is_empty() {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .filter(|&p| p != 0)
+                .ok_or_else(|| anyhow::anyhow!("--fast-cdp-endpoint has an invalid port"))?;
+            let _ = port;
+        }
+        ip_str
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.is_empty() || h.contains(':') {
+            anyhow::bail!("--fast-cdp-endpoint has an invalid host");
+        }
+        let port = p
+            .parse::<u16>()
+            .ok()
+            .filter(|&n| n != 0)
+            .ok_or_else(|| anyhow::anyhow!("--fast-cdp-endpoint has an invalid port"))?;
+        let _ = port;
+        h
+    } else {
+        authority
+    };
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()) {
+        anyhow::bail!("--fast-cdp-endpoint has an empty or invalid host");
+    }
+    Ok(format!("{scheme}://{rest}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn http_daemon(
     address: SocketAddr,
@@ -474,7 +548,14 @@ async fn http_daemon(
     otlp_endpoint: Option<String>,
     otlp_service_name: Option<String>,
     embed_frame_ancestors: String,
+    low_memory: bool,
+    recycle_rss_mb: Option<NonZeroU64>,
+    fast_cdp_endpoint: Option<String>,
 ) -> Result<()> {
+    let _fast_cdp_endpoint = fast_cdp_endpoint
+        .as_deref()
+        .map(validate_fast_cdp_endpoint)
+        .transpose()?;
     let is_worker = join.is_some();
     let (join_token, mut config) =
         server_config_for(is_worker, max_jobs, journal, store, result_ttl_secs)?;
@@ -487,6 +568,11 @@ async fn http_daemon(
         otlp_service_name,
         Some(embed_frame_ancestors),
     )?;
+    // TODO(integrator): once merged with `feat/phase1-fastpath`, wire `_fast_cdp_endpoint` to
+    // `ServerConfig::with_fast_cdp_endpoint`:
+    // if let Some(endpoint) = _fast_cdp_endpoint {
+    //     config = config.with_fast_cdp_endpoint(endpoint)?;
+    // }
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
     let mut builder = BrowserEngine::builder();
@@ -500,6 +586,12 @@ async fn http_daemon(
         .queue_capacity(max_jobs)
         .queue_full_mode(QueueFullMode::Wait)
         .acquire_timeout(Duration::from_secs(300));
+    if low_memory {
+        builder = builder.low_memory(true);
+    }
+    if let Some(mb) = recycle_rss_mb {
+        builder = builder.recycle_rss_mb(mb.get());
+    }
     if let Some(ch) = channel {
         builder = builder.channel(ch);
     }
@@ -837,6 +929,9 @@ mod tests {
                 otlp_endpoint,
                 otlp_service_name,
                 embed_frame_ancestors,
+                low_memory,
+                recycle_rss_mb,
+                fast_cdp_endpoint,
             } => {
                 assert!(
                     max_per_host.is_none()
@@ -852,7 +947,10 @@ mod tests {
                         && webhook_secret.is_none()
                         && otlp_endpoint.is_none()
                         && otlp_service_name.is_none()
+                        && recycle_rss_mb.is_none()
+                        && fast_cdp_endpoint.is_none()
                 );
+                assert!(!low_memory);
                 assert_eq!(embed_frame_ancestors, "*");
                 assert_eq!(result_ttl_secs, 3600);
                 assert!(!allow_query_token);
@@ -1046,6 +1144,89 @@ mod tests {
             _ => panic!("expected Cmd::Install"),
         }
         assert!(Cli::try_parse_from(["fluxwright", "install"]).is_ok());
+    }
+
+    #[test]
+    fn cli_parses_low_memory_recycle_and_fast_cdp_flags() {
+        let parsed = Cli::try_parse_from([
+            "fluxwright",
+            "serve",
+            "--low-memory",
+            "--recycle-rss-mb",
+            "512",
+            "--fast-cdp-endpoint",
+            "ws://127.0.0.1:9222",
+        ])
+        .expect("phase 2/3 flags should parse");
+        match parsed.cmd {
+            Cmd::Serve {
+                low_memory,
+                recycle_rss_mb,
+                fast_cdp_endpoint,
+                ..
+            } => {
+                assert!(low_memory);
+                assert_eq!(recycle_rss_mb, Some(NonZeroU64::new(512).unwrap()));
+                assert_eq!(
+                    fast_cdp_endpoint.as_deref(),
+                    Some("ws://127.0.0.1:9222")
+                );
+            }
+            _ => panic!("expected Cmd::Serve"),
+        }
+        assert!(
+            Cli::try_parse_from(["fluxwright", "serve", "--recycle-rss-mb", "0"]).is_err(),
+            "--recycle-rss-mb 0 must be rejected by NonZeroU64"
+        );
+    }
+
+    #[test]
+    fn validate_fast_cdp_endpoint_checks_syntax() {
+        assert_eq!(
+            validate_fast_cdp_endpoint("WS://127.0.0.1:9222/devtools/browser/1").unwrap(),
+            "ws://127.0.0.1:9222/devtools/browser/1"
+        );
+        assert_eq!(
+            validate_fast_cdp_endpoint("wss://cdp.example.com:9443/ws").unwrap(),
+            "wss://cdp.example.com:9443/ws"
+        );
+        assert_eq!(
+            validate_fast_cdp_endpoint("http://localhost:9222").unwrap(),
+            "http://localhost:9222"
+        );
+        assert_eq!(
+            validate_fast_cdp_endpoint("https://[::1]:9222/json/version").unwrap(),
+            "https://[::1]:9222/json/version"
+        );
+        for bad in [
+            "",
+            "ftp://127.0.0.1:9222",
+            "127.0.0.1:9222",
+            "ws://",
+            "ws://user:pass@127.0.0.1:9222",
+            "ws://127.0.0.1:0",
+            "ws://127.0.0.1:abc",
+            "ws://[::1",
+            "ws://127.0.0.1:9222 bad",
+        ] {
+            assert!(
+                validate_fast_cdp_endpoint(bad).is_err(),
+                "expected invalid endpoint to fail: {bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_builder_wires_low_memory_and_recycle_rss_mb() {
+        let engine = BrowserEngine::builder()
+            .low_memory(true)
+            .recycle_rss_mb(512)
+            .build()
+            .await
+            .expect("engine");
+        assert!(engine.config().launch.low_memory);
+        assert_eq!(engine.config().recycle_rss_mb, Some(512));
+        engine.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
     #[test]
