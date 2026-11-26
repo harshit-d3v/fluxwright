@@ -391,6 +391,7 @@ async function spawnFluxwrightServer(opts, token) {
     env: {
       ...process.env,
       FLUXWRIGHT_SERVER_TOKEN: token,
+      FLUXWRIGHT_SERVER_ANY_URL: "1",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -965,6 +966,11 @@ async function main() {
       process.stdout.write(JSON.stringify(report, null, 2) + "\n");
     } else {
       printTable(results, fixture.assetHits);
+    }
+
+    const totalFailures = results.reduce((sum, r) => sum + r.failures, 0);
+    if (totalFailures > 0) {
+      process.exitCode = 1;
     }
   } finally {
     process.removeListener("SIGINT", onSignal);
