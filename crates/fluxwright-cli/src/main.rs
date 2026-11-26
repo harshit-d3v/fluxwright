@@ -463,62 +463,7 @@ async fn coordinator_daemon(
 }
 
 fn validate_fast_cdp_endpoint(raw: &str) -> Result<String> {
-    if raw.is_empty()
-        || raw.len() > 2048
-        || raw.chars().any(|c| c.is_whitespace() || c.is_control())
-        || raw.contains('\\')
-    {
-        anyhow::bail!(
-            "--fast-cdp-endpoint must be 1-2048 characters without whitespace, control characters, or backslashes"
-        );
-    }
-    let (scheme_raw, rest) = raw
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("--fast-cdp-endpoint must use ws://, wss://, http://, or https://"))?;
-    let scheme = scheme_raw.to_ascii_lowercase();
-    if !matches!(scheme.as_str(), "ws" | "wss" | "http" | "https") {
-        anyhow::bail!("--fast-cdp-endpoint must use ws://, wss://, http://, or https://");
-    }
-    let rest_no_frag = rest.split('#').next().unwrap_or(rest);
-    let auth_end = rest_no_frag.find(['/', '?']).unwrap_or(rest_no_frag.len());
-    let authority = &rest_no_frag[..auth_end];
-    if authority.is_empty() || authority.contains('@') {
-        anyhow::bail!("--fast-cdp-endpoint authority is invalid or contains userinfo");
-    }
-    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
-        let Some((ip_str, tail)) = after_bracket.split_once(']') else {
-            anyhow::bail!("--fast-cdp-endpoint has an unclosed IPv6 host");
-        };
-        if ip_str.parse::<std::net::Ipv6Addr>().is_err() {
-            anyhow::bail!("--fast-cdp-endpoint has an invalid IPv6 host");
-        }
-        if !tail.is_empty() {
-            let port = tail
-                .strip_prefix(':')
-                .and_then(|p| p.parse::<u16>().ok())
-                .filter(|&p| p != 0)
-                .ok_or_else(|| anyhow::anyhow!("--fast-cdp-endpoint has an invalid port"))?;
-            let _ = port;
-        }
-        ip_str
-    } else if let Some((h, p)) = authority.rsplit_once(':') {
-        if h.is_empty() || h.contains(':') {
-            anyhow::bail!("--fast-cdp-endpoint has an invalid host");
-        }
-        let port = p
-            .parse::<u16>()
-            .ok()
-            .filter(|&n| n != 0)
-            .ok_or_else(|| anyhow::anyhow!("--fast-cdp-endpoint has an invalid port"))?;
-        let _ = port;
-        h
-    } else {
-        authority
-    };
-    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()) {
-        anyhow::bail!("--fast-cdp-endpoint has an empty or invalid host");
-    }
-    Ok(format!("{scheme}://{rest}"))
+    Ok(fluxwright_server::validate_fast_cdp_endpoint(raw)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,7 +497,7 @@ async fn http_daemon(
     recycle_rss_mb: Option<NonZeroU64>,
     fast_cdp_endpoint: Option<String>,
 ) -> Result<()> {
-    let _fast_cdp_endpoint = fast_cdp_endpoint
+    let fast_cdp_endpoint = fast_cdp_endpoint
         .as_deref()
         .map(validate_fast_cdp_endpoint)
         .transpose()?;
@@ -568,11 +513,9 @@ async fn http_daemon(
         otlp_service_name,
         Some(embed_frame_ancestors),
     )?;
-    // TODO(integrator): once merged with `feat/phase1-fastpath`, wire `_fast_cdp_endpoint` to
-    // `ServerConfig::with_fast_cdp_endpoint`:
-    // if let Some(endpoint) = _fast_cdp_endpoint {
-    //     config = config.with_fast_cdp_endpoint(endpoint)?;
-    // }
+    if let Some(endpoint) = fast_cdp_endpoint {
+        config = config.with_fast_cdp_endpoint(endpoint)?;
+    }
     // Bind before creating the engine so an occupied address never starts browser work.
     let listener = tokio::net::TcpListener::bind(address).await?;
     let mut builder = BrowserEngine::builder();

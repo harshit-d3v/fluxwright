@@ -3541,3 +3541,131 @@ async fn fastpath_http_scrape_and_map_with_sitemap_and_browser_escalations() {
     server.shutdown(Duration::from_secs(5)).await.unwrap();
     app_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fast_cdp_endpoint_falls_back_to_local_chromium_and_bypasses_ineligible_requests() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let app = axum::Router::new()
+        .route(
+            "/spa",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>Shell</title>",
+                    "<body><div id='root'></div>",
+                    "<script>",
+                    "document.getElementById('root').innerHTML = '<h1>Hydrated Fallback</h1><p>Chromium fallback ok</p>';",
+                    "document.title = 'Hydrated Fallback';",
+                    "</script></body>"
+                ))
+            }),
+        )
+        .route(
+            "/map-spa",
+            axum::routing::get(|| async {
+                axum::response::Html(concat!(
+                    "<!doctype html><title>MapShell</title>",
+                    "<body><div id='app'></div>",
+                    "<script>",
+                    "document.getElementById('app').innerHTML = '<a href=\"/fallback-link\">Fallback Link</a>';",
+                    "</script></body>"
+                ))
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // Allocate and immediately drop a TCP listener so `unreachable_ws` fails fast.
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead_listener.local_addr().unwrap().port();
+    drop(dead_listener);
+
+    let engine = BrowserEngine::builder()
+        .max_browsers(1)
+        .max_contexts_per_browser(1)
+        .memory_ceiling_mb(16_384)
+        .acquire_timeout(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+    let cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_fast_cdp_endpoint(format!("ws://127.0.0.1:{dead_port}"))
+        .unwrap();
+    let srv = HttpServer::new(engine.clone(), cfg).unwrap();
+
+    let (st_scrape, body_scrape) = request(
+        &srv,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base_url}/spa"), "timeout_ms": 15000 }),
+    )
+    .await;
+    assert_eq!(st_scrape, StatusCode::OK, "{body_scrape}");
+    assert_eq!(body_scrape["engine"], "browser");
+    assert!(body_scrape["fallback_reason"].is_string());
+    assert_eq!(body_scrape["title"], "Hydrated Fallback");
+    assert!(body_scrape["markdown"]
+        .as_str()
+        .unwrap_or("")
+        .contains("Hydrated Fallback"));
+
+    let (st_map, body_map) = request(
+        &srv,
+        "POST",
+        "/v1/map",
+        json!({ "url": format!("{base_url}/map-spa"), "timeout_ms": 15000 }),
+    )
+    .await;
+    assert_eq!(st_map, StatusCode::OK, "{body_map}");
+    assert_eq!(body_map["engine"], "browser");
+    assert!(body_map["fallback_reason"].is_string());
+    let expected_link = format!("{base_url}/fallback-link");
+    assert!(body_map["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some(expected_link.as_str())));
+
+    // Ineligible requests (visual screenshot, block_resources, block_url_patterns) must bypass fast-CDP completely.
+    let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe_addr = probe_listener.local_addr().unwrap();
+    let probe_hits = Arc::new(AtomicUsize::new(0));
+    let probe_hits_srv = probe_hits.clone();
+    let probe_task = tokio::spawn(async move {
+        while let Ok((_sock, _)) = probe_listener.accept().await {
+            probe_hits_srv.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let bypass_cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_fast_cdp_endpoint(format!("ws://{probe_addr}"))
+        .unwrap();
+    let bypass_srv = HttpServer::new(engine, bypass_cfg).unwrap();
+
+    for payload in [
+        json!({ "url": format!("{base_url}/spa"), "formats": ["markdown", "screenshot"] }),
+        json!({ "url": format!("{base_url}/spa"), "block_resources": ["image"] }),
+        json!({ "url": format!("{base_url}/spa"), "block_url_patterns": ["*analytics*"] }),
+    ] {
+        let (st, body) = request(&bypass_srv, "POST", "/v1/scrape", payload).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["engine"], "browser");
+    }
+    assert_eq!(
+        probe_hits.load(Ordering::SeqCst),
+        0,
+        "fast-CDP must not be contacted for visual or resource/pattern-blocked requests"
+    );
+
+    bypass_srv.shutdown(Duration::from_secs(5)).await.unwrap();
+    srv.shutdown(Duration::from_secs(5)).await.unwrap();
+    probe_task.abort();
+    app_task.abort();
+}

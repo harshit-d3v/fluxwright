@@ -4559,3 +4559,291 @@ async fn fast_fetch_blocks_ssrf_redirects_and_decodes_compressed_bodies() {
     proxy_task.abort();
     srv.abort();
 }
+
+#[tokio::test]
+async fn with_fast_cdp_endpoint_validates_and_wires_config() {
+    let cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_fast_cdp_endpoint("WS://127.0.0.1:9222/devtools/browser/1".into())
+        .expect("valid ws endpoint");
+    let srv = HttpServer::new(idle_engine().await, cfg).unwrap();
+    assert_eq!(
+        srv.inner.fast_cdp_endpoint.as_deref(),
+        Some("ws://127.0.0.1:9222/devtools/browser/1")
+    );
+    srv.shutdown(Duration::ZERO).await.unwrap();
+
+    for ok in [
+        "wss://cdp.example.com:9443/ws",
+        "http://localhost:9222",
+        "https://[::1]:9222/json/version",
+    ] {
+        assert!(
+            ServerConfig::new(TOKEN.into())
+                .unwrap()
+                .with_fast_cdp_endpoint(ok.into())
+                .is_ok(),
+            "expected valid fast-CDP endpoint: {ok}"
+        );
+    }
+
+    for bad in [
+        "",
+        "ftp://127.0.0.1:9222",
+        "127.0.0.1:9222",
+        "ws://",
+        "ws://user:pass@127.0.0.1:9222",
+        "ws://127.0.0.1:0",
+        "ws://127.0.0.1:abc",
+        "ws://[::1",
+        "ws://127.0.0.1:9222 bad",
+        "ws://127.0.0.1\\9222",
+    ] {
+        let err = match ServerConfig::new(TOKEN.into())
+            .unwrap()
+            .with_fast_cdp_endpoint(bad.into())
+        {
+            Ok(_) => panic!("expected invalid fast-CDP endpoint to fail: {bad:?}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ConfigError::InvalidFastCdpEndpoint(_)),
+            "unexpected error for {bad:?}: {err}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fast_cdp_tier_handles_escalated_scrape_and_map_with_32601_fallback() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{http_port}");
+    let http_srv_task = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = http_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = match target {
+                    "/map-spa" => {
+                        "<!doctype html><title>MapShell</title><body><div id='app'></div><script>app()</script></body>"
+                    }
+                    _ => {
+                        "<!doctype html><title>Shell</title><body><div id='root'></div><script>hydrate()</script></body>"
+                    }
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    let cdp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdp_addr = cdp_listener.local_addr().unwrap();
+    let closed_targets = Arc::new(AtomicUsize::new(0));
+    let closed_targets_srv = closed_targets.clone();
+    let base_for_cdp = base.clone();
+
+    let cdp_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = cdp_listener.accept().await {
+            let closed_targets_conn = closed_targets_srv.clone();
+            let base_conn = base_for_cdp.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let mut target_seq = 0usize;
+                let mut current_url = String::from("about:blank");
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&text).unwrap();
+                    let id = req["id"].clone();
+                    let method = req["method"].as_str().unwrap_or_default();
+                    let reply = match method {
+                        "Browser.getVersion" => json!({
+                            "id": id,
+                            "result": { "product": "Lightpanda/0.1.0", "protocolVersion": "1.3" }
+                        }),
+                        "Target.createBrowserContext"
+                        | "Target.disposeBrowserContext"
+                        | "Page.setLifecycleEventsEnabled"
+                        | "Fetch.enable"
+                        | "Emulation.setDeviceMetricsOverride"
+                        | "Network.enable"
+                        | "Network.setBlockedURLs" => json!({
+                            "id": id,
+                            "error": { "code": -32601, "message": "Method not found" }
+                        }),
+                        "Target.createTarget" => {
+                            target_seq += 1;
+                            let tid = format!("T-FAST-{target_seq}");
+                            let sid = format!("S-FAST-{target_seq}");
+                            let ev = json!({
+                                "method": "Target.attachedToTarget",
+                                "params": {
+                                    "sessionId": sid,
+                                    "waitingForDebugger": false,
+                                    "targetInfo": {
+                                        "targetId": tid,
+                                        "type": "page",
+                                        "url": "about:blank"
+                                    }
+                                }
+                            });
+                            if ws.send(Message::Text(ev.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            json!({ "id": id, "result": { "targetId": tid } })
+                        }
+                        "Target.closeTarget" => {
+                            closed_targets_conn.fetch_add(1, Ordering::SeqCst);
+                            json!({ "id": id, "result": { "success": true } })
+                        }
+                        "Page.navigate" => {
+                            let url = req["params"]["url"].as_str().unwrap_or("about:blank");
+                            current_url = url.to_string();
+                            let tid = format!("T-FAST-{target_seq}");
+                            let sid = format!("S-FAST-{target_seq}");
+                            let ev = json!({
+                                "method": "Page.frameNavigated",
+                                "sessionId": sid,
+                                "params": { "frame": { "id": tid, "url": url } }
+                            });
+                            if ws.send(Message::Text(ev.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            json!({ "id": id, "result": { "frameId": tid } })
+                        }
+                        "Runtime.evaluate" => {
+                            let expr = req["params"]["expression"].as_str().unwrap_or("");
+                            let val = if expr == "location.href" {
+                                if current_url.ends_with("/ssrf-sim") {
+                                    json!("http://169.254.169.254/latest/meta-data")
+                                } else {
+                                    json!(current_url)
+                                }
+                            } else if expr == "document.title" {
+                                json!("LightCDP Hydrated")
+                            } else if expr == "document.documentElement.outerHTML" {
+                                json!("<html><body><h1>LightCDP</h1></body></html>")
+                            } else if expr.contains("innerText") {
+                                json!("LightCDP hydrated text")
+                            } else if expr.contains("SKIP_TAGS") {
+                                json!("# LightCDP\n\nHydrated by external fast-CDP")
+                            } else if expr.contains("querySelectorAll('a[href]')") {
+                                json!([
+                                    format!("{base_conn}/spa-link"),
+                                    "https://external.example/skip"
+                                ])
+                            } else {
+                                json!("complete")
+                            };
+                            json!({
+                                "id": id,
+                                "result": { "result": { "type": "object", "value": val } }
+                            })
+                        }
+                        _ => json!({ "id": id, "result": {} }),
+                    };
+                    if ws.send(Message::Text(reply.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    // Uses idle_engine() (NeverStarts): passing proves Tier 2 fast-CDP handled the escalated requests
+    // without touching local Chromium.
+    let cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_fast_cdp_endpoint(format!("ws://{cdp_addr}"))
+        .unwrap();
+    let srv = HttpServer::new(idle_engine().await, cfg).unwrap();
+
+    let scrape_resp = call(
+        &srv,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{base}/spa"),
+            "formats": ["markdown", "html", "text"]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(scrape_resp.status(), StatusCode::OK);
+    let scrape_json = body(scrape_resp).await;
+    assert_eq!(scrape_json["engine"], "browser");
+    assert!(scrape_json["fallback_reason"]
+        .as_str()
+        .unwrap_or("")
+        .contains("SPA shell"));
+    assert_eq!(scrape_json["title"], "LightCDP Hydrated");
+    assert_eq!(
+        scrape_json["markdown"],
+        "# LightCDP\n\nHydrated by external fast-CDP"
+    );
+    assert_eq!(
+        scrape_json["html"],
+        "<html><body><h1>LightCDP</h1></body></html>"
+    );
+    assert_eq!(scrape_json["text"], "LightCDP hydrated text");
+
+    let map_resp = call(
+        &srv,
+        "POST",
+        "/v1/map",
+        json!({ "url": format!("{base}/map-spa") }).to_string(),
+    )
+    .await;
+    assert_eq!(map_resp.status(), StatusCode::OK);
+    let map_json = body(map_resp).await;
+    assert_eq!(map_json["engine"], "browser");
+    assert!(map_json["fallback_reason"].is_string());
+    assert_eq!(map_json["links"], json!([format!("{base}/spa-link")]));
+
+    // If fast-CDP navigation lands on a link-local SSRF destination, it is blocked with 400.
+    let ssrf_resp = call(
+        &srv,
+        "POST",
+        "/v1/scrape",
+        json!({ "url": format!("{base}/ssrf-sim") }).to_string(),
+    )
+    .await;
+    assert_eq!(ssrf_resp.status(), StatusCode::BAD_REQUEST);
+    let ssrf_json = body(ssrf_resp).await;
+    assert_eq!(ssrf_json["error"]["code"], "invalid_request");
+
+    assert_eq!(closed_targets.load(Ordering::SeqCst), 3);
+
+    let metrics_text = String::from_utf8(
+        to_bytes(call(&srv, "GET", "/metrics", Body::empty()).await.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(metrics_text.contains("fluxwright_fastpath_hits_total 0\n"), "{metrics_text}");
+    assert!(
+        metrics_text.contains("fluxwright_fastpath_fallbacks_total 3\n"),
+        "{metrics_text}"
+    );
+
+    srv.shutdown(Duration::from_secs(2)).await.unwrap();
+    cdp_task.abort();
+    http_srv_task.abort();
+}

@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
 
+use crate::fast_cdp::{self, FastCdpOutcome};
 use crate::fast_fetch::{self, FastFetchError, FetchMode};
 use crate::fast_html;
 use crate::job::{JobPriority, JobRequest, NavigationWait, ServerResourcePreset, Step};
@@ -29,7 +30,7 @@ const MAX_MAP_TIMEOUT_MS: u64 = 120_000;
 const MAX_SEARCH_BYTES: usize = 512;
 const MAX_SUB_SITEMAPS: usize = 5;
 
-const EXTRACT_LINKS_JS: &str = r#"(() => {
+pub(crate) const EXTRACT_LINKS_JS: &str = r#"(() => {
   const seen = new Set();
   const out = [];
   for (const a of document.querySelectorAll('a[href]')) {
@@ -281,9 +282,12 @@ pub(crate) async fn map_handler(
 
     let req_url = req.url.clone();
     let mode = req.mode;
+    let wait_until = req.wait_until;
+    let block_cookie_banners = req.block_cookie_banners;
     let include_sitemap = req.include_sitemap;
     let total_timeout_ms = req.timeout_ms;
     let proxy_session = req.proxy_session.clone();
+    let browser_resource_preset = req.resource_preset.or(Some(ServerResourcePreset::Scraping));
     let has_browser_only_opts = req.profile.is_some();
     let is_about_blank = req_url.trim().eq_ignore_ascii_case("about:blank");
 
@@ -291,7 +295,7 @@ pub(crate) async fn map_handler(
         steps: vec![
             Step::Goto {
                 url: req.url,
-                wait_until: req.wait_until,
+                wait_until,
             },
             Step::Url {},
             Step::Evaluate {
@@ -301,7 +305,7 @@ pub(crate) async fn map_handler(
         timeout_ms: total_timeout_ms,
         retries: 0,
         priority: JobPriority::Normal,
-        resource_preset: req.resource_preset.or(Some(ServerResourcePreset::Scraping)),
+        resource_preset: browser_resource_preset,
         block_resources: Vec::new(),
         block_url_patterns: Vec::new(),
         block_cookie_banners: req.block_cookie_banners,
@@ -371,6 +375,51 @@ pub(crate) async fn map_handler(
                     final_url = resp.final_url;
                     discovered_links = Some(fast_html::extract_links(&html_str, &final_url));
                 }
+            }
+        }
+    }
+
+    if discovered_links.is_none()
+        && mode == FetchMode::Auto
+        && fallback_reason.is_some()
+        && inner.fast_cdp_endpoint.is_some()
+        && !has_browser_only_opts
+        && !is_about_blank
+        && proxy_session.is_none()
+        && engine.proxy_pool().is_none()
+    {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= total_timeout_ms {
+            return Err(ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "map request timed out",
+            ));
+        }
+        match fast_cdp::map(
+            &inner,
+            &req_url,
+            wait_until,
+            browser_resource_preset,
+            block_cookie_banners,
+            started,
+            total_timeout_ms,
+        )
+        .await
+        {
+            FastCdpOutcome::Ok(fast) => {
+                final_url = fast.url;
+                discovered_links = Some(fast.links);
+            }
+            FastCdpOutcome::Blocked(msg) => {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", msg));
+            }
+            FastCdpOutcome::Fallback(reason) => {
+                tracing::warn!(
+                    url = %req_url,
+                    %reason,
+                    "fast-CDP map unavailable; falling back to local Chromium"
+                );
             }
         }
     }
