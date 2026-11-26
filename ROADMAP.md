@@ -45,6 +45,11 @@ The goal is to be the best engine for running many browser jobs on your own mach
 - **0.13.1:** Enforce `block_cookie_banners` on managed `POST /v1/sessions` via the gateway Fetch blocker, add `Page.loadEventFired` fallback and 10s screenshot budget for session replay frames, and align `22-tool` / `export_api_calls` / platform target docs across `README.md`, `docs/SERVER.md`, and `www`.
 - **0.13.2:** Add `block_cookie_banners` support to `POST /v1/map`, track session replay URLs and frame capture per target with consistent throttling, and install gateway blockers on new session targets even when no CDP WebSocket is connected.
 
+## Planned (v0.14.0)
+
+- **Tier 1 HTTP fast path with auto browser escalation:** pure-Rust SSRF-safe HTTP/1.1 + HTTPS fetcher and HTML5 markdown/link extractor for `POST /v1/scrape` and `POST /v1/map` (`mode: "auto" | "http" | "browser"`, `engine: "http" | "browser"`, `fallback_reason`, `include_sitemap`, default `resource_preset: "scraping"` on non-visual scrape/map jobs, and `fluxwright_fastpath_hits_total` / `fluxwright_fastpath_fallbacks_total` Prometheus counters).
+- **Low-memory launch preset and pluggable light-CDP backends:** opt-in `--low-memory` headless Chromium flags, `--recycle-rss-mb` threshold recycling, and `--fast-cdp-endpoint` for external lightweight CDP engines (such as Moli, Obscura, or Lightpanda) with `-32601` Method Not Found graceful fallback, without bundling AGPL code.
+
 ## Next: the fleet at scale
 
 Implement these milestones in order, verifying each before starting the next:
