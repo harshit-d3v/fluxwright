@@ -49,6 +49,7 @@ RUN groupadd --gid 10001 fluxwright \
 
 COPY --from=builder /out/fluxwright /usr/local/bin/fluxwright
 COPY --from=builder /out/fluxwright-mcp /usr/local/bin/fluxwright-mcp
+COPY LICENSE NOTICE /usr/share/doc/fluxwright/
 
 ENV FLUXWRIGHT_CHROMIUM=/usr/bin/chromium \
     HOME=/home/fluxwright \

@@ -14,6 +14,7 @@ exclude = ["bindings/node", "bindings/python"]
 
 [workspace.package]
 version = "0.14.0"
+authors = ["Harshit Prakash"]
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/harshit-d3v/fluxwright"

@@ -1,6 +1,7 @@
 [package]
 name = "fluxwright-core"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Browser pool, scheduler, and metrics for Fluxwright"

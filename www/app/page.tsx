@@ -641,7 +641,7 @@ docker run --rm \\
           <hr className="footer-dotted" />
 
           <div className="footer-bottom">
-            <p className="footer-note">Apache-2.0 licensed · Published release v0.14.0</p>
+            <p className="footer-note">Apache-2.0 licensed · Published release v0.14.0 · Created by <a href="https://github.com/harshit-d3v">Harshit Prakash</a></p>
             <div className="footer-links">
               <a href={GITHUB}>GitHub</a>
               <a href={CRATES}>crates.io</a>

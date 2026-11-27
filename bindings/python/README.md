@@ -172,4 +172,6 @@ pytest            # against a real Chrome
 
 ## License
 
+Fluxwright is created and maintained by [Harshit Prakash](https://github.com/harshit-d3v).
+
 Licensed under the [Apache License, Version 2.0](LICENSE).

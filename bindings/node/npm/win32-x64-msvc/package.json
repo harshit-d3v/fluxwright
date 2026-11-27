@@ -20,7 +20,7 @@
     "automation",
     "napi-rs"
   ],
-  "author": "Fluxwright contributors",
+  "author": "Harshit Prakash",
   "homepage": "https://github.com/harshit-d3v/fluxwright#readme",
   "license": "Apache-2.0",
   "engines": {
