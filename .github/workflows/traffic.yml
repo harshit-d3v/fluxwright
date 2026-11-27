@@ -1,15 +1,16 @@
 name: traffic snapshot
 
 # GitHub keeps repo traffic for 14 days only. This saves a daily copy to the
-# traffic-data branch. Needs a TRAFFIC_TOKEN secret: a fine-grained token for
-# this repo with read-only "Administration" access (GITHUB_TOKEN can't read traffic).
+# private harshit-d3v/fluxwright-stats repo. Needs a TRAFFIC_TOKEN secret: a
+# fine-grained token with read-only "Administration" on this repo (GITHUB_TOKEN
+# can't read traffic) and read/write "Contents" on fluxwright-stats.
 on:
   schedule:
     - cron: "23 4 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: traffic-snapshot
@@ -17,31 +18,28 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: traffic-data
-
-      - name: Save today's traffic
-        env:
-          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+      - name: Check token
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::TRAFFIC_TOKEN secret is not set, see the comment at the top of traffic.yml"
             exit 1
           fi
+
+      - uses: actions/checkout@v7
+        with:
+          repository: harshit-d3v/fluxwright-stats
+          token: ${{ secrets.TRAFFIC_TOKEN }}
+
+      - name: Save today's traffic
+        run: |
           dir="traffic/$(date -u +%F)"
           mkdir -p "$dir"
           for p in views clones popular/referrers popular/paths; do
             gh api "repos/$GITHUB_REPOSITORY/traffic/$p" > "$dir/${p#popular/}.json"
           done
-          {
-            echo "### Traffic, last 14 days"
-            jq -r '"- Views: \(.count) (\(.uniques) unique)"' "$dir/views.json"
-            jq -r '"- Clones: \(.count) (\(.uniques) unique, mostly our own CI)"' "$dir/clones.json"
-            echo "#### Referrers"
-            jq -r '.[] | "- \(.referrer): \(.uniques) unique"' "$dir/referrers.json"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit snapshot
         run: |
