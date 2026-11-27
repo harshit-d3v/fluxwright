@@ -1,5 +1,7 @@
 # Fluxwright
 
+[![npm downloads](https://img.shields.io/npm/dm/fluxwright?label=npm)](https://www.npmjs.com/package/fluxwright) [![PyPI downloads](https://img.shields.io/pypi/dm/fluxwright?label=pypi)](https://pypi.org/project/fluxwright/) [![license](https://img.shields.io/github/license/harshit-d3v/fluxwright)](LICENSE)
+
 Run hundreds of headless Chrome jobs on one machine. Fluxwright pools browsers, queues jobs when every slot is busy, restarts browsers before they bloat, and retries jobs when a browser crashes, behind a Playwright-style API for Node, Python and Rust.
 
 It is not a Playwright rewrite. Playwright drives a browser; Fluxwright runs a fleet of them.
