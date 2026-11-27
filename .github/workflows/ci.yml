@@ -67,6 +67,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- index.js index.d.ts || { echo "::error::Run npm run build:debug and commit index.js and index.d.ts"; exit 1; }
       - run: npm test
+      - run: node ../../tests/parity/playwright-parity.mjs --engine=fluxwright
 
   python:
     name: python binding (${{ matrix.os }})

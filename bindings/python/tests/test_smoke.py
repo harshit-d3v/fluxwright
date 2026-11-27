@@ -852,12 +852,16 @@ async def event_smoke(base: str) -> None:
             await nav.wait_for_function("() => false", timeout=250)
         with pytest.raises(ValueError):
             await nav.wait_for_load_state("bogus")  # type: ignore[arg-type]
+        await nav.wait_for_timeout(15)
+        with pytest.raises(ValueError):
+            await nav.wait_for_timeout(-1)
         await nav.close()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(max_browsers=1)
         page = browser.new_page()
         page.goto(base)
+        page.wait_for_timeout(15)
         with page.expect_response(lambda r: r.url.endswith("/api")) as info:
             page.evaluate(FETCH_API)
         assert info.value.json() == {"real": True}

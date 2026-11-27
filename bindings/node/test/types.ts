@@ -143,7 +143,10 @@ export async function typed(): Promise<void> {
   await page.clock.fastForward(true)
   page.on('console', (m) => void m.text.length).on('pageerror', (e: Error) => void e.message)
   const download = await page.waitForDownload({ timeout: 5000 })
+  const dlViaEvent = await page.waitForEvent('download', { timeout: 5000 })
+  await page.waitForTimeout(10)
   const name: string = download.suggestedFilename()
+  void dlViaEvent.suggestedFilename()
   await download.saveAs(`out/${name}`)
   // @ts-expect-error not an event Fluxwright emits
   page.on('crash', () => {})

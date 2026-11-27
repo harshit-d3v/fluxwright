@@ -626,9 +626,14 @@ declare module './index' {
       optionsOrPredicate?: { predicate?: (webSocket: WebSocket) => boolean | Promise<boolean>; timeout?: number } | ((webSocket: WebSocket) => boolean | Promise<boolean>),
     ): Promise<WebSocket>
     waitForEvent(
+      event: 'download',
+      optionsOrPredicate?: { predicate?: (download: Download) => boolean | Promise<boolean>; timeout?: number } | ((download: Download) => boolean | Promise<boolean>),
+    ): Promise<Download>
+    waitForEvent(
       event: 'worker',
       optionsOrPredicate?: { predicate?: (worker: Worker) => boolean | Promise<boolean>; timeout?: number } | ((worker: Worker) => boolean | Promise<boolean>),
     ): Promise<Worker>
+    waitForTimeout(timeout: number): Promise<void>
     /**
      * The first response from now on whose URL matches (a glob or RegExp, as in `page.route`) or
      * that the predicate accepts. Default timeout 30 s; 0 waits until the page closes.
