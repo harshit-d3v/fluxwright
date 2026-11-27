@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use Fluxwright in your work, please cite it as below."
+title: Fluxwright
+type: software
+authors:
+  - given-names: Harshit
+    family-names: Prakash
+repository-code: "https://github.com/harshit-d3v/fluxwright"
+url: "https://fluxwright.vercel.app"
+license: Apache-2.0

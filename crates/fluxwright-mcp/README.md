@@ -118,3 +118,7 @@ CMD ["fluxwright-mcp", "--http", "0.0.0.0:8088"]
 ```
 
 Pass `FLUXWRIGHT_MCP_TOKEN` (>= 32 random printable ASCII characters) at runtime and put a TLS reverse proxy in front when exposing it outside localhost (`http://<host>:8088/mcp` or `https://<domain>/mcp`). Never pass `--allow-unauthenticated` on a public interface without upstream authentication.
+
+## License
+
+Fluxwright is created and maintained by [Harshit Prakash](https://github.com/harshit-d3v). Licensed under the [Apache License, Version 2.0](LICENSE).
