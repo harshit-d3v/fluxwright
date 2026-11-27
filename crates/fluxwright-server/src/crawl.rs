@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
@@ -21,6 +21,7 @@ use crate::fast_html::{self, ExtractField};
 use crate::job::{JobPriority, JobRequest, NavigationWait, ServerResourcePreset, Step};
 use crate::map::{UrlOrigin, EXTRACT_LINKS_JS};
 use crate::scrape::{ScrapeFormat, EXTRACT_TEXT_JS};
+use crate::tenants::TenantIdentity;
 use crate::{execute_job, now_ms, ApiError, ExecutionProgress, Inner, JobTraceContext};
 
 const MAX_CRAWLS: usize = 64;
@@ -150,6 +151,7 @@ pub(crate) struct CrawlSnapshot {
 }
 
 struct CrawlRecord {
+    tenant: String,
     snapshot: CrawlSnapshot,
     abort: Option<AbortHandle>,
 }
@@ -175,7 +177,7 @@ impl CrawlRegistry {
         }
     }
 
-    fn admit(&self, snapshot: CrawlSnapshot) -> Result<(), ApiError> {
+    fn admit(&self, snapshot: CrawlSnapshot, tenant: String) -> Result<(), ApiError> {
         let mut reg = self.records.lock().unwrap_or_else(|e| e.into_inner());
         while reg.len() >= MAX_CRAWLS {
             if let Some(idx) = reg.iter().position(|r| r.snapshot.status.terminal()) {
@@ -189,6 +191,7 @@ impl CrawlRegistry {
             }
         }
         reg.push_back(CrawlRecord {
+            tenant,
             snapshot,
             abort: None,
         });
@@ -246,16 +249,18 @@ impl CrawlRegistry {
         }
     }
 
-    fn get(&self, id: &str) -> Option<CrawlSnapshot> {
+    fn get(&self, id: &str, tenant: &TenantIdentity) -> Option<CrawlSnapshot> {
         let reg = self.records.lock().unwrap_or_else(|e| e.into_inner());
         reg.iter()
-            .find(|r| r.snapshot.id == id)
+            .find(|r| r.snapshot.id == id && tenant.can_access(&r.tenant))
             .map(|r| r.snapshot.clone())
     }
 
-    fn cancel(&self, id: &str) -> Option<CrawlSnapshot> {
+    fn cancel(&self, id: &str, tenant: &TenantIdentity) -> Option<CrawlSnapshot> {
         let mut reg = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        let rec = reg.iter_mut().find(|r| r.snapshot.id == id)?;
+        let rec = reg
+            .iter_mut()
+            .find(|r| r.snapshot.id == id && tenant.can_access(&r.tenant))?;
         if !rec.snapshot.status.terminal() {
             rec.snapshot.status = CrawlStatus::Cancelled;
             rec.snapshot.finished_at = Some(now_ms());
@@ -396,12 +401,14 @@ fn validate_target_url(
         proxy_session,
         webhook_url: None,
         webhook_headers: HashMap::new(),
+        affinity_key: None,
     };
     req.validate_with(allow_any_url)
 }
 
 pub(crate) async fn start_crawl(
     State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
     payload: Result<Json<CrawlRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     if inner.engine.is_none() {
@@ -505,7 +512,7 @@ pub(crate) async fn start_crawl(
         error: None,
     };
 
-    inner.crawls.admit(snapshot.clone())?;
+    inner.crawls.admit(snapshot.clone(), tenant.id)?;
 
     let cfg = CrawlRunConfig {
         seed_url,
@@ -528,7 +535,7 @@ pub(crate) async fn start_crawl(
         proxy_session: req.proxy_session,
     };
 
-    let inner_bg = Arc::clone(&inner);
+    let inner_bg = Arc::downgrade(&inner);
     let id_bg = id.clone();
     let handle = tokio::spawn(async move {
         run_crawl(inner_bg, id_bg, cfg).await;
@@ -540,6 +547,7 @@ pub(crate) async fn start_crawl(
 
 pub(crate) async fn get_crawl(
     State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     if inner.engine.is_none() {
@@ -549,7 +557,7 @@ pub(crate) async fn get_crawl(
             "/v1/crawl is unavailable in coordinator mode",
         ));
     }
-    match inner.crawls.get(&id) {
+    match inner.crawls.get(&id, &tenant) {
         Some(snap) => Ok((StatusCode::OK, Json(snap)).into_response()),
         None => Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -561,6 +569,7 @@ pub(crate) async fn get_crawl(
 
 pub(crate) async fn cancel_crawl(
     State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     if inner.engine.is_none() {
@@ -570,7 +579,7 @@ pub(crate) async fn cancel_crawl(
             "/v1/crawl is unavailable in coordinator mode",
         ));
     }
-    match inner.crawls.cancel(&id) {
+    match inner.crawls.cancel(&id, &tenant) {
         Some(snap) => Ok((StatusCode::OK, Json(snap)).into_response()),
         None => Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -607,15 +616,20 @@ struct CrawlPageOutcome {
     links: Vec<String>,
 }
 
-async fn run_crawl(inner: Arc<Inner>, crawl_id: String, cfg: CrawlRunConfig) {
-    let Some(engine) = inner.engine.clone() else {
-        inner
-            .crawls
-            .finish(&crawl_id, CrawlStatus::Failed, Some("engine unavailable".into()), 0);
+async fn run_crawl(weak_inner: Weak<Inner>, crawl_id: String, cfg: CrawlRunConfig) {
+    let Some(engine) = weak_inner.upgrade().and_then(|inn| inn.engine.clone()) else {
+        if let Some(inn) = weak_inner.upgrade() {
+            inn.crawls
+                .finish(&crawl_id, CrawlStatus::Failed, Some("engine unavailable".into()), 0);
+        }
         return;
     };
 
-    inner.crawls.mark_running(&crawl_id, now_ms(), 1);
+    if let Some(inn) = weak_inner.upgrade() {
+        inn.crawls.mark_running(&crawl_id, now_ms(), 1);
+    } else {
+        return;
+    }
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     visited.insert(cfg.seed_url.clone());
@@ -625,8 +639,11 @@ async fn run_crawl(inner: Arc<Inner>, crawl_id: String, cfg: CrawlRunConfig) {
     let queue_cap = cfg.max_pages.saturating_mul(4);
 
     while !queue.is_empty() && scheduled < cfg.max_pages {
-        if !inner.with_registry(|r, _| r.accepting) {
-            inner.crawls.finish(
+        let Some(inner_now) = weak_inner.upgrade() else {
+            return;
+        };
+        if !inner_now.with_registry(|r, _| r.accepting) {
+            inner_now.crawls.finish(
                 &crawl_id,
                 CrawlStatus::Cancelled,
                 Some("server shutting down".into()),
@@ -634,6 +651,7 @@ async fn run_crawl(inner: Arc<Inner>, crawl_id: String, cfg: CrawlRunConfig) {
             );
             return;
         }
+        drop(inner_now);
 
         let batch_limit = cfg.concurrency.min(cfg.max_pages - scheduled);
         let mut join_set = JoinSet::new();
@@ -642,7 +660,7 @@ async fn run_crawl(inner: Arc<Inner>, crawl_id: String, cfg: CrawlRunConfig) {
                 break;
             };
             scheduled += 1;
-            let inner_c = Arc::clone(&inner);
+            let inner_c = weak_inner.clone();
             let engine_c = engine.clone();
             let cfg_c = cfg.clone();
             join_set.spawn(async move { crawl_one_page(inner_c, engine_c, cfg_c, url, depth).await });
@@ -676,24 +694,31 @@ async fn run_crawl(inner: Arc<Inner>, crawl_id: String, cfg: CrawlRunConfig) {
                     }
                 }
             }
-            inner.crawls.push_page(&crawl_id, outcome.result, visited.len());
+            if let Some(inn) = weak_inner.upgrade() {
+                inn.crawls.push_page(&crawl_id, outcome.result, visited.len());
+            } else {
+                return;
+            }
         }
     }
 
-    inner
-        .crawls
-        .finish(&crawl_id, CrawlStatus::Completed, None, visited.len());
+    if let Some(inn) = weak_inner.upgrade() {
+        inn.crawls
+            .finish(&crawl_id, CrawlStatus::Completed, None, visited.len());
+    }
 }
 
 async fn crawl_one_page(
-    inner: Arc<Inner>,
+    inner: Weak<Inner>,
     engine: fluxwright::BrowserEngine,
     cfg: CrawlRunConfig,
     url: String,
     depth: usize,
 ) -> CrawlPageOutcome {
     let started = Instant::now();
-    let allow_any_url = inner.allow_any_url();
+    let allow_any_url = inner
+        .upgrade()
+        .is_some_and(|inn| inn.allow_any_url());
     if let Err(reason) = validate_target_url(
         &url,
         allow_any_url,
@@ -771,7 +796,9 @@ async fn crawl_one_page(
                         links: Vec::new(),
                     };
                 }
-                inner.fastpath_fallbacks.fetch_add(1, Ordering::Relaxed);
+                if let Some(inn) = inner.upgrade() {
+                    inn.fastpath_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Ok(resp) => {
                 let html_str =
@@ -800,9 +827,13 @@ async fn crawl_one_page(
                             links: Vec::new(),
                         };
                     }
-                    inner.fastpath_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    if let Some(inn) = inner.upgrade() {
+                        inn.fastpath_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
-                    inner.fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                    if let Some(inn) = inner.upgrade() {
+                        inn.fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                    }
                     let want_md = cfg.formats.contains(&ScrapeFormat::Markdown);
                     let want_html = cfg.formats.contains(&ScrapeFormat::Html);
                     let want_txt = cfg.formats.contains(&ScrapeFormat::Text);
@@ -892,6 +923,7 @@ async fn crawl_one_page(
         proxy_session: cfg.proxy_session,
         webhook_url: None,
         webhook_headers: HashMap::new(),
+        affinity_key: None,
     };
     let progress = Arc::new(Mutex::new(ExecutionProgress::default()));
     let tail_len = 2 + cfg.formats.len() + usize::from(extra_html) + usize::from(need_links);
@@ -899,7 +931,7 @@ async fn crawl_one_page(
     match execute_job(
         engine,
         job_req,
-        Some(Arc::downgrade(&inner)),
+        Some(inner),
         Uuid::new_v4(),
         JobTraceContext::from_headers(None),
         0,

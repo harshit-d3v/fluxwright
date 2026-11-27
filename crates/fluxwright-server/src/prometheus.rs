@@ -2,6 +2,15 @@
 
 use fluxwright::MetricsSnapshot;
 
+/// Per-tenant request, rate-limit, and active job counters for multi-tenant deployments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantMetrics {
+    pub tenant: String,
+    pub requests_total: u64,
+    pub rate_limited_total: u64,
+    pub active_jobs: usize,
+}
+
 /// Combined metrics snapshot of the underlying fleet and the HTTP server registry.
 #[derive(Debug, Clone, Default)]
 pub struct ServerMetrics {
@@ -20,6 +29,7 @@ pub struct ServerMetrics {
     pub total_cdp_sessions: u64,
     pub fastpath_hits: u64,
     pub fastpath_fallbacks: u64,
+    pub tenant_metrics: Vec<TenantMetrics>,
 }
 
 impl ServerMetrics {
@@ -217,8 +227,53 @@ impl ServerMetrics {
             self.fastpath_fallbacks,
         );
 
+        if !self.tenant_metrics.is_empty() {
+            out.push_str("# HELP fluxwright_tenant_requests_total Total authenticated requests accepted per tenant.\n");
+            out.push_str("# TYPE fluxwright_tenant_requests_total counter\n");
+            for row in &self.tenant_metrics {
+                let label = escape_prom_label(&row.tenant);
+                out.push_str(&format!(
+                    "fluxwright_tenant_requests_total{{tenant=\"{label}\"}} {}\n",
+                    row.requests_total
+                ));
+            }
+
+            out.push_str("# HELP fluxwright_tenant_rate_limited_total Total requests rejected by per-tenant rate limits.\n");
+            out.push_str("# TYPE fluxwright_tenant_rate_limited_total counter\n");
+            for row in &self.tenant_metrics {
+                let label = escape_prom_label(&row.tenant);
+                out.push_str(&format!(
+                    "fluxwright_tenant_rate_limited_total{{tenant=\"{label}\"}} {}\n",
+                    row.rate_limited_total
+                ));
+            }
+
+            out.push_str("# HELP fluxwright_tenant_active_jobs Current number of active queued and running jobs per tenant.\n");
+            out.push_str("# TYPE fluxwright_tenant_active_jobs gauge\n");
+            for row in &self.tenant_metrics {
+                let label = escape_prom_label(&row.tenant);
+                out.push_str(&format!(
+                    "fluxwright_tenant_active_jobs{{tenant=\"{label}\"}} {}\n",
+                    row.active_jobs
+                ));
+            }
+        }
+
         out
     }
+}
+
+fn escape_prom_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn write_metric<T: std::fmt::Display>(
@@ -277,6 +332,7 @@ mod tests {
             total_cdp_sessions: 7,
             fastpath_hits: 15,
             fastpath_fallbacks: 3,
+            tenant_metrics: Vec::new(),
         };
 
         let text = metrics.to_prometheus_text();
@@ -298,5 +354,34 @@ mod tests {
         assert!(text.contains("fluxwright_fastpath_hits_total 15\n"));
         assert!(text.contains("fluxwright_fastpath_fallbacks_total 3\n"));
         assert!(text.contains("fluxwright_effective_concurrency_limit 16\n"));
+        assert!(!text.contains("fluxwright_tenant_requests_total"));
+    }
+
+    #[test]
+    fn formats_per_tenant_metrics_and_escapes_labels() {
+        let metrics = ServerMetrics {
+            tenant_metrics: vec![
+                TenantMetrics {
+                    tenant: "acme-prod".into(),
+                    requests_total: 42,
+                    rate_limited_total: 3,
+                    active_jobs: 2,
+                },
+                TenantMetrics {
+                    tenant: "quote\"slash\\\nline".into(),
+                    requests_total: 1,
+                    rate_limited_total: 0,
+                    active_jobs: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let text = metrics.to_prometheus_text();
+        assert!(text.contains("fluxwright_tenant_requests_total{tenant=\"acme-prod\"} 42\n"));
+        assert!(text.contains("fluxwright_tenant_rate_limited_total{tenant=\"acme-prod\"} 3\n"));
+        assert!(text.contains("fluxwright_tenant_active_jobs{tenant=\"acme-prod\"} 2\n"));
+        assert!(text.contains(
+            "fluxwright_tenant_requests_total{tenant=\"quote\\\"slash\\\\\\nline\"} 1\n"
+        ));
     }
 }

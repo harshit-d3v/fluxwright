@@ -754,6 +754,7 @@ fn eviction_keeps_active_jobs() {
             JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
         );
         Record {
+            tenant: tenants::DEFAULT_TENANT.to_string(),
             job: Job {
                 id: Uuid::new_v4(),
                 status,
@@ -781,6 +782,7 @@ fn eviction_keeps_active_jobs() {
                 proxy_session: None,
                 webhook_url: None,
                 webhook_headers: HashMap::new(),
+                affinity_key: None,
             },
             trace_ctx: JobTraceContext::new(),
             submitted_ns: 0,
@@ -801,6 +803,8 @@ fn eviction_keeps_active_jobs() {
         ]),
         workers: HashMap::new(),
         last_leased_per_host: HashMap::new(),
+        affinity_map: HashMap::new(),
+        sticky_sessions: HashMap::new(),
         succeeded_jobs: 0,
         failed_jobs: 0,
         cancelled_jobs: 0,
@@ -3541,9 +3545,21 @@ async fn embed_live_ws_enforces_read_only_vs_interactive_ttl_expiry_and_session_
 #[tokio::test]
 async fn managed_sessions_and_scrape_validate_auth_and_bounds() {
     let coordinator = HttpServer::coordinator(ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    // Coordinator mode exposes sticky sessions on /v1/sessions (503 when no workers online),
+    // while standalone-only /v1/scrape returns 404.
+    assert_eq!(
+        call(&coordinator, "POST", "/v1/sessions", Body::empty())
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(&coordinator, "GET", "/v1/sessions", Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
     for (method, path) in [
-        ("POST", "/v1/sessions"),
-        ("GET", "/v1/sessions"),
         ("GET", "/v1/sessions/sess-1"),
         ("POST", "/v1/sessions/sess-1/extend"),
         ("DELETE", "/v1/sessions/sess-1"),
@@ -4996,4 +5012,859 @@ async fn scrape_extract_crawl_and_openapi_endpoints() {
 
     srv.shutdown(Duration::from_secs(2)).await.unwrap();
     site_task.abort();
+}
+
+async fn call_with_token(
+    server: &HttpServer,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: impl Into<Body>,
+) -> Response {
+    server
+        .router()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.into())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_tenant_auth_quotas_rate_limits_and_isolation() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    const ACME_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BETA_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let tenants_path =
+        std::env::temp_dir().join(format!("fluxwright-tenants-{}.json", Uuid::new_v4()));
+    let tenants_json = json!([
+        {
+            "id": "acme",
+            "token": ACME_TOKEN,
+            "max_concurrent_jobs": 1,
+            "rate_limit_per_min": 4
+        },
+        {
+            "id": "beta",
+            "token": BETA_TOKEN,
+            "max_concurrent_jobs": 2
+        }
+    ]);
+    std::fs::write(&tenants_path, tenants_json.to_string()).unwrap();
+
+    let cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_tenants_file(&tenants_path)
+        .unwrap();
+    let _ = std::fs::remove_file(&tenants_path);
+    let srv = HttpServer::new(idle_engine().await, cfg).unwrap();
+
+    // Unknown token is rejected.
+    let bad = call_with_token(
+        &srv,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "GET",
+        "/v1/stats",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+    // 1. Per-tenant max_concurrent_jobs quota (acme limit = 1).
+    let r1 = call_with_token(
+        &srv,
+        ACME_TOKEN,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}]}"#,
+    )
+    .await;
+    assert_eq!(r1.status(), StatusCode::ACCEPTED);
+    let acme_job: Job = serde_json::from_value(body(r1).await).unwrap();
+
+    let r2 = call_with_token(
+        &srv,
+        ACME_TOKEN,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}]}"#,
+    )
+    .await;
+    assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body(r2).await["error"]["code"], "tenant_quota_exceeded");
+
+    // Independent tenant quota: beta can still submit.
+    let r_beta = call_with_token(
+        &srv,
+        BETA_TOKEN,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}]}"#,
+    )
+    .await;
+    assert_eq!(r_beta.status(), StatusCode::ACCEPTED);
+
+    // 2. Tenant isolation on /v1/jobs/{id}: beta gets 404 on acme's job; admin sees it.
+    assert_eq!(
+        call_with_token(
+            &srv,
+            BETA_TOKEN,
+            "GET",
+            &format!("/v1/jobs/{}", acme_job.id),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call_with_token(
+            &srv,
+            BETA_TOKEN,
+            "DELETE",
+            &format!("/v1/jobs/{}", acme_job.id),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&srv, "GET", &format!("/v1/jobs/{}", acme_job.id), Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 3. Tenant isolation on /v1/crawl/{id}.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let site_task = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let html = "<!doctype html><title>Tenant</title><body><h1>Tenant Page</h1><p>Enough static readable content for HTTP fast path crawl verification across tenants without Chrome.</p></body>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let crawl_start = call_with_token(
+        &srv,
+        BETA_TOKEN,
+        "POST",
+        "/v1/crawl",
+        json!({ "url": format!("http://127.0.0.1:{port}/"), "mode": "http", "max_depth": 0, "max_pages": 1 })
+            .to_string(),
+    )
+    .await;
+    assert_eq!(crawl_start.status(), StatusCode::ACCEPTED);
+    let crawl_id = body(crawl_start).await["id"].as_str().unwrap().to_string();
+
+    // acme cannot read or cancel beta's crawl (request #3 and #4 for acme).
+    assert_eq!(
+        call_with_token(&srv, ACME_TOKEN, "GET", &format!("/v1/crawl/{crawl_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call_with_token(
+            &srv,
+            ACME_TOKEN,
+            "DELETE",
+            &format!("/v1/crawl/{crawl_id}"),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    // beta and admin can read beta's crawl.
+    assert_eq!(
+        call_with_token(&srv, BETA_TOKEN, "GET", &format!("/v1/crawl/{crawl_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&srv, "GET", &format!("/v1/crawl/{crawl_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 4. Per-tenant rate limiting: acme has already used 4/4 requests in the 60s window.
+    let limited = call_with_token(&srv, ACME_TOKEN, "GET", "/v1/stats", Body::empty()).await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = limited
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(retry_after >= 1);
+    assert_eq!(body(limited).await["error"]["code"], "rate_limit_exceeded");
+
+    // 5. Prometheus metrics expose per-tenant counters and active jobs.
+    let metrics_text = String::from_utf8(
+        to_bytes(call(&srv, "GET", "/metrics", Body::empty()).await.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        metrics_text.contains("fluxwright_tenant_requests_total{tenant=\"acme\"} 4\n"),
+        "{metrics_text}"
+    );
+    assert!(
+        metrics_text.contains("fluxwright_tenant_rate_limited_total{tenant=\"acme\"} 1\n"),
+        "{metrics_text}"
+    );
+    assert!(
+        metrics_text.contains("fluxwright_tenant_active_jobs{tenant=\"acme\"} 1\n"),
+        "{metrics_text}"
+    );
+    assert!(
+        metrics_text.contains("fluxwright_tenant_active_jobs{tenant=\"beta\"} 1\n"),
+        "{metrics_text}"
+    );
+
+    srv.shutdown(Duration::ZERO).await.unwrap();
+    site_task.abort();
+}
+
+#[tokio::test]
+async fn session_files_validation_crud_and_traversal_blocked() {
+    // 1. Strict filename validation blocks traversal, hidden files, separators, and whitespace.
+    for ok_name in ["a", "report.pdf", "data_1-2.csv", "FILE.TAR.GZ"] {
+        assert!(sessions::validate_session_filename(ok_name).is_ok(), "{ok_name}");
+    }
+    let long_name = "a".repeat(129);
+    for bad_name in [
+        "",
+        ".env",
+        "..",
+        "../secret.txt",
+        "a..b",
+        "dir/file.txt",
+        "dir\\file.txt",
+        "bad name.txt",
+        long_name.as_str(),
+    ] {
+        assert!(
+            sessions::validate_session_filename(bad_name).is_err(),
+            "{bad_name:?}"
+        );
+    }
+
+    // 2. File store CRUD, overwrite, size/count caps, and non-regular file/symlink rejection.
+    let base = std::env::temp_dir().join(format!("fluxwright-sess-files-{}", Uuid::new_v4()));
+    assert!(sessions::list_files_in_dir(&base).unwrap().is_empty());
+
+    let (sz, path_str) = sessions::write_file_in_dir(&base, "hello.txt", b"hello world").unwrap();
+    assert_eq!(sz, 11);
+    assert!(path_str.ends_with("hello.txt"));
+
+    let _ = sessions::write_file_in_dir(&base, "data.bin", &[0u8, 1, 2, 255]).unwrap();
+    let listed = sessions::list_files_in_dir(&base).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name, "data.bin");
+    assert_eq!(listed[0].size, 4);
+    assert_eq!(listed[1].name, "hello.txt");
+    assert_eq!(listed[1].size, 11);
+    assert_eq!(sessions::read_file_in_dir(&base, "hello.txt").unwrap(), b"hello world");
+
+    // Overwrite existing file cleanly.
+    let (sz2, _) = sessions::write_file_in_dir(&base, "hello.txt", b"updated").unwrap();
+    assert_eq!(sz2, 7);
+    assert_eq!(sessions::read_file_in_dir(&base, "hello.txt").unwrap(), b"updated");
+
+    // Oversized file rejected with 413.
+    let too_big = vec![b'x'; sessions::MAX_SESSION_FILE_BYTES + 1];
+    let err = sessions::write_file_in_dir(&base, "huge.bin", &too_big).unwrap_err();
+    assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // Subdirectory inside download_dir is skipped in listing and rejected on read/write/delete.
+    std::fs::create_dir_all(base.join("subdir")).unwrap();
+    assert_eq!(sessions::list_files_in_dir(&base).unwrap().len(), 2);
+    assert_eq!(
+        sessions::read_file_in_dir(&base, "subdir").unwrap_err().status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        sessions::write_file_in_dir(&base, "subdir", b"x").unwrap_err().status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        sessions::delete_file_in_dir(&base, "subdir").unwrap_err().status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Unix symlink pointing outside download_dir is ignored in listing and blocked on access.
+    #[cfg(unix)]
+    {
+        let outside = std::env::temp_dir().join(format!("fluxwright-outside-{}", Uuid::new_v4()));
+        std::fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("escape.txt")).unwrap();
+        assert_eq!(sessions::list_files_in_dir(&base).unwrap().len(), 2);
+        assert_eq!(
+            sessions::read_file_in_dir(&base, "escape.txt").unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            sessions::write_file_in_dir(&base, "escape.txt", b"no").unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            sessions::delete_file_in_dir(&base, "escape.txt").unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    // Delete file and verify 404 afterwards.
+    sessions::delete_file_in_dir(&base, "hello.txt").unwrap();
+    assert_eq!(
+        sessions::read_file_in_dir(&base, "hello.txt").unwrap_err().status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        sessions::delete_file_in_dir(&base, "hello.txt").unwrap_err().status,
+        StatusCode::NOT_FOUND
+    );
+
+    // Enforce MAX_SESSION_FILES cap (32 files; data.bin already occupies 1 slot).
+    for idx in 0..(sessions::MAX_SESSION_FILES - 1) {
+        let name = format!("f-{idx:02}.txt");
+        let res = sessions::write_file_in_dir(&base, &name, b"ok");
+        assert!(res.is_ok(), "file {name} failed: {res:?}");
+    }
+    assert_eq!(
+        sessions::write_file_in_dir(&base, "overflow.txt", b"x")
+            .unwrap_err()
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    let _ = std::fs::remove_dir_all(&base);
+
+    // 3. HTTP routes enforce auth, filename validation, and coordinator 404.
+    let srv = server(4).await;
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-missing/files", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &srv,
+            "POST",
+            "/v1/sessions/sess-missing/files",
+            r#"{"name":"a.txt","content":"hi"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&srv, "GET", "/v1/sessions/sess-1/files/.hidden", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&srv, "DELETE", "/v1/sessions/sess-1/files/a..b", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    srv.shutdown(Duration::ZERO).await.unwrap();
+
+    let coord = HttpServer::coordinator(ServerConfig::new(TOKEN.into()).unwrap()).unwrap();
+    assert_eq!(
+        call(&coord, "GET", "/v1/sessions/sess-1/files", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&coord, "GET", "/v1/sessions/sess-1/files/a.txt", Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn session_extensions_validation_and_dir_enforcement() {
+    let ext_root = std::env::temp_dir().join(format!("fluxwright-ext-dir-{}", Uuid::new_v4()));
+    let valid_ext = ext_root.join("my-ext");
+    let no_manifest = ext_root.join("no-manifest");
+    std::fs::create_dir_all(&valid_ext).unwrap();
+    std::fs::create_dir_all(&no_manifest).unwrap();
+    std::fs::write(valid_ext.join("manifest.json"), r#"{"manifest_version":3,"name":"Test","version":"1.0"}"#).unwrap();
+    std::fs::write(ext_root.join("not-a-dir"), b"plain file").unwrap();
+
+    // Unconfigured extensions_dir fails with 400.
+    let err_unset = sessions::resolve_session_extensions(None, &["my-ext".into()]).unwrap_err();
+    assert_eq!(err_unset.status, StatusCode::BAD_REQUEST);
+    assert_eq!(err_unset.code, "extensions_not_configured");
+
+    // Valid extension resolves cleanly inside extensions_dir.
+    let resolved =
+        sessions::resolve_session_extensions(Some(&ext_root), &["my-ext".into()]).unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert!(resolved[0].ends_with("my-ext"));
+
+    // Missing extension, missing manifest.json, non-directory, and traversal names are rejected.
+    assert_eq!(
+        sessions::resolve_session_extensions(Some(&ext_root), &["missing".into()])
+            .unwrap_err()
+            .code,
+        "extension_not_found"
+    );
+    assert_eq!(
+        sessions::resolve_session_extensions(Some(&ext_root), &["no-manifest".into()])
+            .unwrap_err()
+            .code,
+        "invalid_extension"
+    );
+    assert_eq!(
+        sessions::resolve_session_extensions(Some(&ext_root), &["not-a-dir".into()])
+            .unwrap_err()
+            .code,
+        "invalid_extension"
+    );
+    for bad in ["../escape", ".hidden", "sub/ext"] {
+        assert_eq!(
+            sessions::resolve_session_extensions(Some(&ext_root), &[bad.into()])
+                .unwrap_err()
+                .code,
+            "invalid_extension",
+            "{bad}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let outside_ext =
+            std::env::temp_dir().join(format!("fluxwright-ext-outside-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&outside_ext).unwrap();
+        std::fs::write(outside_ext.join("manifest.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&outside_ext, ext_root.join("sym-escape")).unwrap();
+        assert_eq!(
+            sessions::resolve_session_extensions(Some(&ext_root), &["sym-escape".into()])
+                .unwrap_err()
+                .code,
+            "invalid_extension"
+        );
+        let _ = std::fs::remove_dir_all(&outside_ext);
+    }
+
+    // HTTP POST /v1/sessions enforces extensions_dir configuration and request constraints.
+    let srv_no_ext = server(4).await;
+    let r_unconf = call(
+        &srv_no_ext,
+        "POST",
+        "/v1/sessions",
+        r#"{"extensions":["my-ext"]}"#,
+    )
+    .await;
+    assert_eq!(r_unconf.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(r_unconf).await["error"]["code"], "extensions_not_configured");
+    srv_no_ext.shutdown(Duration::ZERO).await.unwrap();
+
+    let mut cfg = ServerConfig::new(TOKEN.into()).unwrap();
+    cfg.extensions_dir = Some(ext_root.clone());
+    cfg.allow_session_cdp_endpoint = true;
+    let srv_ext = HttpServer::new(idle_engine().await, cfg).unwrap();
+
+    // Combining extensions with cdp_endpoint is rejected.
+    let r_combo = call(
+        &srv_ext,
+        "POST",
+        "/v1/sessions",
+        r#"{"extensions":["my-ext"],"cdp_endpoint":"ws://127.0.0.1:9222"}"#,
+    )
+    .await;
+    assert_eq!(r_combo.status(), StatusCode::BAD_REQUEST);
+
+    // More than 8 extensions or duplicates rejected.
+    let r_many = call(
+        &srv_ext,
+        "POST",
+        "/v1/sessions",
+        r#"{"extensions":["e1","e2","e3","e4","e5","e6","e7","e8","e9"]}"#,
+    )
+    .await;
+    assert_eq!(r_many.status(), StatusCode::BAD_REQUEST);
+
+    let r_dup = call(
+        &srv_ext,
+        "POST",
+        "/v1/sessions",
+        r#"{"extensions":["my-ext","my-ext"]}"#,
+    )
+    .await;
+    assert_eq!(r_dup.status(), StatusCode::BAD_REQUEST);
+
+    let r_missing = call(
+        &srv_ext,
+        "POST",
+        "/v1/sessions",
+        r#"{"extensions":["does-not-exist"]}"#,
+    )
+    .await;
+    assert_eq!(r_missing.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(r_missing).await["error"]["code"], "extension_not_found");
+
+    srv_ext.shutdown(Duration::ZERO).await.unwrap();
+    let _ = std::fs::remove_dir_all(&ext_root);
+}
+
+#[tokio::test]
+async fn coordinator_sticky_session_and_job_affinity_with_failover() {
+    const ACME_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BETA_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let cfg = ServerConfig::new(TOKEN.into())
+        .unwrap()
+        .with_tenants(vec![
+            TenantConfig {
+                id: "acme".into(),
+                token: ACME_TOKEN.into(),
+                max_concurrent_jobs: None,
+                rate_limit_per_min: None,
+            },
+            TenantConfig {
+                id: "beta".into(),
+                token: BETA_TOKEN.into(),
+                max_concurrent_jobs: None,
+                rate_limit_per_min: None,
+            },
+        ])
+        .unwrap();
+    let coord = HttpServer::coordinator(cfg).unwrap();
+
+    // 1. No online workers -> 503 no_workers_available.
+    let no_workers = call_with_token(&coord, ACME_TOKEN, "POST", "/v1/sessions", "{}").await;
+    assert_eq!(no_workers.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body(no_workers).await["error"]["code"], "no_workers_available");
+
+    // 2. Register w1 and w2 with advertise_url.
+    let reg1 = call(
+        &coord,
+        "POST",
+        "/v1/workers/w1/lease",
+        r#"{"max_jobs":0,"capacity":4,"advertise_url":"http://10.0.0.1:7331"}"#,
+    )
+    .await;
+    assert_eq!(reg1.status(), StatusCode::OK);
+    let reg2 = call(
+        &coord,
+        "POST",
+        "/v1/workers/w2/lease",
+        r#"{"max_jobs":0,"capacity":4,"advertise_url":"http://10.0.0.2:7331"}"#,
+    )
+    .await;
+    assert_eq!(reg2.status(), StatusCode::OK);
+
+    let workers_json = body(call(&coord, "GET", "/v1/workers", Body::empty()).await).await;
+    assert_eq!(workers_json["workers"][0]["worker"], "w1");
+    assert_eq!(workers_json["workers"][0]["advertise_url"], "http://10.0.0.1:7331");
+    assert_eq!(workers_json["workers"][1]["worker"], "w2");
+    assert_eq!(workers_json["workers"][1]["advertise_url"], "http://10.0.0.2:7331");
+
+    // 3. Create sticky session for acme with affinity_key (least loaded tie-break -> w1).
+    let s1_resp = call_with_token(
+        &coord,
+        ACME_TOKEN,
+        "POST",
+        "/v1/sessions",
+        r#"{"ttl_secs":120,"affinity_key":"acct-42"}"#,
+    )
+    .await;
+    assert_eq!(s1_resp.status(), StatusCode::CREATED);
+    let s1 = body(s1_resp).await;
+    let s1_id = s1["id"].as_str().unwrap().to_string();
+    assert_eq!(s1["status"], "assigned");
+    assert_eq!(s1["affinity"], "sticky");
+    assert_eq!(s1["worker"], "w1");
+    assert_eq!(s1["worker_url"], "http://10.0.0.1:7331");
+    assert_eq!(s1["cdp_path"], format!("/v1/sessions/{s1_id}/cdp"));
+
+    // 4. Second sticky session for beta balances onto least-loaded w2.
+    let s2_resp = call_with_token(&coord, BETA_TOKEN, "POST", "/v1/sessions", "{}").await;
+    assert_eq!(s2_resp.status(), StatusCode::CREATED);
+    let s2 = body(s2_resp).await;
+    assert_eq!(s2["worker"], "w2");
+    assert_eq!(s2["worker_url"], "http://10.0.0.2:7331");
+
+    // 5. Tenant scoping on sticky sessions: beta sees only its own; admin sees both.
+    let beta_list =
+        body(call_with_token(&coord, BETA_TOKEN, "GET", "/v1/sessions", Body::empty()).await).await;
+    assert_eq!(beta_list["sessions"].as_array().unwrap().len(), 1);
+    let admin_list = body(call(&coord, "GET", "/v1/sessions", Body::empty()).await).await;
+    assert_eq!(admin_list["sessions"].as_array().unwrap().len(), 2);
+
+    assert_eq!(
+        call_with_token(&coord, BETA_TOKEN, "GET", &format!("/v1/sessions/{s1_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call_with_token(
+            &coord,
+            BETA_TOKEN,
+            "POST",
+            &format!("/v1/sessions/{s1_id}/extend"),
+            r#"{"ttl_secs":600}"#,
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call_with_token(
+            &coord,
+            BETA_TOKEN,
+            "DELETE",
+            &format!("/v1/sessions/{s1_id}"),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Owner acme can extend and delete its sticky session.
+    let ext = call_with_token(
+        &coord,
+        ACME_TOKEN,
+        "POST",
+        &format!("/v1/sessions/{s1_id}/extend"),
+        r#"{"ttl_secs":600}"#,
+    )
+    .await;
+    assert_eq!(ext.status(), StatusCode::OK);
+    let ext_json = body(ext).await;
+    assert!(ext_json["expires_at"].as_u64().unwrap() > s1["expires_at"].as_u64().unwrap());
+
+    assert_eq!(
+        call_with_token(
+            &coord,
+            ACME_TOKEN,
+            "DELETE",
+            &format!("/v1/sessions/{s1_id}"),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_with_token(&coord, ACME_TOKEN, "GET", &format!("/v1/sessions/{s1_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // 6. Sticky job affinity + automatic failover when pinned worker drains.
+    let bad_aff = call(
+        &coord,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}],"affinity_key":"has space"}"#,
+    )
+    .await;
+    assert_eq!(bad_aff.status(), StatusCode::BAD_REQUEST);
+
+    let j1_resp = call(
+        &coord,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}],"affinity_key":"acct-42"}"#,
+    )
+    .await;
+    assert_eq!(j1_resp.status(), StatusCode::ACCEPTED);
+    let j1: Job = serde_json::from_value(body(j1_resp).await).unwrap();
+
+    // w2 polls first, but acct-42 is pinned to healthy online w1 -> w2 receives 0 jobs.
+    let w2_lease = body(call(&coord, "POST", "/v1/workers/w2/lease", r#"{"max_jobs":1}"#).await).await;
+    assert!(w2_lease["jobs"].as_array().unwrap().is_empty());
+
+    // w1 polls -> receives j1.
+    let w1_lease = body(call(&coord, "POST", "/v1/workers/w1/lease", r#"{"max_jobs":1}"#).await).await;
+    assert_eq!(w1_lease["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(w1_lease["jobs"][0]["id"], j1.id.to_string());
+
+    // Submit j2 with same affinity_key, then drain w1 -> w2 automatically takes over (failover).
+    let j2_resp = call(
+        &coord,
+        "POST",
+        "/v1/jobs",
+        r#"{"steps":[{"action":"title"}],"affinity_key":"acct-42"}"#,
+    )
+    .await;
+    assert_eq!(j2_resp.status(), StatusCode::ACCEPTED);
+    let j2: Job = serde_json::from_value(body(j2_resp).await).unwrap();
+
+    assert_eq!(
+        call(&coord, "POST", "/v1/workers/w1/drain", Body::empty())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let w2_failover =
+        body(call(&coord, "POST", "/v1/workers/w2/lease", r#"{"max_jobs":1}"#).await).await;
+    assert_eq!(w2_failover["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(w2_failover["jobs"][0]["id"], j2.id.to_string());
+
+    coord.shutdown(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_and_shutdown_audit() {
+    // Local slow HTTP server that holds connections open so crawls stay active until cancelled.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let slow_task = tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _hold = sock;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    let srv = server(8).await;
+
+    // 1. Cancel queued job (idempotent on repeat DELETE).
+    let job1 = submit_job(&srv).await;
+    let cancel1 = call(&srv, "DELETE", &format!("/v1/jobs/{}", job1.id), Body::empty()).await;
+    assert_eq!(cancel1.status(), StatusCode::OK);
+    assert_eq!(body(cancel1).await["status"], "cancelled");
+    let cancel1_again = call(&srv, "DELETE", &format!("/v1/jobs/{}", job1.id), Body::empty()).await;
+    assert_eq!(cancel1_again.status(), StatusCode::OK);
+    assert_eq!(body(cancel1_again).await["status"], "cancelled");
+
+    // 2. Abort active crawl via DELETE /v1/crawl/{id}.
+    let crawl1_resp = call(
+        &srv,
+        "POST",
+        "/v1/crawl",
+        json!({
+            "url": format!("http://127.0.0.1:{port}/slow"),
+            "mode": "http",
+            "timeout_ms": 30_000
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(crawl1_resp.status(), StatusCode::ACCEPTED);
+    let crawl1_id = body(crawl1_resp).await["id"].as_str().unwrap().to_string();
+
+    let cancel_crawl = call(&srv, "DELETE", &format!("/v1/crawl/{crawl1_id}"), Body::empty()).await;
+    assert_eq!(cancel_crawl.status(), StatusCode::OK);
+    assert_eq!(body(cancel_crawl).await["status"], "cancelled");
+    let after_cancel = body(
+        call(&srv, "GET", &format!("/v1/crawl/{crawl1_id}"), Body::empty()).await,
+    )
+    .await;
+    assert_eq!(after_cancel["status"], "cancelled");
+
+    // 3. Shutdown cancels active queued jobs & crawls and rejects new submissions with 503.
+    let job2 = submit_job(&srv).await;
+    let crawl2_resp = call(
+        &srv,
+        "POST",
+        "/v1/crawl",
+        json!({
+            "url": format!("http://127.0.0.1:{port}/slow2"),
+            "mode": "http",
+            "timeout_ms": 30_000
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(crawl2_resp.status(), StatusCode::ACCEPTED);
+    let crawl2_id = body(crawl2_resp).await["id"].as_str().unwrap().to_string();
+
+    srv.shutdown(Duration::from_millis(200)).await.unwrap();
+
+    let j2_after = body(call(&srv, "GET", &format!("/v1/jobs/{}", job2.id), Body::empty()).await).await;
+    assert_eq!(j2_after["status"], "cancelled");
+    assert_eq!(j2_after["error"], "server shutting down");
+
+    let c2_after = body(call(&srv, "GET", &format!("/v1/crawl/{crawl2_id}"), Body::empty()).await).await;
+    assert_eq!(c2_after["status"], "cancelled");
+    assert_eq!(c2_after["error"], "server shutting down");
+
+    assert_eq!(
+        call(&srv, "POST", "/v1/jobs", r#"{"steps":[{"action":"title"}]}"#)
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(
+            &srv,
+            "POST",
+            "/v1/crawl",
+            json!({ "url": format!("http://127.0.0.1:{port}/x"), "mode": "http" }).to_string(),
+        )
+        .await
+        .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(&srv, "POST", "/v1/sessions", "{}").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // 4. Dropping HttpServer without calling shutdown() aborts background job & crawl tasks cleanly.
+    let drop_srv = server(4).await;
+    let _ = submit_job(&drop_srv).await;
+    let c3_resp = call(
+        &drop_srv,
+        "POST",
+        "/v1/crawl",
+        json!({
+            "url": format!("http://127.0.0.1:{port}/slow3"),
+            "mode": "http",
+            "timeout_ms": 30_000
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(c3_resp.status(), StatusCode::ACCEPTED);
+    let weak = Arc::downgrade(&drop_srv.inner);
+    drop(drop_srv);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Inner should drop promptly once HttpServer is dropped");
+
+    slow_task.abort();
 }

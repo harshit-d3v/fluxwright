@@ -245,6 +245,7 @@ pub(crate) async fn scrape_handler(
         proxy_session: req.proxy_session,
         webhook_url: None,
         webhook_headers: HashMap::new(),
+        affinity_key: None,
     };
     job_req
         .validate_with(inner.allow_any_url())

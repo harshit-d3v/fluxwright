@@ -100,6 +100,9 @@ Additional server operations flags on `fluxwright serve` (also available on `flu
 - `--otlp-service-name <name>` / `OTEL_SERVICE_NAME`: `service.name` resource attribute on exported OTLP spans (default `fluxwright-server`).
 - `--embed-frame-ancestors <policy>`: `Content-Security-Policy` `frame-ancestors` directive served on `GET /embed/live/{token}` (`fluxwright serve` only; default `*`).
 - `--allow-session-cdp-endpoint`: opt-in flag enabling per-session `"cdp_endpoint"` (BYOB external browser) on `POST /v1/sessions` (`fluxwright serve` only; disabled by default).
+- `--extensions-dir <dir>`: directory containing unpacked Chrome extension subdirectories (each with `manifest.json`) loadable per session via `POST /v1/sessions` (`"extensions": ["my-ext"]`, `fluxwright serve` only).
+- `--tenants-file <path>` / `FLUXWRIGHT_TENANTS_FILE`: JSON file configuring multi-tenant bearer tokens, per-tenant `max_concurrent_jobs`, and `rate_limit_per_min` (supported on both `fluxwright serve` and `fluxwright coordinate`).
+- `--advertise-url <url>`: routable worker base URL advertised to the coordinator when `--join` is set so sticky sessions return `worker_url`.
 `--max-contexts` defaults to 8 per browser. Ctrl+C (and SIGTERM on Unix) stops admission,
 cancels outstanding jobs, and shuts down Chrome, allowing up to 10 seconds for lease cleanup.
 The existing local `start` / `stats` / `browsers` commands are unchanged: the HTTP server is a
@@ -311,12 +314,16 @@ or live contexts are shared between jobs. All steps in one job run on the same p
 | GET | `/v1/proxies` | Bearer token | Inspect sanitized proxy pool health/cooldown stats (requires `--proxy`) |
 | GET | `/json/version` | Bearer (or `?token=` with `--allow-query-token`) | Standard DevTools discovery JSON pointing at `ws(s)://<host>/cdp` (standalone only) |
 | GET (WS) | `/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Pooled, context-isolated Chrome DevTools Protocol WebSocket gateway (standalone only) |
-| POST | `/v1/sessions` | Bearer token | Mint a persistent managed cloud session with `cdp_ws_url`, `live_view_url`, `profile`, `proxy_session`, `viewport`, and TTL (standalone only) |
-| GET | `/v1/sessions` | Bearer token | List active managed browser sessions (standalone only) |
-| GET | `/v1/sessions/{id}` | Bearer token | Read managed session metadata and connection state (standalone only) |
-| POST | `/v1/sessions/{id}/extend` | Bearer token | Reset a managed session's expiration TTL (`10..=3600`s) (standalone only) |
-| DELETE | `/v1/sessions/{id}` | Bearer token | Close a managed session, persist profile cookies if enabled, and dispose its context (standalone only) |
+| POST | `/v1/sessions` | Bearer token | Mint a persistent managed cloud session (standalone) or assign a sticky worker session (coordinator) |
+| GET | `/v1/sessions` | Bearer token | List active managed browser sessions (filtered to caller tenant unless admin) |
+| GET | `/v1/sessions/{id}` | Bearer token | Read managed session metadata and connection state |
+| POST | `/v1/sessions/{id}/extend` | Bearer token | Reset a managed session's expiration TTL (`10..=3600`s) |
+| DELETE | `/v1/sessions/{id}` | Bearer token | Close a managed session, persist profile cookies if enabled, and clean up its ephemeral workspace |
 | GET (WS) | `/v1/sessions/{id}/cdp` | Bearer (or `?token=` with `--allow-query-token`) | Connect or reconnect (`keep_alive: true`) over CDP to an existing managed session (`409` if already connected) (standalone only) |
+| GET | `/v1/sessions/{id}/files` | Bearer token | List ephemeral files stored in a managed session workspace (standalone only) |
+| POST | `/v1/sessions/{id}/files` | Bearer token | Upload a file (`content_base64` or `content`, max `4 MiB`/file, `16 MiB`/session, `32` files) into a managed session (standalone only) |
+| GET | `/v1/sessions/{id}/files/{name}` | Bearer token | Download a file from a managed session workspace (standalone only) |
+| DELETE | `/v1/sessions/{id}/files/{name}` | Bearer token | Delete a file from a managed session workspace (standalone only) |
 | GET | `/v1/sessions/{id}/replay` | Bearer token | Searchable session replay timeline (`?q=`, `?kind=`, `?include_frames=`) for active or recently closed sessions (standalone only) |
 | GET | `/v1/sessions/{id}/network` | Bearer token | Export recorded session network/API requests (`?filter=`, `?api_only=`, `?format=json\|har`, `?include_auth=`) (standalone only) |
 | POST | `/v1/scrape` | Bearer token | Synchronously navigate and extract `markdown`, `html`, `text`, `snapshot`, `screenshot`, and/or `pdf` in one HTTP call (standalone only) |
@@ -352,6 +359,31 @@ Start `fluxwright serve --allow-session-cdp-endpoint` to let `POST /v1/sessions`
 - **Fail-closed default:** When `--allow-session-cdp-endpoint` is off, supplying `"cdp_endpoint"` returns `403` (`byob_disabled`).
 - **SSRF boundary:** Permits loopback (`localhost`, `127.0.0.1`, `::1`) while blocking cloud metadata (`169.254.0.0/16`, `metadata.google.internal`), link-local (`fe80::/10`), and private RFC 1918 / ULA IP ranges unless `FLUXWRIGHT_SERVER_ANY_URL=1` is set.
 - **Isolation:** Closing or expiring a BYOB session disposes only its created browser context and shuts down the temporary CDP client without terminating the external browser process.
+
+### Session files & unpacked Chrome extensions
+
+- **Session files (`/v1/sessions/{id}/files`):** Upload (`POST` with `{ "name", "content_base64" | "content" }`), list (`GET`), download (`GET /v1/sessions/{id}/files/{name}`), and delete (`DELETE /v1/sessions/{id}/files/{name}`) files inside a session's isolated ephemeral workspace (capped at `4 MiB` per file, `16 MiB` total, and `32` files per session). Filenames are restricted to `[A-Za-z0-9._-]` (no leading `.`, `..`, or path separators), symlinks are refused, and the workspace directory is always deleted when the session closes.
+- **Unpacked Chrome extensions (`--extensions-dir`):** Start `fluxwright serve --extensions-dir <dir>` and pass `"extensions": ["my-ext"]` (up to `8` names, cannot combine with `cdp_endpoint`) on `POST /v1/sessions`. Each named directory is canonicalized inside `--extensions-dir` and verified to contain `manifest.json`, launching an isolated per-session browser with `--load-extension` / `--disable-extensions-except` that shuts down cleanly on session close.
+
+### Multi-tenant authentication, quotas & rate limits (`--tenants-file`)
+
+Pass `--tenants-file <path>` (or set `FLUXWRIGHT_TENANTS_FILE`) with a JSON array of tenant entries (max `256` tenants, `1 MiB` file cap):
+
+```json
+[
+  {
+    "id": "acme",
+    "token": "<32-256 char random bearer token>",
+    "max_concurrent_jobs": 4,
+    "rate_limit_per_min": 120
+  }
+]
+```
+
+- Tenant tokens authenticate alongside the primary admin `FLUXWRIGHT_SERVER_TOKEN` using constant-time comparison.
+- Non-admin tenants can only access their own jobs (`/v1/jobs/{id}`), crawls (`/v1/crawl/{id}`), and sessions (`/v1/sessions*`); other tenants' resources return `404`.
+- Exceeding `rate_limit_per_min` returns `429` (`rate_limit_exceeded`) with `Retry-After`; exceeding `max_concurrent_jobs` returns `429` (`tenant_quota_exceeded`).
+- When tenants are configured, `/metrics` emits `fluxwright_tenant_requests_total`, `fluxwright_tenant_rate_limited_total`, and `fluxwright_tenant_active_jobs` labeled by `tenant`.
 
 ### Session replay timeline & Network/API inspector
 
@@ -626,6 +658,8 @@ FLUXWRIGHT_WORKER_TOKEN="$WORKER_TOKEN" \
 ```
 
 Coordinators also accept `--max-per-host <n>` and `--min-host-delay-ms <ms>` to enforce cluster-wide per-host concurrency and lease spacing across all workers (based on the job's first `goto` host) without head-of-line blocking other hosts, and accept either `--store <file>` (SQLite with `--result-ttl-secs`, default `3600`) or `--journal <file>`. Workers pull up to their local capacity (`POST /v1/workers/{worker}/lease`), extend 30-second leases every 10 seconds (`POST /v1/workers/{worker}/heartbeat`), abort client-cancelled jobs, and post results or failure evidence (`POST /v1/jobs/{id}/result`). Those worker routes are exposed only by `fluxwright coordinate`. Expired leases requeue within `retries` or fail with `"worker lost"`. On Ctrl+C / SIGTERM, a worker drains already-leased jobs up to 10 seconds, then calls `POST /v1/workers/{worker}/release` so any still-unfinished jobs return to `queued` without losing an attempt.
+
+- **Sticky sessions & job affinity:** Workers started with `--advertise-url <url>` report their routable base URL on lease polls (`GET /v1/workers`). On `fluxwright coordinate`, `POST /v1/sessions` (optional `{ "ttl_secs", "affinity_key" }`) assigns a sticky session to the least-loaded online non-draining worker (returning `worker`, `worker_url`, `cdp_path`, `affinity: "sticky"`, and `expires_at`, or `503` `no_workers_available`), with `GET`/`POST .../extend`/`DELETE` enforcing tenant ownership. Jobs submitted with `"affinity_key"` stick to their pinned worker while it remains online and automatically fail over to another worker if the pinned worker drains or goes stale.
 
 > **Security boundary:** `fluxwright serve --join` supports native `https://` TLS (`rustls` + WebPKI roots, e.g. via a TLS reverse proxy in front of `fluxwright coordinate`) as well as `http://` (non-loopback `http://` logs a warning). Set a dedicated `FLUXWRIGHT_WORKER_TOKEN` on both coordinator and workers so worker credentials cannot call client/operator routes (`POST /v1/jobs`, `/v1/stats`, `/metrics`, `/v1/workers/*` management) and client tokens cannot pull or post worker results; when `FLUXWRIGHT_WORKER_TOKEN` is unset, both fall back to `FLUXWRIGHT_SERVER_TOKEN`. Keep plaintext `http://` links strictly inside a private subnet or VPN.
 

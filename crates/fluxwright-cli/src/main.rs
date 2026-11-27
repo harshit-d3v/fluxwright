@@ -108,6 +108,15 @@ enum Cmd {
         /// Optional external lightweight CDP endpoint URL for fast Tier-2 fallback (e.g. ws://127.0.0.1:9222).
         #[arg(long, value_name = "URL")]
         fast_cdp_endpoint: Option<String>,
+        /// Directory containing unpacked Chrome extension subdirectories (each with manifest.json).
+        #[arg(long, value_name = "DIR")]
+        extensions_dir: Option<PathBuf>,
+        /// JSON file defining multi-tenant API tokens, concurrency quotas, and rate limits (falls back to FLUXWRIGHT_TENANTS_FILE).
+        #[arg(long, value_name = "PATH")]
+        tenants_file: Option<PathBuf>,
+        /// Routable base URL advertised to the coordinator when `--join` is set (for sticky session routing).
+        #[arg(long, value_name = "URL")]
+        advertise_url: Option<String>,
     },
     /// Coordinate jobs over HTTP for remote `fluxwright serve --join` workers without running browsers locally.
     Coordinate {
@@ -140,6 +149,9 @@ enum Cmd {
         /// OpenTelemetry service.name attribute (falls back to OTEL_SERVICE_NAME, default "fluxwright-server").
         #[arg(long)]
         otlp_service_name: Option<String>,
+        /// JSON file defining multi-tenant API tokens, concurrency quotas, and rate limits (falls back to FLUXWRIGHT_TENANTS_FILE).
+        #[arg(long, value_name = "PATH")]
+        tenants_file: Option<PathBuf>,
     },
     Start {
         #[arg(long, default_value_t = 4)]
@@ -242,6 +254,9 @@ async fn main() -> Result<()> {
             low_memory,
             recycle_rss_mb,
             fast_cdp_endpoint,
+            extensions_dir,
+            tenants_file,
+            advertise_url,
         } => {
             let address = listen.unwrap_or_else(|| {
                 if join.is_some() {
@@ -279,6 +294,9 @@ async fn main() -> Result<()> {
                 low_memory,
                 recycle_rss_mb,
                 fast_cdp_endpoint,
+                extensions_dir,
+                tenants_file,
+                advertise_url,
             )
             .await
         }
@@ -293,6 +311,7 @@ async fn main() -> Result<()> {
             webhook_secret,
             otlp_endpoint,
             otlp_service_name,
+            tenants_file,
         } => {
             coordinator_daemon(
                 listen,
@@ -305,6 +324,7 @@ async fn main() -> Result<()> {
                 webhook_secret,
                 otlp_endpoint,
                 otlp_service_name,
+                tenants_file,
             )
             .await
         }
@@ -411,12 +431,17 @@ fn resolve_opt_with_env(cli: Option<String>, env_name: &str) -> Option<String> {
     cli.filter(|v| !v.is_empty()).or_else(|| nonempty_env(env_name))
 }
 
+fn resolve_path_with_env(cli: Option<PathBuf>, env_name: &str) -> Option<PathBuf> {
+    cli.or_else(|| nonempty_env(env_name).map(PathBuf::from))
+}
+
 fn apply_server_ops_config(
     mut config: ServerConfig,
     webhook_secret: Option<String>,
     otlp_endpoint: Option<String>,
     otlp_service_name: Option<String>,
     embed_frame_ancestors: Option<String>,
+    tenants_file: Option<PathBuf>,
 ) -> Result<ServerConfig> {
     if let Some(secret) = resolve_opt_with_env(webhook_secret, "FLUXWRIGHT_WEBHOOK_SECRET") {
         config = config.with_webhook_secret(secret)?;
@@ -429,6 +454,9 @@ fn apply_server_ops_config(
     }
     if let Some(policy) = embed_frame_ancestors {
         config = config.with_embed_frame_ancestors(policy)?;
+    }
+    if let Some(path) = resolve_path_with_env(tenants_file, "FLUXWRIGHT_TENANTS_FILE") {
+        config = config.with_tenants_file(&path)?;
     }
     Ok(config)
 }
@@ -445,6 +473,7 @@ async fn coordinator_daemon(
     webhook_secret: Option<String>,
     otlp_endpoint: Option<String>,
     otlp_service_name: Option<String>,
+    tenants_file: Option<PathBuf>,
 ) -> Result<()> {
     let (_token, mut config) =
         server_config_for(false, max_jobs, journal, store, result_ttl_secs)?;
@@ -462,6 +491,7 @@ async fn coordinator_daemon(
         otlp_endpoint,
         otlp_service_name,
         None,
+        tenants_file,
     )?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let server = HttpServer::coordinator(config)?;
@@ -509,6 +539,9 @@ async fn http_daemon(
     low_memory: bool,
     recycle_rss_mb: Option<NonZeroU64>,
     fast_cdp_endpoint: Option<String>,
+    extensions_dir: Option<PathBuf>,
+    tenants_file: Option<PathBuf>,
+    advertise_url: Option<String>,
 ) -> Result<()> {
     let fast_cdp_endpoint = fast_cdp_endpoint
         .as_deref()
@@ -519,12 +552,14 @@ async fn http_daemon(
         server_config_for(is_worker, max_jobs, journal, store, result_ttl_secs)?;
     config.allow_query_token = allow_query_token;
     config.allow_session_cdp_endpoint = allow_session_cdp_endpoint;
+    config.extensions_dir = extensions_dir;
     config = apply_server_ops_config(
         config,
         webhook_secret,
         otlp_endpoint,
         otlp_service_name,
         Some(embed_frame_ancestors),
+        tenants_file,
     )?;
     if let Some(endpoint) = fast_cdp_endpoint {
         config = config.with_fast_cdp_endpoint(endpoint)?;
@@ -583,12 +618,13 @@ async fn http_daemon(
                 .max_browsers
                 .saturating_mul(engine.config().max_contexts_per_browser)
                 .max(1);
-            let handle = fluxwright_server::spawn_worker(
+            let handle = fluxwright_server::spawn_worker_with_advertise_url(
                 engine.clone(),
                 url.clone(),
                 join_token,
                 worker_id,
                 slots,
+                advertise_url,
             )?;
             eprintln!("fluxwright worker joined coordinator {url} ({slots} slots, experimental)");
             if !handle.coordinator_uses_tls() && !handle.coordinator_is_loopback() {
@@ -888,6 +924,9 @@ mod tests {
                 low_memory,
                 recycle_rss_mb,
                 fast_cdp_endpoint,
+                extensions_dir,
+                tenants_file,
+                advertise_url,
             } => {
                 assert!(
                     max_per_host.is_none()
@@ -905,6 +944,9 @@ mod tests {
                         && otlp_service_name.is_none()
                         && recycle_rss_mb.is_none()
                         && fast_cdp_endpoint.is_none()
+                        && extensions_dir.is_none()
+                        && tenants_file.is_none()
+                        && advertise_url.is_none()
                 );
                 assert!(!low_memory);
                 assert_eq!(embed_frame_ancestors, "*");
@@ -1134,6 +1176,53 @@ mod tests {
             Cli::try_parse_from(["fluxwright", "serve", "--recycle-rss-mb", "0"]).is_err(),
             "--recycle-rss-mb 0 must be rejected by NonZeroU64"
         );
+    }
+
+    #[test]
+    fn cli_parses_extensions_tenants_and_advertise_url_flags() {
+        let parsed = Cli::try_parse_from([
+            "fluxwright",
+            "serve",
+            "--extensions-dir",
+            "/tmp/fw-ext",
+            "--tenants-file",
+            "/tmp/tenants.json",
+            "--join",
+            "http://127.0.0.1:7331",
+            "--advertise-url",
+            "http://10.0.0.5:7331",
+        ])
+        .expect("enterprise serve flags should parse");
+        match parsed.cmd {
+            Cmd::Serve {
+                extensions_dir,
+                tenants_file,
+                advertise_url,
+                ..
+            } => {
+                assert_eq!(extensions_dir.as_deref(), Some(Path::new("/tmp/fw-ext")));
+                assert_eq!(tenants_file.as_deref(), Some(Path::new("/tmp/tenants.json")));
+                assert_eq!(advertise_url.as_deref(), Some("http://10.0.0.5:7331"));
+            }
+            _ => panic!("expected Cmd::Serve"),
+        }
+
+        let coord = Cli::try_parse_from([
+            "fluxwright",
+            "coordinate",
+            "--tenants-file",
+            "/tmp/coord-tenants.json",
+        ])
+        .expect("coordinate tenants-file flag should parse");
+        match coord.cmd {
+            Cmd::Coordinate { tenants_file, .. } => {
+                assert_eq!(
+                    tenants_file.as_deref(),
+                    Some(Path::new("/tmp/coord-tenants.json"))
+                );
+            }
+            _ => panic!("expected Cmd::Coordinate"),
+        }
     }
 
     #[test]

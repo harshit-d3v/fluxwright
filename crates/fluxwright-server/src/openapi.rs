@@ -103,6 +103,20 @@ pub(crate) fn build_openapi_spec() -> Value {
             "/v1/sessions/{id}/cdp": {
                 "get": { "summary": "WebSocket CDP endpoint pinned to a managed session", "responses": { "101": { "description": "WebSocket upgraded" } } }
             },
+            "/v1/sessions/{id}/files": {
+                "get": { "summary": "List ephemeral files stored in a managed session", "responses": { "200": { "description": "Session file list" } } },
+                "post": { "summary": "Upload a file into a managed session workspace", "responses": { "201": { "description": "File uploaded" } } }
+            },
+            "/v1/sessions/{id}/files/{name}": {
+                "get": { "summary": "Download a file from a managed session workspace", "responses": { "200": { "description": "File bytes" }, "404": { "description": "File not found" } } },
+                "delete": { "summary": "Delete a file from a managed session workspace", "responses": { "200": { "description": "File deleted" }, "404": { "description": "File not found" } } }
+            },
+            "/v1/workers": {
+                "get": { "summary": "List registered cluster workers and capacity summary (coordinator mode)", "responses": { "200": { "description": "Workers list and summary" } } }
+            },
+            "/v1/workers/{worker}/drain": {
+                "post": { "summary": "Mark a cluster worker as draining so it stops taking new leases (coordinator mode)", "responses": { "200": { "description": "Draining worker info" }, "404": { "description": "Worker not found" } } }
+            },
             "/v1/stats": {
                 "get": { "summary": "Server queue and browser pool telemetry", "responses": { "200": { "description": "Server stats" } } }
             },
@@ -140,5 +154,54 @@ mod tests {
         assert!(spec["paths"]["/v1/crawl/{id}"]["get"].is_object());
         assert!(spec["paths"]["/v1/scrape"]["post"].is_object());
         assert!(spec["paths"]["/openapi.json"]["get"].is_object());
+    }
+
+    #[test]
+    fn v1_openapi_contract_snapshot() {
+        let spec = build_openapi_spec();
+        let paths = spec["paths"].as_object().expect("paths object");
+        let mut actual: Vec<(String, Vec<String>)> = paths
+            .iter()
+            .filter(|(p, _)| p.starts_with("/v1/"))
+            .map(|(p, v)| {
+                let mut methods: Vec<String> = v
+                    .as_object()
+                    .expect("path item object")
+                    .keys()
+                    .cloned()
+                    .collect();
+                methods.sort();
+                (p.clone(), methods)
+            })
+            .collect();
+        actual.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let expected: Vec<(&str, &[&str])> = vec![
+            ("/v1/crawl", &["post"]),
+            ("/v1/crawl/{id}", &["delete", "get"]),
+            ("/v1/jobs", &["post"]),
+            ("/v1/jobs/{id}", &["delete", "get"]),
+            ("/v1/live", &["get"]),
+            ("/v1/map", &["post"]),
+            ("/v1/profiles", &["get"]),
+            ("/v1/proxies", &["get"]),
+            ("/v1/scrape", &["post"]),
+            ("/v1/sessions", &["get", "post"]),
+            ("/v1/sessions/{id}", &["delete", "get"]),
+            ("/v1/sessions/{id}/cdp", &["get"]),
+            ("/v1/sessions/{id}/extend", &["post"]),
+            ("/v1/sessions/{id}/files", &["get", "post"]),
+            ("/v1/sessions/{id}/files/{name}", &["delete", "get"]),
+            ("/v1/sessions/{id}/network", &["get"]),
+            ("/v1/sessions/{id}/replay", &["get"]),
+            ("/v1/stats", &["get"]),
+            ("/v1/workers", &["get"]),
+            ("/v1/workers/{worker}/drain", &["post"]),
+        ];
+        let expected_owned: Vec<(String, Vec<String>)> = expected
+            .into_iter()
+            .map(|(p, ms)| (p.to_string(), ms.iter().map(|m| (*m).to_string()).collect()))
+            .collect();
+        assert_eq!(actual, expected_owned);
     }
 }
