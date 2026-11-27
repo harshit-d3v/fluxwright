@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: fluxwright
+    runtime: image
+    image:
+      url: ghcr.io/harshit-d3v/fluxwright:latest
+    plan: standard
+    healthCheckPath: /healthz
+    dockerCommand: serve --listen 0.0.0.0:7331 --low-memory --recycle-rss-mb 512 --store /home/fluxwright/data/jobs.db --profiles-dir /home/fluxwright/data/profiles --adaptive-concurrency
+    disk:
+      name: fluxwright-data
+      mountPath: /home/fluxwright/data
+      sizeGB: 10
+    envVars:
+      - key: FLUXWRIGHT_SERVER_TOKEN
+        generateValue: true
+      - key: RUST_LOG
+        value: fluxwright=info
+      # Render's unprivileged runtime disallows Chrome user namespaces; restrict untrusted workloads accordingly.
+      - key: FLUXWRIGHT_NO_SANDBOX
+        value: "1"

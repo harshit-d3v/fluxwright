@@ -1,0 +1,55 @@
+# Deploy from this directory with:
+#   fly volumes create fluxwright_data --size 10
+#   fly secrets set FLUXWRIGHT_SERVER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+#   fly deploy
+
+app = "fluxwright-fleet"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/harshit-d3v/fluxwright:latest"
+
+[experimental]
+  cmd = [
+    "serve",
+    "--listen", "0.0.0.0:7331",
+    "--low-memory",
+    "--recycle-rss-mb", "512",
+    "--store", "/home/fluxwright/data/jobs.db",
+    "--profiles-dir", "/home/fluxwright/data/profiles",
+    "--adaptive-concurrency",
+  ]
+
+[env]
+  RUST_LOG = "fluxwright=info"
+  # Firecracker VMs on Fly disallow unprivileged Chromium user namespaces by default.
+  # Keep behind private networking or trusted target URLs when FLUXWRIGHT_NO_SANDBOX=1 is set.
+  FLUXWRIGHT_NO_SANDBOX = "1"
+
+[http_service]
+  internal_port = 7331
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[http_service.checks]]
+  interval = "15s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/healthz"
+
+[[mounts]]
+  source = "fluxwright_data"
+  destination = "/home/fluxwright/data"
+
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 2

@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluxwright
+  labels:
+    app: fluxwright
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluxwright
+  template:
+    metadata:
+      labels:
+        app: fluxwright
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7331"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: fluxwright
+          image: ghcr.io/harshit-d3v/fluxwright:latest
+          args:
+            - serve
+            - --listen
+            - 0.0.0.0:7331
+            - --low-memory
+            - --recycle-rss-mb
+            - "512"
+            - --store
+            - /home/fluxwright/data/jobs.db
+            - --profiles-dir
+            - /home/fluxwright/data/profiles
+            - --adaptive-concurrency
+          ports:
+            - name: http
+              containerPort: 7331
+          env:
+            - name: FLUXWRIGHT_SERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fluxwright-secrets
+                  key: server-token
+            # If your cluster seccomp/PSP blocks Chromium user namespaces, either apply a
+            # Chromium seccomp profile or add FLUXWRIGHT_NO_SANDBOX=1 explicitly for trusted sites.
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /home/fluxwright/data
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluxwright
+spec:
+  type: ClusterIP
+  selector:
+    app: fluxwright
+  ports:
+    - name: http
+      port: 7331
+      targetPort: http
