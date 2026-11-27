@@ -195,7 +195,7 @@ jobs:
         run: |
           uv venv .venv
           bin=.venv/bin; [ -d .venv/Scripts ] && bin=.venv/Scripts
-          uv pip install --python "$bin/python" maturin pytest
+          uv pip install --python .venv maturin pytest
           VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop
           "$bin/python" -m pytest -q tests
 
