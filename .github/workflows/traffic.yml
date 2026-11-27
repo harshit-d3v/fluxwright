@@ -1,0 +1,52 @@
+name: traffic snapshot
+
+# GitHub keeps repo traffic for 14 days only. This saves a daily copy to the
+# traffic-data branch. Needs a TRAFFIC_TOKEN secret: a fine-grained token for
+# this repo with read-only "Administration" access (GITHUB_TOKEN can't read traffic).
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: traffic-snapshot
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: traffic-data
+
+      - name: Save today's traffic
+        env:
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::TRAFFIC_TOKEN secret is not set, see the comment at the top of traffic.yml"
+            exit 1
+          fi
+          dir="traffic/$(date -u +%F)"
+          mkdir -p "$dir"
+          for p in views clones popular/referrers popular/paths; do
+            gh api "repos/$GITHUB_REPOSITORY/traffic/$p" > "$dir/${p#popular/}.json"
+          done
+          {
+            echo "### Traffic, last 14 days"
+            jq -r '"- Views: \(.count) (\(.uniques) unique)"' "$dir/views.json"
+            jq -r '"- Clones: \(.count) (\(.uniques) unique, mostly our own CI)"' "$dir/clones.json"
+            echo "#### Referrers"
+            jq -r '.[] | "- \(.referrer): \(.uniques) unique"' "$dir/referrers.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add traffic
+          git diff --cached --quiet || git commit -m "traffic: $(date -u +%F)"
+          git push
