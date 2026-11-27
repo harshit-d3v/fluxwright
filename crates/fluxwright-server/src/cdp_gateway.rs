@@ -1025,7 +1025,7 @@ pub(crate) async fn teardown_gateway_state(
     lease.unmark_external_context(&primary_context);
     let _ = lease.close().await;
 
-    if remove_download_dir {
+    if remove_download_dir || matches!(policy.download_dir.try_exists(), Ok(true)) {
         let dir = policy.download_dir.clone();
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
     }

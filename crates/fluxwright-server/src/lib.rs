@@ -23,6 +23,7 @@ mod scrape;
 mod sessions;
 mod store;
 pub mod telemetry;
+mod tenants;
 mod webhook;
 
 #[cfg(test)]
@@ -48,7 +49,8 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 pub use cluster::{
-    job_target_host, spawn_worker, WorkerHandle, WorkerInfo, WorkerStatus, WorkersSummary,
+    job_target_host, spawn_worker, spawn_worker_with_advertise_url, WorkerHandle, WorkerInfo,
+    WorkerStatus, WorkersSummary,
 };
 pub use dashboard::dashboard_html;
 pub use job::{
@@ -56,8 +58,9 @@ pub use job::{
     NetworkEntry, Step, MAX_CONSOLE_ENTRIES, MAX_CONSOLE_TEXT_BYTES, MAX_NETWORK_ENTRIES,
     MAX_NETWORK_URL_BYTES, MAX_RESULT_BYTES, MAX_SCREENSHOT_BYTES,
 };
-pub use prometheus::ServerMetrics;
+pub use prometheus::{ServerMetrics, TenantMetrics};
 pub use telemetry::JobTraceContext;
+pub use tenants::{load_tenants_file, TenantConfig};
 
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
@@ -94,6 +97,10 @@ pub struct ServerConfig {
     /// Allow callers to supply `cdp_endpoint` on `POST /v1/sessions` (BYOB external browser).
     /// Disabled by default.
     pub allow_session_cdp_endpoint: bool,
+    /// Directory containing unpacked Chrome extension subdirectories (each with `manifest.json`)
+    /// that may be loaded per session via `POST /v1/sessions` (`extensions`).
+    pub extensions_dir: Option<std::path::PathBuf>,
+    tenants: Vec<TenantConfig>,
     webhook_secret: Option<Vec<u8>>,
     otlp_endpoint: Option<String>,
     otlp_service_name: String,
@@ -128,6 +135,8 @@ pub enum ConfigError {
     InvalidFrameAncestors(String),
     #[error("invalid fast CDP endpoint: {0}")]
     InvalidFastCdpEndpoint(String),
+    #[error("invalid tenant configuration: {0}")]
+    InvalidTenants(String),
 }
 
 /// Validates and normalizes an optional external lightweight CDP endpoint URL (`ws://`, `wss://`,
@@ -202,7 +211,7 @@ pub fn validate_fast_cdp_endpoint(raw: &str) -> Result<String, ConfigError> {
     Ok(format!("{scheme}://{rest}"))
 }
 
-fn validate_token(token: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_token(token: &str) -> Result<(), ConfigError> {
     if !(32..=256).contains(&token.len()) || !token.bytes().all(|c| c.is_ascii_graphic()) {
         return Err(ConfigError::InvalidToken);
     }
@@ -239,12 +248,27 @@ impl ServerConfig {
             allow_query_token: false,
             allow_any_url: false,
             allow_session_cdp_endpoint: false,
+            extensions_dir: None,
+            tenants: Vec::new(),
             webhook_secret: None,
             otlp_endpoint: None,
             otlp_service_name: DEFAULT_OTLP_SERVICE_NAME.to_string(),
             embed_frame_ancestors: DEFAULT_EMBED_FRAME_ANCESTORS.to_string(),
             fast_cdp_endpoint: None,
         })
+    }
+
+    /// Configures per-tenant bearer tokens, concurrency quotas, and per-minute rate limits.
+    pub fn with_tenants(mut self, tenants: Vec<TenantConfig>) -> Result<Self, ConfigError> {
+        tenants::validate_tenants(&tenants, self.token.as_bytes())?;
+        self.tenants = tenants;
+        Ok(self)
+    }
+
+    /// Loads and validates a JSON file of [`TenantConfig`] entries.
+    pub fn with_tenants_file(self, path: &std::path::Path) -> Result<Self, ConfigError> {
+        let tenants = tenants::load_tenants_file(path)?;
+        self.with_tenants(tenants)
     }
 
     /// Configures a separate bearer token required for coordinator worker endpoints
@@ -314,6 +338,8 @@ pub(crate) struct Inner {
     allow_query_token: bool,
     allow_any_url: bool,
     allow_session_cdp_endpoint: bool,
+    extensions_dir: Option<std::path::PathBuf>,
+    tenants: tenants::TenantRegistry,
     embed_frame_ancestors: String,
     fast_cdp_endpoint: Option<String>,
     fast_cdp_browser: tokio::sync::Mutex<Option<Arc<fluxwright_cdp::CdpBrowser>>>,
@@ -338,6 +364,8 @@ struct Registry {
     jobs: VecDeque<Record>,
     workers: HashMap<String, cluster::WorkerRecord>,
     last_leased_per_host: HashMap<String, u64>,
+    affinity_map: HashMap<String, String>,
+    sticky_sessions: HashMap<String, cluster::StickySession>,
     succeeded_jobs: u64,
     failed_jobs: u64,
     cancelled_jobs: u64,
@@ -345,6 +373,7 @@ struct Registry {
 }
 
 struct Record {
+    tenant: String,
     job: Job,
     request: JobRequest,
     trace_ctx: JobTraceContext,
@@ -434,14 +463,32 @@ impl Inner {
         let metrics = self.with_registry(|reg, now| {
             let mut queued = 0;
             let mut running = 0;
+            let mut active_by_tenant: HashMap<String, usize> = HashMap::new();
             for r in &reg.jobs {
                 match r.job.status {
-                    JobStatus::Queued => queued += 1,
-                    JobStatus::Running => running += 1,
+                    JobStatus::Queued => {
+                        queued += 1;
+                        *active_by_tenant.entry(r.tenant.clone()).or_insert(0) += 1;
+                    }
+                    JobStatus::Running => {
+                        running += 1;
+                        *active_by_tenant.entry(r.tenant.clone()).or_insert(0) += 1;
+                    }
                     _ => {}
                 }
             }
             let (_, workers_summary) = cluster::workers_snapshot(reg, now, lease_ms);
+            let tenant_metrics = self
+                .tenants
+                .prometheus_snapshot(&active_by_tenant)
+                .into_iter()
+                .map(|row| prometheus::TenantMetrics {
+                    tenant: row.tenant,
+                    requests_total: row.requests_total,
+                    rate_limited_total: row.rate_limited_total,
+                    active_jobs: row.active_jobs,
+                })
+                .collect();
             ServerMetrics {
                 fleet,
                 queued_jobs: queued,
@@ -458,6 +505,7 @@ impl Inner {
                 total_cdp_sessions: self.total_cdp_sessions.load(Ordering::Relaxed),
                 fastpath_hits: self.fastpath_hits.load(Ordering::Relaxed),
                 fastpath_fallbacks: self.fastpath_fallbacks.load(Ordering::Relaxed),
+                tenant_metrics,
             }
         });
         metrics.to_prometheus_text()
@@ -571,7 +619,9 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         // Workers and completion monitors hold Weak<Inner>, so dropping the last server/router
-        // aborts outstanding jobs rather than keeping the fleet alive forever.
+        // aborts outstanding jobs and crawls rather than keeping the fleet alive forever.
+        let _ = self.shutdown_tx.send(true);
+        self.crawls.shutdown();
         if let Some(browser) = self.fast_cdp_browser.get_mut().take() {
             browser.start_kill();
         }
@@ -624,6 +674,7 @@ impl HttpServer {
             ),
             None => None,
         };
+        let tenants = tenants::TenantRegistry::new(config.tenants, config.token.as_bytes())?;
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let inner = Arc::new(Inner {
             engine,
@@ -635,6 +686,8 @@ impl HttpServer {
             allow_query_token: config.allow_query_token,
             allow_any_url: config.allow_any_url,
             allow_session_cdp_endpoint: config.allow_session_cdp_endpoint,
+            extensions_dir: config.extensions_dir,
+            tenants,
             embed_frame_ancestors: config.embed_frame_ancestors,
             fast_cdp_endpoint: config.fast_cdp_endpoint,
             fast_cdp_browser: tokio::sync::Mutex::new(None),
@@ -655,6 +708,8 @@ impl HttpServer {
                 jobs: VecDeque::new(),
                 workers: HashMap::new(),
                 last_leased_per_host: HashMap::new(),
+                affinity_map: HashMap::new(),
+                sticky_sessions: HashMap::new(),
                 succeeded_jobs: 0,
                 failed_jobs: 0,
                 cancelled_jobs: 0,
@@ -739,6 +794,7 @@ impl HttpServer {
                 let submitted_ns = telemetry::ms_to_unix_nano(item.job.submitted_at);
                 let started_ns = item.job.started_at.map(telemetry::ms_to_unix_nano);
                 registry.jobs.push_back(Record {
+                    tenant: tenants::DEFAULT_TENANT.to_string(),
                     job: item.job,
                     request,
                     trace_ctx,
@@ -751,7 +807,14 @@ impl HttpServer {
             }
             for (job, request, trace_ctx) in valid_pending {
                 tracing::info!(job_id = %job.id, "queued again from the durable store");
-                enqueue_job(&inner, &mut registry, job, request, trace_ctx);
+                enqueue_job(
+                    &inner,
+                    &mut registry,
+                    tenants::DEFAULT_TENANT.to_string(),
+                    job,
+                    request,
+                    trace_ctx,
+                );
             }
             registry
                 .jobs
@@ -787,6 +850,15 @@ impl HttpServer {
         let mut small = Router::new()
             .route("/v1/jobs", post(submit))
             .route("/v1/jobs/{id}", get(job_status).delete(cancel))
+            .route(
+                "/v1/sessions",
+                post(sessions::create_session).get(sessions::list_sessions),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                get(sessions::get_session).delete(sessions::delete_session),
+            )
+            .route("/v1/sessions/{id}/extend", post(sessions::extend_session))
             .route("/v1/stats", get(stats))
             .route("/v1/events", get(dashboard::dashboard_events))
             .route("/metrics", get(metrics_endpoint));
@@ -813,6 +885,7 @@ impl HttpServer {
         }
 
         let mut protected = small;
+        let mut session_file_routes = Router::new();
         let mut live_ws = Router::new();
         let mut embed_routes = Router::new();
         if self.inner.engine.is_some() {
@@ -826,18 +899,13 @@ impl HttpServer {
                     "/v1/crawl/{id}",
                     get(crawl::get_crawl).delete(crawl::cancel_crawl),
                 )
-                .route(
-                    "/v1/sessions",
-                    post(sessions::create_session).get(sessions::list_sessions),
-                )
-                .route(
-                    "/v1/sessions/{id}",
-                    get(sessions::get_session).delete(sessions::delete_session),
-                )
-                .route("/v1/sessions/{id}/extend", post(sessions::extend_session))
                 .route("/v1/sessions/{id}/replay", get(sessions::get_session_replay))
                 .route("/v1/sessions/{id}/network", get(sessions::get_session_network))
                 .route("/v1/sessions/{id}/cdp", get(sessions::cdp_ws_handler))
+                .route(
+                    "/v1/sessions/{id}/files/{name}",
+                    get(sessions::download_session_file).delete(sessions::delete_session_file),
+                )
                 .route("/v1/profiles", get(list_profiles))
                 .route("/v1/profiles/{name}", delete(delete_profile))
                 .route("/v1/proxies", get(list_proxies))
@@ -846,6 +914,16 @@ impl HttpServer {
                 .route("/v1/live/{id}/embed", post(live::create_embed))
                 .route("/v1/jobs/{id}/pause", post(live::pause_job))
                 .route("/v1/jobs/{id}/resume", post(live::resume_job));
+            session_file_routes = Router::new()
+                .route(
+                    "/v1/sessions/{id}/files",
+                    get(sessions::list_session_files).post(sessions::upload_session_file),
+                )
+                .layer(DefaultBodyLimit::max(sessions::MAX_SESSION_FILE_BODY_BYTES))
+                .route_layer(middleware::from_fn_with_state(
+                    self.inner.clone(),
+                    authorize,
+                ));
             live_ws = Router::new()
                 .route("/v1/live/{id}/ws", get(live::ws_handler))
                 .route_layer(middleware::from_fn_with_state(
@@ -871,6 +949,7 @@ impl HttpServer {
             .route("/dashboard", get(dashboard::dashboard_html))
             .route("/", get(dashboard::dashboard_html))
             .merge(protected)
+            .merge(session_file_routes)
             .merge(worker_routes)
             .merge(live_ws)
             .merge(embed_routes)
@@ -902,6 +981,7 @@ impl HttpServer {
                 }
             }
             registry.cancelled_jobs += newly_cancelled;
+            registry.sticky_sessions.clear();
         }
         self.inner.lease_notify.notify_one();
         let _ = self.inner.shutdown_tx.send(true);
@@ -952,24 +1032,47 @@ fn unauthorized_response() -> Response {
 
 /// The `Authorization` header by default; `/cdp` and `/json/version` also accept `?token=` when
 /// `ServerConfig::allow_query_token` is explicitly enabled for CDP clients that cannot set headers.
-async fn authorize(State(inner): State<Arc<Inner>>, request: Request, next: Next) -> Response {
-    let header_valid = bearer_token(&request).is_some_and(|supplied| same_token(supplied, &inner.token));
+async fn authorize(
+    State(inner): State<Arc<Inner>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let header_identity = bearer_token(&request)
+        .and_then(|supplied| inner.tenants.authenticate(supplied, &inner.token));
 
     let path = request.uri().path();
-    let query_valid = !header_valid
-        && inner.allow_query_token
-        && (path == "/cdp"
-            || path == "/json/version"
-            || sessions::is_session_cdp_path(path))
-        && request
+    let identity = if let Some(id) = header_identity {
+        Some(id)
+    } else if inner.allow_query_token
+        && (path == "/cdp" || path == "/json/version" || sessions::is_session_cdp_path(path))
+    {
+        request
             .uri()
             .query()
             .and_then(cdp_gateway::extract_query_token)
-            .is_some_and(|supplied| same_token(&supplied, &inner.token));
+            .and_then(|supplied| inner.tenants.authenticate(&supplied, &inner.token))
+    } else {
+        None
+    };
 
-    if !header_valid && !query_valid {
+    let Some(identity) = identity else {
         return unauthorized_response();
+    };
+
+    if let Err(retry_after) = inner.tenants.check_rate_limit(&identity.id) {
+        let mut resp = ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_exceeded",
+            "tenant rate limit exceeded",
+        )
+        .into_response();
+        if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, val);
+        }
+        return resp;
     }
+
+    request.extensions_mut().insert(identity);
     next.run(request).await
 }
 
@@ -987,7 +1090,7 @@ async fn authorize_worker(
 
 /// Compare all equal-length bytes rather than returning on the first mismatch. The length is
 /// not secret; operators should use a random token with at least 256 bits of entropy.
-fn same_token(supplied: &[u8], expected: &[u8]) -> bool {
+pub(crate) fn same_token(supplied: &[u8], expected: &[u8]) -> bool {
     if supplied.len() != expected.len() {
         return false;
     }
@@ -1012,6 +1115,7 @@ async fn response_headers(request: Request, next: Next) -> Response {
 
 async fn submit(
     State(inner): State<Arc<Inner>>,
+    tenant: tenants::TenantIdentity,
     headers: axum::http::HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, ApiError> {
@@ -1050,6 +1154,28 @@ async fn submit(
             )
             .into_response());
         }
+        if let Some(limit) = inner.tenants.max_concurrent_jobs(&tenant.id) {
+            let active_for_tenant = registry
+                .jobs
+                .iter()
+                .filter(|r| !r.job.status.terminal() && r.tenant == tenant.id)
+                .count();
+            if active_for_tenant >= limit {
+                let mut error = ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "tenant_quota_exceeded",
+                    format!(
+                        "tenant '{}' reached max_concurrent_jobs ({limit})",
+                        tenant.id
+                    ),
+                )
+                .into_response();
+                error
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return Err(error);
+            }
+        }
         if !registry.make_room(inner.max_jobs) {
             let mut error = ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1067,7 +1193,7 @@ async fn submit(
         let job = new_queued_job(id, &trace_ctx);
         // Before the worker starts, so a job is never running without being on file.
         inner.store_submitted(&job, &raw);
-        enqueue_job(&inner, registry, job.clone(), request, trace_ctx);
+        enqueue_job(&inner, registry, tenant.id, job.clone(), request, trace_ctx);
         Ok(job)
     }) {
         Ok(job) => job,
@@ -1119,6 +1245,7 @@ fn fallback_finished_request() -> JobRequest {
         proxy_session: None,
         webhook_url: None,
         webhook_headers: HashMap::new(),
+        affinity_key: None,
     }
 }
 
@@ -1127,6 +1254,7 @@ fn fallback_finished_request() -> JobRequest {
 fn enqueue_job(
     inner: &Arc<Inner>,
     registry: &mut Registry,
+    tenant: String,
     job: Job,
     request: JobRequest,
     trace_ctx: JobTraceContext,
@@ -1152,6 +1280,7 @@ fn enqueue_job(
             .await
         });
         registry.jobs.push_back(Record {
+            tenant,
             job,
             request,
             trace_ctx,
@@ -1172,6 +1301,7 @@ fn enqueue_job(
         });
     } else {
         registry.jobs.push_back(Record {
+            tenant,
             job,
             request,
             trace_ctx,
@@ -1770,6 +1900,7 @@ fn update_record(inner: &Weak<Inner>, id: Uuid, f: impl FnOnce(&mut Record)) {
 
 async fn job_status(
     State(inner): State<Arc<Inner>>,
+    tenant: tenants::TenantIdentity,
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
@@ -1778,7 +1909,7 @@ async fn job_status(
             registry
                 .jobs
                 .iter()
-                .find(|r| r.job.id == id)
+                .find(|r| r.job.id == id && tenant.can_access(&r.tenant))
                 .map(|r| r.job.clone())
         })
         .map(Json)
@@ -1787,11 +1918,15 @@ async fn job_status(
 
 async fn cancel(
     State(inner): State<Arc<Inner>>,
+    tenant: tenants::TenantIdentity,
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
     let (job_clone, abort, terminal) = inner.with_registry(|registry, now| -> Result<_, ApiError> {
         let record = registry.find_mut(id).ok_or_else(not_found)?;
+        if !tenant.can_access(&record.tenant) {
+            return Err(not_found());
+        }
         if record.job.status == JobStatus::Cancelled {
             return Ok((record.job.clone(), None, None));
         }

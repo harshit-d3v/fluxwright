@@ -8,16 +8,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use axum::body::to_bytes;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{FromRequestParts, Path, RawQuery, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::Engine;
 use fluxwright::{
     netguard, validate_profile_name, BrowserEngine, CdpEvent, ContextLease, JobOptions, Priority,
     StorageState,
@@ -37,9 +39,15 @@ use crate::cdp_gateway::{
 use crate::job::{JobPriority, ServerResourcePreset};
 use crate::live::{EmbedMode, LiveGuard};
 use crate::replay::{RetainedReplay, RetainedReplayStore, SessionRecorder};
+use crate::tenants::TenantIdentity;
 use crate::{now_ms, ApiError, Inner};
 
 pub(crate) const MAX_MANAGED_SESSIONS: usize = 64;
+pub(crate) const MAX_SESSION_FILE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_SESSION_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_SESSION_FILES: usize = 32;
+pub(crate) const MAX_SESSION_FILE_BODY_BYTES: usize = 6 * 1024 * 1024;
+const MAX_SESSION_EXTENSIONS: usize = 8;
 const DEFAULT_SESSION_TTL_SECS: u64 = 300;
 const MIN_SESSION_TTL_SECS: u64 = 10;
 const MAX_SESSION_TTL_SECS: u64 = 3600;
@@ -82,6 +90,8 @@ pub(crate) struct CreateSessionRequest {
     pub(crate) record_frames: bool,
     #[serde(default)]
     pub(crate) cdp_endpoint: Option<String>,
+    #[serde(default)]
+    pub(crate) extensions: Vec<String>,
 }
 
 impl Default for CreateSessionRequest {
@@ -99,6 +109,7 @@ impl Default for CreateSessionRequest {
             live_view_mode: EmbedMode::ReadOnly,
             record_frames: false,
             cdp_endpoint: None,
+            extensions: Vec::new(),
         }
     }
 }
@@ -143,6 +154,22 @@ impl CreateSessionRequest {
         if let Some(vp) = self.viewport {
             if !(1..=7680).contains(&vp.width) || !(1..=4320).contains(&vp.height) {
                 return Err("viewport dimensions must be within 1..=7680 x 1..=4320".into());
+            }
+        }
+        if self.extensions.len() > MAX_SESSION_EXTENSIONS {
+            return Err(format!(
+                "extensions may contain at most {MAX_SESSION_EXTENSIONS} entries"
+            ));
+        }
+        if !self.extensions.is_empty() && self.cdp_endpoint.is_some() {
+            return Err("extensions cannot be combined with cdp_endpoint".into());
+        }
+        let mut seen_ext = HashSet::with_capacity(self.extensions.len());
+        for ext in &self.extensions {
+            validate_safe_entry_name(ext)
+                .map_err(|msg| format!("invalid extension name '{ext}': {msg}"))?;
+            if !seen_ext.insert(ext.as_str()) {
+                return Err(format!("duplicate extension name '{ext}'"));
             }
         }
         Ok(())
@@ -199,11 +226,365 @@ pub(crate) fn is_session_cdp_path(path: &str) -> bool {
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
+fn validate_safe_entry_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.len() > 128 {
+        return Err("must be 1-128 ASCII characters");
+    }
+    if name.starts_with('.') || name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err("must not start with '.' or contain '..', '/', or '\\'");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err("must contain only [A-Za-z0-9._-]");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_session_filename(name: &str) -> Result<(), ApiError> {
+    validate_safe_entry_name(name).map_err(|msg| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_filename",
+            format!("invalid session filename: {msg}"),
+        )
+    })
+}
+
+pub(crate) fn resolve_session_extensions(
+    extensions_dir: Option<&StdPath>,
+    names: &[String],
+) -> Result<Vec<PathBuf>, ApiError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    if names.len() > MAX_SESSION_EXTENSIONS {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("extensions may contain at most {MAX_SESSION_EXTENSIONS} entries"),
+        ));
+    }
+    let Some(base_dir) = extensions_dir else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "extensions_not_configured",
+            "extensions_dir is not configured on this server",
+        ));
+    };
+    let base_canon = std::fs::canonicalize(base_dir).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "extensions_not_configured",
+            "extensions_dir does not exist or is unreadable",
+        )
+    })?;
+    if !base_canon.is_dir() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "extensions_not_configured",
+            "extensions_dir is not a directory",
+        ));
+    }
+    let mut resolved = Vec::with_capacity(names.len());
+    for name in names {
+        validate_safe_entry_name(name).map_err(|msg| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_extension",
+                format!("invalid extension name '{name}': {msg}"),
+            )
+        })?;
+        let candidate = base_canon.join(name);
+        let canon = std::fs::canonicalize(&candidate).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "extension_not_found",
+                format!("extension '{name}' not found"),
+            )
+        })?;
+        if !canon.starts_with(&base_canon) || canon == base_canon {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_extension",
+                format!("extension '{name}' escapes extensions_dir"),
+            ));
+        }
+        if !canon.is_dir() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_extension",
+                format!("extension '{name}' is not a directory"),
+            ));
+        }
+        let manifest_path = canon.join("manifest.json");
+        let manifest_canon = std::fs::canonicalize(&manifest_path).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_extension",
+                format!("extension '{name}' is missing manifest.json"),
+            )
+        })?;
+        if !manifest_canon.starts_with(&canon) || !manifest_canon.is_file() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_extension",
+                format!("extension '{name}' has an invalid manifest.json"),
+            ));
+        }
+        resolved.push(canon);
+    }
+    Ok(resolved)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SessionFileInfo {
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) modified_at: u64,
+}
+
+pub(crate) fn list_files_in_dir(dir: &StdPath) -> Result<Vec<SessionFileInfo>, ApiError> {
+    if !matches!(dir.try_exists(), Ok(true)) {
+        return Ok(Vec::new());
+    }
+    let dir_meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            format!("failed to inspect session files directory: {e}"),
+        )
+    })?;
+    if !dir_meta.file_type().is_dir() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            "session files path is not a directory",
+        ));
+    }
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            format!("failed to list session files: {e}"),
+        )
+    })?;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_safe_entry_name(&name).is_err() {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let modified_at = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        files.push(SessionFileInfo {
+            name,
+            size: meta.len(),
+            modified_at,
+        });
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
+
+pub(crate) fn write_file_in_dir(
+    dir: &StdPath,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(u64, String), ApiError> {
+    validate_session_filename(name)?;
+    if bytes.len() > MAX_SESSION_FILE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            format!("session file exceeds {MAX_SESSION_FILE_BYTES} bytes"),
+        ));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            format!("failed to create session files directory: {e}"),
+        )
+    })?;
+    let dir_meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            format!("failed to inspect session files directory: {e}"),
+        )
+    })?;
+    if !dir_meta.file_type().is_dir() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            "session files path is not a directory",
+        ));
+    }
+    let target = dir.join(name);
+    let mut existed = false;
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if !meta.file_type().is_file() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_file",
+                "refusing to write to a symlink or non-regular file",
+            ));
+        }
+        existed = true;
+    }
+
+    let mut other_count = 0usize;
+    let mut other_bytes = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            if entry.file_name().to_str() == Some(name) {
+                continue;
+            }
+            other_count += 1;
+            other_bytes = other_bytes.saturating_add(meta.len());
+        }
+    }
+    if !existed && other_count >= MAX_SESSION_FILES {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "file_limit_exceeded",
+            format!("session may store at most {MAX_SESSION_FILES} files"),
+        ));
+    }
+    if other_bytes.saturating_add(bytes.len() as u64) > MAX_SESSION_TOTAL_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "session_storage_exceeded",
+            format!("session file storage exceeds {MAX_SESSION_TOTAL_BYTES} bytes"),
+        ));
+    }
+
+    std::fs::write(&target, bytes).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            format!("failed to write session file: {e}"),
+        )
+    })?;
+    let dir_canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let file_canon = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    if !file_canon.starts_with(&dir_canon) {
+        let _ = std::fs::remove_file(&target);
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_file",
+            "session file path escaped session directory",
+        ));
+    }
+    Ok((bytes.len() as u64, file_canon.to_string_lossy().into_owned()))
+}
+
+pub(crate) fn read_file_in_dir(dir: &StdPath, name: &str) -> Result<Vec<u8>, ApiError> {
+    validate_session_filename(name)?;
+    let target = dir.join(name);
+    let meta = std::fs::symlink_metadata(&target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::new(StatusCode::NOT_FOUND, "file_not_found", "session file not found")
+        } else {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_error",
+                format!("failed to inspect session file: {e}"),
+            )
+        }
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_file",
+            "refusing to read symlink or non-regular file",
+        ));
+    }
+    if meta.len() > MAX_SESSION_FILE_BYTES as u64 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            format!("session file exceeds {MAX_SESSION_FILE_BYTES} bytes"),
+        ));
+    }
+    let dir_canon = std::fs::canonicalize(dir).map_err(|_| {
+        ApiError::new(StatusCode::NOT_FOUND, "file_not_found", "session file not found")
+    })?;
+    let file_canon = std::fs::canonicalize(&target).map_err(|_| {
+        ApiError::new(StatusCode::NOT_FOUND, "file_not_found", "session file not found")
+    })?;
+    if !file_canon.starts_with(&dir_canon) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_file",
+            "session file path escaped session directory",
+        ));
+    }
+    std::fs::read(&file_canon).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            format!("failed to read session file: {e}"),
+        )
+    })
+}
+
+pub(crate) fn delete_file_in_dir(dir: &StdPath, name: &str) -> Result<(), ApiError> {
+    validate_session_filename(name)?;
+    let target = dir.join(name);
+    let meta = std::fs::symlink_metadata(&target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::new(StatusCode::NOT_FOUND, "file_not_found", "session file not found")
+        } else {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_error",
+                format!("failed to inspect session file: {e}"),
+            )
+        }
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_file",
+            "refusing to delete symlink or non-regular file",
+        ));
+    }
+    std::fs::remove_file(&target).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            format!("failed to delete session file: {e}"),
+        )
+    })
+}
+
 #[derive(Default)]
 struct SessionMap {
     sessions: HashMap<String, Arc<ManagedSession>>,
     reserved: usize,
     retained: RetainedReplayStore,
+    retained_tenants: HashMap<String, String>,
 }
 
 struct SlotReservation {
@@ -222,11 +603,14 @@ impl Drop for SlotReservation {
 
 pub(crate) struct ManagedSession {
     id: String,
+    tenant: String,
     keep_alive: bool,
     profile: Option<String>,
     persist_profile: bool,
     proxy_session: Option<String>,
     record_frames: bool,
+    is_byob: bool,
+    extensions: Vec<String>,
     byob_engine: Option<BrowserEngine>,
     created_at: u64,
     lease: Arc<ContextLease>,
@@ -262,7 +646,8 @@ impl ManagedSession {
             "profile": self.profile,
             "proxy_session": self.proxy_session,
             "record_frames": self.record_frames,
-            "byob": self.byob_engine.is_some(),
+            "byob": self.is_byob,
+            "extensions": self.extensions,
             "created_at": self.created_at,
             "expires_at": expires_at,
         })
@@ -281,7 +666,8 @@ impl ManagedSession {
             "url": url,
             "profile": self.profile,
             "proxy_session": self.proxy_session,
-            "byob": self.byob_engine.is_some(),
+            "byob": self.is_byob,
+            "extensions": self.extensions,
             "record_frames": self.record_frames,
             "created_at": self.created_at,
             "expires_at": expires_at,
@@ -337,22 +723,28 @@ impl SessionStoreState {
             keep_alive: session.keep_alive,
             profile: session.profile.clone(),
             proxy_session: session.proxy_session.clone(),
-            byob: session.byob_engine.is_some(),
+            byob: session.is_byob,
             record_frames: session.record_frames,
             recorder,
         };
         let mut g = self.inner.lock().unwrap();
         g.sessions.remove(&session.id);
         g.retained.push(retained, closed_at);
+        if g.retained_tenants.len() >= 256 {
+            g.retained_tenants.clear();
+        }
+        g.retained_tenants
+            .insert(session.id.clone(), session.tenant.clone());
     }
 
-    fn list(&self) -> Vec<Value> {
+    fn list(&self, tenant: &TenantIdentity) -> Vec<Value> {
         let mut items: Vec<_> = self
             .inner
             .lock()
             .unwrap()
             .sessions
             .values()
+            .filter(|s| tenant.can_access(&s.tenant))
             .map(|s| s.summary())
             .collect();
         items.sort_by_key(|v| v["created_at"].as_u64().unwrap_or(0));
@@ -380,13 +772,25 @@ impl SessionStoreState {
     fn with_replay<R>(
         &self,
         id: &str,
+        tenant: &TenantIdentity,
         f: impl FnOnce(&str, u64, Option<u64>, &str, &SessionRecorder) -> R,
     ) -> Option<R> {
         let active = {
             let mut g = self.inner.lock().unwrap();
             if let Some(sess) = g.sessions.get(id).cloned() {
+                if !tenant.can_access(&sess.tenant) {
+                    return None;
+                }
                 Some(sess)
             } else {
+                let owner = g
+                    .retained_tenants
+                    .get(id)
+                    .map(String::as_str)
+                    .unwrap_or(crate::tenants::DEFAULT_TENANT);
+                if !tenant.can_access(owner) {
+                    return None;
+                }
                 let now = now_ms();
                 return g.retained.with_entry(id, now, |r| {
                     let url = if r.url.is_empty() {
@@ -611,21 +1015,7 @@ pub(crate) async fn create_session(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let Some(engine) = inner.engine.clone() else {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "managed sessions are unavailable in coordinator mode",
-        ));
-    };
-    if !inner.with_registry(|r, _| r.accepting) {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "shutting_down",
-            "the server is shutting down",
-        ));
-    }
-
+    let tenant = crate::tenants::tenant_from_ext(request.extensions());
     let bytes = to_bytes(request.into_body(), crate::MAX_REQUEST_BYTES)
         .await
         .map_err(|_| {
@@ -635,6 +1025,17 @@ pub(crate) async fn create_session(
                 "session request body exceeds 64 KiB",
             )
         })?;
+    let Some(engine) = inner.engine.clone() else {
+        return crate::cluster::create_sticky_session(&inner, tenant, &bytes);
+    };
+    if !inner.with_registry(|r, _| r.accepting) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "the server is shutting down",
+        ));
+    }
+
     let req: CreateSessionRequest = if bytes.iter().all(u8::is_ascii_whitespace) {
         CreateSessionRequest::default()
     } else {
@@ -662,6 +1063,24 @@ pub(crate) async fn create_session(
         None => None,
     };
 
+    let resolved_extensions = if req.extensions.is_empty() {
+        Vec::new()
+    } else {
+        let ext_dir = inner.extensions_dir.clone();
+        let ext_names = req.extensions.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_session_extensions(ext_dir.as_deref(), &ext_names)
+        })
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "extension_error",
+                e.to_string(),
+            )
+        })??
+    };
+
     let reservation = inner.sessions.try_reserve().ok_or_else(|| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -671,6 +1090,7 @@ pub(crate) async fn create_session(
     })?;
 
     let opts = req.job_options();
+    let is_byob = validated_cdp_endpoint.is_some();
     let (byob_engine, active_engine) = if let Some(endpoint) = validated_cdp_endpoint {
         let mut builder = BrowserEngine::builder()
             .connect_over_cdp(endpoint)
@@ -684,6 +1104,41 @@ pub(crate) async fn create_session(
             ApiError::new(StatusCode::BAD_GATEWAY, "browser_error", e.to_string())
         })?;
         (Some(byob.clone()), byob)
+    } else if !resolved_extensions.is_empty() {
+        let joined = resolved_extensions
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(",");
+        let launch = &engine.config().launch;
+        let mut builder = BrowserEngine::builder()
+            .max_browsers(1)
+            .max_contexts_per_browser(1)
+            .acquire_timeout(Duration::from_secs(15))
+            .no_sandbox(launch.no_sandbox)
+            .headless(launch.headless)
+            .low_memory(launch.low_memory)
+            .ignore_default_args_list(["--disable-extensions"]);
+        if let Some(ref exe) = launch.executable {
+            builder = builder.chrome(exe.clone());
+        }
+        if let Some(ref ch) = launch.channel {
+            builder = builder.channel(ch.clone());
+        }
+        if let Some(ref profiles_dir) = engine.config().profiles_dir {
+            builder = builder.profiles_dir(profiles_dir.clone());
+        }
+        if !launch.extra_args.is_empty() {
+            builder = builder.args(launch.extra_args.clone());
+        }
+        builder = builder.args([
+            format!("--disable-extensions-except={joined}"),
+            format!("--load-extension={joined}"),
+        ]);
+        let ext_engine = builder.build().await.map_err(|e| {
+            ApiError::new(StatusCode::BAD_GATEWAY, "browser_error", e.to_string())
+        })?;
+        (Some(ext_engine.clone()), ext_engine)
     } else {
         (None, engine)
     };
@@ -775,11 +1230,14 @@ pub(crate) async fn create_session(
 
     let session = Arc::new(ManagedSession {
         id: id.clone(),
+        tenant: tenant.id,
         keep_alive: req.keep_alive,
         profile: req.profile,
         persist_profile: req.persist_profile,
         proxy_session: req.proxy_session,
         record_frames: req.record_frames,
+        is_byob,
+        extensions: req.extensions,
         byob_engine,
         created_at,
         lease,
@@ -823,7 +1281,8 @@ pub(crate) async fn create_session(
         "profile": session.profile,
         "proxy_session": session.proxy_session,
         "record_frames": session.record_frames,
-        "byob": session.byob_engine.is_some(),
+        "byob": session.is_byob,
+        "extensions": session.extensions,
         "created_at": session.created_at,
         "expires_at": expires_at,
         "ttl_secs": effective_ttl,
@@ -831,16 +1290,30 @@ pub(crate) async fn create_session(
     Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
-pub(crate) async fn list_sessions(State(inner): State<Arc<Inner>>) -> Json<Value> {
-    Json(json!({ "sessions": inner.sessions.list() }))
+pub(crate) async fn list_sessions(
+    State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
+) -> Json<Value> {
+    if inner.engine.is_none() {
+        return crate::cluster::list_sticky_sessions(&inner, &tenant);
+    }
+    Json(json!({ "sessions": inner.sessions.list(&tenant) }))
 }
 
 pub(crate) async fn get_session(
     State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     validate_session_id(&id)?;
-    let sess = inner.sessions.get(&id).ok_or_else(session_not_found)?;
+    if inner.engine.is_none() {
+        return crate::cluster::get_sticky_session(&inner, &id, &tenant);
+    }
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
     Ok(Json(sess.summary()))
 }
 
@@ -850,6 +1323,7 @@ pub(crate) async fn extend_session(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     validate_session_id(&id)?;
+    let tenant = crate::tenants::tenant_from_ext(request.extensions());
     let bytes = to_bytes(request.into_body(), crate::MAX_REQUEST_BYTES)
         .await
         .map_err(|_| {
@@ -869,7 +1343,14 @@ pub(crate) async fn extend_session(
     validate_ttl(req.ttl_secs)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
-    let sess = inner.sessions.get(&id).ok_or_else(session_not_found)?;
+    if inner.engine.is_none() {
+        return crate::cluster::extend_sticky_session(&inner, &id, req.ttl_secs, &tenant);
+    }
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
     if *sess.close_tx.borrow() || sess.lease.is_closed() {
         let _ = sess.close_tx.send(true);
         return Err(session_not_found());
@@ -884,10 +1365,18 @@ pub(crate) async fn extend_session(
 
 pub(crate) async fn delete_session(
     State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     validate_session_id(&id)?;
-    let sess = inner.sessions.get(&id).ok_or_else(session_not_found)?;
+    if inner.engine.is_none() {
+        return crate::cluster::delete_sticky_session(&inner, &id, &tenant);
+    }
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
     let notified = sess.closed_notify.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
@@ -896,6 +1385,196 @@ pub(crate) async fn delete_session(
         let _ = tokio::time::timeout(DELETE_WAIT_TIMEOUT, notified).await;
     }
     Ok(Json(json!({ "id": id, "status": "closed" })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadSessionFileRequest {
+    name: String,
+    #[serde(default)]
+    content_base64: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+pub(crate) async fn list_session_files(
+    State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if inner.engine.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "session files are unavailable in coordinator mode",
+        ));
+    }
+    validate_session_id(&id)?;
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
+    let dir = sess.policy.download_dir.clone();
+    let files = tokio::task::spawn_blocking(move || list_files_in_dir(&dir))
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_error",
+                e.to_string(),
+            )
+        })??;
+    Ok(Json(json!({ "id": id, "files": files })))
+}
+
+pub(crate) async fn upload_session_file(
+    State(inner): State<Arc<Inner>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    if inner.engine.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "session files are unavailable in coordinator mode",
+        ));
+    }
+    validate_session_id(&id)?;
+    let tenant = crate::tenants::tenant_from_ext(request.extensions());
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
+    if *sess.close_tx.borrow() || sess.lease.is_closed() {
+        let _ = sess.close_tx.send(true);
+        return Err(session_not_found());
+    }
+    let body = to_bytes(request.into_body(), MAX_SESSION_FILE_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "session file upload body exceeds 6 MiB",
+            )
+        })?;
+    let Json(req) = Json::<UploadSessionFileRequest>::from_bytes(&body)
+        .map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
+    validate_session_filename(&req.name)?;
+    let data = match (req.content_base64, req.content) {
+        (Some(b64), None) => base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("invalid content_base64: {e}"),
+                )
+            })?,
+        (None, Some(text)) => text.into_bytes(),
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "specify exactly one of content_base64 or content",
+            ));
+        }
+    };
+    let dir = sess.policy.download_dir.clone();
+    let name = req.name;
+    let name_for_write = name.clone();
+    let (size, path) = tokio::task::spawn_blocking(move || {
+        write_file_in_dir(&dir, &name_for_write, &data)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "file_error",
+            e.to_string(),
+        )
+    })??;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "name": name, "size": size, "path": path })),
+    )
+        .into_response())
+}
+
+pub(crate) async fn download_session_file(
+    State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    if inner.engine.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "session files are unavailable in coordinator mode",
+        ));
+    }
+    validate_session_id(&id)?;
+    validate_session_filename(&name)?;
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
+    let dir = sess.policy.download_dir.clone();
+    let name_for_read = name.clone();
+    let bytes = tokio::task::spawn_blocking(move || read_file_in_dir(&dir, &name_for_read))
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_error",
+                e.to_string(),
+            )
+        })??;
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(cd) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        response.headers_mut().insert(header::CONTENT_DISPOSITION, cd);
+    }
+    Ok(response)
+}
+
+pub(crate) async fn delete_session_file(
+    State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    if inner.engine.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "session files are unavailable in coordinator mode",
+        ));
+    }
+    validate_session_id(&id)?;
+    validate_session_filename(&name)?;
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
+    let dir = sess.policy.download_dir.clone();
+    let name_for_delete = name.clone();
+    tokio::task::spawn_blocking(move || delete_file_in_dir(&dir, &name_for_delete))
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "file_error",
+                e.to_string(),
+            )
+        })??;
+    Ok(Json(json!({ "deleted": name })))
 }
 
 struct ConnectionGuard {
@@ -914,6 +1593,7 @@ pub(crate) async fn cdp_ws_handler(
     request: Request,
 ) -> Result<Response, ApiError> {
     validate_session_id(&id)?;
+    let tenant = crate::tenants::tenant_from_ext(request.extensions());
     let Some(_) = inner.engine else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -921,7 +1601,11 @@ pub(crate) async fn cdp_ws_handler(
             "managed sessions are unavailable in coordinator mode",
         ));
     };
-    let sess = inner.sessions.get(&id).ok_or_else(session_not_found)?;
+    let sess = inner
+        .sessions
+        .get(&id)
+        .filter(|s| tenant.can_access(&s.tenant))
+        .ok_or_else(session_not_found)?;
     if *sess.close_tx.borrow() || sess.lease.is_closed() {
         let _ = sess.close_tx.send(true);
         return Err(session_not_found());
@@ -1134,6 +1818,7 @@ fn parse_query_bool(name: &str, val: &str) -> Result<bool, ApiError> {
 
 pub(crate) async fn get_session_replay(
     State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
     Path(id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
@@ -1148,7 +1833,7 @@ pub(crate) async fn get_session_replay(
     let query = ReplayQuery::parse(raw_query.as_deref())?;
     let payload = inner
         .sessions
-        .with_replay(&id, |status, created_at, closed_at, url, rec| {
+        .with_replay(&id, &tenant, |status, created_at, closed_at, url, rec| {
             let (total_events, events) =
                 rec.query_replay(query.q.as_deref(), query.kind.as_deref(), query.include_frames);
             json!({
@@ -1167,6 +1852,7 @@ pub(crate) async fn get_session_replay(
 
 pub(crate) async fn get_session_network(
     State(inner): State<Arc<Inner>>,
+    tenant: TenantIdentity,
     Path(id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError> {
@@ -1181,7 +1867,7 @@ pub(crate) async fn get_session_network(
     let query = NetworkQuery::parse(raw_query.as_deref())?;
     let payload = inner
         .sessions
-        .with_replay(&id, |status, created_at, closed_at, url, rec| {
+        .with_replay(&id, &tenant, |status, created_at, closed_at, url, rec| {
             match query.format {
                 NetworkFormat::Har => {
                     let har = rec.export_har(

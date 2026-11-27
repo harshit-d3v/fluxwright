@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluxwright::BrowserEngine;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use uuid::Uuid;
 
 use crate::http_post::{post_bytes, HttpEndpoint, MAX_HTTP_RESPONSE_BYTES};
 use crate::telemetry::now_unix_nano;
+use crate::tenants::TenantIdentity;
 use crate::{
     bounded_error, execute_job, json_len, not_found, parse_id, ApiError, ConfigError,
     ExecutionProgress, FailureEvidence, Inner, Job, JobPriority, JobRequest, JobStatus,
@@ -25,6 +27,11 @@ use crate::{
 };
 
 const MAX_TRACKED_HOSTS: usize = 4096;
+const MAX_AFFINITY_KEYS: usize = 4096;
+const MAX_STICKY_SESSIONS: usize = 1024;
+const DEFAULT_STICKY_TTL_SECS: u64 = 300;
+const MIN_STICKY_TTL_SECS: u64 = 10;
+const MAX_STICKY_TTL_SECS: u64 = 3600;
 
 /// Extracts the normalized lowercase target host from the job's first `Step::Goto { url, .. }`.
 /// Returns `None` when the job has no `goto` step or targets a non-network URL such as `about:blank`.
@@ -100,6 +107,34 @@ pub(crate) struct WorkerRecord {
     pub(crate) succeeded_jobs: u64,
     pub(crate) failed_jobs: u64,
     pub(crate) expired_leases: u64,
+    pub(crate) advertise_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StickySession {
+    pub(crate) id: String,
+    pub(crate) worker: String,
+    pub(crate) worker_url: Option<String>,
+    pub(crate) affinity_key: Option<String>,
+    pub(crate) tenant: String,
+    pub(crate) created_at: u64,
+    pub(crate) expires_at: u64,
+}
+
+impl StickySession {
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "status": "assigned",
+            "worker": self.worker,
+            "worker_url": self.worker_url,
+            "cdp_path": format!("/v1/sessions/{}/cdp", self.id),
+            "affinity": "sticky",
+            "affinity_key": self.affinity_key,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -122,6 +157,8 @@ pub struct WorkerInfo {
     pub registered_at: u64,
     pub last_seen_at: u64,
     pub draining: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertise_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -142,6 +179,8 @@ pub(crate) struct LeaseRequest {
     pub(crate) max_jobs: usize,
     #[serde(default)]
     pub(crate) capacity: Option<usize>,
+    #[serde(default)]
+    pub(crate) advertise_url: Option<String>,
 }
 
 fn default_lease_max() -> usize {
@@ -217,12 +256,46 @@ fn validate_worker(worker: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_advertise_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 {
+        return Err("advertise_url must be 1-2048 characters".into());
+    }
+    let _ = HttpEndpoint::parse(trimmed, false)?;
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+fn record_affinity(map: &mut HashMap<String, String>, key: String, worker: String) {
+    if map.len() >= MAX_AFFINITY_KEYS && !map.contains_key(&key) {
+        if let Some(evict) = map.keys().next().cloned() {
+            map.remove(&evict);
+        }
+    }
+    map.insert(key, worker);
+}
+
+fn worker_is_online(registry: &crate::Registry, worker: &str, now: u64, stale_after: u64) -> bool {
+    let Some(rec) = registry.workers.get(worker) else {
+        return false;
+    };
+    if rec.draining {
+        return false;
+    }
+    let active = registry
+        .jobs
+        .iter()
+        .filter(|r| r.job.status == JobStatus::Running && r.worker.as_deref() == Some(worker))
+        .count();
+    active > 0 || now.saturating_sub(rec.last_seen_at) <= stale_after
+}
+
 fn touch_worker<'a>(
     registry: &'a mut crate::Registry,
     worker: &str,
     now: u64,
     capacity: Option<usize>,
     fallback_max_jobs: Option<usize>,
+    advertise_url: Option<&str>,
 ) -> &'a mut WorkerRecord {
     if !registry.workers.contains_key(worker) && registry.workers.len() >= MAX_WORKERS {
         let evict = registry
@@ -250,10 +323,14 @@ fn touch_worker<'a>(
             succeeded_jobs: 0,
             failed_jobs: 0,
             expired_leases: 0,
+            advertise_url: advertise_url.map(str::to_string),
         });
     rec.last_seen_at = now;
     if let Some(cap) = capacity {
         rec.max_jobs = cap;
+    }
+    if let Some(url) = advertise_url {
+        rec.advertise_url = Some(url.to_string());
     }
     rec
 }
@@ -283,6 +360,7 @@ fn worker_info_for(
         registered_at: rec.registered_at,
         last_seen_at: rec.last_seen_at,
         draining: rec.draining,
+        advertise_url: rec.advertise_url.clone(),
     }
 }
 
@@ -372,8 +450,15 @@ pub(crate) async fn lease(
     validate_worker(&worker)?;
     let Json(req) =
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
+    let advertise_url = req
+        .advertise_url
+        .as_deref()
+        .map(validate_advertise_url)
+        .transpose()
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
 
     let lease_ms = inner.lease_ms();
+    let stale_after = lease_ms.saturating_mul(2).max(1_000);
     let max_per_host = inner.max_concurrency_per_host;
     let min_delay_ms = inner.min_delay_per_host_ms;
     let leased = inner.with_registry(|registry, now| -> Result<Vec<LeasedJob>, ApiError> {
@@ -388,7 +473,15 @@ pub(crate) async fn lease(
         let limit = req.max_jobs.min(MAX_LEASE_BATCH);
         let reported_capacity = req.capacity.map(|c| c.clamp(1, MAX_LEASE_BATCH));
         let fallback_max = (limit > 0).then_some(limit);
-        let draining = touch_worker(registry, &worker, now, reported_capacity, fallback_max).draining;
+        let draining = touch_worker(
+            registry,
+            &worker,
+            now,
+            reported_capacity,
+            fallback_max,
+            advertise_url.as_deref(),
+        )
+        .draining;
         if draining {
             return Ok(Vec::new());
         }
@@ -417,6 +510,18 @@ pub(crate) async fn lease(
                     }
                     if record.job.status != JobStatus::Queued || record.request.priority != prio {
                         continue;
+                    }
+
+                    // Sticky job affinity: hold jobs pinned to another healthy online worker,
+                    // while allowing automatic failover if that worker is missing, draining, or stale.
+                    if let Some(ref key) = record.request.affinity_key {
+                        if let Some(preferred) = registry.affinity_map.get(key) {
+                            if preferred != &worker
+                                && worker_is_online(registry, preferred, now, stale_after)
+                            {
+                                continue;
+                            }
+                        }
                     }
 
                     let target_host = job_target_host(&record.request);
@@ -468,6 +573,7 @@ pub(crate) async fn lease(
 
         let mut leased = Vec::with_capacity(candidates.len());
         for (idx, item, target_host) in candidates {
+            let affinity_key = registry.jobs[idx].request.affinity_key.clone();
             let record = &mut registry.jobs[idx];
             record.job.status = JobStatus::Running;
             record.job.started_at.get_or_insert(now);
@@ -477,6 +583,9 @@ pub(crate) async fn lease(
             record.job.failure_evidence = None;
             record.worker = Some(worker.clone());
             record.lease_until = Some(now.saturating_add(lease_ms));
+            if let Some(key) = affinity_key {
+                record_affinity(&mut registry.affinity_map, key, worker.clone());
+            }
             if let Some(host) = target_host {
                 record_last_leased(&mut registry.last_leased_per_host, host, now, min_delay_ms);
             }
@@ -499,7 +608,7 @@ pub(crate) async fn heartbeat(
 
     let lease_ms = inner.lease_ms();
     let cancelled = inner.with_registry(|registry, now| {
-        touch_worker(registry, &worker, now, None, None);
+        touch_worker(registry, &worker, now, None, None, None);
         let mut cancelled = Vec::new();
         for item in req.jobs {
             if let Some(record) = registry.find_mut(item.id) {
@@ -532,7 +641,7 @@ pub(crate) async fn release(
         payload.map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
 
     let released = inner.with_registry(|registry, now| {
-        touch_worker(registry, &worker, now, None, None);
+        touch_worker(registry, &worker, now, None, None, None);
         let mut released = Vec::new();
         for id in req.jobs {
             if let Some(record) = registry.find_mut(id) {
@@ -586,7 +695,7 @@ pub(crate) async fn result(
     }
 
     let (job, terminal) = inner.with_registry(|registry, now| -> Result<(Job, Option<TerminalJob>), ApiError> {
-        touch_worker(registry, &req.worker, now, None, None);
+        touch_worker(registry, &req.worker, now, None, None, None);
         let record = registry.find_mut(id).ok_or_else(not_found)?;
         if record.job.status == JobStatus::Cancelled {
             return Ok((record.job.clone(), None));
@@ -718,7 +827,221 @@ pub(crate) async fn remove_worker(
             ));
         }
         registry.workers.remove(&worker);
+        registry.affinity_map.retain(|_, w| w != &worker);
         Ok(Json(json!({ "removed": worker })))
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoordinatorCreateSessionRequest {
+    #[serde(default = "default_sticky_ttl")]
+    ttl_secs: u64,
+    #[serde(default)]
+    affinity_key: Option<String>,
+}
+
+impl Default for CoordinatorCreateSessionRequest {
+    fn default() -> Self {
+        Self {
+            ttl_secs: DEFAULT_STICKY_TTL_SECS,
+            affinity_key: None,
+        }
+    }
+}
+
+fn default_sticky_ttl() -> u64 {
+    DEFAULT_STICKY_TTL_SECS
+}
+
+fn prune_sticky_sessions(registry: &mut crate::Registry, now: u64) {
+    registry.sticky_sessions.retain(|_, s| s.expires_at > now);
+}
+
+fn sticky_session_not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "session_not_found",
+        "managed session not found or expired",
+    )
+}
+
+pub(crate) fn create_sticky_session(
+    inner: &Inner,
+    tenant: TenantIdentity,
+    body_bytes: &[u8],
+) -> Result<Response, ApiError> {
+    let req: CoordinatorCreateSessionRequest = if body_bytes.iter().all(u8::is_ascii_whitespace) {
+        CoordinatorCreateSessionRequest::default()
+    } else {
+        let Json(parsed) = Json::<CoordinatorCreateSessionRequest>::from_bytes(body_bytes)
+            .map_err(|e| ApiError::new(e.status(), "invalid_request", e.body_text()))?;
+        parsed
+    };
+    if !(MIN_STICKY_TTL_SECS..=MAX_STICKY_TTL_SECS).contains(&req.ttl_secs) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("ttl_secs must be between {MIN_STICKY_TTL_SECS} and {MAX_STICKY_TTL_SECS}"),
+        ));
+    }
+    if let Some(ref key) = req.affinity_key {
+        if key.is_empty() || key.len() > 128 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "affinity_key must be 1-128 printable ASCII characters without whitespace",
+            ));
+        }
+    }
+
+    let lease_ms = inner.lease_ms();
+    let payload = inner.with_registry(|registry, now| -> Result<Value, ApiError> {
+        if !registry.accepting {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shutting_down",
+                "the coordinator is shutting down",
+            ));
+        }
+        prune_sticky_sessions(registry, now);
+        if registry.sticky_sessions.len() >= MAX_STICKY_SESSIONS {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "capacity_exceeded",
+                "maximum active sticky sessions reached",
+            ));
+        }
+
+        let (workers, _) = workers_snapshot(registry, now, lease_ms);
+        let online: Vec<WorkerInfo> = workers
+            .into_iter()
+            .filter(|w| w.status == WorkerStatus::Online)
+            .collect();
+        if online.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_workers_available",
+                "no online workers available for sticky session assignment",
+            ));
+        }
+
+        let chosen = if let Some(ref key) = req.affinity_key {
+            registry
+                .affinity_map
+                .get(key)
+                .and_then(|preferred| online.iter().find(|w| w.worker == *preferred))
+        } else {
+            None
+        }
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut pinned_counts: HashMap<&str, usize> = HashMap::new();
+            for s in registry.sticky_sessions.values() {
+                *pinned_counts.entry(s.worker.as_str()).or_insert(0) += 1;
+            }
+            online
+                .iter()
+                .min_by(|a, b| {
+                    let load_a = a
+                        .active_jobs
+                        .saturating_add(pinned_counts.get(a.worker.as_str()).copied().unwrap_or(0));
+                    let load_b = b
+                        .active_jobs
+                        .saturating_add(pinned_counts.get(b.worker.as_str()).copied().unwrap_or(0));
+                    load_a.cmp(&load_b).then_with(|| a.worker.cmp(&b.worker))
+                })
+                .expect("online is non-empty")
+                .clone()
+        });
+
+        if let Some(ref key) = req.affinity_key {
+            record_affinity(&mut registry.affinity_map, key.clone(), chosen.worker.clone());
+        }
+
+        let id = format!("sess-{}", Uuid::new_v4().simple());
+        let session = StickySession {
+            id: id.clone(),
+            worker: chosen.worker,
+            worker_url: chosen.advertise_url,
+            affinity_key: req.affinity_key,
+            tenant: tenant.id,
+            created_at: now,
+            expires_at: now.saturating_add(req.ttl_secs.saturating_mul(1000)),
+        };
+        let out = session.to_json();
+        registry.sticky_sessions.insert(id, session);
+        Ok(out)
+    })?;
+
+    Ok((StatusCode::CREATED, Json(payload)).into_response())
+}
+
+pub(crate) fn list_sticky_sessions(inner: &Inner, tenant: &TenantIdentity) -> Json<Value> {
+    let items = inner.with_registry(|registry, now| {
+        prune_sticky_sessions(registry, now);
+        let mut sessions: Vec<Value> = registry
+            .sticky_sessions
+            .values()
+            .filter(|s| tenant.can_access(&s.tenant))
+            .map(StickySession::to_json)
+            .collect();
+        sessions.sort_by_key(|v| v["created_at"].as_u64().unwrap_or(0));
+        sessions
+    });
+    Json(json!({ "sessions": items }))
+}
+
+pub(crate) fn get_sticky_session(
+    inner: &Inner,
+    id: &str,
+    tenant: &TenantIdentity,
+) -> Result<Json<Value>, ApiError> {
+    inner.with_registry(|registry, now| {
+        prune_sticky_sessions(registry, now);
+        let session = registry
+            .sticky_sessions
+            .get(id)
+            .filter(|s| tenant.can_access(&s.tenant))
+            .ok_or_else(sticky_session_not_found)?;
+        Ok(Json(session.to_json()))
+    })
+}
+
+pub(crate) fn extend_sticky_session(
+    inner: &Inner,
+    id: &str,
+    ttl_secs: u64,
+    tenant: &TenantIdentity,
+) -> Result<Json<Value>, ApiError> {
+    inner.with_registry(|registry, now| {
+        prune_sticky_sessions(registry, now);
+        let session = registry
+            .sticky_sessions
+            .get_mut(id)
+            .filter(|s| tenant.can_access(&s.tenant))
+            .ok_or_else(sticky_session_not_found)?;
+        session.expires_at = now.saturating_add(ttl_secs.saturating_mul(1000));
+        Ok(Json(session.to_json()))
+    })
+}
+
+pub(crate) fn delete_sticky_session(
+    inner: &Inner,
+    id: &str,
+    tenant: &TenantIdentity,
+) -> Result<Json<Value>, ApiError> {
+    inner.with_registry(|registry, now| {
+        prune_sticky_sessions(registry, now);
+        let owned = registry
+            .sticky_sessions
+            .get(id)
+            .is_some_and(|s| tenant.can_access(&s.tenant));
+        if !owned {
+            return Err(sticky_session_not_found());
+        }
+        registry.sticky_sessions.remove(id);
+        Ok(Json(json!({ "id": id, "status": "closed" })))
     })
 }
 
@@ -815,7 +1138,7 @@ pub fn spawn_worker(
     worker_id: Option<String>,
     max_jobs: usize,
 ) -> Result<WorkerHandle, ConfigError> {
-    spawn_worker_with(
+    spawn_worker_inner(
         engine,
         coordinator_url,
         token,
@@ -823,6 +1146,29 @@ pub fn spawn_worker(
         max_jobs,
         DEFAULT_POLL_INTERVAL,
         DEFAULT_HEARTBEAT_INTERVAL,
+        None,
+    )
+}
+
+/// Starts a background pull loop that also advertises `advertise_url` to the coordinator so
+/// sticky session assignments can return a routable worker endpoint.
+pub fn spawn_worker_with_advertise_url(
+    engine: BrowserEngine,
+    coordinator_url: String,
+    token: String,
+    worker_id: Option<String>,
+    max_jobs: usize,
+    advertise_url: Option<String>,
+) -> Result<WorkerHandle, ConfigError> {
+    spawn_worker_inner(
+        engine,
+        coordinator_url,
+        token,
+        worker_id,
+        max_jobs,
+        DEFAULT_POLL_INTERVAL,
+        DEFAULT_HEARTBEAT_INTERVAL,
+        advertise_url,
     )
 }
 
@@ -835,7 +1181,35 @@ pub(crate) fn spawn_worker_with(
     poll_interval: Duration,
     heartbeat_interval: Duration,
 ) -> Result<WorkerHandle, ConfigError> {
+    spawn_worker_inner(
+        engine,
+        coordinator_url,
+        token,
+        worker_id,
+        max_jobs,
+        poll_interval,
+        heartbeat_interval,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_worker_inner(
+    engine: BrowserEngine,
+    coordinator_url: String,
+    token: String,
+    worker_id: Option<String>,
+    max_jobs: usize,
+    poll_interval: Duration,
+    heartbeat_interval: Duration,
+    advertise_url: Option<String>,
+) -> Result<WorkerHandle, ConfigError> {
     let endpoint = CoordinatorEndpoint::parse(&coordinator_url)?;
+    let advertise_url = advertise_url
+        .as_deref()
+        .map(validate_advertise_url)
+        .transpose()
+        .map_err(ConfigError::InvalidCoordinator)?;
     let loopback = endpoint.is_loopback();
     let tls = endpoint.tls;
     let worker_id = match worker_id {
@@ -861,6 +1235,7 @@ pub(crate) fn spawn_worker_with(
         max_jobs,
         poll_interval,
         heartbeat_interval,
+        advertise_url,
         drain_rx,
         finished_tx,
     ));
@@ -977,6 +1352,7 @@ async fn worker_loop(
     max_jobs: usize,
     poll_interval: Duration,
     heartbeat_interval: Duration,
+    advertise_url: Option<String>,
     mut drain_rx: watch::Receiver<Option<Duration>>,
     finished_tx: watch::Sender<bool>,
 ) {
@@ -1056,7 +1432,16 @@ async fn worker_loop(
 
         if !draining && can_lease && active_len < max_jobs && pending_results.len() < max_jobs * 2 {
             let want = (max_jobs - active_len).min(MAX_LEASE_BATCH);
-            match post_lease(&endpoint, &token, &worker_id, want, max_jobs).await {
+            match post_lease(
+                &endpoint,
+                &token,
+                &worker_id,
+                want,
+                max_jobs,
+                advertise_url.as_deref(),
+            )
+            .await
+            {
                 Ok(leased) if !leased.is_empty() => {
                     backoff = poll_interval.max(Duration::from_millis(50));
                     let got = leased.len();
@@ -1292,12 +1677,17 @@ async fn post_lease(
     worker: &str,
     max_jobs: usize,
     capacity: usize,
+    advertise_url: Option<&str>,
 ) -> Result<Vec<LeasedJob>, String> {
+    let mut payload = serde_json::json!({ "max_jobs": max_jobs, "capacity": capacity });
+    if let Some(url) = advertise_url {
+        payload["advertise_url"] = serde_json::json!(url);
+    }
     let (status, body) = post_json_raw(
         ep,
         token,
         &format!("/v1/workers/{worker}/lease"),
-        &serde_json::json!({ "max_jobs": max_jobs, "capacity": capacity }),
+        &payload,
     )
     .await?;
     if status != 200 {

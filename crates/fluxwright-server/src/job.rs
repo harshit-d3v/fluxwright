@@ -54,6 +54,8 @@ pub struct JobRequest {
     pub webhook_url: Option<String>,
     #[serde(default)]
     pub webhook_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub affinity_key: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +144,17 @@ impl JobRequest {
             {
                 return Err(
                     "proxy_session must be 1-128 printable ASCII characters".into(),
+                );
+            }
+        }
+        if let Some(ref key) = self.affinity_key {
+            if key.is_empty()
+                || key.len() > 128
+                || !key.bytes().all(|b| b.is_ascii_graphic())
+            {
+                return Err(
+                    "affinity_key must be 1-128 printable ASCII characters without whitespace"
+                        .into(),
                 );
             }
         }
