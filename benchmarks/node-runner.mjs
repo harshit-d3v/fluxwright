@@ -321,28 +321,36 @@ async function withCrawlee() {
   record(latencyMetrics(lat, fail, duration_ms));
 }
 
+async function bidiSend(bidi, method, params) {
+  const res = await bidi.send({ method, params });
+  if (!res || res.type === "error" || "error" in res) {
+    throw new Error(res?.message || res?.error || `BiDi ${method} failed`);
+  }
+  return res.result;
+}
+
 async function withSelenium() {
   const { Builder } = await import("selenium-webdriver");
   const chromeMod = await import("selenium-webdriver/chrome.js");
   const chromedriver = process.env.FLUXWRIGHT_CHROMEDRIVER;
 
   const opts = new chromeMod.Options();
+  opts.enableBidi();
   if (chrome) opts.setChromeBinaryPath(chrome);
   opts.addArguments("--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check");
   if (process.env.FLUXWRIGHT_NO_SANDBOX) {
     opts.addArguments("--no-sandbox");
   }
 
-  const sessionCount = Math.min(nBrowsers, jobs, 10);
-  const drivers = [];
-  for (let i = 0; i < sessionCount; i++) {
+  const sessions = [];
+  for (let i = 0; i < nBrowsers; i++) {
     let builder = new Builder().forBrowser("chrome").setChromeOptions(opts);
     if (chromedriver) {
       builder = builder.setChromeService(new chromeMod.ServiceBuilder(chromedriver));
     }
     const driver = await builder.build();
-    await driver.manage().setTimeouts({ pageLoad: jobTimeoutMs });
-    drivers.push(driver);
+    const bidi = await driver.getBidi();
+    sessions.push({ driver, bidi });
     await sleep(50);
   }
 
@@ -350,23 +358,47 @@ async function withSelenium() {
   let fail = 0;
   const lat = [];
   const t0 = Date.now();
-  const workers = drivers.map(async (driver) => {
+  const workers = Array.from({ length: concurrency }, async () => {
     for (;;) {
       const i = next++;
       if (i >= jobs) return;
+      const { bidi } = sessions[i % sessions.length];
       const s = Date.now();
       try {
         await withTimeout(
           (async () => {
-            await driver.manage().deleteAllCookies();
-            await driver.get(url);
-            if (isPdf) {
-              const b64 = await driver.printPage({ background: true });
-              if (!b64 || Buffer.from(b64, "base64").subarray(0, 5).toString("latin1") !== "%PDF-") {
-                throw new Error("unexpected pdf output");
+            const { userContext } = await bidiSend(bidi, "browser.createUserContext", {});
+            try {
+              const { context } = await bidiSend(bidi, "browsingContext.create", {
+                type: "tab",
+                userContext,
+              });
+              await bidiSend(bidi, "browsingContext.navigate", {
+                context,
+                url,
+                wait: "complete",
+              });
+              if (isPdf) {
+                const pdfRes = await bidiSend(bidi, "browsingContext.print", {
+                  context,
+                  background: true,
+                  page: { width: 21.0, height: 29.7 },
+                });
+                if (
+                  !pdfRes?.data ||
+                  Buffer.from(pdfRes.data, "base64").subarray(0, 5).toString("latin1") !== "%PDF-"
+                ) {
+                  throw new Error("unexpected pdf output");
+                }
+              } else {
+                await bidiSend(bidi, "script.evaluate", {
+                  expression: "document.title",
+                  target: { context },
+                  awaitPromise: false,
+                });
               }
-            } else {
-              await driver.getTitle();
+            } finally {
+              await bidiSend(bidi, "browser.removeUserContext", { userContext }).catch(() => {});
             }
           })(),
           jobTimeoutMs + 5_000,
@@ -381,7 +413,7 @@ async function withSelenium() {
   await Promise.all(workers);
   const duration_ms = Date.now() - t0;
   await withTimeout(
-    Promise.all(drivers.map((d) => d.quit().catch(() => {}))),
+    Promise.all(sessions.map(({ driver }) => driver.quit().catch(() => {}))),
     5_000,
     "selenium-quit",
   ).catch(() => {});
