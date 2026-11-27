@@ -1649,7 +1649,7 @@
   }
   .bench tbody th {
     font-weight: 500;
-    inline-size: 36%;
+    inline-size: 30%;
   }
   .bench-value {
     display: block;
@@ -1709,7 +1709,7 @@
     }
     .bench tr {
       display: grid;
-      grid-template-columns: 1fr 1fr auto;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 0.65rem 1rem;
       padding-block: 0.9rem;
       border-block-end: 1px solid var(--line);
@@ -1733,10 +1733,13 @@
       content: "Fluxwright";
     }
     .bench td:nth-child(3)::before {
-      content: "Playwright";
+      content: "puppeteer-cluster";
     }
     .bench td:nth-child(4)::before {
-      content: "Gain";
+      content: "Crawlee";
+    }
+    .bench td:nth-child(5)::before {
+      content: "Playwright";
     }
   }
 
