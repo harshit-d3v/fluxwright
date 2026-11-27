@@ -1116,8 +1116,39 @@ function installEvents(Page) {
     })
   }
   Page.prototype.waitForEvent = function (event, optionsOrPredicate) {
+    if (event === 'download') {
+      const options = typeof optionsOrPredicate === 'function' ? { predicate: optionsOrPredicate } : optionsOrPredicate
+      try {
+        checkOptions('page.waitForEvent', options, { predicate: true, timeout: true })
+        if (options?.predicate != null && typeof options.predicate !== 'function') {
+          throw new TypeError('page.waitForEvent: predicate must be a function')
+        }
+        if (options?.timeout != null && (typeof options.timeout !== 'number' || !Number.isFinite(options.timeout) || options.timeout < 0)) {
+          throw new TypeError('page.waitForEvent: timeout must be a non-negative number')
+        }
+        if (closing.has(this) || this.isClosed()) throw new Error('page.waitForEvent: the page is closed')
+      } catch (err) {
+        return Promise.reject(err)
+      }
+      const predicate = options?.predicate ?? null
+      const timeout = options?.timeout ?? 30000
+      if (!predicate) {
+        return this.waitForDownload({ timeout })
+      }
+      const deadline = timeout > 0 ? Date.now() + timeout : 0
+      return (async () => {
+        for (;;) {
+          const remaining = deadline > 0 ? Math.max(1, deadline - Date.now()) : 0
+          if (deadline > 0 && Date.now() >= deadline) {
+            throw new Error(`page.waitForEvent: timeout ${timeout}ms exceeded`)
+          }
+          const dl = await this.waitForDownload({ timeout: remaining })
+          if (await predicate(dl)) return dl
+        }
+      })()
+    }
     if (!events.includes(event)) {
-      throw new Error(`page.waitForEvent: '${event}' is not supported (${events.join(', ')})`)
+      throw new Error(`page.waitForEvent: '${event}' is not supported (${[...events, 'download'].join(', ')})`)
     }
     const options = typeof optionsOrPredicate === 'function' ? { predicate: optionsOrPredicate } : optionsOrPredicate
     return waitForEvent(this, 'waitForEvent', event, { predicate: true, timeout: true }, options, () => {
@@ -1125,6 +1156,33 @@ function installEvents(Page) {
         throw new TypeError('page.waitForEvent: predicate must be a function')
       }
       return options?.predicate ?? (() => true)
+    })
+  }
+  Page.prototype.waitForTimeout = function (timeout) {
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+      return Promise.reject(new TypeError('page.waitForTimeout: timeout must be a non-negative number'))
+    }
+    if (closing.has(this) || this.isClosed()) {
+      return Promise.reject(new Error('page.waitForTimeout: the page is closed'))
+    }
+    let st = emitters.get(this)
+    if (!st) {
+      const em = new EventEmitter()
+      em.setMaxListeners(0)
+      st = { em, started: new Set(), waits: new Set(), closeSockets: null }
+      emitters.set(this, st)
+    }
+    return new Promise((resolve, reject) => {
+      const closed = () => {
+        clearTimeout(timer)
+        st.waits.delete(closed)
+        reject(new Error('page.waitForTimeout: the page closed'))
+      }
+      st.waits.add(closed)
+      const timer = setTimeout(() => {
+        st.waits.delete(closed)
+        resolve()
+      }, timeout)
     })
   }
   Page.prototype.opener = async function () {

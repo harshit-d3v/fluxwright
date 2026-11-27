@@ -388,7 +388,7 @@ try {
   // of console output arrives whole.
   const rv = await browser.newPage()
   await rv.goto(base)
-  const pending = rv.waitForDownload({ timeout: 10000 })
+  const pending = rv.waitForEvent('download', { timeout: 10000 })
   await rv.evaluate(() => {
     const a = document.createElement('a')
     a.href = '/report'
@@ -396,6 +396,8 @@ try {
     a.click()
   })
   assert.equal((await pending).suggestedFilename(), 'report.csv')
+  await rv.waitForTimeout(10)
+  await assert.rejects(() => rv.waitForTimeout(-1), TypeError)
   const quiet = console.error
   const warn = console.warn
   let warning = ''

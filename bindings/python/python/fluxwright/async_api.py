@@ -2380,6 +2380,24 @@ class Page(_native.Page):
             lambda: self._wait_for_url_impl(url, timeout=timeout, wait_until=wait_until),
         )
 
+    async def wait_for_timeout(self, timeout: float) -> None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or math.isnan(timeout)
+            or math.isinf(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be a non-negative finite number")
+        if self.is_closed():
+            raise Error("page is closed")
+        return await self._trace_action(
+            "waitForTimeout",
+            "page.wait_for_timeout",
+            {"waitTimeout": timeout},
+            lambda: asyncio.sleep(timeout / 1000.0),
+        )
+
     async def _wait_for_url_impl(
         self,
         url: URLMatch,
