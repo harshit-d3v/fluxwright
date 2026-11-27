@@ -2,15 +2,31 @@
 import fluxwright, {
   chromium,
   expect,
+  FluxwrightApiError,
+  FluxwrightClient,
+  type CrawlSnapshot,
+  type JobSnapshot,
   type LocatorAssertions,
+  type ManagedSession,
+  type MapResponse,
   type PageAssertions,
   type RecordVideoOptions,
+  type ScrapeResponse,
   type StorageState,
   type ToHaveScreenshotOptions,
   type Tracing,
   type Video,
 } from '../addon'
-import fluxwrightPkg, { chromium as pkgChromium, expect as pkgExpect } from 'fluxwright'
+import fluxwrightPkg, {
+  chromium as pkgChromium,
+  expect as pkgExpect,
+  FluxwrightClient as PkgClient,
+} from 'fluxwright'
+import {
+  FluxwrightClient as SubpathClient,
+  FluxwrightApiError as SubpathApiError,
+  type FluxwrightClientOptions,
+} from 'fluxwright/client'
 import {
   test,
   expect as runnerExpect,
@@ -436,4 +452,83 @@ export function typedRunner(): void {
     void [page, context, browser]
   })
   void fx.acquire({ name: 'node:test example' }).then(({ page, dispose }) => dispose(false))
+}
+
+export async function typedClient(): Promise<void> {
+  const opts: FluxwrightClientOptions = { baseUrl: 'http://127.0.0.1:8080', token: 'secret', timeoutMs: 5000 }
+  const client = new FluxwrightClient(opts)
+  const subpathClient = new SubpathClient(opts)
+  const pkgClient = new PkgClient(opts)
+  const defaultClient = new fluxwright.FluxwrightClient(opts)
+  const err = new FluxwrightApiError('nope', { status: 401, code: 'unauthorized', body: null })
+  const subErr = new SubpathApiError('nope', { status: 404 })
+  const _status: number = err.status
+  const _code: string | null = subErr.code
+
+  const health = await client.healthz()
+  const spec = await client.openapi()
+  const st = await client.stats()
+  const prom: string = await client.metrics()
+  const scraped: ScrapeResponse = await client.scrape({
+    url: 'https://example.com',
+    formats: ['markdown', 'text'],
+    mode: 'auto',
+  })
+  const mapped: MapResponse = await client.map({ url: 'https://example.com', include_sitemap: true })
+  const startedCrawl: CrawlSnapshot = await client.startCrawl({ url: 'https://example.com', max_pages: 10 })
+  const polledCrawl: CrawlSnapshot = await client.getCrawl(startedCrawl.id)
+  const cancelledCrawl: CrawlSnapshot = await client.cancelCrawl(startedCrawl.id)
+  const fullCrawl: CrawlSnapshot = await client.crawl({ url: 'https://example.com' }, { pollIntervalMs: 100, timeoutMs: 5000 })
+
+  const submittedJob: JobSnapshot = await client.submitJob({ steps: [{ action: 'goto', url: 'https://example.com' }] })
+  const polledJob: JobSnapshot = await client.getJob(submittedJob.id)
+  const cancelledJob: JobSnapshot = await client.cancelJob(submittedJob.id)
+  const fullJob: JobSnapshot = await client.runJob({ steps: [{ action: 'title' }] }, { pollIntervalMs: 100 })
+
+  const sess: ManagedSession = await client.createSession({ ttl_secs: 300, keep_alive: true })
+  const sessions = await client.listSessions()
+  const fetchedSess: ManagedSession = await client.getSession(sess.id)
+  const extendedSess: ManagedSession = await client.extendSession(sess.id, 600)
+  const files = await client.listSessionFiles(sess.id)
+  const uploaded = await client.uploadSessionFile(sess.id, 'a.txt', 'hello')
+  await client.uploadSessionFile(sess.id, 'b.bin', Buffer.from([1, 2, 3]))
+  await client.uploadSessionFile(sess.id, 'c.bin', new Uint8Array([4, 5]))
+  const downloaded: Buffer = await client.downloadSessionFile(sess.id, 'a.txt')
+  const deletedFile = await client.deleteSessionFile(sess.id, 'a.txt')
+  const deletedSess = await client.deleteSession(sess.id)
+
+  // @ts-expect-error token is required in FluxwrightClientOptions
+  new FluxwrightClient({ baseUrl: 'http://127.0.0.1:8080' })
+  // @ts-expect-error invalid scrape mode
+  await client.scrape({ url: 'https://example.com', mode: 'invalid' })
+  // @ts-expect-error content cannot be a number
+  await client.uploadSessionFile(sess.id, 'bad.bin', 123)
+
+  void [
+    subpathClient,
+    pkgClient,
+    defaultClient,
+    _status,
+    _code,
+    health.status,
+    spec,
+    st,
+    prom,
+    scraped,
+    mapped,
+    polledCrawl,
+    cancelledCrawl,
+    fullCrawl,
+    polledJob,
+    cancelledJob,
+    fullJob,
+    sessions,
+    fetchedSess,
+    extendedSess,
+    files,
+    uploaded,
+    downloaded,
+    deletedFile,
+    deletedSess,
+  ]
 }

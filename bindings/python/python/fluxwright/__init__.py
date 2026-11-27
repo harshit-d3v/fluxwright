@@ -4,9 +4,20 @@
 mirrors the Playwright module of the same name.
 """
 
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _version
 
 from ._errors import Error, TimeoutError
+from .client import AsyncFluxwrightClient, FluxwrightApiError, FluxwrightClient
 
-__all__ = ["Error", "TimeoutError"]
-__version__ = _version("fluxwright")
+__all__ = [
+    "AsyncFluxwrightClient",
+    "Error",
+    "FluxwrightApiError",
+    "FluxwrightClient",
+    "TimeoutError",
+]
+try:
+    __version__ = _version("fluxwright")
+except _PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
