@@ -90,4 +90,4 @@ node tests/parity/playwright-parity.mjs
 | Context tracing `.zip` (`context.tracing.start/startChunk/stopChunk/stop`) | Supported | Supported | Supported | Opens directly in Playwright Trace Viewer (`npx playwright show-trace trace.zip`). |
 | Video recording (`recordVideo` + `page.video()`) | Supported | Supported | Supported | WebM (when `ffmpeg` is on `PATH`) or built-in MJPEG-in-AVI fallback. |
 | Test runner (`fluxwright-test` / `pytest`) | Supported | Supported (`pytest11`) | `cargo test` | Parallel `--workers`, `--shard`, `--retries`, `--grep`, HTML/JSON/list reporters, `createFluxwrightFixtures`. |
-| Interactive GUI Codegen / hosted Trace Viewer UI | Unsupported | Unsupported | Unsupported | Use Playwright's Trace Viewer CLI with Fluxwright `.zip` trace bundles. |
+| Standalone trace viewer (`fluxwright show-trace`) | Supported | Supported (`trace.zip`) | Supported (`trace.zip`) | Offline single-file HTML export (`--out report.html`) or local HTTP viewer for any Fluxwright/Playwright `.zip` trace; no GUI recorder yet. |

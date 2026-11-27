@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -42,6 +42,25 @@ struct Pending {
 
 /// Every subscriber of a connection, each handed a pointer to the same parsed event.
 type Watchers = Mutex<Vec<mpsc::UnboundedSender<Arc<CdpEvent>>>>;
+
+fn parse_cdp_debug_env(val: &str) -> bool {
+    val.split(',').any(|tok| {
+        let t = tok.trim();
+        t == "1"
+            || t.eq_ignore_ascii_case("true")
+            || t.eq_ignore_ascii_case("all")
+            || t.eq_ignore_ascii_case("cdp")
+    })
+}
+
+fn cdp_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FLUXWRIGHT_DEBUG")
+            .map(|v| parse_cdp_debug_env(&v))
+            .unwrap_or(false)
+    })
+}
 
 /// Handle for dynamically adding/removing child session routes (e.g. OOPIF iframes, workers)
 /// to an active [`SessionSubscription`]. Dropping the last handle and subscription cleans up
@@ -551,10 +570,11 @@ impl Connection {
         if let Some(sid) = session_id {
             body["sessionId"] = json!(sid);
         }
+        let debug_start = cdp_debug_enabled().then(Instant::now);
         self.tx
             .send(Outgoing::Json(body.to_string()))
             .map_err(|_| Error::WebSocket("writer gone".into()))?;
-        match tokio::time::timeout(timeout, rx).await {
+        let outcome = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(CdpReply::Ok(val)))) => Ok(Ok(val)),
             Ok(Ok(Ok(CdpReply::Err(err)))) => Ok(Err(err)),
             Ok(Ok(Err(transport_err))) => Err(transport_err),
@@ -563,7 +583,21 @@ impl Connection {
                 self.pending.lock().unwrap().remove(&id);
                 Err(Error::timeout(method, timeout.as_millis() as u64))
             }
+        };
+        if let Some(t0) = debug_start {
+            let status = match &outcome {
+                Ok(Ok(_)) => "ok",
+                Ok(Err(_)) => "cdp_error",
+                Err(Error::Timeout { .. }) => "timeout",
+                Err(_) => "transport_error",
+            };
+            eprintln!(
+                "[fluxwright:cdp] id={id} session={} method={method} status={status} elapsed_ms={}",
+                session_id.unwrap_or("-"),
+                t0.elapsed().as_millis(),
+            );
         }
+        outcome
     }
 
     pub fn mark_dead(&self) {
@@ -1015,5 +1049,17 @@ mod tests {
         let recorded = writes.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0], b"p1\0p2\0p3\0");
+    }
+
+    #[test]
+    fn parse_cdp_debug_env_recognizes_flags() {
+        assert!(super::parse_cdp_debug_env("1"));
+        assert!(super::parse_cdp_debug_env("true"));
+        assert!(super::parse_cdp_debug_env("CDP"));
+        assert!(super::parse_cdp_debug_env("http, cdp"));
+        assert!(super::parse_cdp_debug_env("all"));
+        assert!(!super::parse_cdp_debug_env("0"));
+        assert!(!super::parse_cdp_debug_env(""));
+        assert!(!super::parse_cdp_debug_env("http"));
     }
 }
