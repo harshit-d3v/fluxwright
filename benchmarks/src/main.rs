@@ -417,7 +417,7 @@ fn print_table(records: &[Record]) {
          and `scraping-200` uses Fluxwright's `ResourcePreset::Scraping` against `/scraping` (images, font, CSS, JS); \
          Crawlee runs PlaywrightCrawler with incognito contexts, maxRequestRetries=2, and `blockRequests()` on \
          `scraping-200`; `puppeteer-cluster` runs CONCURRENCY_CONTEXT (single managed browser) with retryLimit=2; \
-         selenium reuses min(browsers, 10) pre-warmed WebDriver sessions with deleteAllCookies() between jobs; \
+         selenium uses Selenium 4 WebDriver BiDi with fresh browser.createUserContext() per job; \
          raw Playwright/Puppeteer/Selenium run default navigation without relaunch code in chaos. In-flight contexts on Node \
          are capped at 24. Memory is total process-tree RSS; CPU% is normalized across all logical host cores."
     );
