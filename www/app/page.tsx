@@ -58,17 +58,23 @@ const STEPS: { num: string; title: string; text: string }[] = [
   { num: "05", title: "Recycle", text: "Destroys the context immediately and drains bloated browsers without stalling." },
 ];
 
-// GitHub Actions benchmarks run 45825257140 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.88), 26 November 2026.
-const BENCH: { setup: string; flux: number; pw: number }[] = [
-  { setup: "1 browser, 10 pages (100 jobs)", flux: 46.1, pw: 36.9 },
-  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 66.1, pw: 36.3 },
-  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 54.0, pw: 38.3 },
-  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 52.0, pw: 40.5 },
-  { setup: "100 PDFs (8 browsers × 2 pages)", flux: 50.1, pw: 39.2 },
-  { setup: "200 scraping jobs (images + fonts)", flux: 35.7, pw: 30.6 },
-  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 48.6, pw: 23.5 },
+// GitHub Actions benchmarks run 45939361663 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.88), 27 November 2026.
+const BENCH: {
+  setup: string;
+  flux: number;
+  cluster: number | null;
+  crawlee: number;
+  pw: number;
+}[] = [
+  { setup: "1 browser, 10 pages (100 jobs)", flux: 34.5, cluster: 29.3, crawlee: 16.8, pw: 28.3 },
+  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 42.5, cluster: 28.8, crawlee: 17.9, pw: 28.2 },
+  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 40.5, cluster: 30.2, crawlee: 20.5, pw: 29.2 },
+  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 37.5, cluster: 30.2, crawlee: 19.0, pw: 30.3 },
+  { setup: "100 PDFs (4 browsers × 8 pages)", flux: 32.7, cluster: 23.7, crawlee: 17.5, pw: 26.7 },
+  { setup: "200 scraping jobs (images + fonts)", flux: 24.8, cluster: 20.8, crawlee: 16.5, pw: 21.2 },
+  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 32.1, cluster: null, crawlee: 2.7, pw: 23.3 },
 ];
-const BENCH_MAX = 70;
+const BENCH_MAX = 46;
 
 const TS_EXAMPLE = `import { chromium } from "fluxwright";
 
@@ -328,22 +334,22 @@ export default function Home() {
               <div className="kpi-card">
                 <span className="kpi-label">8 / 8 scenarios</span>
                 <strong>Fastest</strong>
-                <span>Beat Playwright and Puppeteer in every CI test case</span>
+                <span>Beat Crawlee, puppeteer-cluster, Playwright, and Puppeteer</span>
+              </div>
+              <div className="kpi-card">
+                <span className="kpi-label">1,000-job chaos</span>
+                <strong>32.1 /s</strong>
+                <span>0.0% failed across 13 browser kills (Crawlee 2.7 /s, PW 80.1% failed)</span>
+              </div>
+              <div className="kpi-card">
+                <span className="kpi-label">Chaos p95 latency</span>
+                <strong>1,093 ms</strong>
+                <span>vs 16,226 ms for Crawlee under 2s kills (0 leaked Chrome)</span>
               </div>
               <div className="kpi-card">
                 <span className="kpi-label">Tier 1 fast path</span>
                 <strong>518.8 /s</strong>
                 <span>Static /v1/scrape in 13 MB RSS vs 28.9 /s in browser</span>
-              </div>
-              <div className="kpi-card">
-                <span className="kpi-label">Chaos throughput</span>
-                <strong>48.6 /s</strong>
-                <span>vs 23.5 /s for Playwright with browser kills every 2s</span>
-              </div>
-              <div className="kpi-card">
-                <span className="kpi-label">Chaos reliability</span>
-                <strong>0.0% failed</strong>
-                <span>Playwright dropped 71.3% and Puppeteer 67.7% of jobs</span>
               </div>
             </div>
 
@@ -353,38 +359,50 @@ export default function Home() {
                 <tr>
                   <th scope="col">Workload scenario</th>
                   <th scope="col">Fluxwright (jobs/s)</th>
-                  <th scope="col">Playwright (jobs/s)</th>
-                  <th scope="col">Speedup</th>
+                  <th scope="col">puppeteer-cluster</th>
+                  <th scope="col">Crawlee</th>
+                  <th scope="col">Playwright</th>
                 </tr>
               </thead>
               <tbody>
-                {BENCH.map((b) => {
-                  const pct = Math.round(((b.flux - b.pw) / b.pw) * 100);
-                  return (
-                    <tr key={b.setup}>
-                      <th scope="row">{b.setup}</th>
-                      <td>
-                        <span className="bench-value">{b.flux.toFixed(1)}</span>
-                        <Bar value={b.flux} />
-                      </td>
-                      <td className="bench-other">
-                        <span className="bench-value">{b.pw.toFixed(1)}</span>
-                        <Bar value={b.pw} />
-                      </td>
-                      <td className="bench-delta">
-                        <span className="delta-pill">+{pct}%</span>
-                      </td>
-                    </tr>
-                  );
-                })}
+                {BENCH.map((b) => (
+                  <tr key={b.setup}>
+                    <th scope="row">{b.setup}</th>
+                    <td>
+                      <span className="bench-value">{b.flux.toFixed(1)}</span>
+                      <Bar value={b.flux} />
+                    </td>
+                    <td className="bench-other">
+                      {b.cluster === null ? (
+                        <span className="bench-value">timeout</span>
+                      ) : (
+                        <>
+                          <span className="bench-value">{b.cluster.toFixed(1)}</span>
+                          <Bar value={b.cluster} />
+                        </>
+                      )}
+                    </td>
+                    <td className="bench-other">
+                      <span className="bench-value">{b.crawlee.toFixed(1)}</span>
+                      <Bar value={b.crawlee} />
+                    </td>
+                    <td className="bench-other">
+                      <span className="bench-value">{b.pw.toFixed(1)}</span>
+                      <Bar value={b.pw} />
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
 
             <p className="note bench-note">
-              Measured in GitHub Actions run <code>45825257140</code> (26 November 2026):{" "}
-              <code>10-concurrent-browsers</code> saved 36.3% peak RAM (3,869 MB vs 6,073 MB),{" "}
-              <code>soak-5m</code> completed 7,898 jobs with 0 failures and flat RSS (505 to 442 MB), and{" "}
-              <code>fastpath-bench.mjs</code> reached 518.8 req/s on <code>/v1/scrape</code> (13.9 ms p50, 13 MB RSS) and 1,140.7 req/s on <code>/v1/map</code>.
+              Measured in GitHub Actions run <code>45939361663</code> (27 November 2026) with
+              full-lifecycle job timing, process-tree RSS, and normalized host CPU% on{" "}
+              <code>chrome-headless-shell 158.0.8127.88</code>. Crawlee used 773 to 1,129 MB peak RAM
+              by serializing page creation behind <code>browser-pool</code>&apos;s <code>pLimit(1)</code> lock at roughly half
+              the throughput; <code>puppeteer-cluster</code> (<code>CONCURRENCY_CONTEXT</code>, 1 browser) stalled past
+              465s in chaos. Soak (7,898 jobs, 0 failures, flat 505 to 442 MB RSS) and{" "}
+              <code>fastpath-bench.mjs</code> (518.8 req/s on <code>/v1/scrape</code>, 1,140.7 req/s on <code>/v1/map</code>) were measured in run <code>45825257140</code>.
             </p>
           </div>
         </section>

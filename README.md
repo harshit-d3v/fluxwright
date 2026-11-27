@@ -128,7 +128,49 @@ Use Fluxwright when you run many browser jobs — scraping, crawling, PDF and sc
 
 ## Speed
 
-Measured on GitHub's ubuntu-latest runner (4 vCPU, 2026-11-26, run `45825257140`): every tool on the same chrome-headless-shell 158.0.8127.88 binary with fresh isolated contexts per job. Fluxwright beat Playwright and Puppeteer in all 8 fleet scenarios with 0.0% failures and 0 leaked processes: `1-browser-10-pages` **46.1 vs 36.9** jobs/s, `10-concurrent-browsers` **66.1 vs 36.3** jobs/s (-36.3% peak RAM: 3,869 vs 6,073 MB), `100-concurrent` **53.7 vs 39.7** jobs/s (-9.5% peak RAM), `500-concurrent` **54.0 vs 38.3** jobs/s (-21.9% peak RAM), `1000-queued` **52.0 vs 40.5** jobs/s, `100-pdfs` **50.1 vs 39.2** jobs/s, `scraping-200` **35.7 vs 30.6** jobs/s, and `chaos-1000-queued` **48.6 jobs/s with 0.0% failures** across 9 browser kills (vs 71.3% failures on Playwright and 67.7% on Puppeteer). In the same run, a 5-minute soak (`soak-5m`) completed 7,898 jobs with 0.0% failures, 0 leaked processes, and stable RSS after recycling (`505 -> 517 -> 443 -> 442` MB), while Tier 1 pure-Rust HTTP fast path (`benchmarks/fastpath-bench.mjs`, 30 requests x 8 concurrency) reached **518.8 req/s** (`13.9 ms` p50, `13 MB` server RSS vs `28.9 req/s` / `384 MB` browser scraping) on static `/v1/scrape` and **1,140.7 req/s** (`6.7 ms` p50) on `/v1/map`. A shared cloud machine varies from run to run, so rerun it (Actions → benchmarks) and measure your own workload with `cargo run --release -p fluxwright-benchmarks` (results go to `benchmarks/results/`).
+Measured on GitHub's `ubuntu-latest` runner (4 vCPU, 2026-11-27, run `45939361663`): every tool on the same `chrome-headless-shell 158.0.8127.88` binary with fresh isolated contexts per job and full job-lifecycle timing (context acquire/create, navigation, work, close). Fluxwright led all 4 competitors on throughput in all 8 scenarios (including `1-browser-10-pages` **34.5** vs 30.2 / 29.3 / 28.3 / 16.8 jobs/s and `100-concurrent` **41.5** vs 34.0 / 29.4 / 28.2 / 19.4 jobs/s) with **0.0% failures** and **0 leaked processes**:
+
+| Scenario | Tool | jobs/s | peak MB | avg CPU% | p50 ms | p95 ms | p99 ms | fail % | killed | leaked |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `10-concurrent-browsers` (40 jobs) | `fluxwright` | **42.5** | 3,968 | 54.0% | 403 | 577 | 632 | 0.0% | 0 | 0 |
+|  | `puppeteer` | 32.1 | 6,538 | 27.0% | 608 | 678 | 683 | 0.0% | 0 | 0 |
+|  | `puppeteer-cluster` | 28.8 | 2,392 | 33.7% | 627 | 960 | 978 | 0.0% | 0 | 0 |
+|  | `playwright` | 28.2 | 5,657 | 25.9% | 689 | 830 | 927 | 0.0% | 0 | 0 |
+|  | `crawlee` | 17.9 | **1,129** | 20.3% | 998 | 1,103 | 1,141 | 0.0% | 0 | 0 |
+| `500-concurrent` (500 jobs) | `fluxwright` | **40.5** | 5,062 | 74.9% | 592 | 750 | 798 | 0.0% | 0 | 0 |
+|  | `puppeteer` | 34.3 | 6,828 | 65.0% | 690 | 900 | 1,021 | 0.0% | 0 | 0 |
+|  | `puppeteer-cluster` | 30.2 | 2,884 | 46.9% | 792 | 875 | 1,098 | 0.0% | 0 | 0 |
+|  | `playwright` | 29.2 | 6,377 | 65.5% | 815 | 965 | 1,054 | 0.0% | 0 | 0 |
+|  | `crawlee` | 20.5 | **882** | 30.0% | 1,149 | 1,211 | 1,235 | 0.0% | 0 | 0 |
+| `1000-queued` (1,000 jobs) | `fluxwright` | **37.5** | 3,759 | 83.9% | 632 | 889 | 1,062 | 0.0% | 0 | 0 |
+|  | `puppeteer` | 34.6 | 4,413 | 79.2% | 681 | 973 | 1,101 | 0.0% | 0 | 0 |
+|  | `playwright` | 30.3 | 4,304 | 69.9% | 784 | 977 | 1,081 | 0.0% | 0 | 0 |
+|  | `puppeteer-cluster` | 30.2 | 2,975 | 47.1% | 788 | 870 | 1,027 | 0.0% | 0 | 0 |
+|  | `crawlee` | 19.0 | **949** | 30.5% | 1,257 | 1,304 | 1,340 | 0.0% | 0 | 0 |
+| `100-pdfs` (100 jobs) | `fluxwright` | **32.7** | 3,540 | 85.4% | 714 | 979 | 1,095 | 0.0% | 0 | 0 |
+|  | `puppeteer` | 27.0 | 4,724 | 50.1% | 859 | 1,088 | 1,206 | 0.0% | 0 | 0 |
+|  | `playwright` | 26.7 | 4,299 | 58.0% | 875 | 1,171 | 1,287 | 0.0% | 0 | 0 |
+|  | `puppeteer-cluster` | 23.7 | 3,063 | 46.9% | 996 | 1,260 | 1,263 | 0.0% | 0 | 0 |
+|  | `crawlee` | 17.5 | **801** | 28.1% | 1,298 | 1,338 | 1,448 | 0.0% | 0 | 0 |
+| `scraping-200` (200 jobs) | `fluxwright` | **24.8** | 4,136 | 95.7% | 952 | 1,232 | 1,381 | 0.0% | 0 | 0 |
+|  | `puppeteer` | 22.6 | 4,512 | 77.2% | 1,034 | 1,498 | 1,567 | 0.0% | 0 | 0 |
+|  | `playwright` | 21.2 | 4,273 | 73.3% | 1,100 | 1,478 | 1,671 | 0.0% | 0 | 0 |
+|  | `puppeteer-cluster` | 20.8 | 2,973 | 54.8% | 1,125 | 1,417 | 1,594 | 0.0% | 0 | 0 |
+|  | `crawlee` | 16.5 | **907** | 32.8% | 1,413 | 1,445 | 1,539 | 0.0% | 0 | 0 |
+| `chaos-1000-queued` (SIGKILL / 2s) | `fluxwright` | **32.1** | 3,829 | 84.5% | 722 | 1,093 | 1,441 | **0.0%** | 13 | 0 |
+|  | `crawlee` | 2.7 | **826** | 4.2% | 16,111 | 16,226 | 18,422 | **0.0%** | 26 | 0 |
+|  | `playwright` | 23.3 | 3,861 | 8.0% | 3 | 906 | 1,087 | 80.1% | 4 | 0 |
+|  | `puppeteer` | 26.2 | 4,465 | 9.0% | 0 | 883 | 1,084 | 78.5% | 4 | 0 |
+|  | `puppeteer-cluster` | timed out (>465s) | - | - | - | - | - | - | - | - |
+
+Methodology and tradeoffs:
+- **Process-tree memory & CPU%:** `peak MB` sums RSS across the driver and every Chrome process it started; `avg CPU%` is normalized across all logical host cores.
+- **Crawlee:** runs `PlaywrightCrawler` with `useIncognitoPages: true`, `maxRequestRetries: 2`, and built-in `blockRequests()` on `scraping-200`. It uses the lowest peak RAM (`773–1,129 MB`) and recovers cleanly with `0.0%` failures in chaos because `@crawlee/browser-pool` serializes page creation behind a `pLimit(1)` lock (`apify/crawlee#1126`), keeping fewer Chrome instances open while capping steady-state throughput at `16.5–20.5 jobs/s` and dropping to `2.7 jobs/s` (`16.1 s` p50) under chaos kills.
+- **`puppeteer-cluster`:** runs `CONCURRENCY_CONTEXT` (one managed Chrome with isolated contexts, `retryLimit: 2`, and automatic `repair()`), using less RAM (`2.4–3.1 GB`) than multi-browser pools and achieving tight steady-state p95/p99 on `1000-queued` (`870 / 1,027 ms`), while stalling past the 465s runner budget under repeated chaos kills in run `45939361663` (earlier run `45936372750` finished at `29.1 jobs/s` with `1.2%` failures and `20.9 s` p95 recovery tail).
+- **Fluxwright vs raw Playwright/Puppeteer:** Fluxwright enables `prewarm_contexts(2)` and `ResourcePreset::Scraping` (`scraping-200`). Raw Playwright and Puppeteer run without custom relaunch or retry code in chaos (their low `p50` in chaos reflects fast connection-refused errors after browsers die).
+- **Soak & Tier 1 HTTP fast path (run `45825257140`):** a 5-minute soak (`soak-5m`) completed `7,898` jobs with `0.0%` failures, `0` leaked processes, and flat RSS after recycling (`505 -> 517 -> 443 -> 442 MB`); Tier 1 pure-Rust HTTP fast path (`benchmarks/fastpath-bench.mjs`, 30 requests x 8 concurrency) reached **518.8 req/s** (`13.9 ms` p50, `13 MB` RSS vs `28.9 req/s` / `384 MB` browser scraping) on static `/v1/scrape` and **1,140.7 req/s** (`6.7 ms` p50) on `/v1/map`.
+
+Reproduce on Linux/macOS/Windows with `cargo run --release -p fluxwright-benchmarks -- --chaos` (results write to `benchmarks/results/latest.json`).
 
 ## Rust
 
