@@ -2370,4 +2370,189 @@ mod tests {
         drop(a);
         assert!(weak_a.upgrade().is_none());
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v1_mcp_tool_schema_contract_snapshot() {
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let (app, sessions, shutdown_cfg) = test_http_app(None);
+
+        let init_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(init_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_resp.status(), StatusCode::OK);
+        let session_id = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .expect("mcp-session-id header")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let notif_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", &session_id)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/initialized"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notif_resp.status(), StatusCode::ACCEPTED);
+
+        let list_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", &session_id)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/list"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_bytes = axum::body::to_bytes(list_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let list_json = parse_first_sse_json(&list_bytes);
+        let tools = list_json["result"]["tools"]
+            .as_array()
+            .expect("tools/list result.tools array");
+
+        let mut names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool name string"))
+            .collect();
+        names.sort_unstable();
+        let expected_names = [
+            "back",
+            "click",
+            "close",
+            "console",
+            "content",
+            "evaluate",
+            "export_api_calls",
+            "fill",
+            "forward",
+            "goto",
+            "hover",
+            "markdown",
+            "network",
+            "open",
+            "press",
+            "screenshot",
+            "scroll",
+            "select",
+            "snapshot",
+            "tabs",
+            "title",
+            "wait_for",
+        ];
+        assert_eq!(names.len(), 22);
+        assert_eq!(names, expected_names);
+
+        let by_name: BTreeMap<&str, &serde_json::Value> = tools
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap(), t))
+            .collect();
+
+        for (name, tool) in &by_name {
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|d| !d.trim().is_empty()),
+                "tool `{name}` must have a non-empty description"
+            );
+            assert_eq!(
+                tool["inputSchema"]["type"].as_str(),
+                Some("object"),
+                "tool `{name}` inputSchema.type must be \"object\""
+            );
+        }
+
+        let expected_properties: &[(&str, &[&str])] = &[
+            ("open", &["url"]),
+            ("goto", &["url"]),
+            (
+                "snapshot",
+                &[
+                    "compact",
+                    "diff",
+                    "interactive_only",
+                    "max_depth",
+                    "max_nodes",
+                ],
+            ),
+            (
+                "markdown",
+                &[
+                    "include_images",
+                    "include_links",
+                    "main_content_only",
+                    "selector",
+                ],
+            ),
+            ("click", &["selector"]),
+            ("fill", &["selector", "value"]),
+            (
+                "export_api_calls",
+                &["filter", "format", "include_auth", "limit"],
+            ),
+        ];
+
+        for &(name, required_props) in expected_properties {
+            let tool = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("missing tool `{name}`"));
+            let props = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("tool `{name}` inputSchema missing `properties`"));
+            for &prop in required_props {
+                assert!(
+                    props.contains_key(prop),
+                    "tool `{name}` inputSchema.properties missing `{prop}` (found: {:?})",
+                    props.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        shutdown_cfg.cancellation_token.cancel();
+        close_all_sessions(&sessions).await;
+    }
 }

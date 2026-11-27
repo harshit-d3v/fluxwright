@@ -1,0 +1,13 @@
+{
+  "name": "fluxwright-example-ai-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency AI agent starter using fluxwright-mcp Streamable HTTP and /v1/sessions HITL Live View.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node agent.mjs"
+  }
+}

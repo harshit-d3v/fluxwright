@@ -1,0 +1,13 @@
+{
+  "name": "fluxwright-example-rag-crawler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency RAG crawler using Fluxwright POST /v1/crawl to emit JSONL chunks for vector ingestion.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.mjs"
+  }
+}
