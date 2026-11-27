@@ -5,78 +5,164 @@ on:
     branches: [main]
   pull_request:
 
-# Checkout is all any job needs from the GITHUB_TOKEN.
-permissions:
-  contents: read
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust || 'true' }}
+      node: ${{ steps.filter.outputs.node || 'true' }}
+      python: ${{ steps.filter.outputs.python || 'true' }}
+      docker: ${{ steps.filter.outputs.docker || 'true' }}
+      site: ${{ steps.filter.outputs.site || 'true' }}
+      e2e: ${{ steps.filter.outputs.e2e || 'true' }}
+    steps:
+      - id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'benchmark-server/**'
+              - 'benchmarks/**'
+              - '.github/workflows/ci.yml'
+            node:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'bindings/node/**'
+              - 'tests/parity/**'
+              - '.github/workflows/ci.yml'
+            python:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'bindings/python/**'
+              - '.github/workflows/ci.yml'
+            docker:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'benchmark-server/**'
+              - 'benchmarks/**'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+            site:
+              - 'www/**'
+              - '.github/workflows/ci.yml'
+            e2e:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'www/**'
+              - 'tests/e2e/**'
+              - '.github/workflows/ci.yml'
+
   test:
     name: rust
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     env:
       FLUXWRIGHT_NO_SANDBOX: "1"
       FLUXWRIGHT_HEADLESS: "1"
       RUST_BACKTRACE: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Skip (no relevant changes)
+        if: needs.changes.outputs.rust != 'true'
+        working-directory: .
+        run: echo "No rust-impacting files changed; skipping."
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@v2
       - name: Locate Chrome
+        if: needs.changes.outputs.rust == 'true'
         run: |
           echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
           google-chrome --version
       - name: Test
+        if: needs.changes.outputs.rust == 'true'
         run: cargo test --workspace -- --test-threads=1
 
   # Chrome comes preinstalled on all three runners, where the engine finds it by itself.
   node:
     name: node binding (${{ matrix.os }})
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
     env:
       FLUXWRIGHT_NO_SANDBOX: "1"
     defaults:
       run:
         working-directory: bindings/node
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Skip (no relevant changes)
+        if: needs.changes.outputs.node != 'true'
+        working-directory: .
+        run: echo "No node-impacting files changed; skipping."
+      - if: needs.changes.outputs.node == 'true'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.node == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.node == 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: bindings/node -> target
-      - uses: actions/setup-node@v7
+      - if: needs.changes.outputs.node == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: bindings/node/package-lock.json
-      - run: npm ci
-      - run: npm run test:types
-      - run: npm run build:debug
+      - if: needs.changes.outputs.node == 'true'
+        run: npm ci
+      - if: needs.changes.outputs.node == 'true'
+        run: npm run test:types
+      - if: needs.changes.outputs.node == 'true'
+        run: npm run build:debug
       # The build regenerates both; the loader carries the package version, so a version bump
       # that skips the rebuild would publish a loader expecting the old one.
       - name: Generated index.js and index.d.ts are committed
-        if: matrix.os == 'ubuntu-latest'
+        if: needs.changes.outputs.node == 'true' && matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- index.js index.d.ts || { echo "::error::Run npm run build:debug and commit index.js and index.d.ts"; exit 1; }
-      - run: npm test
-      - run: node ../../tests/parity/playwright-parity.mjs --engine=fluxwright
+      - if: needs.changes.outputs.node == 'true'
+        run: npm test
+      - if: needs.changes.outputs.node == 'true'
+        run: node ../../tests/parity/playwright-parity.mjs --engine=fluxwright
 
   python:
     name: python binding (${{ matrix.os }})
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
     env:
       FLUXWRIGHT_NO_SANDBOX: "1"
     defaults:
@@ -84,19 +170,32 @@ jobs:
         working-directory: bindings/python
         shell: bash
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Skip (no relevant changes)
+        if: needs.changes.outputs.python != 'true'
+        working-directory: .
+        run: echo "No python-impacting files changed; skipping."
+      - if: needs.changes.outputs.python == 'true'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.python == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.python == 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: bindings/python -> target
-      - uses: actions/setup-python@v7
+      - if: needs.changes.outputs.python == 'true'
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - if: needs.changes.outputs.python == 'true'
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - name: Build and test
+        if: needs.changes.outputs.python == 'true'
         run: |
-          python -m venv .venv
+          uv venv .venv
           bin=.venv/bin; [ -d .venv/Scripts ] && bin=.venv/Scripts
-          "$bin/python" -m pip install maturin pytest
+          uv pip install --python .venv maturin pytest
           VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop
           "$bin/python" -m pytest -q tests
 
@@ -104,12 +203,30 @@ jobs:
   # page, which the SSRF guard must let through).
   docker:
     name: docker image
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - run: docker build -t fluxwright .
+      - name: Skip (no relevant changes)
+        if: needs.changes.outputs.docker != 'true'
+        working-directory: .
+        run: echo "No docker-impacting files changed; skipping."
+      - if: needs.changes.outputs.docker == 'true'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.docker == 'true'
+        uses: docker/setup-buildx-action@v3
+      - if: needs.changes.outputs.docker == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: fluxwright
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       - name: Run one job through fluxwright serve
+        if: needs.changes.outputs.docker == 'true'
         run: |
           token=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
           mkdir site && echo '<title>docker-ok</title>' > site/index.html
@@ -129,36 +246,58 @@ jobs:
           done
           jq . <<<"$job"
           test "$(jq -r '.results[1]' <<<"$job")" = docker-ok
-      - if: always()
+      - if: always() && needs.changes.outputs.docker == 'true'
         run: docker logs fw || true
 
   site:
     name: website
+    needs: changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: www
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - name: Skip (no relevant changes)
+        if: needs.changes.outputs.site != 'true'
+        working-directory: .
+        run: echo "No site-impacting files changed; skipping."
+      - if: needs.changes.outputs.site == 'true'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.site == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: www/package-lock.json
-      - run: npm ci
-      - run: npm run build
+      - if: needs.changes.outputs.site == 'true'
+        run: npm ci
+      - if: needs.changes.outputs.site == 'true'
+        run: npm run build
 
   e2e:
     name: black-box e2e
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     env:
       FLUXWRIGHT_NO_SANDBOX: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v7
+      - name: Skip (no relevant changes)
+        if: needs.changes.outputs.e2e != 'true'
+        working-directory: .
+        run: echo "No e2e-impacting files changed; skipping."
+      - if: needs.changes.outputs.e2e == 'true'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.e2e == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.e2e == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: needs.changes.outputs.e2e == 'true'
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -166,18 +305,23 @@ jobs:
             www/package-lock.json
             tests/e2e/package-lock.json
       - name: Locate Chrome
+        if: needs.changes.outputs.e2e == 'true'
         run: |
           echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
           google-chrome --version
       - name: Build website
+        if: needs.changes.outputs.e2e == 'true'
         working-directory: www
         run: |
           npm ci
           npm run build
       - name: Build fluxwright-cli
+        if: needs.changes.outputs.e2e == 'true'
         run: cargo build -p fluxwright-cli
       - name: Install E2E dependencies
+        if: needs.changes.outputs.e2e == 'true'
         working-directory: tests/e2e
         run: npm ci
       - name: Run E2E suite
+        if: needs.changes.outputs.e2e == 'true'
         run: node tests/e2e/run.mjs
