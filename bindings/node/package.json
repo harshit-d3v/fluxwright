@@ -43,7 +43,7 @@
     "cdp",
     "napi-rs"
   ],
-  "author": "Fluxwright contributors",
+  "author": "Harshit Prakash",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=18"
@@ -65,7 +65,8 @@
     "test_runner.d.ts",
     "MISSING.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "build": "napi build --platform --release",

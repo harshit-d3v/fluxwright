@@ -1,6 +1,7 @@
 [package]
 name = "fluxwright-cdp"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Chrome DevTools Protocol transport and sessions for Fluxwright"

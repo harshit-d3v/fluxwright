@@ -9,8 +9,8 @@ description = "Run hundreds of headless Chrome jobs on one machine: pooling, que
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
-authors = [{ name = "Fluxwright contributors" }]
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Harshit Prakash" }]
 keywords = ["chromium", "chrome", "headless", "playwright", "puppeteer", "browser-pool", "browser-automation", "scraping", "cdp"]
 classifiers = [
     "Development Status :: 4 - Beta",
