@@ -4847,3 +4847,153 @@ async fn fast_cdp_tier_handles_escalated_scrape_and_map_with_32601_fallback() {
     cdp_task.abort();
     http_srv_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scrape_extract_crawl_and_openapi_endpoints() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let filler = "Fluxwright Tier 1 HTTP scraper and crawler verification payload with plenty of readable content so static HTML extraction triggers cleanly without launching headless Chromium.";
+
+    let site_task = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let filler = filler.to_string();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let html = match target {
+                    "/" => format!(
+                        "<!doctype html><title>Home</title><body><h1>Home Hub</h1><a href=\"/docs\">Docs</a><a href=\"/admin/secret\">Admin</a><p>{filler}</p></body>"
+                    ),
+                    "/docs" => format!(
+                        "<!doctype html><title>Docs</title><body><h1>Docs Guide</h1><a href=\"/docs/api\">API</a><p>{filler}</p></body>"
+                    ),
+                    "/docs/api" => format!(
+                        "<!doctype html><title>API</title><body><h1>API Reference</h1><a href=\"/\">Back</a><p>{filler}</p></body>"
+                    ),
+                    "/admin/secret" => format!(
+                        "<!doctype html><title>Secret</title><body><h1>Secret</h1><p>{filler}</p></body>"
+                    ),
+                    _ => "<!doctype html><title>404</title><body>Missing</body>".to_string(),
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let srv = server(16).await;
+
+    // 1. OpenAPI schema is public without auth.
+    let spec_resp = srv
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spec_resp.status(), StatusCode::OK);
+    let spec = body(spec_resp).await;
+    assert_eq!(spec["openapi"], "3.1.0");
+    assert!(spec["paths"]["/v1/crawl"]["post"].is_object());
+
+    // 2. Declarative CSS extraction on /v1/scrape in Tier 1 HTTP mode.
+    let scrape_resp = call(
+        &srv,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{base}/"),
+            "mode": "http",
+            "formats": ["markdown"],
+            "extract": {
+                "heading": "h1",
+                "links": { "selector": "a", "attr": "href", "all": true }
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(scrape_resp.status(), StatusCode::OK);
+    let scrape_json = body(scrape_resp).await;
+    assert_eq!(scrape_json["engine"], "http");
+    assert_eq!(scrape_json["extracted"]["heading"], "Home Hub");
+    assert_eq!(
+        scrape_json["extracted"]["links"],
+        json!(["/docs", "/admin/secret"])
+    );
+
+    let bad_extract = call(
+        &srv,
+        "POST",
+        "/v1/scrape",
+        json!({
+            "url": format!("{base}/"),
+            "mode": "http",
+            "extract": { "bad": "[[[" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(bad_extract.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Async recursive /v1/crawl with depth + exclude_paths + extract rules.
+    let start_resp = call(
+        &srv,
+        "POST",
+        "/v1/crawl",
+        json!({
+            "url": format!("{base}/"),
+            "mode": "http",
+            "max_depth": 2,
+            "max_pages": 5,
+            "concurrency": 2,
+            "exclude_paths": ["/admin*"],
+            "extract": { "heading": "h1" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(start_resp.status(), StatusCode::ACCEPTED);
+    let started_crawl = body(start_resp).await;
+    let crawl_id = started_crawl["id"].as_str().unwrap().to_string();
+
+    let mut final_crawl = Value::Null;
+    for _ in 0..80 {
+        let poll_resp = call(&srv, "GET", &format!("/v1/crawl/{crawl_id}"), Body::empty()).await;
+        assert_eq!(poll_resp.status(), StatusCode::OK);
+        let snap = body(poll_resp).await;
+        if snap["status"] == "completed" || snap["status"] == "failed" {
+            final_crawl = snap;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(final_crawl["status"], "completed");
+    assert_eq!(final_crawl["completed"], 3);
+    assert_eq!(final_crawl["failed"], 0);
+    let pages = final_crawl["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 3);
+    assert!(!pages.iter().any(|p| p["url"].as_str().unwrap().contains("/admin")));
+    assert!(pages.iter().all(|p| p["engine"] == "http" && p["extracted"]["heading"].is_string()));
+
+    srv.shutdown(Duration::from_secs(2)).await.unwrap();
+    site_task.abort();
+}
