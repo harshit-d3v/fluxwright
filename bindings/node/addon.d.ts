@@ -1,4 +1,6 @@
 export * from './index'
+export * from './client'
+import { FluxwrightApiError, FluxwrightClient } from './client'
 import {
   BoundingBox,
   Browser,
@@ -98,7 +100,12 @@ export const expect: Expect
 export const chromium: Pick<typeof Chromium, 'launch'> & {
   connectOverCDP(endpointURL: string, options?: Record<string, never>): Promise<Browser>
 }
-declare const fluxwright: { chromium: typeof chromium; expect: typeof expect }
+declare const fluxwright: {
+  chromium: typeof chromium
+  expect: typeof expect
+  FluxwrightClient: typeof FluxwrightClient
+  FluxwrightApiError: typeof FluxwrightApiError
+}
 export default fluxwright
 
 /** Playwright's `page.pdf` options. */

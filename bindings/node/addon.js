@@ -5,6 +5,7 @@ const fs = require('node:fs/promises')
 const { dirname } = require('node:path')
 const { Script } = require('node:vm')
 const { createExpect } = require('./expect.js')
+const { FluxwrightClient, FluxwrightApiError } = require('./client.js')
 const { Tracing } = require('./tracing.js')
 const { Video, VideoRecorder, validateRecordVideoOptions } = require('./video.js')
 const { validateMaskColor, resolveMaskSelectors } = require('./visual.js')
@@ -3225,6 +3226,8 @@ function applyFilter(loc, options, label) {
     },
   }
   module.exports.expect = createExpect(native.Page, native.Locator, undefined, ownerPage)
+  module.exports.FluxwrightClient = FluxwrightClient
+  module.exports.FluxwrightApiError = FluxwrightApiError
   module.exports.default = module.exports
 } catch (err) {
   // Keep why: no prebuild for this platform, a missing optional dependency, or a checkout that
@@ -3245,6 +3248,8 @@ function applyFilter(loc, options, label) {
       },
     },
     expect: createExpect(null, null),
+    FluxwrightClient,
+    FluxwrightApiError,
   }
   module.exports.default = module.exports
 }

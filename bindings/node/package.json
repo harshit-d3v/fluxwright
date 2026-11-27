@@ -9,6 +9,10 @@
       "types": "./addon.d.ts",
       "default": "./addon.js"
     },
+    "./client": {
+      "types": "./client.d.ts",
+      "default": "./client.js"
+    },
     "./test": {
       "types": "./test_runner.d.ts",
       "default": "./test_runner.js"
@@ -47,6 +51,8 @@
   "files": [
     "addon.js",
     "addon.d.ts",
+    "client.js",
+    "client.d.ts",
     "cli_test.js",
     "expect.js",
     "html_report.js",
@@ -63,7 +69,7 @@
   ],
   "scripts": {
     "build": "napi build --platform --release",
-    "test": "node --expose-gc test/smoke.mjs && node test/expect.mjs && node test/tracing.mjs && node test/video_visual.mjs && node test/runner.mjs",
+    "test": "node --expose-gc test/smoke.mjs && node test/expect.mjs && node test/tracing.mjs && node test/video_visual.mjs && node test/runner.mjs && node test/client.mjs",
     "test:types": "tsc -p test",
     "build:debug": "napi build --platform",
     "artifacts": "napi artifacts",
