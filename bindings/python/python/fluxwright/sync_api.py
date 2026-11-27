@@ -1488,6 +1488,9 @@ class Page(_Finders):
     ) -> Any:
         return _run(self._impl.wait_for_function, expression, arg, timeout=timeout, polling=polling)
 
+    def wait_for_timeout(self, timeout: float) -> None:
+        _run(self._impl.wait_for_timeout, timeout)
+
     def set_default_timeout(self, timeout: float) -> None:
         """The timeout in milliseconds for this page's calls from now on, navigation included;
         0 for none. A call's own ``timeout`` wins."""
