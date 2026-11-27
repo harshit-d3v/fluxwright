@@ -646,7 +646,9 @@ version = "0.14.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.23.1",
  "clap",
+ "flate2",
  "fluxwright",
  "fluxwright-server",
  "serde",
