@@ -14,9 +14,14 @@ COPY benchmark-server ./benchmark-server
 COPY benchmarks/Cargo.toml ./benchmarks/Cargo.toml
 COPY benchmarks/src ./benchmarks/src
 
-RUN cargo build --release --locked -p fluxwright-cli -p fluxwright-mcp \
-    && strip /usr/src/fluxwright/target/release/fluxwright \
-             /usr/src/fluxwright/target/release/fluxwright-mcp
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/fluxwright/target \
+    cargo build --release --locked -p fluxwright-cli -p fluxwright-mcp \
+    && mkdir -p /out \
+    && cp /usr/src/fluxwright/target/release/fluxwright /out/fluxwright \
+    && cp /usr/src/fluxwright/target/release/fluxwright-mcp /out/fluxwright-mcp \
+    && strip /out/fluxwright /out/fluxwright-mcp
 
 # -----------------------------------------------------------------------------
 # Stage 2: Minimal Debian Bookworm runtime with system Chromium and tini
@@ -42,8 +47,8 @@ RUN groupadd --gid 10001 fluxwright \
     && mkdir -p /tmp/fluxwright \
     && chown -R fluxwright:fluxwright /home/fluxwright /tmp/fluxwright
 
-COPY --from=builder /usr/src/fluxwright/target/release/fluxwright /usr/local/bin/fluxwright
-COPY --from=builder /usr/src/fluxwright/target/release/fluxwright-mcp /usr/local/bin/fluxwright-mcp
+COPY --from=builder /out/fluxwright /usr/local/bin/fluxwright
+COPY --from=builder /out/fluxwright-mcp /usr/local/bin/fluxwright-mcp
 
 ENV FLUXWRIGHT_CHROMIUM=/usr/bin/chromium \
     HOME=/home/fluxwright \
