@@ -1,6 +1,6 @@
 # Competitive analysis
 
-Researched 2026-09-21; updated 2026-11-27 against 2026 competitor repositories, `v0.14.0` capabilities, and GitHub Actions CI runs (`45939361663` and `45825257140`). Fluxwright is a 3-tier fleet engine (HTTP fast path, optional light-CDP, pooled Chromium), not just a Playwright rewrite. This document judges alternatives on pooling, admission control, recycling, crash recovery, licensing, and reproducible CI metrics.
+Researched 2026-09-21; updated 2026-11-27 against 2026 competitor repositories, `v0.14.0` capabilities, and GitHub Actions CI runs (`45952022742` and `45825257140`). Fluxwright is a 3-tier fleet engine (HTTP fast path, optional light-CDP, pooled Chromium), not just a Playwright rewrite. This document judges alternatives on pooling, admission control, recycling, crash recovery, licensing, and reproducible CI metrics.
 
 **How to read this.** Each section splits **claimed** (the project’s own words) from **verified** (read from source, repo APIs, docs, or CI benchmark artifacts). Unverified marketing numbers and unverified third-party pricing tiers are not treated as facts.
 
@@ -334,8 +334,8 @@ These platforms compete for AI browser agents, RAG scraping, and remote Chrome s
 
 | Project (GitHub) | Verified License | Core Architecture | Strengths vs Fluxwright `v0.14.0` | Fluxwright `v0.14.0` Advantage |
 |---|---|---|---|---|
-| **Steel.dev** (`steel-dev/steel-browser`) | `Apache-2.0` | Node/Fastify API (`actions`, `cdp`, `commands`, `files`, `logs`, `recording`, `selenium`, `sessions`) + Docker/Render templates | Managed `/files` upload/download HTTP API, unpacked Chrome extensions, typed SDKs | Compiled Rust core + Tier 1 HTTP fast path (`518.8 req/s`), M x K RSS-ceiling fleet, priority queue, built-in E2E tests, multi-node cluster (`coordinate`) |
-| **Firecrawl** (`mendableai/firecrawl`) | `AGPL-3.0` | Multi-service extraction API (`apps/api/src/routes/v2.ts`) | Recursive `/crawl`, schema JSON extraction, zero-ops SaaS, huge AI RAG ecosystem | Permissive `Apache-2.0` single binary, full stateful automation (`/v1/sessions`, Live View, HITL, CDP gateway), `518.8 req/s` pure-Rust `/v1/scrape` (`13 MB` RSS) |
+| **Steel.dev** (`steel-dev/steel-browser`) | `Apache-2.0` | Node/Fastify API (`actions`, `cdp`, `commands`, `files`, `logs`, `recording`, `selenium`, `sessions`) + Docker/Render templates | Managed `/files` upload/download HTTP API, unpacked Chrome extensions, typed SDKs | Compiled Rust core + Tier 1 HTTP fast path (`497.0 req/s`), M x K RSS-ceiling fleet, priority queue, built-in E2E tests, multi-node cluster (`coordinate`) |
+| **Firecrawl** (`mendableai/firecrawl`) | `AGPL-3.0` | Multi-service extraction API (`apps/api/src/routes/v2.ts`) | Recursive `/crawl`, schema JSON extraction, zero-ops SaaS, huge AI RAG ecosystem | Permissive `Apache-2.0` single binary, full stateful automation (`/v1/sessions`, Live View, HITL, CDP gateway), `497.0 req/s` pure-Rust `/v1/scrape` (`14 MB` RSS) |
 | **Browserbase + Stagehand** (`browserbase/stagehand`) | SaaS (`stagehand` `MIT`) | Hosted cloud infrastructure + TypeScript `act`/`extract`/`observe` SDK | Zero-ops cloud, cached self-healing AI selectors, managed residential proxies | Self-hosted Apache-2.0 (`0` per-hour or proxy meter), in-process SDKs + MCP + Live View/replay + Tier 1 HTTP fast path (`examples/adapters/stagehand` works directly) |
 | **Browserless** (`browserless/browserless`) | Non-commercial / commercial | Node BaaS service (`/scrape`, `/pdf`, `BrowserQL`, `/playwright` wire) | Mature BaaS brand, K8s/cloud familiarity | Permissive `Apache-2.0`, process-tree RSS admission + N-job/age/RSS drain, Tier 1 HTTP fast path, in-process Rust/Node/Python SDKs + MCP |
 | **Hyperbrowser** | Managed SaaS | Cloud stealth browsers + microVM code sandboxes + `/scrape`/`/crawl` | Bundled microVM sandboxes and turnkey geo-proxies in one credit pool | Self-hosted Apache-2.0 single binary, full E2E test suite, deterministic Rust/Python/Node SDKs |
@@ -364,18 +364,18 @@ These platforms compete for AI browser agents, RAG scraping, and remote Chrome s
 
 Measured on GitHub Actions (`ubuntu-latest`, 4 vCPU) with full-lifecycle job timing (`context acquire/create -> goto -> work -> close`), total process-tree RSS, and normalized host CPU%:
 
-- **5-tool fleet & chaos (`run 45939361663`, 2026-11-27):** Fluxwright won throughput in **8/8 scenarios** with **0.0% failures** and **0 leaked Chrome processes** (`42.5` jobs/s on `10-concurrent-browsers`, `40.5` on `500-concurrent`, `37.5` on `1000-queued`, `32.7` on `100-pdfs`, `24.8` on `scraping-200`).
-  - Under `chaos-1000-queued` (`SIGKILL` Chrome every 2s): Fluxwright held **`32.1` jobs/s** (`0.0%` failed across `13` kills, `722 ms` p50, `1,093 ms` p95), Crawlee recovered with `0.0%` failures across `26` kills at **`2.7` jobs/s** (`16,111 ms` p50, `826 MB` peak RSS), raw Playwright and Puppeteer failed `80.1%` and `78.5%`, and `puppeteer-cluster@0.25.0` timed out past `465s`.
-  - Honest Crawlee memory note: Crawlee used `773–1,129 MB` peak RAM because `@crawlee/browser-pool` serializes `newPage()` behind a `pLimit(1)` lock (`apify/crawlee#1126`), running fewer simultaneous browsers/pages at roughly half the throughput.
-- **Tier 1 HTTP fast path & 5-minute soak (`run 45825257140`, 2026-11-26):** Tier 1 static `/v1/scrape` hit **`518.8 req/s`** (`13.9 ms` p50, `13 MB` RSS vs `28.9 req/s` / `384 MB` in browser mode), `/v1/map` hit **`1,140.7 req/s`** (`6.7 ms` p50), and `soak-5m` completed `7,898` jobs with `0.0%` failures and flat RSS (`505 -> 517 -> 443 -> 442 MB`).
-
-> Next CI run (with `selenium-webdriver` added in PR #151) will append head-to-head Selenium WebDriver numbers on the exact same `chrome-headless-shell` binary.
+- **6-tool fleet, chaos & Tier 1 fast path (`run 45952022742`, 2026-11-27):** Fluxwright won throughput in **8/8 scenarios** with **0.0% failures** and **0 leaked Chrome processes** (`41.8` jobs/s on `10-concurrent-browsers`, `47.4` on `100-concurrent`, `43.8` on `500-concurrent`, `42.7` on `1000-queued`, `37.6` on `100-pdfs`, `30.2` on `scraping-200`).
+  - Head-to-head against Selenium 4 WebDriver BiDi (`selenium-webdriver@4.54.0` + matched `chromedriver`, fresh `browser.createUserContext()` per job on the same `chrome-headless-shell` binary): Fluxwright led `28.1` -> **`35.2`** (`1-browser-10-pages`), `25.5` -> **`41.8`** (`10-concurrent-browsers`), `26.3` -> **`47.4`** (`100-concurrent`), `26.0` -> **`43.8`** (`500-concurrent`), `27.7` -> **`42.7`** (`1000-queued`, using `3,818` vs `4,886 MB` peak RSS), `23.7` -> **`37.6`** (`100-pdfs`), and `20.8` -> **`30.2`** (`scraping-200`).
+  - Under `chaos-1000-queued` (`SIGKILL` Chrome every 2s): Fluxwright held **`40.0` jobs/s** (`0.0%` failed across `11` kills, `579 ms` p50, `869 ms` p95, `1,227 ms` p99), `puppeteer-cluster@0.25.0` recovered at **`23.3` jobs/s** (`0.0%` failed across `20` kills, `5,858 ms` p99), Crawlee recovered with `0.0%` failures across `24` kills at **`3.3` jobs/s** (`16,105 ms` p95, `18,132 ms` p99, `822 MB` peak RSS), while raw Playwright (`74.0%`), Puppeteer (`73.3%`), and Selenium (`82.4%`) failed immediately after their 4 browsers died (`0–3 ms` p50).
+  - Honest Crawlee memory note: Crawlee used `797–1,216 MB` peak RAM because `@crawlee/browser-pool` serializes `newPage()` behind a `pLimit(1)` lock (`apify/crawlee#1126`), keeping fewer simultaneous browsers/pages open.
+  - Tier 1 HTTP fast path (`run 45952022742`): `/v1/scrape` static (`mode: "auto"`) hit **`497.0 req/s`** (`15.4 ms` p50, `14 MB` RSS vs `23.8–24.8 req/s` / `492–495 MB` in browser mode) and `/v1/map` hit **`1,023.5 req/s`** (`7.5 ms` p50).
+- **5-minute soak (`run 45825257140`, 2026-11-26):** `soak-5m` completed `7,898` jobs with `0.0%` failures and flat RSS (`505 -> 517 -> 443 -> 442 MB`).
 
 ---
 
 ## 7. Remaining gaps Fluxwright still has to close
 
-1. **Selenium WebDriver CI head-to-head proof** (in progress via `feat/bench-selenium` / `bench.yml`).
-2. **Machine-verified `docs/COMPATIBILITY.md` + CI dual-runner Playwright parity suite** (`tests/parity/`).
+1. **Selenium WebDriver BiDi 6-tool CI head-to-head proof** — **done** in run `45952022742` (`1000-queued` `42.7` vs `27.7` jobs/s; `chaos` `0.0%` vs `82.4%` failure rate).
+2. **`docs/COMPATIBILITY.md` + CI dual-runner Playwright parity suite** — **done** on `main` (`docs/COMPATIBILITY.md` and `tests/parity/playwright-parity.mjs` running on Ubuntu, Windows, and macOS in CI).
 3. **Firecrawl/Steel killer HTTP additions:** `POST /v1/crawl` recursive crawler, declarative JSON schema extraction, `/openapi.json` + typed Node/Python `FluxwrightClient`, and managed `/v1/sessions/{id}/files` transfer.
 4. **2-hour soak proof, multi-tenant API keys/quotas, and multi-worker `fluxwright coordinate` scaling proof** ahead of `v1.0.0`.

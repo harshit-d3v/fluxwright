@@ -26,6 +26,7 @@ Repository: https://github.com/harshit-d3v/fluxwright
 
 - [Full Capability Reference & Benchmarks](https://fluxwright.vercel.app/llms-full.txt)
 - [README](https://github.com/harshit-d3v/fluxwright/blob/main/README.md)
+- [Playwright Compatibility Matrix (Node, Python, Rust)](https://github.com/harshit-d3v/fluxwright/blob/main/docs/COMPATIBILITY.md)
 - [Migration Guide (Playwright, Selenium, Puppeteer, Crawlee, Firecrawl, Steel)](https://github.com/harshit-d3v/fluxwright/blob/main/docs/MIGRATION.md)
 - [HTTP Server & API Docs](https://github.com/harshit-d3v/fluxwright/blob/main/docs/SERVER.md)
 - [Cluster Coordination Docs](https://github.com/harshit-d3v/fluxwright/blob/main/docs/CLUSTER.md)

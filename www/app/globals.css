@@ -1649,7 +1649,7 @@
   }
   .bench tbody th {
     font-weight: 500;
-    inline-size: 30%;
+    inline-size: 26%;
   }
   .bench-value {
     display: block;
@@ -1740,6 +1740,9 @@
     }
     .bench td:nth-child(5)::before {
       content: "Playwright";
+    }
+    .bench td:nth-child(6)::before {
+      content: "Selenium (BiDi)";
     }
   }
 

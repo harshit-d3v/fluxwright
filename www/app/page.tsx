@@ -61,23 +61,24 @@ const STEPS: { num: string; title: string; text: string }[] = [
   { num: "05", title: "Recycle", text: "Destroys the context immediately and drains bloated browsers without stalling." },
 ];
 
-// GitHub Actions benchmarks run 45939361663 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.88), 27 November 2026.
+// GitHub Actions benchmarks run 45952022742 on ubuntu-latest (4 vCPU, chrome-headless-shell 158.0.8127.88), 27 November 2026.
 const BENCH: {
   setup: string;
   flux: number;
   cluster: number | null;
   crawlee: number;
   pw: number;
+  sel: number | null;
 }[] = [
-  { setup: "1 browser, 10 pages (100 jobs)", flux: 34.5, cluster: 29.3, crawlee: 16.8, pw: 28.3 },
-  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 42.5, cluster: 28.8, crawlee: 17.9, pw: 28.2 },
-  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 40.5, cluster: 30.2, crawlee: 20.5, pw: 29.2 },
-  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 37.5, cluster: 30.2, crawlee: 19.0, pw: 30.3 },
-  { setup: "100 PDFs (4 browsers × 8 pages)", flux: 32.7, cluster: 23.7, crawlee: 17.5, pw: 26.7 },
-  { setup: "200 scraping jobs (images + fonts)", flux: 24.8, cluster: 20.8, crawlee: 16.5, pw: 21.2 },
-  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 32.1, cluster: null, crawlee: 2.7, pw: 23.3 },
+  { setup: "1 browser, 10 pages (100 jobs)", flux: 35.2, cluster: 33.5, crawlee: 21.8, pw: 31.0, sel: 28.1 },
+  { setup: "10 browsers, 2 pages each (40 jobs)", flux: 41.8, cluster: 30.7, crawlee: 19.6, pw: 31.3, sel: 25.5 },
+  { setup: "500 concurrent (10 browsers × 20 pages)", flux: 43.8, cluster: 33.5, crawlee: 23.9, pw: 33.3, sel: 26.0 },
+  { setup: "1,000 queued (4 browsers × 8 pages)", flux: 42.7, cluster: 32.7, crawlee: 24.0, pw: 34.5, sel: 27.7 },
+  { setup: "100 PDFs (4 browsers × 8 pages)", flux: 37.6, cluster: 29.1, crawlee: 22.1, pw: 32.5, sel: 23.7 },
+  { setup: "200 scraping jobs (images + fonts)", flux: 30.2, cluster: 27.1, crawlee: 20.6, pw: 25.1, sel: 20.8 },
+  { setup: "1,000 chaos jobs (browser kill / 2s)", flux: 40.0, cluster: 23.3, crawlee: 3.3, pw: 25.8, sel: null },
 ];
-const BENCH_MAX = 46;
+const BENCH_MAX = 48;
 
 const TS_EXAMPLE = `import { chromium } from "fluxwright";
 
@@ -337,22 +338,22 @@ export default function Home() {
               <div className="kpi-card">
                 <span className="kpi-label">8 / 8 scenarios</span>
                 <strong>Fastest</strong>
-                <span>Beat Crawlee, puppeteer-cluster, Playwright, and Puppeteer</span>
+                <span>Beat Crawlee, puppeteer-cluster, Playwright, Puppeteer, and Selenium</span>
               </div>
               <div className="kpi-card">
                 <span className="kpi-label">1,000-job chaos</span>
-                <strong>32.1 /s</strong>
-                <span>0.0% failed across 13 browser kills (Crawlee 2.7 /s, PW 80.1% failed)</span>
+                <strong>40.0 /s</strong>
+                <span>0.0% failed across 11 browser kills (Crawlee 3.3 /s, Selenium 82.4% failed)</span>
               </div>
               <div className="kpi-card">
                 <span className="kpi-label">Chaos p95 latency</span>
-                <strong>1,093 ms</strong>
-                <span>vs 16,226 ms for Crawlee under 2s kills (0 leaked Chrome)</span>
+                <strong>869 ms</strong>
+                <span>vs 16,105 ms for Crawlee under 2s kills (0 leaked Chrome)</span>
               </div>
               <div className="kpi-card">
                 <span className="kpi-label">Tier 1 fast path</span>
-                <strong>518.8 /s</strong>
-                <span>Static /v1/scrape in 13 MB RSS vs 28.9 /s in browser</span>
+                <strong>497.0 /s</strong>
+                <span>Static /v1/scrape in 14 MB RSS vs 23.8–24.8 /s in browser</span>
               </div>
             </div>
 
@@ -365,6 +366,7 @@ export default function Home() {
                   <th scope="col">puppeteer-cluster</th>
                   <th scope="col">Crawlee</th>
                   <th scope="col">Playwright</th>
+                  <th scope="col">Selenium (BiDi)</th>
                 </tr>
               </thead>
               <tbody>
@@ -393,19 +395,31 @@ export default function Home() {
                       <span className="bench-value">{b.pw.toFixed(1)}</span>
                       <Bar value={b.pw} />
                     </td>
+                    <td className="bench-other">
+                      {b.sel === null ? (
+                        <span className="bench-value">82.4% failed</span>
+                      ) : (
+                        <>
+                          <span className="bench-value">{b.sel.toFixed(1)}</span>
+                          <Bar value={b.sel} />
+                        </>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
 
             <p className="note bench-note">
-              Measured in GitHub Actions run <code>45939361663</code> (27 November 2026) with
+              Measured in GitHub Actions run <code>45952022742</code> (27 November 2026) with
               full-lifecycle job timing, process-tree RSS, and normalized host CPU% on{" "}
-              <code>chrome-headless-shell 158.0.8127.88</code>. Crawlee used 773 to 1,129 MB peak RAM
-              by serializing page creation behind <code>browser-pool</code>&apos;s <code>pLimit(1)</code> lock at roughly half
-              the throughput; <code>puppeteer-cluster</code> (<code>CONCURRENCY_CONTEXT</code>, 1 browser) stalled past
-              465s in chaos. Soak (7,898 jobs, 0 failures, flat 505 to 442 MB RSS) and{" "}
-              <code>fastpath-bench.mjs</code> (518.8 req/s on <code>/v1/scrape</code>, 1,140.7 req/s on <code>/v1/map</code>) were measured in run <code>45825257140</code>.
+              <code>chrome-headless-shell 158.0.8127.88</code>, plus <code>fastpath-bench.mjs</code>{" "}
+              (497.0 req/s on <code>/v1/scrape</code>, 1,023.5 req/s on <code>/v1/map</code> in 14 MB RSS).
+              Selenium runs WebDriver BiDi (fresh <code>browser.createUserContext()</code> per job); Crawlee
+              uses <code>797–1,216 MB</code> peak RAM behind <code>pLimit(1)</code> page serialization. In
+              chaos, raw Playwright (<code>74.0%</code> failed) and Selenium (<code>82.4%</code> failed) drop
+              jobs once their 4 browsers die, while <code>soak-5m</code> (<code>45825257140</code>) held
+              7,898 jobs at 0.0% failure.
             </p>
           </div>
         </section>

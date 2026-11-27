@@ -39,11 +39,10 @@ Fluxwright is an Apache-2.0 3-tier hybrid browser fleet engine written in Rust (
 
 ## Latest Verified CI Benchmarks (`ubuntu-latest` 4 vCPU, `chrome-headless-shell 158.0.8127.88`)
 
-- **Fleet & Chaos (CI run `45939361663`, full-lifecycle timing):**
-  - Fluxwright led throughput in 8/8 scenarios with `0.0%` failures and `0` leaked Chrome processes (`42.5` jobs/s on `10-concurrent-browsers`, `40.5` on `500-concurrent`, `37.5` on `1000-queued`, `32.7` on `100-pdfs`, `24.8` on `scraping-200`).
-  - Under `chaos-1000-queued` (`SIGKILL` every 2s): Fluxwright ran `32.1 jobs/s` (`0.0%` failures across 13 kills, `722 / 1,093 / 1,441 ms` p50/p95/p99), Crawlee recovered at `2.7 jobs/s` (`16,111 ms` p50, `826 MB` RSS across 26 kills), raw Playwright failed `80.1%`, Puppeteer failed `78.5%`, and `puppeteer-cluster` timed out after `465s`.
-  - Steady-state comparison (`1000-queued`): Fluxwright `37.5/s` (`632ms` p50) vs Puppeteer `34.6/s` (`681ms`), Playwright `30.3/s` (`784ms`), `puppeteer-cluster` `30.2/s` (`788ms`), Crawlee `19.0/s` (`1,257ms` p50, `949MB` RSS).
-- **Tier 1 HTTP Fast Path & 5m Soak (CI run `45825257140`):**
-  - `/v1/scrape` static (`mode: "auto"`): `518.8 req/s`, `13.9 ms` p50, `13 MB` RSS (vs `28.9 req/s` / `384 MB` browser mode).
-  - `/v1/map` static (`mode: "auto"`): `1,140.7 req/s`, `6.7 ms` p50.
+- **6-Tool Fleet, Chaos & Tier 1 Fast Path (CI run `45952022742`, full-lifecycle timing with isolated per-job contexts including Selenium 4 WebDriver BiDi `createUserContext`):**
+  - Fluxwright led throughput in 8/8 scenarios with `0.0%` failures and `0` leaked Chrome processes (`41.8` jobs/s on `10-concurrent-browsers`, `47.4` on `100-concurrent`, `43.8` on `500-concurrent`, `42.7` on `1000-queued`, `37.6` on `100-pdfs`, `30.2` on `scraping-200`).
+  - Under `chaos-1000-queued` (`SIGKILL` every 2s): Fluxwright ran `40.0 jobs/s` (`0.0%` failures across 11 kills, `579 / 869 / 1,227 ms` p50/p95/p99), `puppeteer-cluster` recovered at `23.3 jobs/s` (`0.0%` failures across 20 kills, `5,858 ms` p99), Crawlee recovered at `3.3 jobs/s` (`16,105 / 18,132 ms` p95/p99, `822 MB` RSS across 24 kills), while raw Playwright (`74.0%`), Puppeteer (`73.3%`), and Selenium (`82.4%`) failed immediately after their 4 browsers died.
+  - Steady-state comparison (`1000-queued`): Fluxwright `42.7/s` (`552ms` p50) vs Puppeteer `37.7/s` (`628ms`), Playwright `34.5/s` (`694ms`), `puppeteer-cluster` `32.7/s` (`736ms`), Selenium BiDi `27.7/s` (`850ms`, `4,886MB` RSS), Crawlee `24.0/s` (`989ms` p50, `930MB` RSS).
+  - Tier 1 `/v1/scrape` static (`mode: "auto"`): `497.0 req/s`, `15.4 ms` p50, `14 MB` RSS (vs `23.8–24.8 req/s` / `492–495 MB` browser mode). `/v1/map` static (`mode: "auto"`): `1,023.5 req/s`, `7.5 ms` p50.
+- **5m Soak (CI run `45825257140`):**
   - `soak-5m`: `7,898` jobs in 300s, `0.0%` failures, `0` leaked Chrome processes, flat RSS after recycling (`505 -> 517 -> 443 -> 442 MB`).
