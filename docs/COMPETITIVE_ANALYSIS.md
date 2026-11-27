@@ -1,8 +1,8 @@
 # Competitive analysis
 
-Researched 2026-09-21. Fluxwright is a fleet engine, not a Playwright rewrite. This document judges other tools on pooling, admission control, recycling, crash recovery, and honest metrics.
+Researched 2026-09-21; updated 2026-11-27 against 2026 competitor repositories, `v0.14.0` capabilities, and GitHub Actions CI runs (`45939361663` and `45825257140`). Fluxwright is a 3-tier fleet engine (HTTP fast path, optional light-CDP, pooled Chromium), not just a Playwright rewrite. This document judges alternatives on pooling, admission control, recycling, crash recovery, licensing, and reproducible CI metrics.
 
-**How to read this.** Each section splits **claimed** (the project’s own words) from **verified** (read from source, docs, or issue trackers). Unverified marketing numbers are not treated as facts. Fluxwright’s own measurements, with their method, are in the README’s opening section; this file compares designs, not speed.
+**How to read this.** Each section splits **claimed** (the project’s own words) from **verified** (read from source, repo APIs, docs, or CI benchmark artifacts). Unverified marketing numbers and unverified third-party pricing tiers are not treated as facts.
 
 ---
 
@@ -321,47 +321,61 @@ None of these implement RSS-ceiling admission + drain-recycle + bounded priority
 
 ---
 
-## 4. Cross-cutting comparison
+### 3.4 Selenium 4 WebDriver BiDi and Cypress
 
-| Capability | Browserless | puppeteer-cluster | Crawlee pool | Selenium Grid | Rustwright | Kitewright | Playwright/Puppeteer |
-|------------|-------------|-------------------|--------------|---------------|------------|------------|----------------------|
-| Context-per-job isolation | Caller | Opt-in CONTEXT | Opt-in incognito (default **off**) | Process/session | Caller | Per MCP session | Caller |
-| Bounded queue + reject | 429 | Unbounded | Remote: wait on max browsers | Queue timeout | n/a | Rate limit (HTTP) | n/a |
-| Priority queue | No | No | No | FIFO only | n/a | n/a | n/a |
-| Recycle after N jobs | TTL / session, not N-jobs drain | No (PRs only) | **Yes** (pages) | Drain node after N | No | Idle reap | No |
-| Recycle on RSS | Container % | No | No | No | No | No | No |
-| Process-tree RSS admission | No | No | No | No | No | No | No |
-| Crash → fail in-flight + replace | Session bookkeeping | Worker repair | Relaunch | New session | Page errors | Relaunch on next call | Connection errors |
-| Drain then replace | Implicit on TTL | No | **Yes** (retire) | Node drain | No | Idle | No |
-| Honest “memory per job” metric | Session/container metrics | Monitor RSS | Crawler stats | Grid status | Client RSS claims | Server RSS vs Chrome | None |
-| In-process Rust engine | No | No | No | No | Yes (no pool) | Yes (tiny pool) | No |
-| Request blocking (images/fonts) | Via client | Via Puppeteer | Via client | Limited | Via API | Lite mode | Via client |
+- **Selenium 4 WebDriver BiDi** (`SeleniumHQ/selenium`, Apache-2.0): adds bidirectional WebSocket event streaming and console/network interception over classic W3C HTTP WebDriver, narrowing the protocol gap on Chromium and Firefox while retaining cross-browser compliance (`Firefox`, `Safari`, `Edge`) and Java/C#/Ruby enterprise grids. **Verified limitation:** Grid slots remain browser-process-oriented rather than in-process M x K context pools with process-tree RSS admission ceilings, priority queues, or Tier 1 pure-Rust HTTP fast paths.
+- **Cypress:** excels at interactive frontend time-travel DX and component testing, executing inside the browser event loop. Structurally mismatched for high-concurrency multi-tab scraping, PDF generation, or non-JS Rust/Python fleets.
 
 ---
 
-## 5. What Fluxwright would do that none of them do
+## 4. AI-agent and cloud-browser platforms (2026 landscape)
 
-The honest answer is not “a better page API” and not “Rust therefore lighter Chrome”. Chrome is the bill. The gap is **one engine that treats the machine as a scarce browser fleet**.
+These platforms compete for AI browser agents, RAG scraping, and remote Chrome sessions.
 
-**Combined product nobody ships:**
+| Project (GitHub) | Verified License | Core Architecture | Strengths vs Fluxwright `v0.14.0` | Fluxwright `v0.14.0` Advantage |
+|---|---|---|---|---|
+| **Steel.dev** (`steel-dev/steel-browser`) | `Apache-2.0` | Node/Fastify API (`actions`, `cdp`, `commands`, `files`, `logs`, `recording`, `selenium`, `sessions`) + Docker/Render templates | Managed `/files` upload/download HTTP API, unpacked Chrome extensions, typed SDKs | Compiled Rust core + Tier 1 HTTP fast path (`518.8 req/s`), M x K RSS-ceiling fleet, priority queue, built-in E2E tests, multi-node cluster (`coordinate`) |
+| **Firecrawl** (`mendableai/firecrawl`) | `AGPL-3.0` | Multi-service extraction API (`apps/api/src/routes/v2.ts`) | Recursive `/crawl`, schema JSON extraction, zero-ops SaaS, huge AI RAG ecosystem | Permissive `Apache-2.0` single binary, full stateful automation (`/v1/sessions`, Live View, HITL, CDP gateway), `518.8 req/s` pure-Rust `/v1/scrape` (`13 MB` RSS) |
+| **Browserbase + Stagehand** (`browserbase/stagehand`) | SaaS (`stagehand` `MIT`) | Hosted cloud infrastructure + TypeScript `act`/`extract`/`observe` SDK | Zero-ops cloud, cached self-healing AI selectors, managed residential proxies | Self-hosted Apache-2.0 (`0` per-hour or proxy meter), in-process SDKs + MCP + Live View/replay + Tier 1 HTTP fast path (`examples/adapters/stagehand` works directly) |
+| **Browserless** (`browserless/browserless`) | Non-commercial / commercial | Node BaaS service (`/scrape`, `/pdf`, `BrowserQL`, `/playwright` wire) | Mature BaaS brand, K8s/cloud familiarity | Permissive `Apache-2.0`, process-tree RSS admission + N-job/age/RSS drain, Tier 1 HTTP fast path, in-process Rust/Node/Python SDKs + MCP |
+| **Hyperbrowser** | Managed SaaS | Cloud stealth browsers + microVM code sandboxes + `/scrape`/`/crawl` | Bundled microVM sandboxes and turnkey geo-proxies in one credit pool | Self-hosted Apache-2.0 single binary, full E2E test suite, deterministic Rust/Python/Node SDKs |
+| **Lightpanda** (`lightpanda-io/browser`) | `AGPL-3.0` | Custom Zig + V8 + `html5ever` non-Chromium headless engine | Very low RAM and startup latency on lightweight DOM workloads | Full Chromium SPA fidelity — and Fluxwright `--fast-cdp-endpoint` delegates Tier 2 jobs to Lightpanda with `-32601` fallback to Chrome without AGPL entanglement |
+| **Browser-Use** (`browser-use/browser-use`) | `MIT` | Python autonomous LLM agent framework | Massive Python agent adoption and multimodal loop orchestration | Runs *under* Browser-Use (`examples/adapters/browser-use`) as a crash-proof multi-browser pool with Live View, HITL, and HAR replay |
 
-1. **Lease as the core primitive** — acquire a fresh context on a reused browser; drop cleans up. Closures (`run`) wrap leases; FFI/TS bind to leases. Crawlee and puppeteer-cluster hand you a page inside a callback but do not cross an FFI boundary on purpose. Browserless hands you a WebSocket.
-2. **Admission on Chromium process-tree RSS plus slot counts** — grant a lease only if a healthy browser has a free context *and* total tree RSS is under a ceiling. Browserless health is container CPU/RAM percent. Crawlee counts pages. Grid counts CPU slots. Nobody we studied sums renderer+GPU+utility child RSS and refuses work because of it.
-3. **Placement: least-loaded healthy browser; launch only when all are full** — puppeteer-cluster does not cap contexts per browser; Crawlee round-robins pages up to `maxOpenPagesPerBrowser` but does not least-load on RSS; Grid places by capabilities.
-4. **Bounded queue with a few priority levels, FIFO within level, explicit `QueueFull` vs wait** — Browserless has bounded+429 but no priorities. puppeteer-cluster is unbounded. Grid is FIFO with timeout, not `QueueFull` as a typed error in a library.
-5. **Recycle by job count, wall time, *or* RSS, with drain** — Crawlee has job-count (pages) drain. Grid drains nodes. Nobody combines all three triggers with per-browser drain while the rest of the pool keeps serving.
-6. **Crash: in-flight leases fail retryable; `run` retries; browser replaced** — pieces exist (cluster repair, Grid new session). Wiring that to a lease + job policy in-process, with structured tracing IDs, is not a packaged library.
-7. **Metrics that refuse to lie** — browsers, contexts, pages, active leases, queue depth, **reuse rate**, crash/recycle counts, engine RSS, **browser process-tree RSS**, and “memory per job” labelled as **tree RSS / active leases (estimate)**. Rustwright’s 70% figure is client RSS; we will not publish that shape as fleet memory.
+---
 
-**Features where the honest answer is “nothing new”:**
+## 5. Cross-cutting comparison
 
-- Speaking CDP to Chromium — everyone above except Grid/fantoccini/WDIO-default.
-- Playwright-flavoured `goto` / `click` / `locator` / auto-wait — Playwright, Kitewright (narrow), Rustwright (wide), ferrous/chromist.
-- napi-rs bindings — Kitewright, Rustwright.
-- Blocking images/fonts — trivial CDP; Kitewright lite mode already does it.
-- Fresh context per job — Playwright, Puppeteer, cluster CONTEXT, Crawlee incognito. We only make it the **default** and refuse silent reuse.
-- Being written in Rust — does not reduce Chromium RSS.
+| Capability | Fluxwright `v0.14.0` | Browserless | puppeteer-cluster | Crawlee pool | Selenium Grid | Steel.dev | Playwright / Puppeteer |
+|---|---|---|---|---|---|---|---|
+| License | `Apache-2.0` | Commercial / non-comm | `MIT` | `Apache-2.0` | `Apache-2.0` | `Apache-2.0` | `Apache-2.0` |
+| Tier 1 pure-HTTP fast path | **Yes** (`mode: "auto"`) | No | No | `CheerioCrawler` separate | No | No | No |
+| Context-per-job default isolation | **Yes** (strict) | Caller | Opt-in CONTEXT | Opt-in incognito (default **off**) | Process/session | Per session | Caller |
+| Bounded priority queue + `QueueFull` | **Yes** (Wait/Error + priorities) | 429 (FIFO) | Unbounded | Remote: wait | FIFO + timeout | Queue/sessions | Caller |
+| Recycle on jobs, age, or RSS with drain | **Yes** (all 3 + drain) | TTL/container % | Missing (no RSS recycle) | Page count + idle | Node drain | Session TTL | No |
+| Process-tree RSS admission ceiling | **Yes** (cgroup-aware) | Container % | No | No | No | Container | No |
+| Auto crash retry + zero leaked Chrome | **Yes** (`0.0%` chaos fail) | Session bookkeeping | `repair()` (can stall) | Retry + backoff | New session | Session errors | Caller |
+| Built-in E2E tests + tracing + video | **Yes** (`fluxwright/test`, `pytest`, `.zip`, video) | No | No | No | External runners | No | **Yes** (Playwright) |
+| Live View HITL + replay + HAR + MCP | **Yes** (22-tool MCP) | Live Debugger / CDP | No | No | Grid UI / no MCP | Recording / files / CDP | Playwright MCP |
 
-**Closest neighbours.** Operationally: **Crawlee’s retire/drain + Browserless’s bounded queue**. Density model: **Playwright contexts on reused Chrome**. Language: **chromiumoxide / Kitewright**. None of them add RSS-tree admission, priority+`QueueFull`, and lease-shaped FFI in one place.
+---
 
-If Milestone 2 later shows that Crawlee-on-Playwright with incognito + `retireBrowserAfterPageCount` plus an external RSS cgroup already matches us on jobs/sec and failure rate, that result belongs in the benchmark write-up unmodified. Until then we do not claim a win.
+## 6. Verified CI benchmark proof (`ubuntu-latest`, `chrome-headless-shell 158.0.8127.88`)
+
+Measured on GitHub Actions (`ubuntu-latest`, 4 vCPU) with full-lifecycle job timing (`context acquire/create -> goto -> work -> close`), total process-tree RSS, and normalized host CPU%:
+
+- **5-tool fleet & chaos (`run 45939361663`, 2026-11-27):** Fluxwright won throughput in **8/8 scenarios** with **0.0% failures** and **0 leaked Chrome processes** (`42.5` jobs/s on `10-concurrent-browsers`, `40.5` on `500-concurrent`, `37.5` on `1000-queued`, `32.7` on `100-pdfs`, `24.8` on `scraping-200`).
+  - Under `chaos-1000-queued` (`SIGKILL` Chrome every 2s): Fluxwright held **`32.1` jobs/s** (`0.0%` failed across `13` kills, `722 ms` p50, `1,093 ms` p95), Crawlee recovered with `0.0%` failures across `26` kills at **`2.7` jobs/s** (`16,111 ms` p50, `826 MB` peak RSS), raw Playwright and Puppeteer failed `80.1%` and `78.5%`, and `puppeteer-cluster@0.25.0` timed out past `465s`.
+  - Honest Crawlee memory note: Crawlee used `773–1,129 MB` peak RAM because `@crawlee/browser-pool` serializes `newPage()` behind a `pLimit(1)` lock (`apify/crawlee#1126`), running fewer simultaneous browsers/pages at roughly half the throughput.
+- **Tier 1 HTTP fast path & 5-minute soak (`run 45825257140`, 2026-11-26):** Tier 1 static `/v1/scrape` hit **`518.8 req/s`** (`13.9 ms` p50, `13 MB` RSS vs `28.9 req/s` / `384 MB` in browser mode), `/v1/map` hit **`1,140.7 req/s`** (`6.7 ms` p50), and `soak-5m` completed `7,898` jobs with `0.0%` failures and flat RSS (`505 -> 517 -> 443 -> 442 MB`).
+
+> Next CI run (with `selenium-webdriver` added in PR #151) will append head-to-head Selenium WebDriver numbers on the exact same `chrome-headless-shell` binary.
+
+---
+
+## 7. Remaining gaps Fluxwright still has to close
+
+1. **Selenium WebDriver CI head-to-head proof** (in progress via `feat/bench-selenium` / `bench.yml`).
+2. **Machine-verified `docs/COMPATIBILITY.md` + CI dual-runner Playwright parity suite** (`tests/parity/`).
+3. **Firecrawl/Steel killer HTTP additions:** `POST /v1/crawl` recursive crawler, declarative JSON schema extraction, `/openapi.json` + typed Node/Python `FluxwrightClient`, and managed `/v1/sessions/{id}/files` transfer.
+4. **2-hour soak proof, multi-tenant API keys/quotas, and multi-worker `fluxwright coordinate` scaling proof** ahead of `v1.0.0`.

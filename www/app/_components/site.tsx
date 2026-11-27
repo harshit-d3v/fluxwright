@@ -17,6 +17,9 @@ export const RELEASES = "https://github.com/harshit-d3v/fluxwright/releases";
 export const GHCR = "https://github.com/harshit-d3v/fluxwright/pkgs/container/fluxwright";
 export const SERVER_DOCS = "https://github.com/harshit-d3v/fluxwright/blob/main/docs/SERVER.md";
 export const CLUSTER_DOCS = "https://github.com/harshit-d3v/fluxwright/blob/main/docs/CLUSTER.md";
+export const MIGRATION_DOCS = "https://github.com/harshit-d3v/fluxwright/blob/main/docs/MIGRATION.md";
+export const COMPARE_DOCS = "https://github.com/harshit-d3v/fluxwright/blob/main/docs/COMPETITIVE_ANALYSIS.md";
+export const DEPLOY_DOCS = "https://github.com/harshit-d3v/fluxwright/tree/main/deploy";
 
 export function Logo() {
   return (

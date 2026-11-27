@@ -7,10 +7,13 @@ import { FleetBoard } from "./_components/FleetBoard";
 import { SiteHeader } from "./_components/SiteHeader";
 import {
   CLUSTER_DOCS,
+  COMPARE_DOCS,
   CRATES,
+  DEPLOY_DOCS,
   GHCR,
   GITHUB,
   Logo,
+  MIGRATION_DOCS,
   NPM,
   PYPI,
   RELEASES,
@@ -604,6 +607,18 @@ docker run --rm \\
                 </li>
                 <li>
                   <a href={CLUSTER_DOCS}>Cluster coordination docs</a>
+                </li>
+                <li>
+                  <a href={MIGRATION_DOCS}>Migration guide</a>
+                </li>
+                <li>
+                  <a href={COMPARE_DOCS}>Competitive analysis</a>
+                </li>
+                <li>
+                  <a href={DEPLOY_DOCS}>Self-hosting kit</a>
+                </li>
+                <li>
+                  <a href="/llms.txt">llms.txt</a>
                 </li>
               </ul>
             </nav>

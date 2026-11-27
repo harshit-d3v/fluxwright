@@ -4,7 +4,7 @@ Run hundreds of headless Chrome jobs on one machine. Fluxwright pools browsers, 
 
 It is not a Playwright rewrite. Playwright drives a browser; Fluxwright runs a fleet of them.
 
-**Docs:** https://fluxwright.vercel.app · **Roadmap:** [ROADMAP.md](ROADMAP.md)
+**Docs:** https://fluxwright.vercel.app · **Migrate:** [docs/MIGRATION.md](docs/MIGRATION.md) · **Self-host:** [deploy/README.md](deploy/README.md) · **Compare:** [docs/COMPETITIVE_ANALYSIS.md](docs/COMPETITIVE_ANALYSIS.md) · **Roadmap:** [ROADMAP.md](ROADMAP.md)
 
 ## Quick start (Node)
 

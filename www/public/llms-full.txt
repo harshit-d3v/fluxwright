@@ -1,0 +1,49 @@
+# Fluxwright Full Reference (`v0.14.0`)
+
+Fluxwright is an Apache-2.0 3-tier hybrid browser fleet engine written in Rust (`fluxwright-cdp`, `fluxwright-core`, `fluxwright`, `fluxwright-cli`, `fluxwright-mcp`, `fluxwright-server`) with native in-process Node.js (`napi-rs`, unscoped `fluxwright` npm package) and Python (`PyO3` `abi3`, `fluxwright` PyPI package) bindings.
+
+## Packages & Distributions (`v0.14.0`)
+
+- **Rust crates (crates.io):** `fluxwright`, `fluxwright-core`, `fluxwright-cdp`, `fluxwright-server`, `fluxwright-cli`, `fluxwright-mcp` (Rust 1.95+, pure-Rust `rustls` + `ring`)
+- **Node.js (npm):** `fluxwright` + 5 platform packages (`win32-x64-msvc`, `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`)
+- **Python (PyPI):** `fluxwright` (`cp310-abi3` wheels + sdist; provides `fluxwright.async_api.async_playwright`, `fluxwright.sync_api.sync_playwright`, and auto-loaded `pytest` plugin)
+- **Container (GHCR):** `ghcr.io/harshit-d3v/fluxwright:latest` (`linux/amd64` + `linux/arm64`)
+- **Binaries (GitHub Releases):** 7 prebuilt archives (`x86_64` / `aarch64` Linux gnu/musl, macOS x64/arm64, Windows x64/arm64)
+
+## Architecture
+
+1. **Tier 1 (HTTP Fast Path):** `POST /v1/scrape` and `POST /v1/map` default to `mode: "auto"`, checking a pure-Rust `rustls` HTTP client + `html5ever` Markdown and link extractor with per-hop DNS-pinned SSRF protection (`netguard`) before starting Chrome. Sitemaps supported via `include_sitemap: true`.
+2. **Tier 2 (Optional External Light-CDP):** `--fast-cdp-endpoint <ws|http>` delegates non-visual escalated JS jobs to an external lightweight CDP server (such as Lightpanda, Moli, or Obscura) with graceful `-32601` Method Not Found fallback and zero AGPL entanglement.
+3. **Tier 3 (Pooled Chromium Fleet):** `BrowserEngine` maintains M browsers x K isolated `BrowserContext`s per browser on `chrome-headless-shell` or Chromium (DevTools pipe on Linux/macOS, WebSocket on Windows), enforces a process-tree RSS admission ceiling (`memoryCeilingMb`, auto-sized from Linux cgroups at 75% free/limit RAM), supports priority queueing (`Priority::High|Normal|Low`) and backpressure (`QueueFullMode::Wait|Error`), throttles per-host concurrency and delay (`maxConcurrencyPerHost`, `minDelayPerHost`), drains bloated browsers by job count/wall age/RSS, and automatically retries jobs when a browser crashes.
+
+## Complete Capability Surface
+
+### Playwright-Style Automation API (Rust, Node, Python)
+- **Navigation & Wait:** `goto(url, { waitUntil: "load" | "domcontentloaded" | "networkidle" | "commit" })`, `waitForSelector`, `waitForURL`, `waitForFunction`, `waitForResponse`, `waitForRequest`, `waitForEvent`
+- **Locators (Shadow DOM piercing by default):** `getByRole`, `getByText`, `getByLabel`, `getByPlaceholder`, `getByAltText`, `getByTitle`, `getByTestId`, `locator(css | "text=..." | "role=...")`, `css:light=...`, `frameLocator(iframe)`, `.nth()`, `.first()`, `.last()`, `.filter({ hasText })`
+- **Actions & Input:** `click`, `dblclick`, `hover`, `tap`, `focus`, `blur`, `scrollIntoViewIfNeeded`, `dragAndDrop`, `fill`, `clear`, `press`, `pressSequentially`, `check`/`uncheck`, `selectOption`, `setInputFiles`, `page.mouse`, `page.keyboard`, `page.touchscreen`
+- **Network, Sessions & Emulation:** `page.route` (`fulfill`, `continue`, `abort`, `fallback`, `{ times }`), `APIRequestContext`, HAR 1.2 recording/replay, `storageState` (cookies, `localStorage`, IndexedDB), per-page proxy with auth, `addInitScript`, `exposeFunction`/`exposeBinding`, `page.clock`, `page.waitForDownload`, `page.on("dialog" | "console" | "pageerror" | "request" | "response")`
+- **Capture & AI Extraction:** `screenshot` (PNG/JPEG/WebP, `fullPage`, `clip`, `omitBackground`, `mask`, `annotations`, Set-of-Marks `annotate: true`), `locator.screenshot`, `pdf` (A4/margin/printBackground), `ariaSnapshot` / `snapshot({ diff: true })` with `@eN@rK` revision guardrails, `markdown()`
+
+### Built-in End-to-End Testing (`v0.10.0+`)
+- **Web-first Assertions:** `expect(page | locator)` with auto-retrying matchers (`toBeVisible`, `toHaveText`, `toContainText`, `toHaveValue`, `toHaveAttribute`, `toHaveClass`, `toHaveCount`, `toHaveTitle`, `toHaveURL`, `.not`, `expect.soft`, `expect.configure`) across Rust, Node, and Python.
+- **Tracing & Media:** `context.tracing` (`start`, `startChunk`, `stopChunk`, `stop`) writing Playwright Trace Viewer-compatible `.zip` archives (`npx playwright show-trace trace.zip`), per-page `recordVideo` + `page.video()` (WebM via `ffmpeg` or pure-Rust MJPEG-in-AVI fallback), and visual regression `expect(...).toHaveScreenshot()` with animation freezing and `FLUXWRIGHT_UPDATE_SNAPSHOTS=1`.
+- **Runners:** Node `fluxwright/test` + `fluxwright-test` CLI (`--workers`, `--shard`, `--retries`, `--grep`, HTML/JSON/list reporters, `createFluxwrightFixtures` for `node:test`/Vitest) and auto-loaded `pytest` plugin (`pytest11`).
+
+### HTTP Server, Managed Sessions & Multi-Node Cluster
+- `fluxwright serve`: bearer-authenticated HTTP API (`POST /v1/jobs`, `POST /v1/scrape`, `POST /v1/map`, `/v1/sessions`), pooled `/cdp` WebSocket gateway, Live View JPEG screencast + HITL pause/resume (`POST /v1/live/{id}/embed`), 15-minute session replay + HAR export (`/v1/sessions/{id}/replay`, `/network`), `--profiles-dir`, `--proxy` rotation with cooldown, `--adaptive-concurrency`, `--store` (SQLite WAL), signed HMAC webhooks, Prometheus `/metrics`, OTLP traces.
+- `fluxwright coordinate` + `fluxwright serve --join`: multi-machine pull-based leases with heartbeat, 30s lease expiration requeue, SQLite `--store`, coordinator-wide `--max-per-host` / `--min-host-delay-ms`, isolated `FLUXWRIGHT_WORKER_TOKEN`, and native TLS (`rustls`).
+
+### MCP Server (`fluxwright-mcp`)
+- 22 tools over stdio or Streamable HTTP (`--http <ADDR>` with bearer auth and isolated per-session contexts): `open`, `goto`, `back`, `forward`, `tabs`, `close`, `snapshot`, `markdown`, `title`, `content`, `click`, `hover`, `fill`, `press`, `select`, `scroll`, `wait_for`, `evaluate`, `console`, `network`, `screenshot`, `export_api_calls`.
+
+## Latest Verified CI Benchmarks (`ubuntu-latest` 4 vCPU, `chrome-headless-shell 158.0.8127.88`)
+
+- **Fleet & Chaos (CI run `45939361663`, full-lifecycle timing):**
+  - Fluxwright led throughput in 8/8 scenarios with `0.0%` failures and `0` leaked Chrome processes (`42.5` jobs/s on `10-concurrent-browsers`, `40.5` on `500-concurrent`, `37.5` on `1000-queued`, `32.7` on `100-pdfs`, `24.8` on `scraping-200`).
+  - Under `chaos-1000-queued` (`SIGKILL` every 2s): Fluxwright ran `32.1 jobs/s` (`0.0%` failures across 13 kills, `722 / 1,093 / 1,441 ms` p50/p95/p99), Crawlee recovered at `2.7 jobs/s` (`16,111 ms` p50, `826 MB` RSS across 26 kills), raw Playwright failed `80.1%`, Puppeteer failed `78.5%`, and `puppeteer-cluster` timed out after `465s`.
+  - Steady-state comparison (`1000-queued`): Fluxwright `37.5/s` (`632ms` p50) vs Puppeteer `34.6/s` (`681ms`), Playwright `30.3/s` (`784ms`), `puppeteer-cluster` `30.2/s` (`788ms`), Crawlee `19.0/s` (`1,257ms` p50, `949MB` RSS).
+- **Tier 1 HTTP Fast Path & 5m Soak (CI run `45825257140`):**
+  - `/v1/scrape` static (`mode: "auto"`): `518.8 req/s`, `13.9 ms` p50, `13 MB` RSS (vs `28.9 req/s` / `384 MB` browser mode).
+  - `/v1/map` static (`mode: "auto"`): `1,140.7 req/s`, `6.7 ms` p50.
+  - `soak-5m`: `7,898` jobs in 300s, `0.0%` failures, `0` leaked Chrome processes, flat RSS after recycling (`505 -> 517 -> 443 -> 442 MB`).

@@ -1,0 +1,51 @@
+services:
+  fluxwright:
+    image: ghcr.io/harshit-d3v/fluxwright:latest
+    container_name: fluxwright
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:7331:7331"
+    shm_size: "2gb"
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      FLUXWRIGHT_SERVER_TOKEN: ${FLUXWRIGHT_SERVER_TOKEN:?Set a 32-256 char FLUXWRIGHT_SERVER_TOKEN in .env}
+      FLUXWRIGHT_WEBHOOK_SECRET: ${FLUXWRIGHT_WEBHOOK_SECRET:-}
+      RUST_LOG: fluxwright=info
+    command:
+      - serve
+      - --listen
+      - 0.0.0.0:7331
+      - --low-memory
+      - --recycle-rss-mb
+      - "512"
+      - --store
+      - /home/fluxwright/data/jobs.db
+      - --profiles-dir
+      - /home/fluxwright/data/profiles
+      - --adaptive-concurrency
+    volumes:
+      - fluxwright_data:/home/fluxwright/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7331/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fluxwright-prometheus
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      fluxwright:
+        condition: service_healthy
+
+volumes:
+  fluxwright_data:
