@@ -26,6 +26,12 @@ struct Args {
     /// Also run a soak of this many minutes with recycling, sampling memory once a minute.
     #[arg(long)]
     soak_minutes: Option<u64>,
+    /// Validate soak health gates after `--soak-minutes` and exit non-zero if violated.
+    #[arg(long)]
+    assert_soak: bool,
+    /// Maximum allowed post-warmup RSS growth slope (MB/hour) when `--assert-soak` is set.
+    #[arg(long, default_value_t = 50.0)]
+    max_rss_slope_mb_per_hour: f64,
 }
 
 fn tool_enabled(filter: &Option<Vec<String>>, name: &str) -> bool {
@@ -76,6 +82,18 @@ struct Record {
     /// Soak only: memory once a minute.
     #[serde(default)]
     memory_samples_mb: Vec<u64>,
+    /// Soak only: Fluxwright temp directories left behind after engine shutdown.
+    #[serde(default)]
+    leaked_temp_dirs: u32,
+    /// Soak only (Linux): open file descriptors in `/proc/self/fd` before the soak.
+    #[serde(default)]
+    open_fds_start: Option<u64>,
+    /// Soak only (Linux): open file descriptors in `/proc/self/fd` after engine shutdown.
+    #[serde(default)]
+    open_fds_end: Option<u64>,
+    /// Soak only: post-warmup linear regression RSS growth slope in MB/hour.
+    #[serde(default)]
+    rss_slope_mb_per_hour: Option<f64>,
     os: String,
     arch: String,
     chrome: Option<String>,
@@ -90,9 +108,120 @@ impl Record {
         self.browsers_killed = watch.killed;
         self.leaked_processes = watch.leaked;
         if self.scenario.starts_with("soak-") {
+            self.rss_slope_mb_per_hour = compute_rss_slope_mb_per_hour(&watch.samples);
             self.memory_samples_mb = watch.samples;
         }
         self
+    }
+}
+
+const FLUXWRIGHT_TEMP_DIR_PREFIXES: &[&str] = &[
+    "fluxwright-profile-",
+    "fluxwright-dl-",
+    "fluxwright-sess-dl-",
+    "fluxwright-cdp-dl-",
+];
+
+const MAX_SOAK_FD_DELTA: u64 = 64;
+
+fn is_fluxwright_temp_dir_name(name: &str) -> bool {
+    FLUXWRIGHT_TEMP_DIR_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+fn count_fluxwright_temp_dirs(dir: &Path) -> u32 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_fluxwright_temp_dir_name)
+        })
+        .count() as u32
+}
+
+#[cfg(target_os = "linux")]
+fn count_open_fds() -> Option<u64> {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .map(|entries| entries.count() as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn count_open_fds() -> Option<u64> {
+    None
+}
+
+/// Ordinary least-squares slope of per-minute RSS samples, converted to MB/hour.
+/// Skips the first warmup sample when at least 3 samples were collected.
+fn compute_rss_slope_mb_per_hour(samples: &[u64]) -> Option<f64> {
+    let series = if samples.len() >= 3 {
+        &samples[1..]
+    } else {
+        samples
+    };
+    let n = series.len();
+    if n < 2 {
+        return None;
+    }
+    let nf = n as f64;
+    let mean_x = (n - 1) as f64 / 2.0;
+    let mean_y = series.iter().map(|&y| y as f64).sum::<f64>() / nf;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for (i, &y) in series.iter().enumerate() {
+        let dx = i as f64 - mean_x;
+        let dy = y as f64 - mean_y;
+        num += dx * dy;
+        den += dx * dx;
+    }
+    if den == 0.0 {
+        return Some(0.0);
+    }
+    Some((num / den) * 60.0)
+}
+
+fn validate_soak_record(rec: &Record, max_slope_mb_per_hour: f64) -> Result<(), String> {
+    let mut violations = Vec::new();
+    if rec.jobs == 0 {
+        violations.push("soak completed 0 jobs".to_string());
+    }
+    if rec.leaked_processes > 0 {
+        violations.push(format!("leaked_processes={} (expected 0)", rec.leaked_processes));
+    }
+    if rec.leaked_temp_dirs > 0 {
+        violations.push(format!("leaked_temp_dirs={} (expected 0)", rec.leaked_temp_dirs));
+    }
+    if rec.failure_rate > 0.0 || !rec.failure_rate.is_finite() {
+        violations.push(format!(
+            "failure_rate={:.4}% (expected 0.0%)",
+            rec.failure_rate * 100.0
+        ));
+    }
+    if let Some(slope) = rec.rss_slope_mb_per_hour {
+        if !slope.is_finite() || slope > max_slope_mb_per_hour {
+            violations.push(format!(
+                "rss_slope_mb_per_hour={slope:.2} exceeds max {max_slope_mb_per_hour:.2}"
+            ));
+        }
+    }
+    if let (Some(start), Some(end)) = (rec.open_fds_start, rec.open_fds_end) {
+        let delta = end.saturating_sub(start);
+        if delta > MAX_SOAK_FD_DELTA {
+            violations.push(format!(
+                "open_fds delta={delta} ({start} -> {end}) exceeds max {MAX_SOAK_FD_DELTA}"
+            ));
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations.join("; "))
     }
 }
 
@@ -364,14 +493,24 @@ async fn main() -> Result<()> {
     }
     eprintln!("kitewright is an MCP server; like-for-like library workload is not possible — skipped");
 
+    let mut soak_failure: Option<String> = None;
     if let Some(minutes) = args.soak_minutes {
-        records.push(run_soak(&url, minutes, chrome.as_ref()).await?);
+        let rec = run_soak(&url, minutes, args.chaos, chrome.as_ref()).await?;
+        if args.assert_soak {
+            if let Err(err) = validate_soak_record(&rec, args.max_rss_slope_mb_per_hour) {
+                soak_failure = Some(err);
+            }
+        }
+        records.push(rec);
     }
 
     let path = args.out.join("latest.json");
     std::fs::write(&path, serde_json::to_string_pretty(&records)?)?;
     print_table(&records);
     println!("wrote {}", path.display());
+    if let Some(err) = soak_failure {
+        anyhow::bail!("soak health gate failed: {err}");
+    }
     Ok(())
 }
 
@@ -410,6 +549,21 @@ fn print_table(records: &[Record]) {
             r.browsers_killed,
             r.leaked_processes
         );
+    }
+    for r in records {
+        if r.scenario.starts_with("soak-") {
+            let slope = r
+                .rss_slope_mb_per_hour
+                .map_or_else(|| "n/a".to_string(), |s| format!("{s:.2} MB/h"));
+            let fds = match (r.open_fds_start, r.open_fds_end) {
+                (Some(s), Some(e)) => format!("{s}->{e} (delta={})", e.saturating_sub(s)),
+                _ => "n/a".to_string(),
+            };
+            println!(
+                "soak diagnostics ({}): rss_slope={slope}, leaked_temp_dirs={}, open_fds={fds}",
+                r.scenario, r.leaked_temp_dirs
+            );
+        }
     }
     println!();
     println!(
@@ -545,6 +699,10 @@ async fn run_fluxwright(
         browsers_killed: 0,
         leaked_processes: 0,
         memory_samples_mb: Vec::new(),
+        leaked_temp_dirs: 0,
+        open_fds_start: None,
+        open_fds_end: None,
+        rss_slope_mb_per_hour: None,
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
         chrome: chrome.map(|p| p.display().to_string()),
@@ -554,7 +712,15 @@ async fn run_fluxwright(
 
 /// One job after another for `minutes`, with browsers recycled every 50 jobs: memory and latency
 /// should end where they began.
-async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<Record> {
+async fn run_soak(
+    url: &str,
+    minutes: u64,
+    chaos: bool,
+    chrome: Option<&PathBuf>,
+) -> Result<Record> {
+    let temp_dir = std::env::temp_dir();
+    let temp_dirs_before = count_fluxwright_temp_dirs(&temp_dir);
+    let open_fds_start = count_open_fds();
     let mut builder = BrowserEngine::builder()
         .max_browsers(3)
         .max_contexts_per_browser(6)
@@ -564,7 +730,7 @@ async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<R
         builder = builder.chrome(c);
     }
     let engine = builder.build().await?;
-    let watch = Watch::start(std::process::id(), false);
+    let watch = Watch::start(std::process::id(), chaos);
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);
     let (mut jobs, mut failures) = (0u32, 0u32);
     let mut latencies = Vec::new();
@@ -595,6 +761,8 @@ async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<R
     let p99 = percentile(&latencies, 99);
     engine.shutdown(Duration::from_secs(10)).await.ok();
     let watched = tokio::task::spawn_blocking(move || watch.finish()).await?;
+    let leaked_temp_dirs = count_fluxwright_temp_dirs(&temp_dir).saturating_sub(temp_dirs_before);
+    let open_fds_end = count_open_fds();
     Ok(Record {
         tool: "fluxwright".into(),
         scenario: format!("soak-{minutes}m"),
@@ -612,6 +780,10 @@ async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<R
         browsers_killed: 0,
         leaked_processes: 0,
         memory_samples_mb: Vec::new(),
+        leaked_temp_dirs,
+        open_fds_start,
+        open_fds_end,
+        rss_slope_mb_per_hour: None,
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
         chrome: chrome.map(|p| p.display().to_string()),
@@ -724,5 +896,122 @@ mod tests {
         assert!(is_chrome_process_name("chrome.exe"));
         assert!(!is_chrome_process_name("chromedriver"));
         assert!(!is_chrome_process_name("chromedriver.exe"));
+    }
+
+    #[test]
+    fn compute_rss_slope_handles_flat_and_growing_series() {
+        assert_eq!(compute_rss_slope_mb_per_hour(&[]), None);
+        assert_eq!(compute_rss_slope_mb_per_hour(&[200]), None);
+
+        // Two-point series has no warmup sample skipped: +2 MB/min = +120 MB/hour.
+        let two = compute_rss_slope_mb_per_hour(&[200, 202]).unwrap();
+        assert!((two - 120.0).abs() < 1e-6, "got {two}");
+
+        // Warmup jump from 50 -> 200 MB is skipped when len >= 3, leaving a flat post-warmup series.
+        let flat = compute_rss_slope_mb_per_hour(&[50, 200, 200, 200, 200]).unwrap();
+        assert!(flat.abs() < 1e-6, "expected 0 slope, got {flat}");
+
+        // +1 MB/min post-warmup -> +60 MB/hour.
+        let growing = compute_rss_slope_mb_per_hour(&[50, 200, 201, 202, 203]).unwrap();
+        assert!((growing - 60.0).abs() < 1e-6, "got {growing}");
+
+        // Shrinking post-warmup series -> -60 MB/hour.
+        let shrinking = compute_rss_slope_mb_per_hour(&[50, 203, 202, 201, 200]).unwrap();
+        assert!((shrinking + 60.0).abs() < 1e-6, "got {shrinking}");
+    }
+
+    fn healthy_soak_record() -> Record {
+        Record {
+            tool: "fluxwright".into(),
+            scenario: "soak-120m".into(),
+            jobs: 1200,
+            duration_ms: 7_200_000,
+            jobs_per_second: 0.16,
+            peak_memory_mb: 512,
+            jobs_per_gb: 0.32,
+            p50_latency_ms: 40,
+            p95_latency_ms: 90,
+            p99_latency_ms: 150,
+            avg_cpu_pct: 12.0,
+            peak_cpu_pct: 30.0,
+            failure_rate: 0.0,
+            browsers_killed: 40,
+            leaked_processes: 0,
+            memory_samples_mb: vec![120, 400, 405, 402, 404],
+            leaked_temp_dirs: 0,
+            open_fds_start: Some(24),
+            open_fds_end: Some(28),
+            rss_slope_mb_per_hour: Some(10.0),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            chrome: None,
+        }
+    }
+
+    #[test]
+    fn validate_soak_record_checks_leaks_failures_and_slope() {
+        let base = healthy_soak_record();
+        assert!(validate_soak_record(&base, 50.0).is_ok());
+
+        let mut leaked_proc = base.clone();
+        leaked_proc.leaked_processes = 1;
+        assert!(validate_soak_record(&leaked_proc, 50.0)
+            .unwrap_err()
+            .contains("leaked_processes=1"));
+
+        let mut leaked_tmp = base.clone();
+        leaked_tmp.leaked_temp_dirs = 2;
+        assert!(validate_soak_record(&leaked_tmp, 50.0)
+            .unwrap_err()
+            .contains("leaked_temp_dirs=2"));
+
+        let mut failed_jobs = base.clone();
+        failed_jobs.failure_rate = 0.01;
+        assert!(validate_soak_record(&failed_jobs, 50.0)
+            .unwrap_err()
+            .contains("failure_rate="));
+
+        let mut steep_slope = base.clone();
+        steep_slope.rss_slope_mb_per_hour = Some(75.5);
+        assert!(validate_soak_record(&steep_slope, 50.0)
+            .unwrap_err()
+            .contains("rss_slope_mb_per_hour=75.50"));
+
+        let mut fd_leak = base.clone();
+        fd_leak.open_fds_start = Some(20);
+        fd_leak.open_fds_end = Some(20 + MAX_SOAK_FD_DELTA + 1);
+        assert!(validate_soak_record(&fd_leak, 50.0)
+            .unwrap_err()
+            .contains("open_fds delta="));
+
+        // Ensure legacy Record JSON without new fields still deserializes cleanly.
+        let legacy_json = r#"{
+            "tool": "fluxwright",
+            "scenario": "1-browser-10-pages",
+            "jobs": 100,
+            "duration_ms": 1000,
+            "jobs_per_second": 100.0,
+            "peak_memory_mb": 200,
+            "p95_latency_ms": 50,
+            "failure_rate": 0.0,
+            "os": "linux",
+            "arch": "x86_64",
+            "chrome": null
+        }"#;
+        let parsed: Record = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.leaked_temp_dirs, 0);
+        assert_eq!(parsed.open_fds_start, None);
+        assert_eq!(parsed.open_fds_end, None);
+        assert_eq!(parsed.rss_slope_mb_per_hour, None);
+    }
+
+    #[test]
+    fn fluxwright_temp_dir_matcher_identifies_owned_prefixes() {
+        assert!(is_fluxwright_temp_dir_name("fluxwright-profile-123"));
+        assert!(is_fluxwright_temp_dir_name("fluxwright-dl-abc"));
+        assert!(is_fluxwright_temp_dir_name("fluxwright-sess-dl-xyz"));
+        assert!(is_fluxwright_temp_dir_name("fluxwright-cdp-dl-999"));
+        assert!(!is_fluxwright_temp_dir_name("fluxwright-other-123"));
+        assert!(!is_fluxwright_temp_dir_name("chrome-profile-123"));
     }
 }

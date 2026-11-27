@@ -1,0 +1,80 @@
+name: soak
+
+on:
+  schedule:
+    # Weekly Sunday 03:00 UTC 2-hour chaos soak proof.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Soak duration in minutes"
+        type: string
+        default: "120"
+      chaos:
+        description: "Kill a top-level Chrome process every 2 seconds during the soak"
+        type: boolean
+        default: true
+      max_rss_slope_mb_per_hour:
+        description: "Maximum allowed post-warmup RSS growth slope (MB/hour)"
+        type: string
+        default: "50"
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: scheduled soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      FLUXWRIGHT_NO_SANDBOX: "1"
+      FLUXWRIGHT_HEADLESS: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Locate Chrome
+        run: |
+          echo "FLUXWRIGHT_CHROMIUM=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          google-chrome --version
+      - name: Run soak test
+        env:
+          SOAK_MINUTES: ${{ inputs.minutes || '120' }}
+          SOAK_CHAOS: ${{ inputs.chaos }}
+          SOAK_MAX_RSS_SLOPE: ${{ inputs.max_rss_slope_mb_per_hour || '50' }}
+        run: |
+          args=(
+            --tools fluxwright
+            --scenario soak
+            --soak-minutes "$SOAK_MINUTES"
+            --assert-soak
+            --max-rss-slope-mb-per-hour "$SOAK_MAX_RSS_SLOPE"
+            --out benchmarks/soak-results
+          )
+          # Enable chaos by default on scheduled runs (SOAK_CHAOS is empty) and when true.
+          if [ "${SOAK_CHAOS:-true}" != "false" ]; then
+            args+=(--chaos)
+          fi
+          cargo run --release -p fluxwright-benchmarks -- "${args[@]}"
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f benchmarks/soak-results/latest.json ]; then
+            {
+              echo "### Soak Report: $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB, $(date -u +%F)"
+              echo
+              echo "| scenario | jobs | jobs/s | peak MB | RSS slope MB/h | p50 ms | p95 ms | p99 ms | fail % | killed | leaked procs | leaked tmp | FDs (start->end) |"
+              echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+              node -e "for (const r of require('./benchmarks/soak-results/latest.json')) { const slope = r.rss_slope_mb_per_hour == null ? 'n/a' : r.rss_slope_mb_per_hour.toFixed(2); const fds = (r.open_fds_start != null && r.open_fds_end != null) ? (r.open_fds_start + '->' + r.open_fds_end) : 'n/a'; console.log('| ' + [r.scenario, r.jobs, r.jobs_per_second.toFixed(1), r.peak_memory_mb, slope, r.p50_latency_ms, r.p95_latency_ms, r.p99_latency_ms, (r.failure_rate * 100).toFixed(2) + '%', r.browsers_killed, r.leaked_processes, r.leaked_temp_dirs ?? 0, fds].join(' | ') + ' |'); }"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: soak-results
+          path: benchmarks/soak-results
+          if-no-files-found: warn
