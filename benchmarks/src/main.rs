@@ -17,12 +17,30 @@ struct Args {
     out: PathBuf,
     #[arg(long)]
     scenario: Option<String>,
+    /// Comma-separated subset of tools to run (default: all).
+    #[arg(long, value_delimiter = ',')]
+    tools: Option<Vec<String>>,
     /// Also run the chaos scenario: a browser process is killed every two seconds.
     #[arg(long)]
     chaos: bool,
     /// Also run a soak of this many minutes with recycling, sampling memory once a minute.
     #[arg(long)]
     soak_minutes: Option<u64>,
+}
+
+fn tool_enabled(filter: &Option<Vec<String>>, name: &str) -> bool {
+    match filter {
+        None => true,
+        Some(list) => list.iter().any(|t| t.trim().eq_ignore_ascii_case(name)),
+    }
+}
+
+fn percentile(sorted: &[u128], p: usize) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (sorted.len().saturating_mul(p) / 100).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -37,7 +55,17 @@ struct Record {
     /// Jobs a second for each GB of that peak.
     #[serde(default)]
     jobs_per_gb: f64,
+    #[serde(default)]
+    p50_latency_ms: u128,
     p95_latency_ms: u128,
+    #[serde(default)]
+    p99_latency_ms: u128,
+    /// Normalized average CPU utilization across the process tree (0-100% of host capacity).
+    #[serde(default)]
+    avg_cpu_pct: f64,
+    /// Peak normalized CPU utilization across the process tree (0-100% of host capacity).
+    #[serde(default)]
+    peak_cpu_pct: f64,
     failure_rate: f64,
     /// Chaos only: browser processes the harness killed during the run.
     #[serde(default)]
@@ -57,6 +85,8 @@ impl Record {
     fn measured(mut self, watch: Watched) -> Self {
         self.peak_memory_mb = watch.peak_mb;
         self.jobs_per_gb = self.jobs_per_second / (watch.peak_mb.max(1) as f64 / 1024.0);
+        self.avg_cpu_pct = watch.avg_cpu_pct;
+        self.peak_cpu_pct = watch.peak_cpu_pct;
         self.browsers_killed = watch.killed;
         self.leaked_processes = watch.leaked;
         if self.scenario.starts_with("soak-") {
@@ -113,17 +143,29 @@ fn is_chrome(sys: &System, pid: Pid) -> bool {
 
 struct Watched {
     peak_mb: u64,
+    avg_cpu_pct: f64,
+    peak_cpu_pct: f64,
     killed: u32,
     leaked: u32,
     samples: Vec<u64>,
 }
 
-/// Samples the memory of `root`'s process tree four times a second on its own thread, so no
-/// process-table walk sits inside a timed job. With `chaos`, also kills one of the browsers the
-/// driver started every two seconds.
+#[derive(Default)]
+struct WatchLoopOut {
+    peak_mb: u64,
+    avg_cpu_pct: f64,
+    peak_cpu_pct: f64,
+    killed: u32,
+    seen: HashSet<(Pid, u64)>,
+    samples: Vec<u64>,
+}
+
+/// Samples the memory and CPU of `root`'s process tree four times a second on its own thread, so
+/// no process-table walk sits inside a timed job. With `chaos`, also kills one of the top-level
+/// browsers the driver started every two seconds.
 struct Watch {
     stop: Arc<AtomicBool>,
-    thread: std::thread::JoinHandle<(u64, u32, HashSet<(Pid, u64)>, Vec<u64>)>,
+    thread: std::thread::JoinHandle<WatchLoopOut>,
 }
 
 impl Watch {
@@ -133,14 +175,38 @@ impl Watch {
         let thread = std::thread::spawn(move || {
             let (mut peak, mut killed, mut seen, mut samples) =
                 (0u64, 0u32, HashSet::new(), Vec::new());
+            let mut sys = System::new();
+            let logical_cores = std::thread::available_parallelism()
+                .map(|n| n.get() as f64)
+                .unwrap_or(1.0);
+            let (mut tick, mut cpu_sum, mut cpu_samples, mut peak_cpu_pct) =
+                (0u64, 0.0f64, 0u64, 0.0f64);
             let mut last_kill = Instant::now();
             let mut next_sample = Instant::now();
             while !flag.load(Ordering::Relaxed) {
-                let sys = snapshot();
+                sys.refresh_cpu_usage();
+                sys.refresh_processes(ProcessesToUpdate::All, true);
                 let pids = tree(&sys, root);
-                let bytes: u64 = pids.iter().filter_map(|p| sys.process(*p)).map(|p| p.memory()).sum();
+                let bytes: u64 = pids
+                    .iter()
+                    .filter_map(|p| sys.process(*p))
+                    .map(|p| p.memory())
+                    .sum();
                 let mb = bytes / (1024 * 1024);
                 peak = peak.max(mb);
+                // Skip tick 0 because sysinfo computes CPU% from the delta between refreshes.
+                if tick > 0 {
+                    let raw_cpu: f64 = pids
+                        .iter()
+                        .filter_map(|p| sys.process(*p))
+                        .map(|p| p.cpu_usage() as f64)
+                        .sum();
+                    let norm_cpu = (raw_cpu / logical_cores).clamp(0.0, 100.0);
+                    cpu_sum += norm_cpu;
+                    cpu_samples += 1;
+                    peak_cpu_pct = peak_cpu_pct.max(norm_cpu);
+                }
+                tick += 1;
                 if Instant::now() >= next_sample {
                     samples.push(mb);
                     next_sample += Duration::from_secs(60);
@@ -151,15 +217,21 @@ impl Watch {
                         .filter_map(|p| sys.process(*p).map(|proc| (*p, proc.start_time()))),
                 );
                 if chaos && last_kill.elapsed() >= Duration::from_secs(2) {
-                    // A browser is a Chrome the driver itself started; its renderers hang off it.
+                    // Target top-level Chrome browser processes even if a driver sits between root
+                    // and Chrome, without directly killing renderer/GPU child processes.
                     let browsers: Vec<Pid> = pids
                         .iter()
                         .filter(|p| is_chrome(&sys, **p))
-                        .filter(|p| sys.process(**p).and_then(|x| x.parent()) == Some(Pid::from_u32(root)))
+                        .filter(|p| {
+                            !sys.process(**p)
+                                .and_then(|x| x.parent())
+                                .is_some_and(|parent| is_chrome(&sys, parent))
+                        })
                         .copied()
                         .collect();
                     if !browsers.is_empty() {
-                        let pick = browsers[last_kill.elapsed().subsec_nanos() as usize % browsers.len()];
+                        let pick =
+                            browsers[last_kill.elapsed().subsec_nanos() as usize % browsers.len()];
                         if sys.process(pick).is_some_and(|p| p.kill()) {
                             killed += 1;
                         }
@@ -168,7 +240,18 @@ impl Watch {
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
-            (peak, killed, seen, samples)
+            WatchLoopOut {
+                peak_mb: peak,
+                avg_cpu_pct: if cpu_samples == 0 {
+                    0.0
+                } else {
+                    cpu_sum / cpu_samples as f64
+                },
+                peak_cpu_pct,
+                killed,
+                seen,
+                samples,
+            }
         });
         Self { stop, thread }
     }
@@ -176,16 +259,24 @@ impl Watch {
     /// Call once the tool has shut down: whatever Chrome it started and left behind is a leak.
     fn finish(self) -> Watched {
         self.stop.store(true, Ordering::Relaxed);
-        let (peak_mb, killed, seen, samples) = self.thread.join().unwrap_or_default();
+        let out = self.thread.join().unwrap_or_default();
         std::thread::sleep(Duration::from_secs(2));
         let sys = snapshot();
-        let leaked = seen
+        let leaked = out
+            .seen
             .iter()
             .filter(|&&(p, born)| {
                 is_chrome(&sys, p) && sys.process(p).is_some_and(|proc| proc.start_time() == born)
             })
             .count() as u32;
-        Watched { peak_mb, killed, leaked, samples }
+        Watched {
+            peak_mb: out.peak_mb,
+            avg_cpu_pct: out.avg_cpu_pct,
+            peak_cpu_pct: out.peak_cpu_pct,
+            killed: out.killed,
+            leaked,
+            samples: out.samples,
+        }
     }
 }
 
@@ -224,23 +315,24 @@ async fn main() -> Result<()> {
             url.clone()
         };
         eprintln!("scenario {name} jobs={jobs} browsers={browsers} ctx={ctx}");
-        let rec = run_fluxwright(
-            &scenario_url,
-            name,
-            browsers,
-            ctx,
-            jobs,
-            chaos,
-            chrome.as_ref(),
-        )
-        .await?;
-        records.push(rec);
-        let tools: &[&str] = if name.ends_with("-pdfs") {
-            &["playwright"]
-        } else {
-            &["playwright", "puppeteer"]
-        };
+        if tool_enabled(&args.tools, "fluxwright") {
+            let rec = run_fluxwright(
+                &scenario_url,
+                name,
+                browsers,
+                ctx,
+                jobs,
+                chaos,
+                chrome.as_ref(),
+            )
+            .await?;
+            records.push(rec);
+        }
+        let tools: &[&str] = &["playwright", "puppeteer", "puppeteer-cluster", "crawlee"];
         for &tool in tools {
+            if !tool_enabled(&args.tools, tool) {
+                continue;
+            }
             if let Some(rec) = run_node_tool(
                 tool,
                 name,
@@ -277,19 +369,34 @@ async fn main() -> Result<()> {
 fn print_table(records: &[Record]) {
     println!();
     println!(
-        "{:<12} {:<24} {:>6} {:>8} {:>8} {:>9} {:>8} {:>7} {:>7} {:>7}",
-        "tool", "scenario", "jobs", "jobs/s", "peak MB", "jobs/s/GB", "p95 ms", "fail", "killed", "leaked"
+        "{:<18} {:<24} {:>5} {:>7} {:>8} {:>9} {:>7} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6}",
+        "tool",
+        "scenario",
+        "jobs",
+        "jobs/s",
+        "peak MB",
+        "jobs/s/GB",
+        "CPU%",
+        "p50 ms",
+        "p95 ms",
+        "p99 ms",
+        "fail",
+        "kill",
+        "leak"
     );
     for r in records {
         println!(
-            "{:<12} {:<24} {:>6} {:>8.2} {:>8} {:>9.1} {:>8} {:>6.1}% {:>7} {:>7}",
+            "{:<18} {:<24} {:>5} {:>7.1} {:>8} {:>9.1} {:>6.1}% {:>7} {:>7} {:>7} {:>5.1}% {:>6} {:>6}",
             r.tool,
             r.scenario,
             r.jobs,
             r.jobs_per_second,
             r.peak_memory_mb,
             r.jobs_per_gb,
+            r.avg_cpu_pct,
+            r.p50_latency_ms,
             r.p95_latency_ms,
+            r.p99_latency_ms,
             r.failure_rate * 100.0,
             r.browsers_killed,
             r.leaked_processes
@@ -298,10 +405,11 @@ fn print_table(records: &[Record]) {
     println!();
     println!(
         "Same Chrome, fresh context per job, same job counts. Fluxwright enables prewarm_contexts(2) per browser, \
-         and `scraping-200` uses Fluxwright's built-in `ResourcePreset::Scraping` against `/scraping` (images, font, \
-         CSS, JS) while Playwright and Puppeteer run default navigation. Playwright/Puppeteer in-flight contexts are \
-         capped at 24 so Chrome does not deadlock on Windows. Memory is the driver plus every process it started, \
-         summed as RSS. In the chaos scenario the Playwright and Puppeteer runners have no relaunch code."
+         and `scraping-200` uses Fluxwright's `ResourcePreset::Scraping` against `/scraping` (images, font, CSS, JS); \
+         Crawlee runs PlaywrightCrawler with incognito contexts, maxRequestRetries=2, and `blockRequests()` on \
+         `scraping-200`; `puppeteer-cluster` runs CONCURRENCY_CONTEXT (single managed browser) with retryLimit=2; \
+         raw Playwright/Puppeteer run default navigation without relaunch code in chaos. In-flight contexts on Node \
+         are capped at 24. Memory is total process-tree RSS; CPU% is normalized across all logical host cores."
     );
 }
 
@@ -405,10 +513,9 @@ async fn run_fluxwright(
     }
     let duration = start.elapsed();
     latencies.sort();
-    let p95 = latencies
-        .get(latencies.len().saturating_mul(95) / 100)
-        .copied()
-        .unwrap_or(0);
+    let p50 = percentile(&latencies, 50);
+    let p95 = percentile(&latencies, 95);
+    let p99 = percentile(&latencies, 99);
     engine.shutdown(Duration::from_secs(10)).await.ok();
     let watched = tokio::task::spawn_blocking(move || watch.finish()).await?;
     Ok(Record {
@@ -419,7 +526,11 @@ async fn run_fluxwright(
         jobs_per_second: jobs as f64 / duration.as_secs_f64().max(0.001),
         peak_memory_mb: 0,
         jobs_per_gb: 0.0,
+        p50_latency_ms: p50,
         p95_latency_ms: p95,
+        p99_latency_ms: p99,
+        avg_cpu_pct: 0.0,
+        peak_cpu_pct: 0.0,
         failure_rate: failures as f64 / jobs as f64,
         browsers_killed: 0,
         leaked_processes: 0,
@@ -469,7 +580,9 @@ async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<R
     }
     let duration = start.elapsed();
     latencies.sort();
-    let p95 = latencies.get(latencies.len().saturating_mul(95) / 100).copied().unwrap_or(0);
+    let p50 = percentile(&latencies, 50);
+    let p95 = percentile(&latencies, 95);
+    let p99 = percentile(&latencies, 99);
     engine.shutdown(Duration::from_secs(10)).await.ok();
     let watched = tokio::task::spawn_blocking(move || watch.finish()).await?;
     Ok(Record {
@@ -480,7 +593,11 @@ async fn run_soak(url: &str, minutes: u64, chrome: Option<&PathBuf>) -> Result<R
         jobs_per_second: jobs as f64 / duration.as_secs_f64().max(0.001),
         peak_memory_mb: 0,
         jobs_per_gb: 0.0,
+        p50_latency_ms: p50,
         p95_latency_ms: p95,
+        p99_latency_ms: p99,
+        avg_cpu_pct: 0.0,
+        peak_cpu_pct: 0.0,
         failure_rate: if jobs == 0 { 0.0 } else { failures as f64 / jobs as f64 },
         browsers_killed: 0,
         leaked_processes: 0,
@@ -568,5 +685,25 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!tree(&snapshot(), me).contains(&Pid::from_u32(child.id())));
+    }
+
+    #[test]
+    fn percentile_handles_empty_single_and_ordered() {
+        assert_eq!(percentile(&[], 50), 0);
+        assert_eq!(percentile(&[42], 50), 42);
+        assert_eq!(percentile(&[42], 99), 42);
+        let sample = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        assert!(percentile(&sample, 50) <= percentile(&sample, 95));
+        assert!(percentile(&sample, 95) <= percentile(&sample, 99));
+        assert_eq!(percentile(&sample, 95), 100);
+    }
+
+    #[test]
+    fn tool_enabled_filters_case_insensitively() {
+        assert!(tool_enabled(&None, "crawlee"));
+        let filter = Some(vec!["Fluxwright".into(), "Crawlee".into()]);
+        assert!(tool_enabled(&filter, "fluxwright"));
+        assert!(tool_enabled(&filter, "crawlee"));
+        assert!(!tool_enabled(&filter, "puppeteer-cluster"));
     }
 }
