@@ -5,6 +5,7 @@
 
 mod cdp_gateway;
 mod cluster;
+mod crawl;
 pub mod dashboard;
 mod fast_cdp;
 mod fast_fetch;
@@ -14,6 +15,7 @@ mod job;
 mod journal;
 mod live;
 mod map;
+mod openapi;
 mod otlp;
 pub mod prometheus;
 mod replay;
@@ -324,6 +326,7 @@ pub(crate) struct Inner {
     fastpath_fallbacks: AtomicU64,
     live: live::LiveRegistry,
     sessions: sessions::SessionStoreState,
+    crawls: crawl::CrawlRegistry,
     webhooks: webhook::WebhookDispatcher,
     otlp: Option<otlp::OtlpExporter>,
     registry: Mutex<Registry>,
@@ -644,6 +647,7 @@ impl HttpServer {
             fastpath_fallbacks: AtomicU64::new(0),
             live: live::LiveRegistry::default(),
             sessions: sessions::SessionStoreState::default(),
+            crawls: crawl::CrawlRegistry::default(),
             webhooks: webhook::WebhookDispatcher::new(config.webhook_secret),
             otlp,
             registry: Mutex::new(Registry {
@@ -817,6 +821,11 @@ impl HttpServer {
                 .route("/json/version", get(cdp_gateway::json_version))
                 .route("/v1/scrape", post(scrape::scrape_handler))
                 .route("/v1/map", post(map::map_handler))
+                .route("/v1/crawl", post(crawl::start_crawl))
+                .route(
+                    "/v1/crawl/{id}",
+                    get(crawl::get_crawl).delete(crawl::cancel_crawl),
+                )
                 .route(
                     "/v1/sessions",
                     post(sessions::create_session).get(sessions::list_sessions),
@@ -858,6 +867,7 @@ impl HttpServer {
                 "/healthz",
                 get(|| async { Json(json!({ "status": "ok" })) }),
             )
+            .route("/openapi.json", get(openapi::openapi_json))
             .route("/dashboard", get(dashboard::dashboard_html))
             .route("/", get(dashboard::dashboard_html))
             .merge(protected)
@@ -895,6 +905,7 @@ impl HttpServer {
         }
         self.inner.lease_notify.notify_one();
         let _ = self.inner.shutdown_tx.send(true);
+        self.inner.crawls.shutdown();
         if self.inner.engine.is_some() {
             self.inner
                 .sessions
@@ -1934,7 +1945,7 @@ fn not_found() -> ApiError {
     )
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

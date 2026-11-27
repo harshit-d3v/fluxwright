@@ -91,7 +91,7 @@ fn default_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UrlOrigin {
+pub(crate) struct UrlOrigin {
     scheme: String,
     host: String,
     port: u16,
@@ -99,7 +99,7 @@ struct UrlOrigin {
 }
 
 impl UrlOrigin {
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
         let (scheme_raw, rest) = trimmed.split_once("://")?;
         let (scheme, default_port) = if scheme_raw.eq_ignore_ascii_case("http") {
@@ -153,7 +153,7 @@ impl UrlOrigin {
         })
     }
 
-    fn matches(&self, base: &Self, include_subdomains: bool) -> bool {
+    pub(crate) fn matches(&self, base: &Self, include_subdomains: bool) -> bool {
         if self.scheme != base.scheme || self.port != base.port {
             return false;
         }

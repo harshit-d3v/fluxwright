@@ -1,8 +1,10 @@
 //! Pure-Rust HTML5 extraction, Markdown conversion, sitemap parsing, and browser-escalation detection.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use scraper::{ElementRef, Html, Node, Selector};
+use serde::Deserialize;
+use serde_json::{Map, Value};
 use url::Url;
 
 const MAX_EXTRACTED_LINKS: usize = 5000;
@@ -942,4 +944,149 @@ fn normalize_newlines(s: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+pub(crate) const MAX_EXTRACT_FIELDS: usize = 64;
+pub(crate) const MAX_EXTRACT_SELECTOR_BYTES: usize = 512;
+pub(crate) const MAX_EXTRACT_MATCHES: usize = 200;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DetailedExtractField {
+    pub(crate) selector: String,
+    #[serde(default)]
+    pub(crate) attr: Option<String>,
+    #[serde(default)]
+    pub(crate) all: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ExtractField {
+    Selector(String),
+    Detailed(DetailedExtractField),
+}
+
+impl ExtractField {
+    fn as_parts(&self) -> (&str, Option<&str>, bool) {
+        match self {
+            ExtractField::Selector(sel) => (sel.as_str(), None, false),
+            ExtractField::Detailed(d) => (d.selector.as_str(), d.attr.as_deref(), d.all),
+        }
+    }
+}
+
+/// Validates CSS extraction schema keys, lengths, attributes, and selector syntax.
+pub(crate) fn validate_extract_rules(rules: &BTreeMap<String, ExtractField>) -> Result<(), String> {
+    if rules.is_empty() || rules.len() > MAX_EXTRACT_FIELDS {
+        return Err(format!(
+            "extract must contain between 1 and {MAX_EXTRACT_FIELDS} fields"
+        ));
+    }
+    for (key, rule) in rules {
+        let key_t = key.trim();
+        if key_t.is_empty() || key_t.len() > 128 {
+            return Err("extract field names must be 1 to 128 bytes".into());
+        }
+        let (raw_sel, attr, _) = rule.as_parts();
+        let sel = raw_sel.trim();
+        if sel.is_empty() || sel.len() > MAX_EXTRACT_SELECTOR_BYTES {
+            return Err(format!(
+                "selector for extract field `{key}` must be 1 to {MAX_EXTRACT_SELECTOR_BYTES} bytes"
+            ));
+        }
+        Selector::parse(sel)
+            .map_err(|_| format!("invalid CSS selector for extract field `{key}`"))?;
+        if let Some(a) = attr {
+            let at = a.trim();
+            if at.is_empty() || at.len() > 128 {
+                return Err(format!(
+                    "attribute name for extract field `{key}` must be 1 to 128 bytes"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates validated CSS extraction rules against an HTML document.
+pub(crate) fn extract_css_fields(
+    html: &str,
+    rules: &BTreeMap<String, ExtractField>,
+) -> Result<Map<String, Value>, String> {
+    validate_extract_rules(rules)?;
+    let doc = Html::parse_document(html);
+    let mut out = Map::with_capacity(rules.len());
+    for (key, rule) in rules {
+        let (raw_sel, attr, all) = rule.as_parts();
+        let selector = Selector::parse(raw_sel.trim())
+            .map_err(|_| format!("invalid CSS selector for extract field `{key}`"))?;
+        let attr_name = attr.map(str::trim);
+
+        let mut matches = Vec::new();
+        for el in doc.select(&selector) {
+            let val = match attr_name {
+                Some(a) => el.value().attr(a).map(str::trim).unwrap_or("").to_string(),
+                None => clean_inline(&el.text().collect::<Vec<_>>().join(" ")),
+            };
+            if val.is_empty() {
+                continue;
+            }
+            matches.push(val);
+            if !all || matches.len() >= MAX_EXTRACT_MATCHES {
+                break;
+            }
+        }
+
+        if all {
+            out.insert(
+                key.clone(),
+                Value::Array(matches.into_iter().map(Value::String).collect()),
+            );
+        } else {
+            out.insert(
+                key.clone(),
+                matches
+                    .into_iter()
+                    .next()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_css_fields_handles_shorthand_attr_and_all_rules() {
+        let html = r#"
+            <html><body>
+              <h1>  Welcome   Home </h1>
+              <a class="nav" href="/docs">Docs</a>
+              <a class="nav" href="/blog">Blog</a>
+            </body></html>
+        "#;
+        let rules: BTreeMap<String, ExtractField> = serde_json::from_value(serde_json::json!({
+            "heading": "h1",
+            "missing": ".does-not-exist",
+            "nav_links": { "selector": "a.nav", "attr": "href", "all": true }
+        }))
+        .unwrap();
+
+        let extracted = extract_css_fields(html, &rules).unwrap();
+        assert_eq!(extracted.get("heading").unwrap(), "Welcome Home");
+        assert!(extracted.get("missing").unwrap().is_null());
+        assert_eq!(
+            extracted.get("nav_links").unwrap(),
+            &serde_json::json!(["/docs", "/blog"])
+        );
+
+        let bad: BTreeMap<String, ExtractField> =
+            serde_json::from_value(serde_json::json!({ "broken": "[[[" })).unwrap();
+        assert!(validate_extract_rules(&bad).is_err());
+    }
 }

@@ -629,6 +629,13 @@ Coordinators also accept `--max-per-host <n>` and `--min-host-delay-ms <ms>` to 
 
 > **Security boundary:** `fluxwright serve --join` supports native `https://` TLS (`rustls` + WebPKI roots, e.g. via a TLS reverse proxy in front of `fluxwright coordinate`) as well as `http://` (non-loopback `http://` logs a warning). Set a dedicated `FLUXWRIGHT_WORKER_TOKEN` on both coordinator and workers so worker credentials cannot call client/operator routes (`POST /v1/jobs`, `/v1/stats`, `/metrics`, `/v1/workers/*` management) and client tokens cannot pull or post worker results; when `FLUXWRIGHT_WORKER_TOKEN` is unset, both fall back to `FLUXWRIGHT_SERVER_TOKEN`. Keep plaintext `http://` links strictly inside a private subnet or VPN.
 
+## Recursive crawling, declarative extraction, and OpenAPI
+
+- `POST /v1/crawl` starts an asynchronous breadth-first crawl (`url`, `max_depth`, `max_pages`, `concurrency`, `same_origin`, `include_subdomains`, `include_paths`, `exclude_paths`, `formats`, `mode`, `extract`) using the 3-tier engine (`http` -> optional `--fast-cdp-endpoint` -> local Chromium) and returns `202 Accepted` with a crawl ID.
+- `GET /v1/crawl/{id}` returns crawl progress (`status`, `discovered`, `completed`, `failed`, `pages[]`), and `DELETE /v1/crawl/{id}` cancels an active crawl.
+- Both `POST /v1/scrape` and `POST /v1/crawl` accept `extract` maps with shorthand CSS selectors (`"heading": "h1"`) or objects (`{ "selector": "a.item", "attr": "href", "all": true }`) to return structured JSON fields under `extracted`.
+- `GET /openapi.json` serves the server's OpenAPI 3.1.0 schema without authentication.
+
 ## Development checks
 
 ```bash

@@ -1,6 +1,6 @@
 //! Synchronous one-shot scrape and render endpoint (`POST /v1/scrape`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -77,6 +77,8 @@ pub(crate) struct ScrapeRequest {
     screenshot_annotate: bool,
     #[serde(default)]
     snapshot_interactive_only: bool,
+    #[serde(default)]
+    extract: Option<BTreeMap<String, fast_html::ExtractField>>,
 }
 
 fn default_formats() -> Vec<ScrapeFormat> {
@@ -134,6 +136,13 @@ pub(crate) async fn scrape_handler(
     }
     let formats = dedup_formats(&req.formats)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
+    if let Some(ref rules) = req.extract {
+        fast_html::validate_extract_rules(rules)
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
+    }
+    let extract_rules = req.extract;
+    let extra_html_for_extract =
+        extract_rules.is_some() && !formats.contains(&ScrapeFormat::Html);
 
     let has_visual = formats
         .iter()
@@ -213,6 +222,9 @@ pub(crate) async fn scrape_handler(
                 tagged: false,
             },
         });
+    }
+    if extra_html_for_extract {
+        steps.push(Step::Content {});
     }
 
     let browser_resource_preset = req
@@ -300,7 +312,7 @@ pub(crate) async fn scrape_handler(
                         want_text,
                     );
                     let duration_ms = started.elapsed().as_millis() as u64;
-                    let obj = build_text_scrape_response(
+                    let mut obj = build_text_scrape_response(
                         resp.final_url,
                         extracted.title,
                         duration_ms,
@@ -311,6 +323,11 @@ pub(crate) async fn scrape_handler(
                         Some(&html_str),
                         extracted.text.as_deref(),
                     );
+                    if let Some(ref rules) = extract_rules {
+                        let extracted_map = fast_html::extract_css_fields(&html_str, rules)
+                            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
+                        obj.insert("extracted".into(), Value::Object(extracted_map));
+                    }
                     return Ok((StatusCode::OK, Json(Value::Object(obj))).into_response());
                 }
             }
@@ -329,6 +346,7 @@ pub(crate) async fn scrape_handler(
             && fallback_reason.is_some()
             && inner.fast_cdp_endpoint.is_some()
             && !has_browser_only_opts
+            && extract_rules.is_none()
             && !is_about_blank
             && proxy_session.is_none()
             && engine.proxy_pool().is_none()
@@ -401,8 +419,9 @@ pub(crate) async fn scrape_handler(
     .map_err(map_scrape_error)?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    // Last (2 + formats.len()) elements hold [url, title, ...format results].
-    let base = results.len().saturating_sub(2 + formats.len());
+    // Last (2 + formats.len() + extra_html) elements hold [url, title, ...format results, ?extra_html].
+    let extra = usize::from(extra_html_for_extract);
+    let base = results.len().saturating_sub(2 + formats.len() + extra);
     let final_url = results
         .get(base)
         .and_then(Value::as_str)
@@ -453,11 +472,24 @@ pub(crate) async fn scrape_handler(
         }
     }
 
+    if let Some(ref rules) = extract_rules {
+        let html_for_extract = if extra_html_for_extract {
+            results.get(base + 2 + formats.len()).and_then(Value::as_str)
+        } else {
+            obj.get("html").and_then(Value::as_str)
+        };
+        if let Some(raw_html) = html_for_extract {
+            let extracted_map = fast_html::extract_css_fields(raw_html, rules)
+                .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", e))?;
+            obj.insert("extracted".into(), Value::Object(extracted_map));
+        }
+    }
+
     Ok((StatusCode::OK, Json(Value::Object(obj))).into_response())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_text_scrape_response(
+pub(crate) fn build_text_scrape_response(
     url: String,
     title: String,
     duration_ms: u64,
@@ -502,7 +534,7 @@ fn build_text_scrape_response(
     obj
 }
 
-fn map_scrape_error(err: fluxwright::Error) -> ApiError {
+pub(crate) fn map_scrape_error(err: fluxwright::Error) -> ApiError {
     match err {
         fluxwright::Error::QueueFull => {
             ApiError::new(StatusCode::TOO_MANY_REQUESTS, "capacity_exceeded", err.to_string())
