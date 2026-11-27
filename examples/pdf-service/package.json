@@ -1,0 +1,13 @@
+{
+  "name": "fluxwright-example-pdf-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted HTTP microservice exposing POST /render/pdf and POST /render/screenshot backed by Fluxwright /v1/jobs.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

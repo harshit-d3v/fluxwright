@@ -1,0 +1,17 @@
+{
+  "name": "fluxwright-example-e2e-migration",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright to Fluxwright 1-line import swap E2E checkout test suite.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "fluxwright-test",
+    "test:headed": "fluxwright-test --headed"
+  },
+  "devDependencies": {
+    "fluxwright": "^0.14.0"
+  }
+}
