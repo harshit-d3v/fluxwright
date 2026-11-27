@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       run_fleet:
-        description: Run Playwright and Puppeteer fleet comparison
+        description: Run 5-tool fleet comparison (Fluxwright, Crawlee, puppeteer-cluster, Playwright, Puppeteer)
         type: boolean
         default: true
       chaos:
@@ -21,6 +21,9 @@ on:
         description: Also run Tier 1 HTTP fast-path vs browser benchmark
         type: boolean
         default: true
+      tools:
+        description: Optional comma-separated tool filter (blank runs all 5 tools)
+        default: ""
 
 permissions:
   contents: read
@@ -38,7 +41,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: benchmarks/package-lock.json
-      - name: Playwright and Puppeteer, without browsers of their own
+      - name: Install Node benchmark competitors without bundled browsers
         working-directory: benchmarks
         env:
           PUPPETEER_SKIP_DOWNLOAD: "true"
@@ -65,19 +68,20 @@ jobs:
         env:
           CHAOS: ${{ inputs.chaos && '--chaos' || '' }}
           SOAK: ${{ inputs.soak_minutes != '0' && format('--soak-minutes {0}', inputs.soak_minutes) || '' }}
+          TOOLS: ${{ inputs.tools != '' && format('--tools {0}', inputs.tools) || '' }}
         # Unquoted on purpose: each is one flag (with its value) or nothing.
-        run: cargo run --release -p fluxwright-benchmarks -- --out bench-results $CHAOS $SOAK
+        run: cargo run --release -p fluxwright-benchmarks -- --out bench-results $CHAOS $SOAK $TOOLS
       - name: Summary
         if: inputs.run_fleet
         run: |
           {
             echo "### Benchmarks: $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB, $(date -u +%F)"
             echo
-            echo "| tool | scenario | jobs | jobs/s | peak MB | jobs/s per GB | p95 ms | failures | browsers killed | Chrome left behind |"
-            echo "|---|---|---|---|---|---|---|---|---|---|"
-            node -e "for (const r of require('./bench-results/latest.json')) console.log('| ' + [r.tool, r.scenario, r.jobs, r.jobs_per_second.toFixed(1), r.peak_memory_mb, r.jobs_per_gb.toFixed(1), r.p95_latency_ms, (r.failure_rate * 100).toFixed(1) + '%', r.browsers_killed, r.leaked_processes].join(' | ') + ' |')"
+            echo "| tool | scenario | jobs | jobs/s | peak MB | jobs/s per GB | avg CPU% | peak CPU% | p50 ms | p95 ms | p99 ms | failures | browsers killed | Chrome left behind |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            node -e "for (const r of require('./bench-results/latest.json')) console.log('| ' + [r.tool, r.scenario, r.jobs, r.jobs_per_second.toFixed(1), r.peak_memory_mb, r.jobs_per_gb.toFixed(1), (r.avg_cpu_pct ?? 0).toFixed(1) + '%', (r.peak_cpu_pct ?? 0).toFixed(1) + '%', r.p50_latency_ms ?? 0, r.p95_latency_ms, r.p99_latency_ms ?? 0, (r.failure_rate * 100).toFixed(1) + '%', r.browsers_killed, r.leaked_processes].join(' | ') + ' |')"
             echo
-            echo "Memory is the driver plus every process it started, summed as RSS. In the chaos rows the Playwright and Puppeteer runners have no relaunch code."
+            echo "Memory is the driver plus every process it started, summed as RSS. CPU% is normalized against total logical host cores. Crawlee uses PlaywrightCrawler (incognito contexts, maxRequestRetries: 2, blockRequests() on scraping-200); puppeteer-cluster uses CONCURRENCY_CONTEXT (single managed browser, retryLimit: 2); raw Playwright and Puppeteer runners have no relaunch/retry code in chaos."
             node -e "for (const r of require('./bench-results/latest.json')) if (r.memory_samples_mb.length) console.log(r.scenario + ' memory (MB, one a minute): ' + r.memory_samples_mb.join(', '))"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Run fast-path benchmark
