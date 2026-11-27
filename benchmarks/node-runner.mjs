@@ -175,26 +175,38 @@ async function withPuppeteerCluster() {
   let succeeded = 0;
   const lat = [];
   cluster.on("taskerror", (_err, data, willRetry) => {
-    if (!willRetry) {
-      fail++;
-      lat.push(Date.now() - (data?.startedAt || Date.now()));
-    }
+    if (!willRetry) data?.done?.(false);
   });
 
   await cluster.task(async ({ page, data }) => {
-    if (!data.startedAt) data.startedAt = Date.now();
     await page.goto(data.targetUrl, { waitUntil: "load", timeout: 15_000 });
     if (isPdf) await assertPdf(page);
     else await page.title();
-    succeeded++;
-    lat.push(Date.now() - data.startedAt);
+    data.done(true);
   });
 
+  let next = 0;
   const t0 = Date.now();
-  for (let i = 0; i < jobs; i++) {
-    cluster.queue({ targetUrl: url });
-  }
-  await withTimeout(cluster.idle(), Math.max(30_000, budgetMs - 15_000), "cluster");
+  const workers = Array.from({ length: concurrency }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= jobs) return;
+      const s = Date.now();
+      const passed = await new Promise((resolve) => {
+        let settled = false;
+        const done = (ok) => {
+          if (settled) return;
+          settled = true;
+          resolve(ok);
+        };
+        cluster.queue({ targetUrl: url, done });
+      });
+      if (passed) succeeded++;
+      else fail++;
+      lat.push(Date.now() - s);
+    }
+  });
+  await withTimeout(Promise.all(workers), Math.max(30_000, budgetMs - 15_000), "cluster");
   const duration_ms = Date.now() - t0;
   await cluster.close().catch(() => {});
   fail += Math.max(0, jobs - succeeded - fail);
@@ -245,25 +257,56 @@ async function withCrawlee() {
         },
       },
       preNavigationHooks: [
-        async ({ request, blockRequests }, gotoOptions) => {
-          if (!request.userData.startedAt) request.userData.startedAt = Date.now();
+        async ({ blockRequests }, gotoOptions) => {
           gotoOptions.waitUntil = "load";
           if (isScraping) await blockRequests();
         },
       ],
-      requestHandler: async ({ page, request }) => {
+      requestHandler: async ({ page }) => {
         if (isPdf) await assertPdf(page);
         else await page.title();
         succeeded++;
-        lat.push(Date.now() - (request.userData.startedAt || Date.now()));
       },
-      failedRequestHandler: async ({ request }) => {
+      failedRequestHandler: async () => {
         fail++;
-        lat.push(Date.now() - (request.userData.startedAt || Date.now()));
       },
     },
     config,
   );
+
+  // Measure each job from worker pickup before browserPool.newPage() through retries and _cleanupContext().
+  const firstStart = new Map();
+  const finished = new Set();
+  const origStart = crawler.stats.startJob.bind(crawler.stats);
+  const origFinish = crawler.stats.finishJob.bind(crawler.stats);
+  const origFail = crawler.stats.failJob.bind(crawler.stats);
+  const origCleanup = crawler._cleanupContext.bind(crawler);
+  crawler.stats.startJob = (id, ...rest) => {
+    if (!firstStart.has(id)) firstStart.set(id, Date.now());
+    return origStart(id, ...rest);
+  };
+  crawler.stats.finishJob = (id, ...rest) => {
+    finished.add(id);
+    return origFinish(id, ...rest);
+  };
+  crawler.stats.failJob = (id, ...rest) => {
+    finished.add(id);
+    return origFail(id, ...rest);
+  };
+  crawler._cleanupContext = async (ctx) => {
+    try {
+      return await origCleanup(ctx);
+    } finally {
+      const id = ctx?.request?.id || ctx?.request?.uniqueKey;
+      if (id && finished.delete(id)) {
+        const t = firstStart.get(id);
+        if (t !== undefined) {
+          firstStart.delete(id);
+          lat.push(Date.now() - t);
+        }
+      }
+    }
+  };
 
   const requests = Array.from({ length: jobs }, (_, i) => ({
     url,
