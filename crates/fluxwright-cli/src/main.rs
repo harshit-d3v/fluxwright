@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod install;
+mod trace_viewer;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -174,6 +175,17 @@ enum Cmd {
         #[arg(long, default_value = "benchmarks/results")]
         out: PathBuf,
     },
+    /// View a Fluxwright or Playwright `.zip` trace locally or export a single-file HTML report.
+    ShowTrace {
+        /// Path to the `.zip` trace bundle written by `context.tracing.stop()`.
+        trace: PathBuf,
+        /// Write a self-contained offline HTML report instead of starting an HTTP viewer.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+        /// Listen address when serving the interactive trace viewer over HTTP.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: SocketAddr,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -335,6 +347,7 @@ async fn main() -> Result<()> {
             anyhow::ensure!(status.success(), "benchmark failed");
             Ok(())
         }
+        Cmd::ShowTrace { trace, out, listen } => trace_viewer::run(trace, out, listen).await,
     }
 }
 

@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>__TITLE__ - Fluxwright Trace Viewer</title>
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --panel: #121621;
+      --border: #23293a;
+      --text: #e6eaf2;
+      --muted: #8b95ab;
+      --accent: #3b82f6;
+      --ok: #22c55e;
+      --err: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header {
+      padding: 12px 18px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 20px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .kpis { display: flex; flex-wrap: wrap; gap: 10px; }
+    .kpi {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .kpi strong { margin-left: 6px; }
+    .kpi.err strong { color: var(--err); }
+    .layout {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      flex: 1;
+      min-height: 0;
+    }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+    .sidebar {
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      min-height: 400px;
+      max-height: calc(100vh - 60px);
+    }
+    .filter-box { padding: 10px; border-bottom: 1px solid var(--border); }
+    .filter-box input {
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-size: 13px;
+    }
+    .action-list { overflow-y: auto; flex: 1; }
+    .action-item {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      color: inherit;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      padding: 9px 12px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .action-item:hover { background: #181d2b; }
+    .action-item.active { background: #1d2740; border-left: 3px solid var(--accent); }
+    .action-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge {
+      font-size: 11px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .badge.err { color: var(--err); font-weight: 600; }
+    .main {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      padding: 14px 18px;
+      gap: 14px;
+    }
+    .player {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .player-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .player-controls button {
+      background: #1c2233;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .player-controls input[type="range"] { flex: 1; min-width: 140px; }
+    .frame-box {
+      background: #050608;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      min-height: 220px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .frame-box img { max-width: 100%; max-height: 460px; display: block; }
+    .empty { color: var(--muted); font-size: 13px; padding: 28px; }
+    .inspector {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+      background: #0f131c;
+    }
+    .tab-btn {
+      background: transparent;
+      color: var(--muted);
+      border: 0;
+      padding: 9px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .tab-btn.active { color: var(--text); border-bottom: 2px solid var(--accent); font-weight: 600; }
+    .tab-body { padding: 12px; max-height: 360px; overflow: auto; font-size: 13px; }
+    pre {
+      margin: 0;
+      padding: 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .err-banner {
+      background: rgba(239, 68, 68, 0.14);
+      border: 1px solid var(--err);
+      color: #fca5a5;
+      border-radius: 6px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    .status-ok { color: var(--ok); }
+    .status-err { color: var(--err); }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="trace-title">__TITLE__</h1>
+      <div class="meta">__ENV__</div>
+    </div>
+    <div class="kpis" id="kpis"></div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="filter-box">
+        <input id="filter" type="search" placeholder="Filter actions..." aria-label="Filter actions" />
+      </div>
+      <div class="action-list" id="action-list"></div>
+    </aside>
+
+    <main class="main">
+      <section class="player">
+        <div class="player-controls">
+          <button id="prev-frame" type="button">Prev</button>
+          <button id="play-pause" type="button">Play</button>
+          <button id="next-frame" type="button">Next</button>
+          <input id="frame-slider" type="range" min="0" max="0" value="0" aria-label="Screencast frame" />
+          <span class="badge" id="frame-label">0 / 0</span>
+        </div>
+        <div class="frame-box" id="frame-box"></div>
+      </section>
+
+      <section class="inspector">
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="action" type="button">Action Details</button>
+          <button class="tab-btn" data-tab="logs" type="button">Console &amp; Errors</button>
+          <button class="tab-btn" data-tab="network" type="button">Network</button>
+        </div>
+        <div class="tab-body" id="tab-body"></div>
+      </section>
+    </main>
+  </div>
+
+  <script id="trace-data" type="application/json">__TRACE_JSON__</script>
+  <script>
+    const data = JSON.parse(document.getElementById("trace-data").textContent || "{}");
+    const actions = data.actions || [];
+    const frames = data.frames || [];
+    const logs = data.logs || [];
+    const network = data.network || [];
+
+    const errCount = actions.filter((a) => a.error).length + logs.filter((l) => l.kind === "pageerror" || l.kind === "error").length;
+    const kpis = document.getElementById("kpis");
+    const addKpi = (label, val, err) => {
+      const div = document.createElement("div");
+      div.className = "kpi" + (err && val > 0 ? " err" : "");
+      div.textContent = label;
+      const st = document.createElement("strong");
+      st.textContent = String(val);
+      div.appendChild(st);
+      kpis.appendChild(div);
+    };
+    addKpi("Actions", actions.length, false);
+    addKpi("Errors", errCount, true);
+    addKpi("Frames", frames.length, false);
+    addKpi("Network", network.length, false);
+
+    let selectedActionIdx = 0;
+    let frameIdx = 0;
+    let activeTab = "action";
+    let playTimer = null;
+
+    const slider = document.getElementById("frame-slider");
+    const frameLabel = document.getElementById("frame-label");
+    const frameBox = document.getElementById("frame-box");
+    const tabBody = document.getElementById("tab-body");
+    const actionList = document.getElementById("action-list");
+    const filterInput = document.getElementById("filter");
+
+    function renderFrame() {
+      frameBox.textContent = "";
+      if (!frames.length) {
+        slider.max = "0";
+        slider.value = "0";
+        frameLabel.textContent = "No frames recorded";
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No screencast frames in archive";
+        frameBox.appendChild(empty);
+        return;
+      }
+      frameIdx = Math.max(0, Math.min(frameIdx, frames.length - 1));
+      slider.max = String(frames.length - 1);
+      slider.value = String(frameIdx);
+      const f = frames[frameIdx];
+      frameLabel.textContent = `${frameIdx + 1} / ${frames.length} (${f.timestampMs.toFixed(1)} ms)`;
+      const img = document.createElement("img");
+      img.src = f.dataUri;
+      img.alt = `Screencast frame ${frameIdx + 1}`;
+      frameBox.appendChild(img);
+    }
+
+    function jumpNearestFrame(targetMs) {
+      if (!frames.length) return;
+      let best = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < frames.length; i++) {
+        const d = Math.abs(frames[i].timestampMs - targetMs);
+        if (d < bestDist) {
+          bestDist = d;
+          best = i;
+        }
+      }
+      frameIdx = best;
+      renderFrame();
+    }
+
+    function renderTab() {
+      tabBody.textContent = "";
+      if (activeTab === "action") {
+        const a = actions[selectedActionIdx];
+        if (!a) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "Select an action from the list";
+          tabBody.appendChild(empty);
+          return;
+        }
+        if (a.error) {
+          const banner = document.createElement("div");
+          banner.className = "err-banner";
+          banner.textContent = a.error;
+          tabBody.appendChild(banner);
+        }
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.style.marginBottom = "8px";
+        const dur = a.durationMs != null ? `${a.durationMs.toFixed(1)} ms` : "pending";
+        meta.textContent = `${a.apiName} (${a.class}.${a.method}) · page=${a.pageId || "-"} · start=${a.startMs.toFixed(1)} ms · duration=${dur}`;
+        tabBody.appendChild(meta);
+        const pre = document.createElement("pre");
+        pre.textContent = a.params || "{}";
+        tabBody.appendChild(pre);
+        return;
+      }
+
+      if (activeTab === "logs") {
+        if (!logs.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "No console or page errors recorded";
+          tabBody.appendChild(empty);
+          return;
+        }
+        const tbl = document.createElement("table");
+        tbl.innerHTML = "<thead><tr><th>Time (ms)</th><th>Level</th><th>Page</th><th>Message</th></tr></thead><tbody></tbody>";
+        const tbody = tbl.querySelector("tbody");
+        for (const l of logs) {
+          const tr = document.createElement("tr");
+          const tdT = document.createElement("td");
+          tdT.textContent = l.timeMs.toFixed(1);
+          const tdK = document.createElement("td");
+          tdK.textContent = l.kind;
+          if (l.kind === "error" || l.kind === "pageerror") tdK.className = "status-err";
+          const tdP = document.createElement("td");
+          tdP.textContent = l.pageId || "-";
+          const tdM = document.createElement("td");
+          tdM.textContent = l.text;
+          tr.append(tdT, tdK, tdP, tdM);
+          tbody.appendChild(tr);
+        }
+        tabBody.appendChild(tbl);
+        return;
+      }
+
+      if (!network.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No network snapshots recorded";
+        tabBody.appendChild(empty);
+        return;
+      }
+      const tbl = document.createElement("table");
+      tbl.innerHTML = "<thead><tr><th>Status</th><th>Method</th><th>URL</th><th>MIME</th><th>Duration</th></tr></thead><tbody></tbody>";
+      const tbody = tbl.querySelector("tbody");
+      for (const n of network) {
+        const tr = document.createElement("tr");
+        const tdS = document.createElement("td");
+        tdS.textContent = n.failedText ? `ERR (${n.failedText})` : `${n.status}`;
+        tdS.className = n.failedText || n.status >= 400 ? "status-err" : "status-ok";
+        const tdM = document.createElement("td");
+        tdM.textContent = n.method;
+        const tdU = document.createElement("td");
+        tdU.textContent = n.url;
+        const tdMime = document.createElement("td");
+        tdMime.textContent = n.mimeType || "-";
+        const tdD = document.createElement("td");
+        tdD.textContent = `${n.durationMs.toFixed(1)} ms`;
+        tr.append(tdS, tdM, tdU, tdMime, tdD);
+        tbody.appendChild(tr);
+      }
+      tabBody.appendChild(tbl);
+    }
+
+    function renderActions() {
+      const q = (filterInput.value || "").trim().toLowerCase();
+      actionList.textContent = "";
+      actions.forEach((a, idx) => {
+        if (q && !a.apiName.toLowerCase().includes(q) && !a.params.toLowerCase().includes(q)) return;
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "action-item" + (idx === selectedActionIdx ? " active" : "");
+        const left = document.createElement("span");
+        left.className = "action-name";
+        left.textContent = a.apiName;
+        const right = document.createElement("span");
+        right.className = "badge" + (a.error ? " err" : "");
+        right.textContent = a.error ? "ERROR" : (a.durationMs != null ? `${a.durationMs.toFixed(0)} ms` : "");
+        btn.append(left, right);
+        btn.addEventListener("click", () => {
+          selectedActionIdx = idx;
+          renderActions();
+          renderTab();
+          jumpNearestFrame(a.startMs);
+        });
+        actionList.appendChild(btn);
+      });
+    }
+
+    filterInput.addEventListener("input", renderActions);
+    slider.addEventListener("input", () => {
+      frameIdx = Number(slider.value) || 0;
+      renderFrame();
+    });
+    document.getElementById("prev-frame").addEventListener("click", () => {
+      frameIdx = Math.max(0, frameIdx - 1);
+      renderFrame();
+    });
+    document.getElementById("next-frame").addEventListener("click", () => {
+      frameIdx = Math.min(Math.max(0, frames.length - 1), frameIdx + 1);
+      renderFrame();
+    });
+    const playBtn = document.getElementById("play-pause");
+    playBtn.addEventListener("click", () => {
+      if (playTimer) {
+        clearInterval(playTimer);
+        playTimer = null;
+        playBtn.textContent = "Play";
+        return;
+      }
+      if (!frames.length) return;
+      playBtn.textContent = "Pause";
+      playTimer = setInterval(() => {
+        frameIdx = (frameIdx + 1) % frames.length;
+        renderFrame();
+      }, 250);
+    });
+    for (const btn of document.querySelectorAll(".tab-btn")) {
+      btn.addEventListener("click", () => {
+        activeTab = btn.dataset.tab;
+        for (const b of document.querySelectorAll(".tab-btn")) b.classList.toggle("active", b === btn);
+        renderTab();
+      });
+    }
+
+    renderActions();
+    renderFrame();
+    renderTab();
+  </script>
+</body>
+</html>
