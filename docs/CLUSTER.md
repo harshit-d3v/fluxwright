@@ -56,6 +56,34 @@ ceiling, pages per browser) keep working unchanged: a full worker does not ask.
 
 Side effects can repeat. A job that clicked "buy" and then lost its worker, hit a coordinator restart with `--journal` / `--store`, or exceeded a worker's 10-second shutdown grace runs again from its first step on another worker. `retries: 0` stops re-runs only after a worker crash or lease expiry, **not** across a coordinator restart or a worker shutdown release: use the cluster only for repeatable jobs (or skip `--journal` / `--store` if you strictly prefer failure over a coordinator-restart rerun).
 
+## Sticky session & job affinity
+
+Long-lived workflows and multi-step scraping pipelines often benefit from reusing the same worker's warm browser cache, proxy exit IP, or in-memory managed session state:
+
+- **Job affinity (`affinity_key` on `POST /v1/jobs`)**: Pass an optional `"affinity_key": "<key>"` string on `POST /v1/jobs`. The coordinator hashes or remembers the worker assigned to that key and prefers leasing subsequent jobs with the same `affinity_key` to that worker while it remains `online` with free capacity. If the preferred worker is `draining`, `stale`, or offline, the coordinator automatically re-routes the job to another healthy worker so work never stalls behind a dead node.
+- **Sticky managed sessions (`POST /v1/sessions`)**: Managed browser sessions keep a live browser context pinned to the specific worker that created the session. Follow-up session actions and CDP/live connections target that pinned worker for the session's lifetime; if the pinned worker crashes, the session terminates cleanly instead of silently splitting browser state across hosts.
+
+## Multi-worker scaling & worker-kill failover benchmarking
+
+Reproduce horizontal throughput scaling (`1` vs `2` vs `4` workers) and mid-job `SIGKILL` lease-expiry recovery locally with the zero-dependency benchmark harness at [`benchmarks/cluster-bench.mjs`](../benchmarks/cluster-bench.mjs):
+
+```bash
+cargo build --release -p fluxwright-cli
+node benchmarks/cluster-bench.mjs \
+  --bin target/release/fluxwright \
+  --workers 1,2,4 \
+  --jobs 60 \
+  --failover \
+  --out benchmarks/results/cluster-latest.json
+```
+
+What the harness measures against a local loopback HTTP fixture server:
+
+1. **Horizontal scaling (`--workers 1,2,4`)**: Spawns `fluxwright coordinate` with distinct `FLUXWRIGHT_SERVER_TOKEN` and `FLUXWRIGHT_WORKER_TOKEN` credentials, joins `N` `fluxwright serve --join` workers, warms up one job per worker, then runs `--jobs` concurrent browser jobs and reports `jobs/s`, relative speedup, scaling efficiency %, `p50`/`p95`/`p99` end-to-end latency, failure rate, and per-worker completed job distribution.
+2. **Worker-kill failover (`--failover`, default `true`)**: Spawns 2 workers, submits a `retries: 1` job that holds on `/failover`, identifies the active owner via `GET /v1/workers`, sends `SIGKILL` mid-job, and measures end-to-end wall-clock recovery time (`recovery_ms`) through the 30-second lease expiration window until the surviving worker completes attempt 2 (`expired_leases >= 1`).
+
+Pass `--no-failover` to run only the scaling tiers, or `--json` to stream the full JSON report to stdout.
+
 ## Current limits vs planned hardening
 
 Implemented in `0.7.0` (experimental) and hardened in `0.9.0`–`0.10.0`:
