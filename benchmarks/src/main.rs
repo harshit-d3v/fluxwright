@@ -134,11 +134,14 @@ fn tree(sys: &System, root: u32) -> Vec<Pid> {
     found
 }
 
+fn is_chrome_process_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !name.contains("chromedriver") && (name.contains("chrom") || name.contains("headless"))
+}
+
 fn is_chrome(sys: &System, pid: Pid) -> bool {
-    sys.process(pid).is_some_and(|p| {
-        let name = p.name().to_string_lossy().to_ascii_lowercase();
-        name.contains("chrom") || name.contains("headless")
-    })
+    sys.process(pid)
+        .is_some_and(|p| is_chrome_process_name(&p.name().to_string_lossy()))
 }
 
 struct Watched {
@@ -328,7 +331,13 @@ async fn main() -> Result<()> {
             .await?;
             records.push(rec);
         }
-        let tools: &[&str] = &["playwright", "puppeteer", "puppeteer-cluster", "crawlee"];
+        let tools: &[&str] = &[
+            "playwright",
+            "puppeteer",
+            "puppeteer-cluster",
+            "crawlee",
+            "selenium",
+        ];
         for &tool in tools {
             if !tool_enabled(&args.tools, tool) {
                 continue;
@@ -408,7 +417,8 @@ fn print_table(records: &[Record]) {
          and `scraping-200` uses Fluxwright's `ResourcePreset::Scraping` against `/scraping` (images, font, CSS, JS); \
          Crawlee runs PlaywrightCrawler with incognito contexts, maxRequestRetries=2, and `blockRequests()` on \
          `scraping-200`; `puppeteer-cluster` runs CONCURRENCY_CONTEXT (single managed browser) with retryLimit=2; \
-         raw Playwright/Puppeteer run default navigation without relaunch code in chaos. In-flight contexts on Node \
+         selenium reuses min(browsers, 10) pre-warmed WebDriver sessions with deleteAllCookies() between jobs; \
+         raw Playwright/Puppeteer/Selenium run default navigation without relaunch code in chaos. In-flight contexts on Node \
          are capped at 24. Memory is total process-tree RSS; CPU% is normalized across all logical host cores."
     );
 }
@@ -705,5 +715,14 @@ mod tests {
         assert!(tool_enabled(&filter, "fluxwright"));
         assert!(tool_enabled(&filter, "crawlee"));
         assert!(!tool_enabled(&filter, "puppeteer-cluster"));
+    }
+
+    #[test]
+    fn chromedriver_name_is_not_classified_as_browser_process() {
+        assert!(is_chrome_process_name("chrome"));
+        assert!(is_chrome_process_name("chrome-headless-shell"));
+        assert!(is_chrome_process_name("chrome.exe"));
+        assert!(!is_chrome_process_name("chromedriver"));
+        assert!(!is_chrome_process_name("chromedriver.exe"));
     }
 }
