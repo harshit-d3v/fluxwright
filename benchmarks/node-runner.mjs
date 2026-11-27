@@ -321,6 +321,73 @@ async function withCrawlee() {
   record(latencyMetrics(lat, fail, duration_ms));
 }
 
+async function withSelenium() {
+  const { Builder } = await import("selenium-webdriver");
+  const chromeMod = await import("selenium-webdriver/chrome.js");
+  const chromedriver = process.env.FLUXWRIGHT_CHROMEDRIVER;
+
+  const opts = new chromeMod.Options();
+  if (chrome) opts.setChromeBinaryPath(chrome);
+  opts.addArguments("--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check");
+  if (process.env.FLUXWRIGHT_NO_SANDBOX) {
+    opts.addArguments("--no-sandbox");
+  }
+
+  const sessionCount = Math.min(nBrowsers, jobs, 10);
+  const drivers = [];
+  for (let i = 0; i < sessionCount; i++) {
+    let builder = new Builder().forBrowser("chrome").setChromeOptions(opts);
+    if (chromedriver) {
+      builder = builder.setChromeService(new chromeMod.ServiceBuilder(chromedriver));
+    }
+    const driver = await builder.build();
+    await driver.manage().setTimeouts({ pageLoad: jobTimeoutMs });
+    drivers.push(driver);
+    await sleep(50);
+  }
+
+  let next = 0;
+  let fail = 0;
+  const lat = [];
+  const t0 = Date.now();
+  const workers = drivers.map(async (driver) => {
+    for (;;) {
+      const i = next++;
+      if (i >= jobs) return;
+      const s = Date.now();
+      try {
+        await withTimeout(
+          (async () => {
+            await driver.manage().deleteAllCookies();
+            await driver.get(url);
+            if (isPdf) {
+              const b64 = await driver.printPage({ background: true });
+              if (!b64 || Buffer.from(b64, "base64").subarray(0, 5).toString("latin1") !== "%PDF-") {
+                throw new Error("unexpected pdf output");
+              }
+            } else {
+              await driver.getTitle();
+            }
+          })(),
+          jobTimeoutMs + 5_000,
+          "job",
+        );
+      } catch {
+        fail++;
+      }
+      lat.push(Date.now() - s);
+    }
+  });
+  await Promise.all(workers);
+  const duration_ms = Date.now() - t0;
+  await withTimeout(
+    Promise.all(drivers.map((d) => d.quit().catch(() => {}))),
+    5_000,
+    "selenium-quit",
+  ).catch(() => {});
+  record(latencyMetrics(lat, fail, duration_ms));
+}
+
 try {
   if (!url) {
     process.stderr.write("usage: node-runner.mjs <tool> <url>\n");
@@ -338,6 +405,7 @@ try {
   else if (tool === "puppeteer") await withPuppeteer();
   else if (tool === "puppeteer-cluster") await withPuppeteerCluster();
   else if (tool === "crawlee") await withCrawlee();
+  else if (tool === "selenium") await withSelenium();
   else {
     process.stderr.write(`unknown tool ${tool}\n`);
     process.exit(2);
